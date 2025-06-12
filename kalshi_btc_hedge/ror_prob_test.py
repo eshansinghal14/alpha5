@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[ ]:
+# In[1]:
 
 
 get_ipython().system('jupyter nbconvert --to script ror_prob_test.ipynb')
@@ -27,7 +27,7 @@ warnings.filterwarnings(
 )
 
 
-# In[104]:
+# In[2]:
 
 
 def load_cleaned_btc_data():
@@ -46,7 +46,7 @@ def load_cleaned_btc_data():
 btc_df = load_cleaned_btc_data()
 
 
-# In[105]:
+# In[3]:
 
 
 def define_training_constants():
@@ -61,13 +61,13 @@ def define_training_constants():
 deltas, ps, ror_bin_edges = define_training_constants()
 
 
-# In[ ]:
+# In[4]:
 
 
 calculate_l_v(np.array([[1 for _ in range(2)] for _ in range(6)]), 2, 1, 2)
 
 
-# In[ ]:
+# In[21]:
 
 
 def determine_gbm_params(btc_df, deltas, c_l_v=None):
@@ -92,11 +92,11 @@ def determine_gbm_params(btc_df, deltas, c_l_v=None):
     btc_df = btc_df.dropna()
     return btc_df
 
-W_star = np.array([[0.9335578548910446, 0.22748139942318604], [0.9108372996057686, 0.4630051795860236], [0.6785285464371982, 0.8211117174744395], [0.5351057488216742, 0.2597588578134788], [0.649160619231901, 0.16839060975157696], [0.13189063397155243, 0.17128778544168569], [0.27383109598201233, 0.6423312331104211], [0.6598464623059107, 0.9609032021234301], [0.10142513169730116, 0.35585813341501726], [0.8649687047058844, 0.35351778591859834]])
+W_star = np.array([[10.009467473030782, 7.646548230654321], [3.65189065265735, 2.1831277568386116], [3.627243428142196, 4.509796213416398], [8.657113676623583, 5.258895555125257], [5.628179859928944, 2.2082482152286698], [10.05912389002543, 2.167535522464349], [4.974406215942629, 9.354025705380616], [9.619450202699198, 6.454095199805068], [5.865453905684857, 1.5705783589879885], [8.839070543899561, 7.289496804763678]])
 btc_df = determine_gbm_params(btc_df, deltas, partial(calculate_l_v, W_star, 3))
 
 
-# In[141]:
+# In[22]:
 
 
 def compute_and_bucket_ror_probs(btc_df, deltas, ps, ror_bin_edges, sampling_prop=1):
@@ -151,7 +151,7 @@ def compute_and_bucket_ror_probs(btc_df, deltas, ps, ror_bin_edges, sampling_pro
 empirical_data_buckets = compute_and_bucket_ror_probs(btc_df, deltas, ps, ror_bin_edges, sampling_prop=1)
 
 
-# In[ ]:
+# In[23]:
 
 
 # Determine dimensions
@@ -204,7 +204,7 @@ plt.tight_layout()
 plt.show()
 
 
-# In[110]:
+# In[8]:
 
 
 rows = [['Delta', 'Price Change'] + ror_bin_edges]
@@ -218,7 +218,7 @@ df.to_csv("results/compute_ror_with_gbm.csv", index=False)
 print(df.head())
 
 
-# In[132]:
+# In[25]:
 
 
 def calculate_error(btc_df, deltas, ps, ror_bin_edges, c_l_v, test_probs, sampling_prop=1):
@@ -231,11 +231,11 @@ def calculate_error(btc_df, deltas, ps, ror_bin_edges, c_l_v, test_probs, sampli
         empirical_probs = np.where(total_counts > 200, success_counts / total_counts, np.nan)
         # empirical_probs = np.divide(success_counts, total_counts)
     empirical_probs[total_counts == 0] = np.nan
-    mse = np.nanmean(abs(empirical_probs - test_probs) ** 3)
+    mse = np.nanmean(abs(empirical_probs - test_probs) ** 4)
     return mse
 
 
-# In[144]:
+# In[26]:
 
 
 ## Train for l and w
@@ -248,24 +248,24 @@ deltas, ps, ror_bin_edges = define_training_constants()
 # In[ ]:
 
 
-h = 1e-3
-deg = 3
+h = 1e-5
+deg = 1
 W_t = np.zeros(((deg + 2) * (deg + 1) // 2, 2), float)
 W_prev = None
-# W_t = np.array([[837.8272249917405, 0.001], [928.444561394567, 0.001], [78.76362407101385, 0.001], [145.02831502173672, 0.001], [0.001, 1000.0], [1000.0, 0.001]])
-W_t = np.array([[0.9845246592673185, 0.33350231400253083], [0.015056183383086563, 0.4966687790283799], [0.10257691702016936, 0.8379186812244079], [0.6179161353810881, 0.257093039156744], [0.16023751939914188, 0.7260624044824605], [0.6472570987946598, 0.032059851567643904], [0.3152508628565547, 0.1550884916632449], [0.5361474849166508, 0.0319343400658717], [0.7765698010711551, 0.27009274393640015], [0.35504970517482115, 0.8353512552287403]])
+# W_t = np.array([[10.009467473030782, 7.646548230654321], [3.65189065265735, 2.1831277568386116], [3.627243428142196, 4.509796213416398], [8.657113676623583, 5.258895555125257], [5.628179859928944, 2.2082482152286698], [10.05912389002543, 2.167535522464349], [4.974406215942629, 9.354025705380616], [9.619450202699198, 6.454095199805068], [5.865453905684857, 1.5705783589879885], [8.839070543899561, 7.289496804763678]])
+W_t = np.array([[10.338096075263444, 10.042785946625758], [6.589816035454418, 1.5059349557070776], [5.247507611081495, 6.27787181763012]])
 curr_mse = float('inf')
 iter = 0
 
 # Alpha
-a = 1e-1
-A = 10.0
+a = 0.1
+A = 100.0
 a_exp = 0.50
 def alpha(k):
-    return a / (A + k) ** a_exp
+    return a
 
 def h_func(k):
-    return h / (A + k) ** a_exp
+    return h
 
 # Adam parameters
 m = np.zeros_like(W_t)
@@ -276,14 +276,14 @@ mse = [float('inf')]
 step_sizes = []
 
 # Sample multiple initialization W_1 to find min starting point
-# for i in range(5):
-#     print(f"Testing W_1 iter: {i}")
-#     W_0 = np.random.rand((deg + 2) * (deg + 1) // 2, 2)
-#     mse_0 = calculate_error(btc_df, deltas, ps, ror_bin_edges, partial(calculate_l_v, W_0, deg), test_probs)
-#     print(f"W_0: {W_0}, MSE: {mse_0}")
-#     if mse_0 < mse[0]:
-#         mse[0] = mse_0
-#         W_t = W_0
+for i in range(5):
+    print(f"Testing W_1 iter: {i}")
+    W_0 = np.random.rand((deg + 2) * (deg + 1) // 2, 2) * 10
+    mse_0 = calculate_error(btc_df, deltas, ps, ror_bin_edges, partial(calculate_l_v, W_0, deg), test_probs)
+    print(f"W_0: {W_0}, MSE: {mse_0}")
+    if mse_0 < mse[0]:
+        mse[0] = mse_0
+        W_t = W_0
 
 while True:
     iter += 1
@@ -293,10 +293,10 @@ while True:
     # Estimate gradient with Simultaneous Perturbation Stochastic Approximation (SPSA)
     print(f"Estimating gradient")
     grad_estimates = []
-    for i in range(1):
+    for i in range(5):
         perturbation = np.round(np.random.rand((deg + 2) * (deg + 1) // 2, 2)) * 2 - 1
-        mse_pos = calculate_error(btc_df, deltas, ps, ror_bin_edges, partial(calculate_l_v, W_t + h_func(iter) * perturbation, deg), test_probs, sampling_prop=1)
-        mse_neg = calculate_error(btc_df, deltas, ps, ror_bin_edges, partial(calculate_l_v, W_t - h_func(iter) * perturbation, deg), test_probs, sampling_prop=1)
+        mse_pos = calculate_error(btc_df, deltas, ps, ror_bin_edges, partial(calculate_l_v, W_t + h_func(iter) * perturbation, deg), test_probs, sampling_prop=0.2)
+        mse_neg = calculate_error(btc_df, deltas, ps, ror_bin_edges, partial(calculate_l_v, W_t - h_func(iter) * perturbation, deg), test_probs, sampling_prop=0.2)
         grad_estimates.append((mse_pos - mse_neg) / ((2 * h_func(iter)) * perturbation))
 
     grad_t = np.array(grad_estimates).mean(axis=0)
@@ -310,61 +310,28 @@ while True:
     v_hat = v / (1 - beta2 ** iter)
 
     W_prev = W_t
-    step = alpha(iter) * m_hat/(np.sqrt(v_hat) + eps)
+    # step = alpha(iter) * m_hat/(np.sqrt(v_hat) + eps)
+    step = alpha(iter) * grad_t
     W_t -= step
     # W_t = np.clip(W_t, 1e-6, None)
     curr_mse = calculate_error(btc_df, deltas, ps, ror_bin_edges, partial(calculate_l_v, W_t, deg), test_probs)
     mse.append(curr_mse)
 
-    if curr_mse > mse[-2]:
-        W_t = W_prev
-        step /= 2
-        W_t -= step
-        W_t = np.clip(W_t, 1e-6, None)
-        curr_mse = calculate_error(btc_df, deltas, ps, ror_bin_edges, partial(calculate_l_v, W_t, deg), test_probs)
-        if curr_mse > mse[-2]:
-            print("Converged")
-            break
-        mse[-1] = curr_mse
+    # if curr_mse > mse[-2]:
+    #     W_t = W_prev
+    #     step /= 2
+    #     W_t -= step
+    #     W_t = np.clip(W_t, 1e-6, None)
+    #     curr_mse = calculate_error(btc_df, deltas, ps, ror_bin_edges, partial(calculate_l_v, W_t, deg), test_probs)
+    #     if curr_mse > mse[-2]:
+    #         print("Converged")
+    #         break
+    #     mse[-1] = curr_mse
 
-    print(f"Hyperparamters: alpha- {alpha(iter)}, m_hat- {m_hat}, v_hat- {v_hat}")
+    print(f"alpha- {alpha(iter)}")
     print(f"Current MSE: {curr_mse}")
     print(f"Gradient: {grad_t}")
     print(f"MSE: {mse}")
     step_sizes.append(np.linalg.norm(step))
     print(f"‖step‖ = {step_sizes[-1]:.3e}")
-
-
-# In[121]:
-
-
-def mse_vec(p):
-    W = p.reshape(W_t.shape)
-    return calculate_error(
-        btc_df, deltas, ps, ror_bin_edges,
-        partial(calculate_l_v, W, deg),
-        test_probs,
-        sampling_prop=1.0
-    )
-
-log = []
-def cb(xk):
-    fval = mse_vec(xk)
-    log.append((xk.copy(), fval))
-    print(f"Iter {len(log):3d}: MSE = {fval:.6f}")
-
-res = minimize(
-    mse_vec,
-    x0=W_t.flatten(),
-    method='L-BFGS-B',
-    bounds=[(1e-6, None)] * W_t.size,
-    options={
-        "maxiter": 20,
-        "ftol": 1e-4,
-        "disp": True,      # turn on final convergence message
-        "iprint": 1        # >0: print per major iteration; 2: per line search
-    },
-)
-W_t = res.x.reshape(W_t.shape)
-print("Final MSE:", res.fun)
 

@@ -52,4 +52,9 @@ def calculate_l_v(W, deg, delta, p):
     poly = PolynomialFeatures(degree=deg, include_bias=True)
     X_kernel = poly.fit_transform(X)
     res = X_kernel @ W
-    return int(res[0, 0]), res[0, 1]
+    window_size = int(res[0, 0])
+    f = res[0,1]
+    nu = f if f > 0 else 0
+    nu += np.log1p(np.exp(-abs(f)))
+    return window_size, nu
+

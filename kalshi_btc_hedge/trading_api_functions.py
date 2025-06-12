@@ -11,10 +11,11 @@ import hmac
 import json
 import os
 import time
-import websockets
 import http.client
 from urllib.parse import urlencode
 import pandas as pd
+from websocket import create_connection
+import threading
 
 
 from api_keys import load_kalshi_api_key
@@ -51,7 +52,7 @@ def get_kalshi_btc_spreads(max_close_time_s):
     markets = requests.get(url, headers=headers, params=params).json()['markets']
 
     kalshi_df = pd.DataFrame(markets)
-    kalshi_df = kalshi_df[['subtitle', 'no_ask', 'close_time']].copy()
+    kalshi_df = kalshi_df[['subtitle', 'no_ask', 'yes_ask', 'close_time']].copy()
     kalshi_df['ceil_price'] = kalshi_df['subtitle'].str.split().str[0].str[1:].str.replace(',', '', regex=False).astype(int)
     kalshi_df['close_time'] = pd.to_datetime(kalshi_df['close_time'], utc=True).dt.tz_convert('America/Chicago')
     return kalshi_df
@@ -67,19 +68,6 @@ def get_kalshi_btc_spreads(max_close_time_s):
 
     # print(response.json())['yes'][-1] # its like 1 - this price should be equal to what we got before
 
-
-async def get_live_btc_data():
-    # https://docs.cdp.coinbase.com/exchange/docs/websocket-overview
-    URI = 'wss://ws-feed.exchange.coinbase.com'
-    SIGNATURE_PATH = '/users/self/verify'
-    subscribe_message = json.dumps({
-    'type': 'subscribe',
-    'channels': [{'name': 'level2', 'product_ids': [product_ids]}],
-    # 'signature': signature_b64,
-    # 'key': API_KEY,
-    'passphrase': PASSPHRASE,
-    'timestamp': str(time.time())
-    })
 
 def get_recent_btc_data():
     conn = http.client.HTTPSConnection("api.exchange.coinbase.com")
@@ -100,6 +88,7 @@ def get_recent_btc_data():
     btc_df['Price'] = (btc_df['High'] + btc_df['Low']) / 2.0
     btc_df = btc_df[['Timestamp', 'Date', 'Low', 'High', 'Open', 'Close', 'Volume', 'Price']]
     btc_df.sort_values('Date', ascending=True, inplace=True)
+    btc_df = btc_df.drop(['Open', 'Close', 'Volume'], axis=1)
     return btc_df
 
 
