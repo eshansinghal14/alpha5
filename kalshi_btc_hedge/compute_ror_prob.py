@@ -1,34 +1,31 @@
 from scipy.stats import norm
 import numpy as np
 from scipy.stats import t
+import torch
+from torch.distributions import StudentT
+import scipy.stats as stats
+from torch.autograd import Function
+import math
 
-def compute_ror_with_gbm(p_f, delta, data=None, mu=None, sigma=None, p_0=None, nu_arr=None, testing=False):
-    if not testing or mu is None or sigma is None or p_0 is None:
-        data.loc[:, 'log_returns'] = np.log(data['Price'] / data['Price'].shift(1))
-        mu = np.mean(data.loc[:, 'log_returns'])
-        sigma = np.std(data.loc[:,'log_returns'])
+def compute_ror_with_gbm(p_f, delta, mu=None, sigma=None, p_0=None, nu=None, testing=False):
+    numerator   = (torch.log(p_f) - torch.log(p_0) - (mu - 0.5 * sigma**2) * delta)
+    denominator = sigma * torch.sqrt(delta)
 
-    numerator = (np.log(p_f) - np.log(p_0) - (mu - 0.5 * sigma**2) * delta)
-    denominator = sigma * np.sqrt(delta)
-    
     if testing:
-        safe_mask = (denominator > 0)
-        ror_arr = np.full_like(denominator, np.nan, dtype=float)
-        z = np.empty_like(denominator, dtype=float)
+        safe_mask = denominator > 0
+        ror_arr   = torch.full_like(denominator, float('nan'))
+        z = torch.zeros_like(denominator)
         z[safe_mask] = numerator[safe_mask] / denominator[safe_mask]
-        ror_arr[safe_mask] = t.cdf(z[safe_mask], df=nu_arr[safe_mask])
+        cdf  = student_t_cdf(z, nu)
+        ror_arr = torch.where(safe_mask, cdf, torch.full_like(z, float('nan')))
     else:
-        z = numerator / denominator
-        ror_arr = t.cdf(z, df=nu_arr)
+        z       = numerator / denominator
+        student = StudentT(df=nu)
+        ror_arr = student.cdf(z)
 
     return ror_arr
 
-def compute_floor_price(delta, data, p_0, nu, risk_threshold):
-    df = data.copy(deep=False)
-    df.loc[:, 'log_returns'] = np.log(df.loc[:, 'Price'] / df.loc[:, 'Price'].shift(1))
-    mu = np.mean(df.loc[:, 'log_returns'])
-    sigma = np.std(df.loc[:, 'log_returns'])
-
+def compute_floor_price(delta, mu, sigma, p_0, nu, risk_threshold):
     z_target = t.ppf(risk_threshold, df=nu)
     drift = (mu - 0.5*sigma**2) * delta
     vol_term = sigma * np.sqrt(delta) * z_target
@@ -36,20 +33,23 @@ def compute_floor_price(delta, data, p_0, nu, risk_threshold):
 
     return np.exp(log1p)
 
-# def get_data_stats(btc_df):
-#     btc_df['log_returns'] = np.log(btc_df['Price'] / btc_df['Price'].shift(1))
+def student_t_cdf(z: torch.Tensor, nu: torch.Tensor) -> torch.Tensor:
+    # z and nu must broadcast to the same shape
+    # 1) compute x = ν / (ν + z^2)
+    x = nu / (nu + z.pow(2))
+    x = torch.clamp(x, min=1e-6, max=1.0 - 1e-6)
 
-#     mu = np.mean(btc_df['log_returns'])
+    # 2) parameters a = ν/2, b = 1/2
+    a = nu * 0.5
+    b = 0.5
 
-#     print('mu')
+    # 3) regularized incomplete beta I_x(a,b)
+    # torch.special.betainc returns the *regularized* incomplete beta
+    I = torch.special.betainc(a, b, x)
 
-#     sigma = np.std(btc_df['log_returns'])
-
-#     print('sigma')
-
-#     p_0 = btc_df.loc[len(btc_df) - 1, 'Price']
-
-#     print('p_0')
-    
-#     return mu, sigma, p_0
-
+    # 4) piecewise CDF
+    #  - for z < 0:  0.5 * I
+    #  - for z >= 0: 1 - 0.5 * I
+    return torch.where(z < 0,
+                       0.5 * I,
+                       1.0 - 0.5 * I)

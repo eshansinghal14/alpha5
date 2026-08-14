@@ -1,3 +1,13 @@
 kalshi_btc_hedge/eshan-kalshi-api-key.txt
-kalshi_btc_hedge/data/.
-kalshi_btc_hedge/results/.
+kalshi_btc_hedge/eshan-kalshi-rsa-private-key.txt
+kalshi_btc_hedge/eshan-ws-key.txt
+kalshi_btc_hedge/data/
+kalshi_btc_hedge/results/
+kalshi_btc_hedge/.venv/
+kalshi_infra/keys.py
+kalshi_infra/kalshi-ws-keypair.pem
+kalshi_infra/logs/
+kalshi_infra/*_log.txt
+data/
+__pycache__/
+.venv/
