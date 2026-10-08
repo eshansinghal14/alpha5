@@ -34,9 +34,79 @@ HIGH_LOW_TEMP_SERIES_TICKERS = [
     "KXLOWTNYC", "KXLOWTOKC", "KXLOWTAUS", "KXLOWTMIN", "KXLOWTLAX",
 ]
 
+# Every series on Kalshi with frequency == "fifteen_min", confirmed directly
+# against /trade-api/v2/series with no category filter (13,029 series
+# total, 19 matched) -- so this is exhaustive as of the check date, not a
+# hand-picked subset. All but KXINX15M/KXNDQ15M were confirmed to actually
+# produce strike-range markets (floor_strike populated once a market opens,
+# same shape as HIGH_LOW_TEMP_SERIES_TICKERS); KXINX15M/KXNDQ15M exist as
+# series but currently have zero markets in any status -- kept in anyway
+# since register_markets() just no-ops on an empty result, so they'll pick
+# up automatically if/when Kalshi activates them. Used by
+# ws_raw_ob_collector.py.
+FIFTEEN_MIN_SERIES_TICKERS = [
+    # crypto (14)
+    "KXBTC15M", "KXETH15M", "KXBNB15M", "KXSOL15M", "KXXRP15M", "KXDOGE15M",
+    "KXADA15M", "KXTON15M", "KXHYPE15M", "KXNEAR15M", "KXZEC15M", "KXBCH15M",
+    "KXCRYPTOCOMP15M", "KXCRYPTOLEAD15M",
+    # commodities (3)
+    "KXWTI15M", "KXGOLD15M", "KXSILVER15M",
+    # financials (2) -- see note above re: currently zero live markets
+    "KXINX15M", "KXNDQ15M",
+]
+
+# S&P 500 range markets (the exact series behind
+# kalshi.com/markets/kxinx/sp-500-range/...) -- confirmed via API: daily
+# series with hourly-bucketed events (e.g. KXINX-26AUG21H1600), 58 open
+# strike-range markets at check time. Used by ws_raw_ob_collector.py.
+SP500_SERIES_TICKERS = ["KXINX"]
+
+# Hourly-cadence "price at time X" siblings of the above -- same
+# crypto/commodities/financials category sweep as FIFTEEN_MIN, this time
+# frequency == "hourly". Confirmed individually, not just by
+# frequency label: every ticker here either had open markets with
+# floor_strike populated, or (WTI/gold/silver, which are Sat/Sun
+# market-hours-closed) had floor_strike populated on recent finalized
+# markets. Excluded a long list of same-asset "hourly" tickers that turned
+# out to be dead/retired duplicates with zero markets ever, in any status
+# (confirmed directly, not assumed) -- e.g. bare KXSOL/KXTON/KXNEAR/KXZEC/
+# KXRIPPLE/KXZECH/KXZECD/KXTONH/KXTOND/KXNEARH/KXNEARD all had 0 markets
+# ever, same "legacy ticker" pattern noted on HIGH_LOW_TEMP_SERIES_TICKERS.
+# Also excluded KXDOGE/KXDOGED specifically: alive, but strike_type="custom"
+# with floor_strike always None (verbal strikes via yes_sub_title instead),
+# a fundamentally different shape the collector can't use regardless of
+# whether the series is live. Used by ws_raw_ob_collector.py.
+HOURLY_SERIES_TICKERS = [
+    # crypto (12)
+    "KXBTC", "KXBTCD", "KXETH", "KXETHD", "KXBNB", "KXBNBD", "KXSOLE", "KXSOLD",
+    "KXXRP", "KXXRPD", "KXHYPE", "KXHYPED",
+    # commodities (3) -- Sat/Sun closed, not dead; see note above
+    "KXWTIH", "KXGOLDH", "KXSILVERH",
+    # financials (2)
+    "KXINXU", "KXNASDAQ100U",
+]
+
+# eshan-ws-key.txt is THE account's RSA key -- it's the one paired with the
+# KALSHI_API_KEY id in keys.py, for REST and websocket alike. The name is
+# historical (it was first added for the WS collector) and does not mean
+# websocket-only; don't add a separate "REST key" alongside it.
+#
+# A second file, eshan-kalshi-rsa-private-key.txt, used to be listed first
+# here and held a DIFFERENT, orphaned key (confirmed directly: different
+# public-key fingerprint, and no key id anywhere in this repo pairs with it).
+# Signing with it returned 401 INCORRECT_API_KEY_SIGNATURE on every
+# authenticated endpoint. It has since been deleted.
+#
+# That mismatch stayed invisible for a long time because the endpoints this
+# module uses most (markets, orderbook, series) are PUBLIC -- confirmed
+# directly that /markets/{ticker}/orderbook returns 200 with a deliberately
+# garbage signature AND with no auth headers at all. So "auth works, I use it
+# all the time" was never actually exercising the signature; only genuinely
+# authenticated endpoints (portfolio/balance, portfolio/positions, order
+# placement) ever revealed it.
 _KEY_CANDIDATES = [
-    os.path.join(os.path.dirname(__file__), "..", "kalshi_btc_hedge", "eshan-kalshi-rsa-private-key.txt"),
-    os.path.join(os.path.dirname(__file__), "eshan-kalshi-rsa-private-key.txt"),
+    os.path.join(os.path.dirname(__file__), "..", "kalshi_btc_hedge", "eshan-ws-key.txt"),
+    os.path.join(os.path.dirname(__file__), "eshan-ws-key.txt"),
 ]
 
 

@@ -15,7 +15,10 @@ sys.path.insert(0, os.path.dirname(__file__))
 from keys import KALSHI_API_KEY as API_KEY
 
 BASE_URL = "https://api.elections.kalshi.com"
-KEY_PATH = os.path.join(os.path.dirname(__file__), "..", "kalshi_btc_hedge", "eshan-kalshi-rsa-private-key.txt")
+# eshan-ws-key.txt, not the former eshan-kalshi-rsa-private-key.txt -- that
+# second file held an orphaned key that 401'd on every authenticated
+# endpoint and has been deleted; see api_functions._KEY_CANDIDATES.
+KEY_PATH = os.path.join(os.path.dirname(__file__), "..", "kalshi_btc_hedge", "eshan-ws-key.txt")
 
 TICKER = "KXHIGHLAX-26AUG01-B82.5"  # one market to probe
 SERIES = "KXHIGHLAX"

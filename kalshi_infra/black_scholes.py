@@ -274,187 +274,68 @@ def fit_normal_to_bucket_bid_ask(
     warm_start: tuple[float, float] | None = None,
     lambda_min_threshold: float = 0.001,
 ) -> tuple[float | None, float | None, float | None]:
-    """
-    Find (mu, sigma) for T ~ N(mu, sigma^2) whose own model-implied probability
-    (bucket_model_prob_and_grad) stays within each market's own [bid, ask] --
-    see the module-level comment above for why this fits each market
-    independently instead of cumulatively across strikes.
+    """Fit (mu, sigma) for T ~ N(mu, sigma^2) so each market's model-implied
+    probability stays inside its own [bid, ask].
 
-    markets: list of (floor, cap, strike_type) tuples, one per market
-        (strike_type: 'between'/'greater'/'less' -- see bucket_model_prob_and_grad).
+    markets: (floor, cap, strike_type) per market, strike_type
+        'between'/'greater'/'less'.
 
-    Minimizes sum of squared band-violations via a hand-rolled
-    Levenberg-Marquardt solve (not scipy.optimize): a range bucket's model
-    probability is a *difference* of two Gaussian CDFs, genuinely nonlinear in
-    (mu, sigma), so this can't be posed as a linear program the way the
-    single-CDF cumulative-SF version could be. It IS smooth, so an *analytic*
-    gradient/Jacobian is used throughout (not finite-difference) -- an earlier
-    nonlinear-fit attempt in this project used numerical gradients on a hinge
-    loss and found they could read as ~0 right at/near a kink that wasn't the
-    true optimum (false convergence); the true gradient here is exact
-    everywhere except exactly on a band boundary (measure zero).
+    Minimizes squared band-violations with a hand-rolled Levenberg-Marquardt
+    solve. Not scipy: a range bucket's probability is a difference of two
+    Gaussian CDFs, so this isn't linear-programmable, and at ~100k fits/day
+    scipy's dispatch plus norm.cdf/pdf cost 15-50ms per fit vs ~0.3ms for plain
+    Python scalar math (numpy is ~10ms -- arrays this small are all dispatch
+    overhead). Gradients are analytic: numerical gradients on a hinge loss read
+    as ~0 near a kink and falsely converge. Two starting points
+    (method-of-moments off mid prices, and a strike-spread-only fallback);
+    lowest cost wins.
 
-    IMPORTANT -- a well-fitting (mu, sigma) does not always exist: Kalshi's
-    bucket design skips ranges (e.g. lists 75-76/77-78/79-80/81-82 but never
-    76-77/78-79/80-81), and when the market prices the *listed* buckets to
-    sum close to 1 on their own (implying the unlisted gaps are ~impossible
-    outcomes, not just unpriced ones), no continuous normal can reproduce
-    that -- a continuous density can't be ~0 on one stretch and large right
-    next to it. This isn't a solver failure; there is genuinely no (mu,sigma)
-    that fits well. It shows up as an unusually large returned `band_cost`
-    (mainly in illiquid/wide-spread moments).
+    A well-fitting (mu, sigma) may not exist. Kalshi skips bucket ranges, and if
+    the listed buckets price to ~1 on their own, no continuous normal can be ~0
+    on a gap and large beside it. That's not solver failure -- it shows up as a
+    large `band_cost`, mostly in wide-spread moments.
 
-    warm_start -- a convergence aid for a DIFFERENT failure mode than the
-    above: a genuinely degenerate cost surface where MULTIPLE very different
-    (mu, sigma) pairs fit every band equally well (band_cost near 0 at ALL of
-    them), not just one. Concretely: when only one or two markets carry real
-    signal (e.g. a single strike near 0.99 with everything else a thin,
-    near-0/near-1 one-sided print), what's actually constrained is the
-    Z-SCORE at that strike, not (mu, sigma) independently -- (mu=79, sigma
-    small) and (mu=38, sigma=17) can produce nearly the same z-score and thus
-    nearly the same fitted probability there, so both sit on the same
-    near-zero-cost ridge despite being wildly different in absolute terms.
-    Confirmed on a real snapshot (KXHIGHLAX-26JUL24, 2026-07-24 ~23:00 UTC): a
-    single market's bid oscillating by a fraction of a cent across the
-    certain_bid=0.99 threshold flipped the fit between a sane point mass
-    (mu=79, sigma=0, via the certain-outcome shortcut below) and sigma=17 on
-    the degenerate ridge, from one second to the next.
-      - warm_start: an optional (mu, sigma) -- typically the PREVIOUS
-        timestep's own fitted values when fitting a time series -- added as
-        an extra LM starting point (floored at sigma_min, since sigma=0
-        would divide by zero as a literal starting point). Anchoring near the
-        previous point keeps the solve on the sane end of a ridge like the
-        above in practice, without this function REJECTING the result if it
-        still lands somewhere poorly-constrained -- see lambda_min below on
-        what changed there.
+    warm_start: optional (mu, sigma), typically the previous timestep's fit,
+    added as an extra LM start (floored at sigma_min). Guards a different
+    failure: when only one or two markets carry signal, what's constrained is
+    the z-score at that strike, not (mu, sigma) separately, so wildly different
+    pairs sit on the same near-zero-cost ridge. Anchoring near the previous
+    point keeps the solve on the sane end.
 
-    lambda_min (returned, no longer a rejection gate): A00/A01/A11 in the
-    Gauss-Newton solve below is exactly J^T J, the local curvature (Hessian
-    approximation) of the cost surface at the converged point. Its smallest
-    eigenvalue measures how sharply ANY direction is pinned down -- a small
-    lambda_min means some direction in (mu, sigma) space is barely
-    constrained at all, the ridge signature described above. This used to
-    also GATE the return value (rejecting -- returning None, None -- any
-    candidate whose lambda_min fell below lambda_min_threshold, preferring a
-    well-constrained-but-higher-cost candidate over a lower-cost-but-poorly-
-    constrained one). That gate is gone: this now always returns the
-    lowest-cost candidate found, full stop, with lambda_min carried along so
-    a caller can still inspect how tightly it was pinned down and judge for
-    itself, rather than this function silently deciding a poorly-constrained
-    point isn't worth reporting. lambda_min_threshold is still accepted as a
-    parameter (threaded through every caller up the stack) but no longer
-    used inside this function.
+    lambda_min (returned): smallest eigenvalue of J^T J at the converged point
+    -- how tightly any direction is pinned; small means the ridge above.
+    Informational only, it no longer gates the return, and lambda_min_threshold
+    is accepted but unused.
 
-    The ONE remaining rejection is narrower and different in kind: if any
-    'less'/'greater' ("<F"/">F") market's own fitted probability at the
-    chosen point exceeds 0.5 -- pricing that open-ended tail as MORE LIKELY
-    THAN NOT -- (mu, sigma) is withheld (None, None), band_cost/lambda_min
-    still returned. Deliberately scoped to 'less'/'greater' only, not
-    'between' (a calm, well-behaved fit routinely has a 'between' bucket
-    price >0.5 near its own peak; that's normal, not a red flag) -- see the
-    return statement below.
+    The one rejection: if a 'less'/'greater' market's fitted probability exceeds
+    0.5 (an open-ended tail priced more likely than not), (mu, sigma) is
+    withheld as (None, None) with band_cost/lambda_min still returned. Not
+    applied to 'between', where >0.5 near the peak is normal.
 
-    Solver is hand-rolled, and the per-market math is plain Python/math.erf
-    rather than numpy, because this runs ~100k times/day: scipy.optimize's
-    generic dispatch overhead plus scipy.stats.norm.cdf/pdf's ~15-30x-heavier
-    per-call cost (vs scipy.special.ndtr / a direct exp() for the PDF) made a
-    single fit take 15-50ms; numpy arrays this tiny (~5-6 elements) were
-    still ~10ms (per-array-op dispatch overhead exceeds the actual math at
-    this size); plain Python scalar math is ~0.3ms -- see
-    _bucket_residuals_and_jac's docstring. Tries 2 different starting points --
-    a method-of-moments guess off the markets' own mid prices (primary; see
-    below) and a strike-spread-only fallback -- and keeps whichever converges
-    to the lower cost, as a safety net against local-optimum risk (e.g. a
-    wide-open market where many (mu, sigma) satisfy every band with room to
-    spare, or the spread-only guess landing far enough from the true optimum
-    that sigma collapses to sigma_min before finding it).
+    bid_depths/ask_depths (optional): two-sided markets (both depths > 0) keep
+    the band hinge plus a small `anchor_weight` pull toward their WAP/midpoint,
+    which only breaks ties and never overrides a band. One-sided markets have no
+    meaningful band, so they're fit directly to their midprice at full weight --
+    otherwise they contribute zero gradient and the anchor term alone can drive
+    the fit to a near-delta solution. Without depths, every market gets the
+    plain hinge.
 
-    bid_depths/ask_depths (optional): if given, splits markets into two
-    groups. TWO-SIDED markets (both depths > 0) keep the band-violation hinge
-    described above, plus a small secondary objective (weight `anchor_weight`,
-    small relative to the primary band weight of 1) pulling their model
-    probability toward their own WAP (1-tick spread, weighted by opposing
-    depth) or midpoint (wider spread) -- same convention as get_candlesticks'
-    mid elsewhere in this codebase; this exists purely to break ties when
-    multiple (mu, sigma) fit every hard band equally well, and never overrides
-    a real band constraint. ONE-SIDED markets (bid_depth<=0 or ask_depth<=0 --
-    no real resting order on one side, so [bid, ask] isn't a meaningful band,
-    typically [0, 0.01] by the missing-side-defaults-to-0-or-1 convention) get
-    no hinge and no anchor -- instead they're fit directly to their raw
-    midprice at full weight. This matters because a market whose trivial band
-    is satisfied by nearly any (mu, sigma) contributes zero gradient once
-    inside it; with several such one-sided markets in one fit, that can leave
-    too few informative constraints, letting the small anchor term on the
-    remaining two-sided markets fully determine (mu, sigma) on its own and
-    land on a degenerate near-delta-function solution (found on a real
-    snapshot: band_cost 0 at both sigma=0.46 and a spurious sigma=0.05, with
-    only the anchor distinguishing them). Fitting one-sided markets to their
-    midprice keeps them contributing real signal instead of going silent.
-    If bid_depths/ask_depths aren't given at all, every market keeps the
-    plain band-hinge treatment (no anchor, no midprice fit) as before.
+    certain_bid/certain_ask: when one market's bid >= certain_bid and every
+    other ask <= certain_ask, the market has called the outcome -- skip the LM
+    solve and return that bucket's location at sigma=0.0 (a true point mass),
+    band_cost 0. Near expiry the cost surface otherwise goes flat along a ridge
+    leaving sigma too high, and since iv_scaled_to_day divides by sqrt(days
+    remaining) that inflates into an apparent vol increase into expiry.
 
-    certain_bid/certain_ask: if one market's bid >= certain_bid while every
-    OTHER market's ask <= certain_ask, the market itself is calling the
-    outcome settled into that one bucket -- skip the LM solve entirely and
-    return that bucket's own representative location (bucket midpoint for
-    'between', one degree past the threshold for a tail -- same convention as
-    the method-of-moments start below) at sigma=0.0 (a genuine point mass,
-    not sigma_min), band_cost 0.0. This matters most right before expiry:
-    with few strikes and one bucket already priced near-certain, the cost
-    surface can go nearly flat along a wide mu/sigma ridge (verified directly
-    on a real case -- a 3-cent move on one two-sided market swung the LM
-    solve's sigma by >20% while band_cost stayed ~0 the whole time, i.e.
-    every (mu, sigma) on that ridge fit the bands equally well). Real
-    consequence: implied_sigma doesn't actually collapse toward 0 the way a
-    genuinely near-certain outcome should, and since iv_scaled_to_day divides
-    by sqrt(days remaining), that lingering sigma gets amplified into an
-    apparent vol INCREASE right into expiry -- backwards from what a well-
-    calibrated market should show. This short-circuit sidesteps the
-    degeneracy in the one case it's actually safe to: the market has already
-    told us which bucket won, so there's no (mu, sigma) search left to do.
+    On that path mu always reuses warm_start's mu when available. Any mu inside
+    the certain region fits every market equally, so snapping to a convention
+    point would bake in a fake jump -- and downstream realized-vol calculations
+    diff consecutive mu values, counting it as real variance. The
+    midpoint/floor+-1 convention only applies with no warm_start.
 
-    mu on this path: ALWAYS uses warm_start's own mu (the previous timestep's
-    fitted spot) when a warm_start is available at all, never the bucket-
-    midpoint/floor+-1 convention in that case. Reasoning: every market's
-    price is satisfied equally well by ANY mu inside the now-certain region
-    (that's what "certain" means here -- pinning mu to a specific point
-    within it doesn't change any market's fitted probability at all), so
-    snapping to a convention point that differs from wherever the market had
-    actually converged to bakes in a fake jump that's pure modeling artifact,
-    not a real move -- and since compute_implied_spot_timeseries's downstream
-    realized-vol calculations (variance_till_expiry, wing_gamma,
-    realized_vol_scaled, the winddown curve itself) all diff consecutive mu
-    values, that fake jump gets counted as real realized variance. Holding
-    continuity with the last trustworthy estimate instead means the
-    transition into certainty costs ~0 realized variance, matching what
-    actually happened (the market gradually narrowing, then having nothing
-    left to move) rather than an instantaneous snap. An earlier version of
-    this gated the warm_start reuse behind an extra check that the previous
-    mu still fell inside the now-certain bucket, falling back to the
-    midpoint/floor+-1 convention otherwise -- removed: that "safety check"
-    reintroduced exactly the fake jump this path exists to avoid, on the
-    ordinary case of the market narrowing its LAST little bit into certainty
-    (mu can legitimately sit just outside the final bucket right up until
-    the print that makes it certain). The floor+-1/midpoint convention now
-    only fires when warm_start is missing entirely (e.g. the very first
-    point of a day, genuinely nothing to hold continuity with).
-
-    Returns sigma=0.0, not sigma_min: this is the one path in the module that
-    can, since there's no LM solve here to floor. Callers that divide by
-    sigma (bucket_model_prob_and_grad; the fitted-curve plot in
-    analysis.ipynb's plot_jump_occurrence) must guard for sigma == 0
-    themselves -- compute_implied_spot_timeseries and everything downstream
-    of it (iv_scaled_to_day, realized_vol_scaled) only ever divide by
-    sqrt(time), never by sigma, so they're unaffected.
-
-    Returns (mu, sigma, band_cost, lambda_min), or (None, None, None, None)
-    if fewer than 2 markets OR every candidate start's lambda_min fell below
-    lambda_min_threshold (see above). lambda_min is returned even on
-    success/the certain-outcome path (float('inf') there, a point mass being
-    maximally well-constrained by definition) so a caller can inspect it
-    directly -- e.g. to see the actual distribution of lambda_min values
-    across a day's worth of fits, for calibrating lambda_min_threshold
-    itself against real data instead of guessing a number in the abstract.
+    sigma=0.0 (not sigma_min) is unique to that path. Callers dividing by sigma
+    must guard for it; compute_implied_spot_timeseries and everything downstream
+    divide only by sqrt(time).
     """
     n = len(markets)
     if n < 2:
@@ -873,81 +754,45 @@ def fit_local_sigma_smile(
     max_violation_to_include: float = 0.25,
     sigma_bound_mult: tuple[float, float] = (0.2, 5.0),
 ) -> tuple[float | None, float | None, float | None, float | None]:
-    """
-    Decoupled, per-snapshot local-volatility smile: given (mu, sigma_atm)
-    already converged from fit_normal_to_bucket_bid_ask, solve for each
-    side's own wing pillar -- the (z, sigma) that the listed 'less'/'greater'
-    market's own price implies, holding mu/sigma_atm fixed -- for
-    expand_smile_pillars/smile_bucket_prob to interpolate between. mu/
-    sigma_atm and the primary solver are untouched.
+    """Per-snapshot local-volatility smile: given (mu, sigma_atm) from
+    fit_normal_to_bucket_bid_ask, solve each side's wing pillar -- the
+    (z, sigma) implied by the listed 'less'/'greater' market's own price,
+    holding mu/sigma_atm fixed -- for expand_smile_pillars/smile_bucket_prob to
+    interpolate between. The primary solver is untouched.
 
-    This supersedes an earlier single-skew-parameter (split-normal) design
-    that had exactly ONE knob for the entire upper (or lower) half of the
-    distribution, splitting at mu. A validation rerun on real data showed the
-    actual bias is concentrated almost entirely in the DEEPEST delta bin
-    (>=0.92), with the 0.5-0.85 range close to flat -- so any single number
-    that widens "the whole upper half enough to explain the deep tail"
-    necessarily over-widened everything between mu and the tail too, which
-    showed up directly as new mispricing in bins that were fine before
-    (confirmed with two different weighting schemes, both trading off HOW
-    MUCH spillover happened, never eliminating it -- the flaw was
-    structural, not a tuning problem). A per-market local sigma sidesteps
-    this entirely: each market is priced off ITS OWN interpolated point on
-    the curve, so a deep-tail correction pinned at the deep-tail pillar
-    doesn't move the ATM price at all (pillars near z=0 stay at sigma_atm by
-    construction), and a mid-delta market between pillars gets a smooth,
-    bounded blend rather than inheriting the tail's full correction.
+    Replaces an earlier single-skew-parameter (split-normal) design. The real
+    bias is concentrated in the deepest delta bin (>=0.92) with 0.5-0.85 close
+    to flat, so one knob for a whole half of the distribution necessarily
+    over-widened everything between mu and the tail -- a structural flaw, not a
+    tuning problem. A per-market local sigma keeps pillars near z=0 at
+    sigma_atm, so a deep-tail correction doesn't move ATM prices at all.
 
-    Why 'greater'/'less' wing markets specifically, not a fixed 15d/85d (or
-    any other fixed-delta) target: an earlier empirical check found a
-    typical KXHIGHLAX event lists only ~6 markets, spread thin enough across
-    the delta range that a FIXED-delta pillar frequently has zero candidates
-    nearby (25-33% of snapshots had nothing within 10 points of 15d or 85d).
-    Using whichever 'greater'/'less' markets are ACTUALLY listed sidesteps
-    that: a separate check found ~98% of days list exactly one 'less' and
-    one 'greater' market (Kalshi always brackets the 'between' buckets with
-    exactly one open-ended market on each side), with a quote present at
-    ~86.5% of individual snapshots -- far better coverage than chasing a
-    fixed delta target that often doesn't exist that day. If more than one
-    market on the same side somehow qualifies (rare), the last one checked
-    wins -- not worth a tie-break rule for a case this uncommon.
+    Uses whichever 'greater'/'less' markets are actually listed rather than a
+    fixed 15d/85d target: a typical event lists only ~6 markets, and 25-33% of
+    snapshots had nothing within 10 delta points of a fixed pillar. ~98% of days
+    list exactly one 'less' and one 'greater' (Kalshi always brackets the
+    'between' buckets), quoted at ~86.5% of snapshots. If several qualify on one
+    side, the last checked wins.
 
-    Each candidate wing market must be two-sided (bid_depth>0 and
-    ask_depth>0 -- one-sided quotes are already the least trustworthy in
-    this dataset) and excluded if its ATM-sigma violation already exceeds
-    max_violation_to_include (the frozen/disconnected-quote guard from the
-    skew-diagnostic deep dive: e.g. KXHIGHLAX-26MAR02-B68.5's bid/ask sat
-    frozen at 0.55/0.56 all day while that day's own mu/sigma moved
-    independently -- no plausible local sigma explains a violation that
-    large, so it's dropped rather than distorting the wing pillar). If
-    sigma_atm already prices the market within its own band, that side's
-    pillar is left as None (nothing to correct).
+    A candidate must be two-sided, and is dropped if its ATM-sigma violation
+    exceeds max_violation_to_include -- the frozen-quote guard (one market's
+    bid/ask sat at 0.55/0.56 all day while mu/sigma moved independently; no
+    plausible local sigma explains that). If sigma_atm already prices the market
+    inside its band, that pillar is None.
 
-    The wing sigma itself is NOT solved to exactly reproduce that one tail
-    market's own price anymore -- see _fit_wing_sigma_joint's docstring for
-    why an exact single-point inversion could make the ramp toward it steep
-    enough to break monotonicity in a nearby 'between' market (confirmed on a
-    real case, KXHIGHLAX-26JUL23). Instead it's the sigma minimizing TOTAL
-    squared band-violation jointly across the tail market AND every
-    'between' market _wing_side_markets finds genuinely affected by this
-    pillar (multiple strikes' worth of data pinning one number, not one).
-    With no such 'between' market in range (the common case), this reduces
-    to exactly the old exact-inversion answer.
+    The wing sigma is not an exact single-point inversion: that could make the
+    ramp steep enough to break monotonicity in a nearby 'between' market. It's
+    the sigma minimizing total squared band violation across the tail market and
+    every 'between' market _wing_side_markets finds affected. With none in range
+    (the common case) this reduces to the exact-inversion answer.
 
-    sigma_bound_mult caps how far a side's implied local sigma is allowed to
-    move from sigma_atm (as a multiplier), both as the joint-fit search
-    bracket AND the effective sanity cap on the pillar's value -- a market
-    whose price would require an absurd local sigma to explain (again, the
-    frozen-quote pathology) gets clamped to the bound rather than returning a
-    wild pillar.
+    sigma_bound_mult caps how far a local sigma may move from sigma_atm, as both
+    the search bracket and the sanity clamp.
 
-    Returns (z_less, sigma_less, z_greater, sigma_greater) -- each pair is
-    (None, None) if that side has no listed wing market, no quote survived
-    the filters above, or sigma_atm already explained it. Deliberately this
-    compact 2-sided form (not a generic pillar list) so it can be stored as
-    flat columns in the cached timeseries -- see expand_smile_pillars for
-    turning it back into the interpolation curve at pricing time, and
-    smile_bucket_prob for how a market gets priced off it.
+    Returns (z_less, sigma_less, z_greater, sigma_greater); a pair is
+    (None, None) if that side has no listed wing market, no quote survived, or
+    sigma_atm already explained it. Kept in this flat 2-sided form so it stores
+    as columns in the cached timeseries.
     """
     if sigma_atm is None or sigma_atm <= 0:
         return None, None, None, None
@@ -1275,180 +1120,75 @@ def compute_implied_spot_timeseries(
     mismatch_tol: float = DEFAULT_MISMATCH_TOL,
     lambda_min_threshold: float = 0.001,
     fit_smile: bool = False,
+    kalshi_backup: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """
-    Compute implied spot and sigma at each time step, fitting each snapshot with
-    fit_normal_to_bucket_bid_ask (each market's own model probability against
-    its own bid/ask band) rather than a single point-estimate price per
-    strike -- see that function's docstring for why.
+    """Implied spot and sigma at each time step, fitting each snapshot with
+    fit_normal_to_bucket_bid_ask.
 
     Parameters
     ----------
-    long_df : long-form DataFrame from predexon_functions.load_predexon_long_df.
-              columns: ticker, floor_strike, cap_strike, strike_type, time
-              (UTC tz-aware), bid, ask, bid_depth, ask_depth. Grouped by
-              ticker, not floor_strike -- floor_strike alone isn't a unique
-              market key (e.g. a range bucket and the lower-tail market can
-              share the same floor).
-    start_ts, end_ts : Unix timestamps (seconds) — bounds for eval grid
-    freq : evaluation frequency as a pandas offset string (e.g. "1min", "1s")
-    max_lookback : if given, only use a market's quote if it's within this
-        pandas offset of the eval timestamp (e.g. "5min"), else drop that
-        market from the fit. If None (default), every market's last known
-        bid/ask is forward-filled indefinitely.
-    staleness_threshold, mismatch_tol : Predexon's tick feed has real,
-        unrecoverable capture gaps for individual tickers (confirmed on a real
-        case, KXHIGHLAX-26JUL22-B75.5, ~21 minutes silent while the true price
-        moved 35+ cents per Kalshi's own record, and confirmed via a live
-        re-fetch straight from Predexon that the gap isn't a fetch bug on our
-        side). Every market's quote is cross-checked against Kalshi's own
-        1-minute candles (predexon_functions.load_kalshi_backup_long_df):
-        Kalshi's BBO is used instead of Predexon's whenever Predexon's quote
-        is older than `staleness_threshold`, OR (even when fresh) whenever it
-        disagrees with Kalshi's own last candle by more than `mismatch_tol` on
-        either side -- Kalshi is the authoritative source, Predexon is a
-        convenience mirror for finer-than-1-minute resolution.
+    long_df : long-form frame from predexon_functions.load_predexon_long_df
+        (ticker, floor_strike, cap_strike, strike_type, time, bid, ask,
+        bid_depth, ask_depth). Grouped by ticker -- floor_strike alone isn't
+        unique, since a range bucket and the lower-tail market can share a floor.
+    start_ts, end_ts : Unix seconds, bounds for the eval grid
+    freq : pandas offset string for the grid (e.g. "1min", "1s")
+    max_lookback : drop a market from the fit if its quote is older than this
+        offset. None (default) forward-fills indefinitely.
+    staleness_threshold, mismatch_tol : Predexon's feed has real capture gaps
+        (one confirmed case sat ~21 minutes silent while the true price moved
+        35+ cents). Every quote is cross-checked against Kalshi's own 1-minute
+        candles, and Kalshi's BBO is used whenever Predexon's is older than
+        `staleness_threshold` or disagrees by more than `mismatch_tol`. Kalshi
+        is authoritative; Predexon is a finer-resolution mirror.
 
-        A STALE row (a genuine Predexon gap) isn't necessarily bracketed
-        between two Kalshi candles specifically -- it's bracketed between
-        whichever KNOWN quote (Kalshi candle or Predexon tick) is nearest on
-        each side of that row, drawn from the union of both sources (see
-        `combined`/`gap_band` below). Kalshi's own candles are only 1-minute
-        close prices, so a plain backward fill would hold the previous
-        minute's value flat for the whole next minute and then snap
-        instantly at the boundary -- a real step function never actually
-        happened; but assuming a smooth, exactly-known LINEAR path between
-        the two bracketing quotes turned out to have its own failure mode
-        (confirmed on a real case, KXHIGHLAX-26JUL25 2026-07-25 10:58 PT):
-        fed as a one-sided market's hard, full-weight midprice target (no
-        real depth from a candle/gap, so fit_normal_to_bucket_bid_ask
-        treats it that way -- see that function's docstring), a straight
-        LINE IN PRICE diverges mid-candle from the true (nonlinear, CDF-
-        difference) probability path, forcing an increasingly strained
-        compromise against every other market before snapping back at the
-        next real candle close -- band_cost climbed smoothly to 0.083 over
-        40 seconds then collapsed to ~0, while every other listed market's
-        own quote never moved at all that whole minute. So instead of a
-        single interpolated point, a stale row is bracketed as a full BAND
-        (_asof_bracket_band: [min(prev_bid, next_bid), max(prev_ask,
-        next_ask)]) -- "it moved SOME time this minute, we don't know when"
-        -- and given nominal depth (1.0, not real book size) specifically so
-        it's fit via the ordinary two-sided band-violation hinge (tolerant
-        of anything inside) instead of a one-sided point target. If
-        Predexon itself has a fresh (non-stale) quote on one side of the
-        gap, that tick brackets the band directly -- kalshi->predexon or
-        predexon->kalshi -- rather than the gap being bridged purely off
-        Kalshi's coarser 1-minute grid.
+        A distrusted row is replaced by a BAND, not an interpolated point
+        (_asof_bracket_band: [min(prev_bid, next_bid), max(prev_ask, next_ask)])
+        with nominal depth 1.0, so it fits through the ordinary two-sided hinge.
+        A straight line in price diverges from the true nonlinear probability
+        path mid-candle, which forces a strained compromise against every other
+        market and then snaps back at the next candle close -- observed as
+        band_cost climbing to 0.083 over 40s then collapsing, while no other
+        market's quote moved at all. The band says "it moved sometime this
+        minute, we don't know when."
 
-        A row falling back to Kalshi purely because of a MISMATCH (Predexon
-        fresh but disagreeing) gets the SAME band treatment, not the plain
-        linear point it originally kept -- confirmed on a second real case
-        (KXHIGHLAX-26JUL26, 2026-07-26 13:04 PT) that the identical climb-
-        then-collapse pattern arises via this path too: Predexon never goes
-        stale at all here, but Kalshi's OWN price -- the one actually used,
-        once mismatched -- is still only known at 1-minute granularity
-        regardless of why it's the one being trusted, so the same linear-
-        price-vs-nonlinear-probability divergence applies. The bracket is
-        Kalshi-ONLY here (not the union `combined` the stale case uses):
-        Predexon's own quote is exactly what's being distrusted on a
-        mismatch row, so it shouldn't reenter as a bracket edge the way it
-        legitimately can for a genuine gap. The fresh-but-untrusted Predexon
-        quote still plays no role in the bracket itself, same as before --
-        only the shape of what replaces it (band, not point) changed.
-
-    fit_smile: if True, also runs fit_local_sigma_smile on top of each row's
-        already-converged (mu, sigma) -- see that function's docstring for
-        why this is a separate, decoupled solve rather than a joint fit
-        (short version: a typical event only lists ~6 markets, spread thin
-        enough across the delta range that a joint fit would often be
-        single-quote-fragile right at the wings; this way every market still
-        fully informs mu/sigma, unchanged, and the smile only has to explain
-        whatever wing residual is left over). Default False so every
-        existing caller's behavior/performance is unchanged; the added cost
-        when enabled is small (reuses this function's own already-built
-        bid/ask/depth matrices, no extra data fetching or as-of merges).
+        Stale rows bracket against the union of both sources; mismatch rows
+        bracket against Kalshi only, since Predexon's quote is precisely what's
+        being distrusted there.
+    fit_smile : also run fit_local_sigma_smile on each row's converged
+        (mu, sigma). Default False. Cheap when enabled -- it reuses the matrices
+        built here.
 
     Returns
     -------
-    DataFrame with columns: time (UTC), implied_spot (°F), implied_sigma (°F),
-    implied_lambda_min, implied_band_cost, n_two_sided, implied_wing_z_less,
-    implied_wing_sigma_less, implied_wing_z_greater, implied_wing_sigma_greater
-    (the last four are NaN when fit_smile=False, on any row implied_spot
-    itself is NaN, or that side simply has no wing correction that snapshot
-    -- see fit_local_sigma_smile; pass straight through to expand_smile_
-    pillars/smile_bucket_prob to price off the smile instead of the plain
-    symmetric model). implied_band_cost is fit_normal_to_bucket_bid_ask's own
-    sum-of-squared-band-violation-residuals at its best-found (mu, sigma) --
-    i.e. how much every listed market's own [bid, ask] band still had to be
-    violated even at the best fit found, the same real number the fit itself
-    minimizes, just not previously kept around past the row it was computed
-    for. A well-explained snapshot (every market's model price already inside
-    its own band) scores exactly 0.
+    Frame with time, implied_spot, implied_sigma, implied_lambda_min,
+    implied_band_cost, n_two_sided, and the four implied_wing_* columns (NaN
+    unless fit_smile and that side has a correction).
 
-    NaN on exactly the same rows implied_spot/implied_sigma are NaN, not a
-    separately-gated column: fit_normal_to_bucket_bid_ask no longer rejects
-    on lambda_min at all (a fit's own constrainedness doesn't gate anything
-    anymore -- see that function's docstring), so the only rejection left is
-    "fewer than 2 markets quoted" or a 'less'/'greater' market pricing its
-    own tail >0.5 -- and in BOTH cases band_cost is withheld right along with
-    (mu, sigma), since band_cost is "violation AT this point," only
-    meaningful once the point itself is trustworthy enough to evaluate
-    anything at.
+    implied_band_cost is the sum of squared band violations at the best fit --
+    0 means every market's model price landed inside its own band. Ranking by it
+    surfaces snapshots the model can't explain, as opposed to ranking by jump
+    size, which surfaces big moves regardless of fit quality.
 
-    Ranking rows by this (e.g. find_worst_fits) surfaces snapshots the
-    symmetric-normal model itself is least able to explain, as opposed to
-    ranking by |implied_spot| jump size, which surfaces big MOVES regardless
-    of whether the fit explaining them was any good -- the two are related
-    but distinct failure modes. -- ONE ROW
-    PER POINT ON THE FULL eval_times GRID, never dropped. Rows
-    where fewer than 2 markets had a quote, OR a 'less'/'greater' market's
-    own fitted probability came out >0.5 (see fit_normal_to_bucket_bid_ask's
-    docstring), are left as NaN rather than forward-filled, clamped to a
-    fallback value, or removed from the frame. This is deliberate: rather
-    than trying to patch an untrustworthy point toward something less wrong
-    (multiple such patches were tried and scrapped -- see fit_normal_to_
-    bucket_bid_ask's docstring), the policy is to not report an estimate at
-    all when the data can't actually support one.
+    ONE ROW PER GRID POINT, never dropped. Rows with fewer than 2 quoted markets,
+    or a 'less'/'greater' market fitting >0.5, are left NaN rather than filled or
+    removed -- if the data can't support an estimate, none is reported. Keeping
+    the rows is what lets consumers treat the stretch as unknown: pandas skips
+    diffs touching a NaN endpoint, so variance_till_expiry and
+    realized_vol_scaled contribute zero there with no gap-detection of their own.
+    Plotting code should shade NaN stretches explicitly so they don't read as a
+    rendering glitch.
 
-    Keeping (not dropping) these rows is what lets downstream consumers
-    treat the stretch as genuinely unknown rather than silently interpolated
-    through: plain pandas .diff()/.cumsum()/.rolling() calls on a NaN-gapped
-    series already skip a diff that touches a NaN endpoint (pandas' default
-    skipna behavior) rather than computing it across the gap as if it were
-    one ordinary step -- so variance_till_expiry and realized_vol_scaled
-    correctly treat "we have no estimate here" as "assume nothing happened
-    here" (zero contribution) without any extra gap-detection code of their
-    own, PROVIDED they receive this full, ungapped-by-dropping grid. Plotting
-    code should explicitly shade NaN stretches (see plot_implied_spot_
-    history) rather than relying on matplotlib's default gap-in-the-line
-    behavior, so a missing estimate reads as "unknown," not a rendering glitch.
+    Each fit warm-starts from the previous row's (mu, sigma); without it, a
+    quote oscillating a fraction of a cent across the certain_bid threshold could
+    flip between a sane point mass and a degenerate sigma=17 between adjacent
+    points. Only successful rows update the anchor.
 
-    Each row's fit is warm-started from the PREVIOUS row's own (mu, sigma)
-    (see fit_normal_to_bucket_bid_ask's warm_start param) -- confirmed on a
-    real case (KXHIGHLAX-26JUL24) that without this, a single market's quote
-    oscillating by a fraction of a cent across fit_normal_to_bucket_bid_ask's
-    certain_bid threshold could flip the fit between a sane point mass and a
-    degenerate sigma=17 from one point to the next; anchoring each fit near
-    where the previous one landed keeps it on the sane end of that ridge.
-    Only successful (non-skipped) rows update the warm-start anchor, so a
-    stretch of skipped/implausible rows doesn't corrupt it -- the next
-    successful fit still anchors off the last genuinely trustworthy point.
+    Per ticker, the latest quote at-or-before each grid timestamp comes from one
+    vectorized as-of merge, which keeps the (n_times, n_markets) matrices fast at
+    second granularity over a full day (~100k points). Each fit is ~0.3-0.6ms.
 
-    Implementation note: for each ticker, the latest bid/ask/depth at-or-before
-    every grid timestamp is located via a single vectorized as-of merge (not a
-    fresh scan of the full long_df per grid point) — keeps building the
-    (n_times, n_markets) matrices fast even at second granularity over a full
-    day (~100k points). The per-timestep fit (fit_normal_to_bucket_bid_ask) is
-    a hand-rolled Levenberg-Marquardt solve (~0.3-0.6ms/point), run as a plain
-    per-row loop.
-
-    lambda_min_threshold is passed straight through to every fit_normal_to_
-    bucket_bid_ask call -- see that function's docstring for what it means
-    and why it replaced the previous per-symptom patches (a hard sigma
-    ceiling, and a separate clamp pinning mu to the listed-strike range):
-    both of those were reacting to the same underlying "poorly-constrained
-    fit" condition lambda_min detects directly, just via two different
-    downstream symptoms (sigma exploding vs. mu overshooting) of one cause.
+    lambda_min_threshold passes through to each fit but is no longer used there.
     """
     if long_df.empty:
         return pd.DataFrame(columns=["time", "implied_spot", "implied_sigma"])
@@ -1467,7 +1207,16 @@ def compute_implied_spot_timeseries(
 
     tickers = sorted(long_df["ticker"].unique())
     event_ticker = tickers[0].rsplit("-", 1)[0]
-    kalshi_backup = predexon_functions.load_kalshi_backup_long_df(event_ticker)
+    # kalshi_backup=None (default): fetch Kalshi's own 1-min candles as the
+    # staleness/mismatch fallback source, same as always. An explicit
+    # DataFrame (including an empty one) is used AS-IS instead -- no fetch,
+    # no live Kalshi API call -- for a caller whose long_df is ALREADY
+    # Kalshi's own data (e.g. kalshi_ws L2) and has no use for a second,
+    # redundant live-polled copy of the same exchange's own quotes, or who
+    # simply needs zero live-network calls (e.g. rebuilding a large cached
+    # day list entirely from already-collected local/S3 data).
+    if kalshi_backup is None:
+        kalshi_backup = predexon_functions.load_kalshi_backup_long_df(event_ticker)
     staleness_td = pd.Timedelta(staleness_threshold)
 
     # One as-of merge per ticker -> (n_times, n_markets) matrices of latest-known
@@ -1706,6 +1455,8 @@ def compute_implied_spot_timeseries_cached(
     cache_dir: str | None = None,
     lambda_min_threshold: float = 0.001,
     fit_smile: bool = False,
+    staleness_threshold: str = DEFAULT_STALENESS_THRESHOLD,
+    kalshi_backup: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Like compute_implied_spot_timeseries, but caches the result to parquet
@@ -1744,6 +1495,20 @@ def compute_implied_spot_timeseries_cached(
     hand it to a function that's about to ignore it on a cache hit; the
     cache-hit check lives here, once, instead of every caller re-deriving
     implied_spot_cache_path to pre-check it themselves.
+
+    staleness_threshold/kalshi_backup: passed straight through to compute_
+    implied_spot_timeseries on a cache miss (also not part of the cache key,
+    same caveat as fit_smile above). kalshi_backup=None (default) keeps that
+    function's own behavior of fetching Kalshi's 1-min candles live as the
+    staleness/mismatch fallback; pass an explicit DataFrame (an EMPTY one is
+    the common case) when long_df is already Kalshi's own data with no need
+    for a second live-polled copy of it, or when the caller wants a
+    guaranteed-zero-live-calls run (e.g. rebuilding a large day list purely
+    from already-collected local/S3 data, with no network available or
+    wanted) -- an empty kalshi_backup also means staleness_threshold's
+    default (tuned for Predexon's much denser tick cadence) may be too
+    tight for a source like kalshi_ws that only logs a new quote when the
+    top of book actually changes; widen it explicitly in that case.
     """
     if cache_dir is None:
         cache_dir = _DEFAULT_TS_CACHE_DIR
@@ -1760,7 +1525,8 @@ def compute_implied_spot_timeseries_cached(
         return pd.DataFrame(columns=["time", "implied_spot", "implied_sigma"])
 
     df = compute_implied_spot_timeseries(long_df, start_ts, end_ts, freq=freq, max_lookback=max_lookback,
-                                          lambda_min_threshold=lambda_min_threshold, fit_smile=fit_smile)
+                                          lambda_min_threshold=lambda_min_threshold, fit_smile=fit_smile,
+                                          staleness_threshold=staleness_threshold, kalshi_backup=kalshi_backup)
     if not df.empty:
         df.to_parquet(cache_path, index=False)
     return df
@@ -1875,4 +1641,80 @@ def snapshot_market_quotes(
             "bid_depth": bidd, "ask_depth": askd, "source": source,
         })
     return pd.DataFrame(rows).sort_values("x_pos").reset_index(drop=True)
+
+
+def market_live_matrix(
+    long_df: pd.DataFrame,
+    kalshi_backup: pd.DataFrame,
+    eval_times,
+    staleness_threshold: str = DEFAULT_STALENESS_THRESHOLD,
+    mismatch_tol: float = DEFAULT_MISMATCH_TOL,
+) -> dict:
+    """
+    Per-ticker (bid, ask, is_live) over `eval_times`, deciding "live" through
+    the exact same Predexon-staleness/mismatch check compute_implied_spot_
+    timeseries and snapshot_market_quotes use to decide whether a market's
+    own BBO -- in the cached fit, and in any snapshot rendered off it --
+    actually came from Predexon directly or was overridden by Kalshi's
+    coarser 1-min-candle fallback. Staleness ALONE isn't enough: a technically
+    fresh Predexon quote (age <= staleness_threshold) can still disagree with
+    Kalshi's own candle by more than mismatch_tol, which the cached pipeline
+    treats as fallback-worthy too (see compute_implied_spot_timeseries's own
+    mismatch handling) -- so is_live is False on BOTH conditions here, not
+    staleness alone. Pulled out as the one shared implementation of that
+    decision, for any caller (e.g. a diagnostic scanning many days'
+    worth of grid points) that needs to know which cells were live without
+    paying for snapshot_market_quotes's own per-timestamp full-day rescan
+    (see that function's docstring on why it's unsuitable for bulk scanning)
+    or re-deriving the fallback policy ad hoc -- exactly the mistake
+    snapshot_market_quotes's own docstring describes fixing once already.
+
+    Unlike compute_implied_spot_timeseries, this does NOT reconstruct a
+    fallback bid/ask band for a stale/mismatched cell -- nothing here needs
+    to fit against one. bid/ask returned are always Predexon's own raw
+    last-known quote (backward as-of), never Kalshi-substituted; is_live
+    tells the caller which of those to actually trust.
+
+    Returns {ticker: (bid, ask, is_live)}, each a length-len(eval_times)
+    array. is_live is False wherever Predexon has no quote yet, its last
+    quote is older than staleness_threshold, it mismatches Kalshi's own
+    linearly-interpolated candle by more than mismatch_tol on either side, OR
+    the quote itself is CROSSED (bid > ask) -- a genuine, if infrequent,
+    Predexon data-capture defect confirmed directly on real cached data
+    (KXHIGHLAX-26FEB22 2026-02-22 06:28 UTC: three markets simultaneously
+    crossed, one by 13 cents -- bid=0.66 vs ask=0.53 -- not a momentary
+    quarter-cent bid-ask-bounce artifact, and not economically real: a market
+    cannot legitimately sit crossed since either side would be free
+    arbitrage). A crossed quote can't be compared against a fitted curve at
+    all (which side would 'deviation' even measure against), so it's exactly
+    as fallback-worthy as a stale or mismatched one, not merely low-quality
+    data to pass through as-is.
+    """
+    staleness_td = pd.Timedelta(staleness_threshold)
+    eval_df = pd.DataFrame({"time": eval_times})
+    out = {}
+    for tk in sorted(long_df["ticker"].unique()):
+        sub = long_df.loc[long_df["ticker"] == tk].sort_values("time")
+        merged = pd.merge_asof(
+            eval_df, sub[["time", "bid", "ask"]].rename(columns={"time": "quote_time"}),
+            left_on="time", right_on="quote_time", direction="backward",
+        )
+        bid = merged["bid"].to_numpy()
+        ask = merged["ask"].to_numpy()
+        age = (merged["time"] - merged["quote_time"]).to_numpy()
+        is_stale = pd.isna(age) | (age > staleness_td)
+        is_crossed = bid > ask
+
+        mismatch = np.zeros(len(eval_df), dtype=bool)
+        ksub = kalshi_backup[kalshi_backup["ticker"] == tk] if not kalshi_backup.empty else kalshi_backup
+        if not ksub.empty:
+            k_interp = _asof_linear_interp(
+                eval_df["time"], ksub.sort_values("time").rename(columns={"time": "k_time"}), "k_time", ["bid", "ask"],
+            )
+            k_bid, k_ask = k_interp["bid"], k_interp["ask"]
+            has_kalshi = ~np.isnan(k_bid) & ~np.isnan(k_ask)
+            mismatch = (~is_stale) & has_kalshi & ((np.abs(bid - k_bid) > mismatch_tol) | (np.abs(ask - k_ask) > mismatch_tol))
+
+        out[tk] = (bid, ask, ~is_stale & ~mismatch & ~is_crossed)
+    return out
 

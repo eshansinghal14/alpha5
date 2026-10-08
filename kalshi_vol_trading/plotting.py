@@ -5,6 +5,7 @@ function call rather than a page of matplotlib code -- the notebook owns
 what to analyze (which days, which event), this module owns how to show it.
 """
 import datetime
+import glob
 import hashlib
 import os
 import sys
@@ -18,12 +19,210 @@ import pytz
 from scipy.stats import norm as _norm
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "kalshi_infra"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "kalshi_backtest"))
 import black_scholes
-from predexon_functions import load_predexon_long_df, load_kalshi_backup_long_df
+from predexon_functions import load_predexon_long_df, load_kalshi_backup_long_df, get_event_markets, _parse_strike_from_ticker
+from book import replay_ws_ticks  # kalshi_backtest/book.py -- L2 reconstruction from raw kalshi_ws ticks
 
 # Kalshi KXHIGHLAX resolves on the LA daily high, measured in Pacific Time
 # (LAX weather station) -- every plot in this module displays in this tz.
 LA_TZ = pytz.timezone('America/Los_Angeles')
+
+_EMPTY_KALSHI_BACKUP = pd.DataFrame(columns=['ticker', 'time', 'bid', 'ask'])
+_KALSHI_WS_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "kalshi_ws")
+
+
+def list_available_kalshi_ws_days(series='KXHIGHLAX'):
+    """
+    Every date with locally cached kalshi_ws raw L2 tick data for `series` --
+    parsed off each cached file's own event ticker
+    ({series}-{%y%b%d}.parquet, e.g. "KXHIGHLAX-26AUG03.parquet"), the same
+    convention black_scholes.list_cached_days uses for the (separate)
+    Predexon-based implied_ts cache. Purely a local directory scan (no S3
+    call) -- this is the live WS collector's own local output directory
+    (kalshi_infra/ws_raw_ob_collector.py), which for a day whose event has
+    already closed and been finalized may be a copy manually pulled down
+    from s3://kalshi-ws rather than something the collector itself still has
+    on disk (delete_local_after_upload removes the collector's own copy once
+    a closed event is safely in S3 -- see finalize_event_to_s3's docstring).
+    """
+    pattern_dir = os.path.join(_KALSHI_WS_ROOT, series, 'raw_ob_ticks')
+    if not os.path.isdir(pattern_dir):
+        return []
+    days = []
+    for fname in os.listdir(pattern_dir):
+        if not fname.endswith('.parquet'):
+            continue
+        event_ticker = fname[:-len('.parquet')]
+        date_str = event_ticker.rsplit('-', 1)[-1]
+        try:
+            d = datetime.datetime.strptime(date_str, '%y%b%d').date()
+        except ValueError:
+            continue
+        days.append(d)
+    return sorted(days)
+
+
+def load_kalshi_ws_long_df(event_ticker):
+    """
+    long_df-shaped DataFrame (ticker, floor_strike, cap_strike, strike_type,
+    time, bid, ask, bid_depth, ask_depth) built ENTIRELY from Kalshi's own
+    live L2 websocket order book -- a plain local read of the raw
+    kalshi_ws parquet this project already collects/archives to S3 (see
+    kalshi_infra/ws_raw_ob_collector.py), replayed into a touch stream via
+    kalshi_backtest.book.replay_ws_ticks (the one existing implementation of
+    that reconstruction, not reimplemented here). Deliberately does NOT go
+    through kalshi_backtest.data.load_event_data -- that also loads trade
+    prints and settlement results via LIVE Kalshi REST calls (irrelevant to
+    this diagnostic, which only needs quotes), which is real, confirmed-slow
+    dead weight here: a 16-day backfill run spent most of its wall-clock time
+    retrying/timing out on those calls with no network available, not on any
+    actual per-timestep fitting work. This function makes zero network calls
+    of any kind -- a day with no local parquet (see list_available_kalshi_
+    ws_days) just returns empty, the same "nothing to report" contract every
+    other loader in this module follows on a cache miss it can't fill itself.
+    No Predexon involvement anywhere in this path either.
+
+    Motivation: real, non-transient data-quality defects were confirmed in
+    the Predexon-sourced feed this project otherwise relies on -- e.g.
+    KXHIGHLAX-26FEB22 2026-02-22 06:28 UTC had THREE markets simultaneously
+    CROSSED (bid > ask, one by 13 cents), which a staleness/mismatch-only
+    liveness check (black_scholes.market_live_matrix, before it also learned
+    to reject a crossed quote) couldn't catch, and which fed directly into a
+    spurious "mispricing episode." Kalshi's own order book, reconstructed
+    from its own exchange-side WS feed rather than a third-party mirror, is
+    the more authoritative source wherever it's available -- at the cost of
+    only covering however far back the WS collector has actually been
+    running (see list_available_kalshi_ws_days), far short of Predexon's
+    multi-month archive.
+
+    A ticker the WS collector never captured a single quote for is simply
+    ABSENT here, exactly as if unlisted, rather than silently filled from
+    elsewhere.
+
+    Missing bid/ask (L2Book.best_bid()/best_ask() return None when nothing
+    currently rests on that side -- a real, known-empty book state, not
+    missing data) fill to the SAME convention load_predexon_long_df uses --
+    0.0/depth 0 for a missing bid, 1.0/depth 0 for a missing ask -- so this
+    is a drop-in long_df for fit_normal_to_bucket_bid_ask/compute_implied_
+    spot_timeseries either way. Pass an explicit EMPTY kalshi_backup (not
+    None) into compute_implied_spot_timeseries[_cached] alongside this --
+    long_df is already Kalshi's own data, so its own internal staleness/
+    mismatch fallback has no live Kalshi candle call to make on top of it.
+    """
+    matches = glob.glob(os.path.join(_KALSHI_WS_ROOT, '*', 'raw_ob_ticks', f'{event_ticker}.parquet'))
+    cols = ['ticker', 'floor_strike', 'cap_strike', 'strike_type', 'time', 'bid', 'ask', 'bid_depth', 'ask_depth']
+    if not matches:
+        return pd.DataFrame(columns=cols)
+    raw = pd.read_parquet(matches[0])
+    quotes_by_ticker = replay_ws_ticks(raw)
+
+    rows = []
+    for ticker, quotes in quotes_by_ticker.items():
+        for q in quotes:
+            if q.time is None or pd.isna(q.time):
+                # A handful of raw WS rows carry no parseable ts/ts_ms
+                # (confirmed on KXHIGHLAX-26AUG03: 9 such rows, each also
+                # showing an implausible six-figure depth) -- unusable
+                # (merge_asof requires every key non-null), so dropped here
+                # same as any other malformed tick would be.
+                continue
+            has_bid, has_ask = q.bid is not None, q.ask is not None
+            rows.append({
+                'ticker': ticker, 'time': q.time,
+                'bid': q.bid if has_bid else 0.0, 'ask': q.ask if has_ask else 1.0,
+                'bid_depth': (q.bid_depth or 0.0) if has_bid else 0.0,
+                'ask_depth': (q.ask_depth or 0.0) if has_ask else 0.0,
+            })
+    if not rows:
+        return pd.DataFrame(columns=cols)
+
+    strike_rows = []
+    for m in get_event_markets(event_ticker):
+        try:
+            floor, cap = _parse_strike_from_ticker(m['ticker'])
+        except ValueError:
+            continue
+        strike_rows.append({'ticker': m['ticker'], 'floor_strike': floor, 'cap_strike': cap,
+                             'strike_type': m.get('strike_type')})
+    if not strike_rows:
+        return pd.DataFrame(columns=cols)
+    strike_map = pd.DataFrame(strike_rows).set_index('ticker')
+
+    df = pd.DataFrame(rows).merge(strike_map, left_on='ticker', right_index=True, how='inner')
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    return df[cols].sort_values(['time', 'floor_strike']).reset_index(drop=True)
+
+
+def kalshi_ws_feed_gap_mask(event_ticker, times, gap_threshold='15min'):
+    """
+    Boolean array (aligned to `times`) flagging stretches where Kalshi's own
+    kalshi_ws feed for this event went entirely quiet -- no LISTED market
+    received a single new quote within `gap_threshold` of that timestamp
+    (freshest-of-any-market quote age, backward asof per ticker). This is a
+    genuine collector-side gap, not an individual market legitimately having
+    nothing new to report: ws_raw_ob_collector.py only logs a tick when a
+    market's own top-of-book actually changes, so any ONE listed market
+    (especially a thin, far-OTM one) can easily go 30min-4h+ between real
+    quote changes with nothing wrong at all -- confirmed directly against
+    this project's own cached KXHIGHLAX days. Because of that,
+    black_scholes.market_live_matrix's per-market/AND-across-every-listed-
+    market liveness check -- built for Predexon's much denser tick stream,
+    and already widened to a 10min threshold for kalshi_ws use elsewhere in
+    this module -- way overflags a whole-day view: ANDing every listed
+    market's own staleness reads as "stale" for 95-100% of most locally
+    cached KXHIGHLAX days, which isn't a useful day-level signal. Taking the
+    freshest quote across ALL listed markets instead -- i.e. "did *anything*
+    on this event update recently" -- fixes that: it only reads stale when
+    literally nothing moved anywhere on the event, which is what an actual
+    collector outage looks like (confirmed: the resulting stale stretches on
+    2026-08-06/07/12/13/16/17/18 line up with kalshi_infra/logs/
+    ws_raw_ob_collector_*.log's own restart timestamps).
+
+    Returns all-True (the whole window counts as one big gap) if the event
+    has no locally cached kalshi_ws data at all -- "nothing to report" here
+    means "no coverage," not "clean."
+    """
+    times = pd.DatetimeIndex(pd.Series(times).to_numpy())
+    long_df = load_kalshi_ws_long_df(event_ticker)
+    if long_df.empty:
+        return np.ones(len(times), dtype=bool)
+
+    gap_td = pd.Timedelta(gap_threshold)
+    eval_df = pd.DataFrame({'time': times})
+    min_age = None
+    for tk in long_df['ticker'].unique():
+        sub = long_df.loc[long_df['ticker'] == tk, ['time']].sort_values('time').rename(columns={'time': 'quote_time'})
+        merged = pd.merge_asof(eval_df, sub, left_on='time', right_on='quote_time', direction='backward')
+        age = (merged['time'] - merged['quote_time']).to_numpy()
+        age = np.where(merged['quote_time'].isna().to_numpy(), np.timedelta64('NaT'), age)
+        min_age = age if min_age is None else np.fmin(min_age, age)
+
+    return pd.isna(min_age) | (min_age > gap_td)
+
+
+def kalshi_ws_feed_gap_fraction(df, date, event_ticker, gap_threshold='15min'):
+    """
+    Fraction (0.0-1.0) of df's own displayed window (11:00 PT the day before
+    -> its last data point -- same day_start/day_end convention _gap_fraction
+    uses) that kalshi_ws_feed_gap_mask flags as a feed gap. 0.0 for a day the
+    collector covered continuously start to finish; 1.0 if the event has no
+    local kalshi_ws data at all. See kalshi_ws_feed_gap_mask for exactly what
+    counts as a gap and why this differs from _gap_fraction (a lambda_min-
+    rejected FIT gap) and from a market_live_matrix-based per-market
+    staleness check (way overflagged for kalshi_ws's change-only tick
+    logging).
+    """
+    times_la = df['time'].dt.tz_convert(LA_TZ)
+    day_ref = pd.Timestamp(date).tz_localize(LA_TZ)
+    day_start = day_ref - pd.Timedelta(hours=13)
+    day_end = times_la.max()
+    mask = ((times_la >= day_start) & (times_la <= day_end)).to_numpy()
+    if not mask.any():
+        return 1.0
+    gap_mask = kalshi_ws_feed_gap_mask(event_ticker, df['time'], gap_threshold=gap_threshold)
+    return float(gap_mask[mask].mean())
 
 
 # ---------------------------------------------------------------------------
@@ -558,6 +757,7 @@ _MAX_PLOT_POINTS = 3000
 
 _VARIANCE_FREQ_PALETTE = ['#e74c3c', '#f39c12', '#8e44ad', '#16a085', '#2c3e50']
 _GAP_COLOR = '#e74c3c'
+_STALE_FEED_COLOR = '#f1c40f'
 
 
 def _nan_gap_intervals(times, is_nan):
@@ -594,12 +794,12 @@ def _nan_gap_intervals(times, is_nan):
     return intervals
 
 
-def _shade_gaps(ax, gap_intervals, label=None):
+def _shade_gaps(ax, gap_intervals, label=None, color=_GAP_COLOR, alpha=0.12):
     """Shade each (start, end) gap interval on ax -- see _nan_gap_intervals. Only the FIRST
     interval gets `label` (if given), so a legend shows one entry for the whole family of spans
     instead of one per gap."""
     for gi, (gstart, gend) in enumerate(gap_intervals):
-        ax.axvspan(gstart, gend, color=_GAP_COLOR, alpha=0.12, zorder=0, lw=0,
+        ax.axvspan(gstart, gend, color=color, alpha=alpha, zorder=0, lw=0,
                    label=(label if gi == 0 else None))
 
 
@@ -644,7 +844,7 @@ def _lookup_ticker(day_results, ticker):
 
 
 def plot_implied_spot_history(day_results, variance_freqs=None, days_per_row=5, vol_panel_end_trim='10min',
-                               wing_k=1.5, winddown_curve=None):
+                               wing_k=1.5, winddown_curve=None, feed_gap_by_ticker=None):
     """
     Stacked in groups of `days_per_row` days (clamped to however many days
     actually have data -- with only 3 valid days, requesting 5 columns would
@@ -740,6 +940,17 @@ def plot_implied_spot_history(day_results, variance_freqs=None, days_per_row=5, 
     own. Gapped stretches within a plotted day are still shaded on every
     panel (see gap_intervals/_shade_gaps below), so a day with a small gap
     displays fine here -- it's just not excluded outright.
+
+    feed_gap_by_ticker: optional {ticker: bool array aligned to that day's
+    own df['time']} -- e.g. from kalshi_ws_feed_gap_mask, one entry per day
+    in day_results keyed by that day's own ticker. Where True, shades every
+    panel in a SEPARATE color (_STALE_FEED_COLOR) from the lambda_min
+    gap_intervals shading above: this is a different failure mode (the
+    underlying kalshi_ws feed itself went quiet -- a collector-side gap --
+    not the fit rejecting a point it did have data for). A day can have
+    both kinds of shading at once and they're visually distinct on purpose.
+    Omit (the default) to skip this shading entirely, e.g. for Predexon-
+    sourced day_results this concept doesn't apply to.
     """
     valid = [(ticker, df, date) for ticker, df, date in day_results if not df.empty]
     if not valid:
@@ -791,10 +1002,18 @@ def plot_implied_spot_history(day_results, variance_freqs=None, days_per_row=5, 
             # docstring) -- shaded on every panel below, not just the spot one, since
             # all of them (vega/gamma/theta especially) are equally untrustworthy here.
             gap_intervals = _nan_gap_intervals(times_la, spot.isna())
+            # Separate failure mode from gap_intervals above: the kalshi_ws feed
+            # itself went quiet (a collector-side gap), not the fit rejecting a
+            # point it did have data for -- see feed_gap_by_ticker's own docstring.
+            feed_gap_intervals = (
+                _nan_gap_intervals(times_la, np.asarray(feed_gap_by_ticker[ticker]))
+                if feed_gap_by_ticker is not None and ticker in feed_gap_by_ticker else []
+            )
 
             # -- Implied spot --
             ax_spot.plot(*_decimate(stride, times_la, spot), color=color, lw=1.5, label='Implied spot')
             _shade_gaps(ax_spot, gap_intervals, label='No trustworthy fit')
+            _shade_gaps(ax_spot, feed_gap_intervals, label='Stale kalshi_ws feed', color=_STALE_FEED_COLOR, alpha=0.18)
             ax_spot.set_xlim(day_start, day_end)
             ylim = _padded_ylim(visible_spot)
             if ylim:
@@ -811,6 +1030,7 @@ def plot_implied_spot_history(day_results, variance_freqs=None, days_per_row=5, 
             ax_vol.plot(*_decimate(stride, times_la, iv2), color='black', lw=1.4,
                         label='Implied variance', zorder=5)
             _shade_gaps(ax_vol, gap_intervals)
+            _shade_gaps(ax_vol, feed_gap_intervals, color=_STALE_FEED_COLOR, alpha=0.18)
 
             freq_items = variance_freqs.items() if variance_freqs else [('', day_results)]
             rv_masked_for_ylim = []
@@ -928,6 +1148,7 @@ def plot_implied_spot_history(day_results, variance_freqs=None, days_per_row=5, 
             ax_rv.plot(*_decimate(rv_stride, rv_times_la, rv30), color='#e74c3c', lw=0.9, alpha=0.8, label='RV 30min')
             ax_rv.plot(*_decimate(rv_stride, rv_times_la, rv60), color='#2ca02c', lw=1.0, alpha=0.85, label='RV 60min')
             _shade_gaps(ax_rv, gap_intervals)
+            _shade_gaps(ax_rv, feed_gap_intervals, color=_STALE_FEED_COLOR, alpha=0.18)
             ax_rv.set_xlim(day_start, vol_day_end)
 
             ylim = _padded_ylim(*ylim_series)
@@ -947,6 +1168,7 @@ def plot_implied_spot_history(day_results, variance_freqs=None, days_per_row=5, 
                          label=f'Wing vega ($/vol pt, k={wing_k}σ)')
             ax_vega.axhline(0, color='#999999', lw=0.7, ls='--')
             _shade_gaps(ax_vega, gap_intervals)
+            _shade_gaps(ax_vega, feed_gap_intervals, color=_STALE_FEED_COLOR, alpha=0.18)
             ax_vega.set_xlim(day_start, vol_day_end)
             ylim = _padded_ylim(wing['wing_vega'][vol_mask])
             if ylim:
@@ -961,6 +1183,7 @@ def plot_implied_spot_history(day_results, variance_freqs=None, days_per_row=5, 
                           label='Wing gamma P&L (1° move)')
             ax_gamma.axhline(0, color='#999999', lw=0.7, ls='--')
             _shade_gaps(ax_gamma, gap_intervals)
+            _shade_gaps(ax_gamma, feed_gap_intervals, color=_STALE_FEED_COLOR, alpha=0.18)
             ax_gamma.set_xlim(day_start, vol_day_end)
             ylim = _padded_ylim(wing['wing_gamma'][vol_mask])
             if ylim:
@@ -975,6 +1198,7 @@ def plot_implied_spot_history(day_results, variance_freqs=None, days_per_row=5, 
                           label='Wing theta (1-day)')
             ax_theta.axhline(0, color='#999999', lw=0.7, ls='--')
             _shade_gaps(ax_theta, gap_intervals)
+            _shade_gaps(ax_theta, feed_gap_intervals, color=_STALE_FEED_COLOR, alpha=0.18)
             ax_theta.set_xlim(day_start, vol_day_end)
             ylim = _padded_ylim(wing['wing_theta'][vol_mask])
             if ylim:
@@ -2501,3 +2725,388 @@ def plot_vol_skew_diagnostic(day_results, max_snapshots_per_day=150, z_bins=12, 
     plt.show()
 
     return diag
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic -- single-market mispricing episodes (one market's own BBO vs.
+# the fitted curve's own price for it, and how long it took to converge)
+# ---------------------------------------------------------------------------
+
+_DEFAULT_MISPRICE_CACHE_DIR = os.path.join(os.path.dirname(__file__), "data", "mispricing_diag")
+_MISPRICE_SCHEMA_VERSION = "v4"  # v2: every listed market must be live, not just the flagged one. v3: "live" also requires no Kalshi mismatch, not staleness alone. v4: "live" also excludes a crossed (bid>ask) quote
+
+
+def _mispricing_cache_key(valid_day_results, staleness_threshold, data_source):
+    """Stable cache key for _gather_market_deviation_table -- same day-list-hash
+    convention as _skew_cache_key. staleness_threshold and data_source ARE part
+    of the key (both change which rows count as 'live' and therefore get a
+    deviation computed at all, and data_source changes the underlying bid/ask
+    data itself); onset/fixed thresholds are NOT (they're applied after
+    loading, to this same table -- see find_market_mispricing_episodes)."""
+    dates = sorted(str(date) for _, _, date in valid_day_results)
+    key_str = f"{_MISPRICE_SCHEMA_VERSION}|staleness={staleness_threshold}|source={data_source}|" + ",".join(dates)
+    return hashlib.md5(key_str.encode()).hexdigest()[:16]
+
+
+_MISPRICE_LOADERS = {
+    'predexon': lambda event_ticker: (load_predexon_long_df(event_ticker), load_kalshi_backup_long_df(event_ticker)),
+    'kalshi_ws': lambda event_ticker: (load_kalshi_ws_long_df(event_ticker), _EMPTY_KALSHI_BACKUP),
+}
+
+
+def _gather_market_deviation_table(day_results, staleness_threshold=black_scholes.DEFAULT_STALENESS_THRESHOLD,
+                                    data_source='predexon', use_cache=True, cache_dir=None):
+    """
+    One row per (event_ticker, market_ticker, time) restricted to instants
+    where EVERY listed market in the event -- not just the one this row is
+    about -- is LIVE per black_scholes.market_live_matrix: a fresh Predexon
+    quote (age <= staleness_threshold) that ALSO doesn't mismatch Kalshi's
+    own candle by more than mismatch_tol. Staleness alone isn't enough to
+    call a quote "live" here -- see market_live_matrix's own docstring for
+    why a technically-fresh-but-mismatched quote is exactly as fallback-
+    reliant as a stale one, in both the cached fit and any snapshot rendered
+    off it (confirmed as the actual cause of Kalshi BBO still showing up in
+    plot_mispricing_episode panels before this check existed: episodes were
+    being selected on staleness alone, but the snapshot panel itself resolves
+    every market through the FULL policy, staleness AND mismatch, so a
+    mismatched-but-fresh market could sail through selection and still render
+    from Kalshi). A single non-live market disqualifies the whole event-
+    timestamp, not just its own row: the fitted implied_spot/sigma/wing curve
+    is a JOINT fit across every listed market, so a hidden fallback quote
+    anywhere in that fit makes the curve itself suspect, not only the
+    comparison for the market that's non-live.
+
+    'deviation' is how far that row's market's own quoted [bid, ask] sits
+    from the ALREADY-FITTED curve's own price for it (black_scholes.
+    smile_bucket_prob off implied_spot/sigma/wing_* -- no refitting) -- 0
+    when the model's own price sits inside its quoted band, model_p - ask
+    when the model prices MORE than the market's own ask, model_p - bid when
+    it prices LESS than bid. Same sign convention _render_snapshot_panel's
+    curve-relative offset uses.
+
+    A disqualified (any-market-stale) timestamp is simply ABSENT from the
+    table, for every market, not present with deviation=NaN -- a caller
+    detecting mispricing episodes over this table sees a genuine time gap at
+    every such stretch, so it can require an episode's onset and its "fixed"
+    crossing to fall within the same unbroken all-live run rather than
+    inferring convergence across a gap in live order-book data.
+
+    data_source: 'predexon' (default -- Predexon top-of-book history, plus
+    Kalshi 1-min candles as the staleness/mismatch fallback, same as every
+    other diagnostic in this module) or 'kalshi_ws' (Kalshi's own live L2
+    order book, reconstructed via load_kalshi_ws_long_df -- see its
+    docstring for why: real crossed-book (bid>ask) defects were confirmed in
+    the Predexon feed, e.g. KXHIGHLAX-26FEB22 2026-02-22 06:28 UTC had three
+    markets crossed simultaneously. 'kalshi_ws' has no separate Kalshi-candle
+    backup to fall back to -- it's already Kalshi's own data -- so liveness
+    there is staleness + crossed-quote only, never a mismatch rejection
+    (market_live_matrix's own mismatch check is a no-op against an empty
+    kalshi_backup). Only covers however far back the WS collector has
+    actually been running (see list_available_kalshi_ws_days), far short of
+    Predexon's multi-month archive.
+
+    Cached to parquet keyed by the exact day list + staleness_threshold +
+    data_source (see _mispricing_cache_key) -- this is the expensive part
+    (one merge_asof per market per day, plus one smile_bucket_prob call per
+    live row, the same "vectorized asof + per-row smile loop" shape
+    plot_vol_skew_diagnostic uses for the same reason: pillars genuinely
+    differ row to row).
+    """
+    valid = [(ticker, df, date) for ticker, df, date in day_results if not df.empty]
+    if not valid:
+        return pd.DataFrame(columns=['event_ticker', 'market_ticker', 'date', 'time', 'deviation'])
+
+    if cache_dir is None:
+        cache_dir = _DEFAULT_MISPRICE_CACHE_DIR
+    cache_path = os.path.join(cache_dir, f"{_mispricing_cache_key(valid, staleness_threshold, data_source)}.parquet")
+    if use_cache and os.path.exists(cache_path):
+        table = pd.read_parquet(cache_path)
+        print(f"[mispricing cache] loaded {len(table)} rows from {cache_path}")
+        return table
+
+    load_quotes = _MISPRICE_LOADERS[data_source]
+    frames = []
+    for event_ticker, df, date in valid:
+        long_df, event_kalshi_backup = load_quotes(event_ticker)
+        if long_df.empty:
+            continue
+        eval_df = pd.DataFrame({'time': df['time'].to_numpy()})
+        mu_arr = df['implied_spot'].to_numpy()
+        sigma_arr = df['implied_sigma'].to_numpy()
+        sigma_ok = sigma_arr > 0
+        if set(_WING_COLS).issubset(df.columns):
+            wzl, wsl = df['implied_wing_z_less'].to_numpy(), df['implied_wing_sigma_less'].to_numpy()
+            wzg, wsg = df['implied_wing_z_greater'].to_numpy(), df['implied_wing_sigma_greater'].to_numpy()
+        else:
+            n = len(df)
+            wzl = wsl = wzg = wsg = np.full(n, np.nan)
+        # Built once per timestamp, reused across every market below -- same
+        # "fit the curve once, price every market off it" shape as
+        # plot_vol_skew_diagnostic's own pillars_per_row.
+        pillars_per_row = [
+            black_scholes.expand_smile_pillars(sigma_arr[j], wzl[j], wsl[j], wzg[j], wsg[j]) if sigma_ok[j] else None
+            for j in range(len(df))
+        ]
+
+        # Pass 1: per-market bid/ask/is_live -- via black_scholes.market_live_
+        # matrix, the ONE shared implementation of the staleness-OR-mismatch
+        # Predexon-vs-Kalshi fallback decision compute_implied_spot_
+        # timeseries/snapshot_market_quotes themselves use (see that
+        # function's docstring: staleness alone isn't enough -- a technically
+        # fresh Predexon quote that disagrees with Kalshi's own candle by
+        # more than mismatch_tol is ALSO fallback-worthy in the cached
+        # pipeline, so checking staleness alone here would let a market the
+        # rendered snapshot actually draws from Kalshi still count as "live").
+        # AND'd across every listed market in the event into a single
+        # all_live mask -- ANY market stale/mismatched at a timestamp
+        # disqualifies that timestamp for EVERY market, not just its own row
+        # (the fitted curve is a joint fit, so a hidden fallback quote
+        # anywhere corrupts the curve itself, not only the market it's on).
+        live_matrix = black_scholes.market_live_matrix(
+            long_df, event_kalshi_backup, eval_df['time'], staleness_threshold=staleness_threshold)
+        tickers = sorted(live_matrix.keys())
+        market_meta = {}
+        all_live = np.ones(len(df), dtype=bool)
+        for mtk in tickers:
+            sub = long_df.loc[long_df['ticker'] == mtk]
+            floor = float(sub['floor_strike'].iloc[0])
+            cap_raw = sub['cap_strike'].iloc[0]
+            cap = float(cap_raw) if pd.notna(cap_raw) else None
+            strike_type = sub['strike_type'].iloc[0]
+            market_meta[mtk] = (floor, cap, strike_type)
+            all_live &= live_matrix[mtk][2]
+
+        # Pass 2: deviation per market, only at timestamps where EVERY market
+        # (not just this one) was live.
+        for mtk in tickers:
+            bid, ask, _ = live_matrix[mtk]
+            floor, cap, strike_type = market_meta[mtk]
+            ok = sigma_ok & all_live & ~np.isnan(bid) & ~np.isnan(ask)
+            if not ok.any():
+                continue
+            ok_idx = np.nonzero(ok)[0]
+            model_p = np.array([
+                black_scholes.smile_bucket_prob(mu_arr[j], sigma_arr[j], pillars_per_row[j], floor, cap, strike_type)
+                for j in ok_idx
+            ])
+            deviation = np.where(model_p > ask[ok_idx], model_p - ask[ok_idx],
+                                  np.where(model_p < bid[ok_idx], model_p - bid[ok_idx], 0.0))
+            frames.append(pd.DataFrame({
+                'event_ticker': event_ticker, 'market_ticker': mtk, 'date': date,
+                'time': df['time'].to_numpy()[ok_idx], 'deviation': deviation,
+            }))
+
+    table = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
+        columns=['event_ticker', 'market_ticker', 'date', 'time', 'deviation'])
+
+    if use_cache:
+        os.makedirs(cache_dir, exist_ok=True)
+        table.to_parquet(cache_path, index=False)
+        print(f"[mispricing cache] saved {len(table)} rows to {cache_path}")
+    return table
+
+
+def find_market_mispricing_episodes(day_results, top_n=10, onset_threshold=0.02, fixed_threshold=0.002,
+                                     min_duration='1min', warmup='15min',
+                                     staleness_threshold=black_scholes.DEFAULT_STALENESS_THRESHOLD,
+                                     data_source='predexon', use_cache=True, cache_dir=None):
+    """
+    Top_n distinct episodes where ONE specific listed market's own quoted
+    [bid, ask] diverged from the fitted curve's own price for it (see
+    _gather_market_deviation_table for what 'deviation' means) by more than
+    `onset_threshold`, ranked by the PEAK |deviation| reached during the
+    episode -- the moments a single market's own quote sat furthest outside
+    what every other listed market implies about the fitted curve, as
+    opposed to find_worst_fits' aggregate multi-market band_cost.
+
+    An episode's onset (first row |deviation| >= onset_threshold) and its fix
+    (first subsequent row |deviation| <= fixed_threshold) must both fall
+    within the SAME unbroken run of rows for that market in _gather_market_
+    deviation_table -- which already excludes every timestamp where ANY
+    listed market in the event (not just this one) was stale/Kalshi-fallback,
+    so a run boundary here is exactly "some market in this event had no live
+    order-book quote for longer than this day's own sampling step," detected
+    directly off consecutive timestamps rather than a separate flag. An
+    episode still open when its run ends (deviation never returns under
+    fixed_threshold before a gap or the day's data ends) is dropped, not
+    reported with an inferred/assumed fix time -- there's no live quote to
+    confirm it actually converged rather than just going stale mid-move.
+
+    Skips the first `warmup` of each event's own series (per-market, off that
+    event's own day_start) -- same thin-opening-liquidity reasoning as
+    find_worst_fits/find_biggest_spot_jumps.
+
+    Selection, after ranking by peak |deviation| descending: capped to AT MOST
+    ONE episode per (event_ticker, market_ticker) -- its single best (highest
+    peak |deviation|), since episodes are already sorted descending by the
+    time a market's own key is first encountered. Without this, a market that
+    genuinely swings in and out of mispricing repeatedly in one day (a real,
+    recurring pattern, not a frozen-quote artifact -- confirmed on a real
+    case, KXHIGHLAX-26APR10-B69.5, 6 distinct excursions >=30min apart all
+    ranking in the raw top 10) can fill most of top_n by itself, crowding out
+    every other market's own worst episode -- the same "one incident
+    shouldn't dominate the leaderboard" concern find_worst_fits' own dedup
+    passes exist for, just enforced here as a hard per-market cap rather than
+    a time-gap heuristic, since "this market's OTHER episodes are still real"
+    doesn't change the point of a top_n survey across DIFFERENT markets.
+    """
+    table = _gather_market_deviation_table(day_results, staleness_threshold=staleness_threshold,
+                                            data_source=data_source, use_cache=use_cache, cache_dir=cache_dir)
+    if table.empty:
+        return []
+
+    valid = [(ticker, df, date) for ticker, df, date in day_results if not df.empty]
+    day_starts = {(ticker, date): df['time'].iloc[0] for ticker, df, date in valid}
+    warmup_td = pd.Timedelta(warmup)
+    min_duration_td = pd.Timedelta(min_duration)
+
+    episodes = []
+    for (event_ticker, market_ticker, date), g in table.groupby(['event_ticker', 'market_ticker', 'date']):
+        day_start = day_starts.get((event_ticker, date))
+        if day_start is not None:
+            g = g[g['time'] >= day_start + warmup_td]
+        if len(g) < 2:
+            continue
+        g = g.sort_values('time')
+        times = g['time'].to_numpy()
+        dev = g['deviation'].to_numpy()
+
+        dt = pd.Series(times).diff()
+        base_step = dt[dt > pd.Timedelta(0)].min()
+        if pd.isna(base_step) or base_step <= pd.Timedelta(0):
+            continue
+        is_break = (dt > base_step * 1.5).to_numpy()
+        is_break[0] = True  # first row of this market always starts a fresh live run
+
+        onset_idx = None
+        peak, peak_idx = 0.0, None
+        for i in range(len(times)):
+            if is_break[i]:
+                onset_idx, peak, peak_idx = None, 0.0, None
+            d = abs(dev[i])
+            if onset_idx is None:
+                if d >= onset_threshold:
+                    onset_idx, peak, peak_idx = i, d, i
+                continue
+            if d > peak:
+                peak, peak_idx = d, i
+            if d <= fixed_threshold:
+                duration = pd.Timestamp(times[i]) - pd.Timestamp(times[onset_idx])
+                if duration >= min_duration_td:
+                    episodes.append({
+                        'event_ticker': event_ticker, 'market_ticker': market_ticker, 'date': date,
+                        't_start': pd.Timestamp(times[onset_idx]), 't_fixed': pd.Timestamp(times[i]),
+                        't_peak': pd.Timestamp(times[peak_idx]),
+                        'peak_deviation': peak, 'duration': duration,
+                    })
+                onset_idx, peak, peak_idx = None, 0.0, None
+
+    episodes.sort(key=lambda r: -r['peak_deviation'])
+    selected = []
+    seen_markets = set()
+    for r in episodes:
+        key = (r['event_ticker'], r['market_ticker'])
+        if key in seen_markets:
+            continue
+        selected.append(r)
+        seen_markets.add(key)
+        if len(selected) == top_n:
+            break
+    return selected
+
+
+def plot_mispricing_episode(record, day_results, long_df=None, kalshi_backup=None, data_source='predexon'):
+    """
+    Two-panel before/after view of one mispricing episode from find_market_
+    mispricing_episodes: left panel at the episode's onset (the moment
+    record['market_ticker']'s own quote first diverged from the fitted curve
+    by more than onset_threshold), right panel at its fix (the moment it
+    first converged back within fixed_threshold) -- both rendered via
+    _render_snapshot_panel, i.e. every listed market's own real bid/ask
+    alongside the fitted curve, same as plot_fit_occurrence/plot_jump_
+    occurrence. The flagged market is the one this episode was found on; it
+    isn't visually distinguished from the rest here (unlike the mispriced-
+    market correction star _render_snapshot_panel draws for a conservation-
+    law violation) -- read record['market_ticker'] to know which one it is.
+
+    mu/sigma/wing at each panel's timestamp are read directly off day_
+    results' own cached implied_spot/sigma/wing_* columns at that exact grid
+    time (t_start/t_fixed are themselves values from that same time column,
+    via find_market_mispricing_episodes/_gather_market_deviation_table) --
+    not refit -- so the drawn curve is exactly what the cached pipeline
+    itself fit at that instant.
+    """
+    if long_df is None or kalshi_backup is None:
+        default_long_df, default_kalshi_backup = _MISPRICE_LOADERS[data_source](record['event_ticker'])
+        long_df = default_long_df if long_df is None else long_df
+        kalshi_backup = default_kalshi_backup if kalshi_backup is None else kalshi_backup
+    df = _lookup_ticker(day_results, record['event_ticker'])
+    if df is None or df.empty:
+        raise ValueError(f"no day_results entry for {record['event_ticker']}")
+    df_by_time = df.set_index('time')
+
+    def _fit_at(t):
+        row = df_by_time.loc[pd.Timestamp(t)]
+        wing = (row.get('implied_wing_z_less'), row.get('implied_wing_sigma_less'),
+                row.get('implied_wing_z_greater'), row.get('implied_wing_sigma_greater'))
+        return row['implied_spot'], row['implied_sigma'], wing
+
+    snap_start = black_scholes.snapshot_market_quotes(long_df, kalshi_backup, record['t_start'])
+    snap_fixed = black_scholes.snapshot_market_quotes(long_df, kalshi_backup, record['t_fixed'])
+    mu_s, sigma_s, wing_s = _fit_at(record['t_start'])
+    mu_f, sigma_f, wing_f = _fit_at(record['t_fixed'])
+
+    t_start_la = pd.Timestamp(record['t_start']).tz_convert(LA_TZ)
+    t_fixed_la = pd.Timestamp(record['t_fixed']).tz_convert(LA_TZ)
+
+    # mispriced_sum_tol=inf: NEVER invoke _render_snapshot_panel's own
+    # conservation-law correction (find_and_correct_mispriced_market) here --
+    # that would refit (mu, sigma) against a DIFFERENT flagged market than
+    # the one this whole panel exists to show, silently diverging from the
+    # exact (mu, sigma) find_market_mispricing_episodes actually scored this
+    # row against. Confirmed as a real, user-visible bug: on a snapshot whose
+    # raw listed mids summed to 1.03 (off by more than the panel's own
+    # default 0.002 tolerance), the panel's auto-correction refit a different
+    # curve than the one the deviation/duration numbers in the title were
+    # computed from -- the drawn curve and the reported numbers told two
+    # different stories. Always draw the SAME curve that was measured.
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5), sharey=True)
+    _render_snapshot_panel(axes[0], snap_start, mu_s, sigma_s, wing_s,
+                            title=f'mispriced onset: {t_start_la.strftime("%H:%M:%S")} PT',
+                            mispriced_sum_tol=float('inf'))
+    _render_snapshot_panel(axes[1], snap_fixed, mu_f, sigma_f, wing_f,
+                            title=f'fixed: {t_fixed_la.strftime("%H:%M:%S")} PT',
+                            mispriced_sum_tol=float('inf'))
+
+    axes[0].set_ylabel('Probability')
+    fig.suptitle(
+        f"{record['market_ticker']} -- peak deviation {record['peak_deviation']:.3f} from curve, "
+        f"fixed after {record['duration']}   (labels = lot size at best bid/ask)",
+        fontsize=12,
+    )
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_market_mispricings(day_results, top_n=10, onset_threshold=0.02, fixed_threshold=0.002,
+                             min_duration='1min', warmup='15min',
+                             staleness_threshold=black_scholes.DEFAULT_STALENESS_THRESHOLD,
+                             data_source='predexon', use_cache=True, cache_dir=None):
+    """
+    Find the top_n single-market mispricing episodes (find_market_
+    mispricing_episodes -- at most one per (event_ticker, market_ticker), its
+    own best) and plot each one's onset/fixed snapshot pair (plot_mispricing_
+    episode). Prints a one-line summary per episode and returns the records,
+    in case the caller wants them directly. data_source: see _gather_market_
+    deviation_table's docstring ('predexon' or 'kalshi_ws').
+    """
+    episodes = find_market_mispricing_episodes(
+        day_results, top_n=top_n, onset_threshold=onset_threshold, fixed_threshold=fixed_threshold,
+        min_duration=min_duration, warmup=warmup, staleness_threshold=staleness_threshold,
+        data_source=data_source, use_cache=use_cache, cache_dir=cache_dir,
+    )
+    for rank, record in enumerate(episodes, 1):
+        print(f"#{rank}: {record['market_ticker']}  peak={record['peak_deviation']:.3f}  "
+              f"{record['t_start']} -> {record['t_fixed']}  (fixed after {record['duration']})")
+        plot_mispricing_episode(record, day_results, data_source=data_source)
+    return episodes

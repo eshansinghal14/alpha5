@@ -34,7 +34,12 @@ class Quote:
 
 @dataclasses.dataclass
 class Trade:
-    """A print of an actual executed trade, YES-side price."""
+    """A print of an actual executed trade, priced in the MAKER's side terms
+    -- the side whose resting queue the print actually depleted, which is the
+    opposite of taker_side. NOT the yes price: execution.QueueTracker matches
+    a resting order to a print by plain equality against that order's own
+    side price, so the two have to agree. Both producers convert (see
+    data.load_trades and live_kalshi_ws)."""
     ticker: str
     time: pd.Timestamp
     price: float
@@ -52,6 +57,12 @@ class Order:
     price: float | None  # required for "limit", ignored for "market" (in `side`'s own price terms)
     size: float
     decision_time: pd.Timestamp   # sim time the strategy call that created this fired at
+    # "take"  -- priced at the touch it means to cross: fills on arrival or not at all.
+    # "quote" -- meant to REST until filled or explicitly cancelled.
+    # The backtest resolves both identically (marketable -> fill, else rest), so
+    # this only changes what the LIVE path sends: an IOC for a take, a resting
+    # limit order that has to be cancelled by hand for a quote.
+    intent: str = "take"
 
 
 @dataclasses.dataclass
@@ -68,8 +79,15 @@ class Fill:
 
 def kalshi_fee(price: float, contracts: float, fee_multiplier: float = 0.07) -> float:
     """
-    Kalshi's standard per-fill trading fee, rounded up to the nearest cent:
-        fee = ceil(fee_multiplier * contracts * price * (1 - price) * 100) / 100
+    Kalshi's standard per-fill trading fee, rounded up to 4 decimal places
+    (a hundredth of a cent -- NOT to the nearest cent):
+        fee = ceil(fee_multiplier * contracts * price * (1 - price) * 10000) / 10000
+
+    Verified against 211 real taker fills from the 2026-08-28 live KXINXU
+    session: this reproduces every one of them exactly (0.15/1ct -> 0.0090,
+    0.62 -> 0.0165, 0.61 -> 0.0167). The previous ceil-to-the-cent version
+    overcharged those same fills by 21% in aggregate, which mattered most at
+    lot_size=1 where a sub-cent fee was being rounded to a full cent.
 
     fee_multiplier=0.07 is Kalshi's advertised *general* rate as of this
     writing -- NOT confirmed against a real fill/statement anywhere in this
@@ -82,7 +100,19 @@ def kalshi_fee(price: float, contracts: float, fee_multiplier: float = 0.07) -> 
     if contracts <= 0:
         return 0.0
     raw = fee_multiplier * contracts * price * (1.0 - price)
-    return math.ceil(raw * 100.0) / 100.0
+    return math.ceil(raw * 10000.0) / 10000.0
+
+
+# Kalshi charges NO maker fee on most markets -- a filled resting order pays
+# nothing. Only designated series charge makers, at a quarter of the taker
+# rate (0.0175 in the same formula), and Kalshi's API does not expose which
+# series those are; it has to be read off the fee-schedule PDF.
+#
+# Checked for KXINX/KXINXU against Kalshi's published fee schedule on
+# 2026-08-31: both list a taker fee only, no maker line. So 0.0 is the
+# measured value here, not the optimistic placeholder it started as. Recheck
+# if the schedule changes -- at 0.0175 quoting results get materially worse.
+MAKER_FEE_MULTIPLIER = 0.0
 
 
 @dataclasses.dataclass
@@ -136,7 +166,8 @@ class Position:
 class Portfolio:
     def __init__(self, fee_multiplier: float = 0.07, maker_fee_multiplier: float | None = None):
         self.fee_multiplier = fee_multiplier
-        self.maker_fee_multiplier = maker_fee_multiplier if maker_fee_multiplier is not None else fee_multiplier
+        self.maker_fee_multiplier = (maker_fee_multiplier if maker_fee_multiplier is not None
+                                     else MAKER_FEE_MULTIPLIER)
         self.positions: dict[str, Position] = {}
         self.fills: list[Fill] = []
 
@@ -145,9 +176,14 @@ class Portfolio:
             self.positions[ticker] = Position(ticker=ticker)
         return self.positions[ticker]
 
-    def record_fill(self, order: Order, price: float, size: float, time: pd.Timestamp, liquidity: str) -> Fill:
-        mult = self.fee_multiplier if liquidity == "taker" else self.maker_fee_multiplier
-        fee = kalshi_fee(price, size, mult)
+    def record_fill(self, order: Order, price: float, size: float, time: pd.Timestamp, liquidity: str,
+                    fee: float | None = None) -> Fill:
+        """`fee` overrides the modelled kalshi_fee -- pass it when the venue
+        reported the real one (live trading does; see live_orders.RealFill),
+        since kalshi_fee's multiplier is an unverified default."""
+        if fee is None:
+            mult = self.fee_multiplier if liquidity == "taker" else self.maker_fee_multiplier
+            fee = kalshi_fee(price, size, mult)
         fill = Fill(order_id=order.order_id, ticker=order.ticker, side=order.side,
                     price=price, size=size, time=time, fee=fee, liquidity=liquidity)
         self.position(order.ticker).apply_fill(fill)

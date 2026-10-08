@@ -1,0 +1,7 @@
+[theme]
+base = "dark"
+
+[server]
+# Serves viz/static/ at /app/static/ -- how the live chart fetches its own
+# data snapshot same-origin, without a second web server or CORS setup.
+enableStaticServing = true

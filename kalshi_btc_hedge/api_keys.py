@@ -8,7 +8,12 @@ from cryptography.exceptions import InvalidSignature
 
 
 def load_kalshi_rsa_private_key():
-    kalshi_api_key_file_path = "eshan-kalshi-rsa-private-key.txt"
+    # eshan-ws-key.txt, not the former eshan-kalshi-rsa-private-key.txt --
+    # that file held an orphaned key (no key id in this repo paired with it)
+    # that returned 401 INCORRECT_API_KEY_SIGNATURE on every authenticated
+    # endpoint, and has been deleted. The "ws" name is historical; this is
+    # the account's single RSA key, used for REST and websocket alike.
+    kalshi_api_key_file_path = "eshan-ws-key.txt"
     with open(kalshi_api_key_file_path, "rb") as key_file:
         private_key = serialization.load_pem_private_key(
             key_file.read(),
