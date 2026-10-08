@@ -14,8 +14,8 @@ Keeps the full raw tick stream -- every price level, not just the touch --
 so the exact book state can be reconstructed at any timestamp.
 
 Usage:
-    python ws_raw_ob_collector.py            # run until Ctrl+C
-    python ws_raw_ob_collector.py 480         # run for 480 minutes then stop
+    python -m kalshi_infra.ws_raw_ob_collector            # run until Ctrl+C
+    python -m kalshi_infra.ws_raw_ob_collector 480         # run for 480 minutes then stop
 """
 
 import asyncio
@@ -42,8 +42,7 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-sys.path.insert(0, os.path.dirname(__file__))
-from api_functions import (
+from kalshi_infra.api_functions import (
     API_KEY,
     FIFTEEN_MIN_SERIES_TICKERS,
     HIGH_LOW_TEMP_SERIES_TICKERS,
@@ -51,15 +50,14 @@ from api_functions import (
     SP500_SERIES_TICKERS,
     kalshi_get,
 )
+from kalshi_infra.kalshi.auth import private_key_path
 
 SERIES_TICKERS = (
     HIGH_LOW_TEMP_SERIES_TICKERS + FIFTEEN_MIN_SERIES_TICKERS + HOURLY_SERIES_TICKERS + SP500_SERIES_TICKERS
 )
 
 WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
-WS_KEY_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "kalshi_btc_hedge", "eshan-ws-key.txt"
-)
+WS_KEY_PATH = private_key_path()
 OUT_DIR_ROOT = os.path.join(os.path.dirname(__file__), "..", "data", "kalshi_ws")
 LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
 

@@ -18,11 +18,9 @@ import matplotlib.dates as mdates
 import pytz
 from scipy.stats import norm as _norm
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "kalshi_infra"))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "kalshi_backtest"))
-import black_scholes
-from predexon_functions import load_predexon_long_df, load_kalshi_backup_long_df, get_event_markets, _parse_strike_from_ticker
-from book import replay_ws_ticks  # kalshi_backtest/book.py -- L2 reconstruction from raw kalshi_ws ticks
+from kalshi_infra import black_scholes
+from kalshi_infra.predexon_functions import load_predexon_long_df, load_kalshi_backup_long_df, get_event_markets, _parse_strike_from_ticker
+from kalshi_backtest.book import replay_ws_ticks  # kalshi_backtest/book.py -- L2 reconstruction from raw kalshi_ws ticks
 
 # Kalshi KXHIGHLAX resolves on the LA daily high, measured in Pacific Time
 # (LAX weather station) -- every plot in this module displays in this tz.

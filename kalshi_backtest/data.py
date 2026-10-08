@@ -27,15 +27,10 @@ import sys
 
 import pandas as pd
 
-_INFRA_DIR = os.path.join(os.path.dirname(__file__), "..", "kalshi_infra")
-if _INFRA_DIR not in sys.path:
-    sys.path.insert(0, _INFRA_DIR)
-
-import databento_functions as dbf
-import predexon_functions as pf
-
-from core import Quote, Trade
-from book import replay_ws_ticks
+from kalshi_infra import databento_functions as dbf
+from kalshi_infra import predexon_functions as pf
+from kalshi_backtest.core import Quote, Trade
+from kalshi_backtest.book import replay_ws_ticks
 
 _DATA_ROOT = os.path.join(os.path.dirname(__file__), "..", "data")
 KALSHI_WS_ROOT = os.path.join(_DATA_ROOT, "kalshi_ws")

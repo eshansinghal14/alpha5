@@ -31,8 +31,8 @@ import dataclasses
 
 import pandas as pd
 
-from core import Order, Trade
-from book import BookView
+from kalshi_backtest.core import Order, Trade
+from kalshi_backtest.book import BookView
 
 
 # --- measured latency constants (see kalshi_infra/measure_order_latency.py) ---

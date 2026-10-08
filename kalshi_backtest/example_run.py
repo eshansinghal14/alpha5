@@ -1,18 +1,12 @@
 """
 Minimal usage example: run strategies/crossing_arb.py through the engine for
-one event and print a summary. Run as `python example_run.py [event_ticker]`
-from inside kalshi_backtest/ (or with it on sys.path).
+one event and print a summary. Run from the repo root as
+`python -m kalshi_backtest.example_run [event_ticker]`.
 """
-import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "strategies"))
-
-import data
-import engine
-import results
-import crossing_arb
+from kalshi_backtest import data, engine, results
+from kalshi_backtest.strategies import crossing_arb
 
 
 def main():

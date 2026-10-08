@@ -18,7 +18,7 @@ under IB's 100-line default). ATM is picked from DELAYED SPX cash so
 this works without the CBOE Streaming Indexes subscription.
 
 Usage:
-    python kalshi_infra/measure_ib_latency.py [--seconds 30] [--atm 7770]
+    python -m kalshi_infra.measure_ib_latency [--seconds 30] [--atm 7770]
 """
 import argparse
 import collections
@@ -29,8 +29,7 @@ import statistics
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import keys
+from kalshi_infra import keys
 
 
 def _resolve_atm(ib) -> float:
@@ -57,7 +56,7 @@ def _resolve_atm(ib) -> float:
 
 def run(seconds: float, atm: float | None):
     from ib_async import IB, Option
-    import ib_functions
+    from kalshi_infra import ib_functions
 
     ib_functions.quiet_ib_logging()
     ib = IB()

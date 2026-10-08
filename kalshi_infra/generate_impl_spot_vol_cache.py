@@ -21,9 +21,8 @@ Safe to re-run: compute_implied_spot_timeseries_cached skips any
 """
 import os
 
-import black_scholes as bs
-import predexon_functions as pf
-
+from kalshi_infra import black_scholes as bs
+from kalshi_infra import predexon_functions as pf
 FREQS = ["1s", "10s", "1min", "10min"]
 MAX_CONSECUTIVE_ERRORS = 5
 WIDE_START_TS = 0

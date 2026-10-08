@@ -11,14 +11,11 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-sys.path.insert(0, os.path.dirname(__file__))
-from keys import KALSHI_API_KEY as API_KEY
+from kalshi_infra.keys import KALSHI_API_KEY as API_KEY
+from kalshi_infra.kalshi.auth import private_key_path
 
 BASE_URL = "https://api.elections.kalshi.com"
-# eshan-ws-key.txt, not the former eshan-kalshi-rsa-private-key.txt -- that
-# second file held an orphaned key that 401'd on every authenticated
-# endpoint and has been deleted; see api_functions._KEY_CANDIDATES.
-KEY_PATH = os.path.join(os.path.dirname(__file__), "..", "kalshi_btc_hedge", "eshan-ws-key.txt")
+KEY_PATH = private_key_path()
 
 TICKER = "KXHIGHLAX-26AUG01-B82.5"  # one market to probe
 SERIES = "KXHIGHLAX"

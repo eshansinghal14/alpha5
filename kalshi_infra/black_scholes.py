@@ -30,7 +30,7 @@ import os
 import numpy as np
 import pandas as pd
 
-import predexon_functions
+from kalshi_infra import predexon_functions
 from scipy.special import ndtr
 
 _INV_SQRT_2PI = 0.3989422804014327  # 1/sqrt(2*pi)

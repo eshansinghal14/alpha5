@@ -11,9 +11,8 @@ import datetime
 import os
 import random
 
-import api_functions
-import predexon_functions as pf
-
+from kalshi_infra import api_functions
+from kalshi_infra import predexon_functions as pf
 COVERAGE_START = datetime.date(2026, 1, 1)
 yesterday = datetime.date.today() - datetime.timedelta(days=1)  # exclude today (event still open)
 N_DAYS = (yesterday - COVERAGE_START).days + 1

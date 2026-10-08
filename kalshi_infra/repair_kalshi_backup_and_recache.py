@@ -28,10 +28,9 @@ import time
 import pandas as pd
 import requests
 
-import api_functions as af
-import black_scholes as bs
-import predexon_functions as pf
-
+from kalshi_infra import api_functions as af
+from kalshi_infra import black_scholes as bs
+from kalshi_infra import predexon_functions as pf
 FREQS = ["1s", "10s", "1min", "10min"]
 MAX_RETRIES = 5
 cols = ["ticker", "time", "bid", "ask"]
@@ -120,6 +119,7 @@ print(
 
 print("\nRe-running generate_impl_spot_vol_cache.py to recompute invalidated entries...", flush=True)
 result = subprocess.run(
-    [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "generate_impl_spot_vol_cache.py")]
+    [sys.executable, "-m", "kalshi_infra.generate_impl_spot_vol_cache"],
+    cwd=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 )
 sys.exit(result.returncode)

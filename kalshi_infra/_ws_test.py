@@ -1,16 +1,16 @@
 """Decode full WebSocket message format with an open market."""
 import sys, os, asyncio, json, base64, datetime
-sys.path.insert(0, os.path.dirname(__file__))
-import api_functions, importlib; importlib.reload(api_functions)
-from api_functions import kalshi_get, event_ticker_from_date
-from keys import KALSHI_API_KEY as API_KEY
+from kalshi_infra import api_functions
+from kalshi_infra.api_functions import kalshi_get, event_ticker_from_date
+from kalshi_infra.keys import KALSHI_API_KEY as API_KEY
+from kalshi_infra.kalshi.auth import private_key_path
 
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 import websockets
 
-WS_KEY   = os.path.join(os.path.dirname(__file__), "..", "kalshi_btc_hedge", "eshan-ws-key.txt")
+WS_KEY   = private_key_path()
 URL      = "wss://api.elections.kalshi.com/trade-api/ws/v2"
 
 def ws_headers():

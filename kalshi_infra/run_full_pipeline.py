@@ -27,6 +27,8 @@ import subprocess
 import sys
 import time
 
+from kalshi_infra import REPO_ROOT
+
 MAX_RETRIES = 12
 BACKOFF_SCHEDULE = [30, 60, 120, 180, 300]  # seconds; last value repeats
 
@@ -40,8 +42,8 @@ def run_stage_with_retries(script: str, max_retries: int = MAX_RETRIES) -> bool:
     for attempt in range(max_retries):
         print(f"\n===== [{script}] attempt {attempt + 1}/{max_retries} =====", flush=True)
         proc = subprocess.run(
-            [sys.executable, script],
-            capture_output=True, text=True,
+            [sys.executable, "-m", f"kalshi_infra.{script.removesuffix('.py')}"],
+            capture_output=True, text=True, cwd=REPO_ROOT,
         )
         sys.stdout.write(proc.stdout)
         sys.stderr.write(proc.stderr)

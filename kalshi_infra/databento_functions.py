@@ -38,7 +38,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from keys import DATABENTO_API_KEY as API_KEY
+from kalshi_infra.keys import DATABENTO_API_KEY as API_KEY
 
 DATASET = "OPRA.PILLAR"
 ET = ZoneInfo("America/New_York")
@@ -550,7 +550,7 @@ def _kxinx_event_markets(event_ticker: str) -> list[dict]:
     on its own (confirmed via a live API check on 2026-08-15), unlike
     KXHIGHLAX, so no ticker-suffix parsing is needed here the way
     predexon_functions._parse_strike_from_ticker needed it."""
-    import api_functions
+    from kalshi_infra import api_functions
     data = api_functions.kalshi_get("/trade-api/v2/markets", params={"event_ticker": event_ticker, "limit": 200})
     return data.get("markets", [])
 

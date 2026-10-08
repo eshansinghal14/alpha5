@@ -22,7 +22,7 @@ reuses the same per-row bid/ask/depth matrices the primary fit already
 builds), and it's simpler for every cache file to consistently have those
 columns than to track which ones do.
 
-Usage: edit DAYS/FREQS below and run `python regen_cache.py`.
+Usage: edit DAYS/FREQS below and run `python -m kalshi_infra.regen_cache`.
 """
 import os
 import glob
@@ -30,10 +30,9 @@ import datetime
 from datetime import timezone, timedelta
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-import api_functions
-import black_scholes
-import predexon_functions
-
+from kalshi_infra import api_functions
+from kalshi_infra import black_scholes
+from kalshi_infra import predexon_functions
 SKEW_DIAG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'kalshi_vol_trading', 'data', 'skew_diag')
 
 

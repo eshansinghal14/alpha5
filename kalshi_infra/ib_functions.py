@@ -12,12 +12,11 @@ import sys
 
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import keys
+from kalshi_infra import keys
 
 # Kalshi-side helpers are venue-agnostic; reusing them keeps backtest and
 # live paths selecting the same strikes from the same bucket boundaries.
-from databento_functions import (_kxinx_event_markets, bracket_listed_strikes,
+from kalshi_infra.databento_functions import (_kxinx_event_markets, bracket_listed_strikes,
                                  select_event_buckets, IB_MARKET_DATA_LINES)
 
 # Buckets the strategy may trade at once (run_live sets max_markets to this).

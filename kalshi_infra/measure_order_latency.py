@@ -59,10 +59,10 @@ latency and make the backtest pessimistic in a way live trading wouldn't
 actually be.
 
 Usage:
-    python measure_order_latency.py                 # dry run: pick market, show book, place NOTHING
-    python measure_order_latency.py --live          # ACTUALLY TRADE (3 trials)
-    python measure_order_latency.py --live -n 5
-    python measure_order_latency.py --live --ticker KXINX-26AUG28H1600-B7662
+    python -m kalshi_infra.measure_order_latency                 # dry run: pick market, show book, place NOTHING
+    python -m kalshi_infra.measure_order_latency --live          # ACTUALLY TRADE (3 trials)
+    python -m kalshi_infra.measure_order_latency --live -n 5
+    python -m kalshi_infra.measure_order_latency --live --ticker KXINX-26AUG28H1600-B7662
 
 Writes a JSON summary to data/latency/order_latency_{timestamp}.json so the
 backtest can read the measured numbers rather than having them retyped by
@@ -79,10 +79,9 @@ import uuid
 import numpy as np
 import requests
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import api_functions as af
-from api_functions import BASE_URL
+from kalshi_infra import api_functions as af
+from kalshi_infra.api_functions import BASE_URL
 
 _DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "latency")
 

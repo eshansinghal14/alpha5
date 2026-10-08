@@ -20,16 +20,11 @@ market data -- it's precomputed and fed into Backtest.run() as
 stream. See find_crossing_signals().
 """
 import datetime
-import os
-import sys
-
-_INFRA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "kalshi_infra")
-if _INFRA_DIR not in sys.path:
-    sys.path.insert(0, _INFRA_DIR)
 
 import pandas as pd
-import predexon_functions as pf
-import station_temp_data as std
+
+from kalshi_infra import predexon_functions as pf
+from kalshi_infra import station_temp_data as std
 
 FILL_BID = 0.99
 ROUNDING_BUFFER_F = 1.0

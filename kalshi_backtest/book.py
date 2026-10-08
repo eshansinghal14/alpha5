@@ -15,7 +15,7 @@ import json
 
 import pandas as pd
 
-from core import Quote
+from kalshi_backtest.core import Quote
 
 
 class L2Book:

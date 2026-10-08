@@ -13,14 +13,13 @@ Idempotent: skips any event already present in S3, so it's safe to re-run
 whenever you want to push newly-completed days up (or sweep for orphans).
 
 Usage:
-    python upload_completed_days_to_s3.py
+    python -m kalshi_infra.upload_completed_days_to_s3
 """
 
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(__file__))
-from ws_raw_ob_collector import Collector, _get_open_markets, _local_events_with_data, _setup_logging, logger
+from kalshi_infra.ws_raw_ob_collector import Collector, _get_open_markets, _local_events_with_data, _setup_logging, logger
 
 
 def main():

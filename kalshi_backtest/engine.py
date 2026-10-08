@@ -45,10 +45,10 @@ from typing import Callable
 
 import pandas as pd
 
-from core import Order, Portfolio
-from book import BookView, L2Book
-from data import EventData, STALE_THRESHOLD_S, MAX_SNAPSHOT_AGE_S
-from execution import LatencyModel, QueueTracker, resolve_marketable, resolve_resting
+from kalshi_backtest.core import Order, Portfolio
+from kalshi_backtest.book import BookView, L2Book
+from kalshi_backtest.data import EventData, STALE_THRESHOLD_S, MAX_SNAPSHOT_AGE_S
+from kalshi_backtest.execution import LatencyModel, QueueTracker, resolve_marketable, resolve_resting
 
 
 @dataclasses.dataclass
@@ -193,7 +193,7 @@ class Backtest:
         data. Not fed into true_book (only Quote/Trade events affect it).
         """
         if event_data is None:
-            from data import load_event_data
+            from kalshi_backtest.data import load_event_data
             event_data = load_event_data(event_ticker, source=source)
 
         # A single pd.NaT anywhere in the heap corrupts ordering for OTHER,

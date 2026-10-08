@@ -2,18 +2,14 @@
 Kalshi API functions for vol trading analysis.
 Handles auth, market discovery, orderbook midpoints, and historical candlestick data.
 """
-import base64
 import datetime
-import os
 import time
 
 import requests
 import pandas as pd
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
 
-from keys import KALSHI_API_KEY as API_KEY
+from kalshi_infra.kalshi import auth
+from kalshi_infra.keys import KALSHI_API_KEY as API_KEY
 
 BASE_URL = "https://api.elections.kalshi.com"
 SERIES_TICKER = "KXHIGHLAX"
@@ -86,54 +82,8 @@ HOURLY_SERIES_TICKERS = [
     "KXINXU", "KXNASDAQ100U",
 ]
 
-# eshan-ws-key.txt is THE account's RSA key -- it's the one paired with the
-# KALSHI_API_KEY id in keys.py, for REST and websocket alike. The name is
-# historical (it was first added for the WS collector) and does not mean
-# websocket-only; don't add a separate "REST key" alongside it.
-#
-# A second file, eshan-kalshi-rsa-private-key.txt, used to be listed first
-# here and held a DIFFERENT, orphaned key (confirmed directly: different
-# public-key fingerprint, and no key id anywhere in this repo pairs with it).
-# Signing with it returned 401 INCORRECT_API_KEY_SIGNATURE on every
-# authenticated endpoint. It has since been deleted.
-#
-# That mismatch stayed invisible for a long time because the endpoints this
-# module uses most (markets, orderbook, series) are PUBLIC -- confirmed
-# directly that /markets/{ticker}/orderbook returns 200 with a deliberately
-# garbage signature AND with no auth headers at all. So "auth works, I use it
-# all the time" was never actually exercising the signature; only genuinely
-# authenticated endpoints (portfolio/balance, portfolio/positions, order
-# placement) ever revealed it.
-_KEY_CANDIDATES = [
-    os.path.join(os.path.dirname(__file__), "..", "kalshi_btc_hedge", "eshan-ws-key.txt"),
-    os.path.join(os.path.dirname(__file__), "eshan-ws-key.txt"),
-]
-
-
-def _load_private_key():
-    for path in _KEY_CANDIDATES:
-        abs_path = os.path.abspath(path)
-        if os.path.exists(abs_path):
-            with open(abs_path, "rb") as f:
-                return serialization.load_pem_private_key(f.read(), password=None, backend=default_backend())
-    raise FileNotFoundError(f"RSA private key not found; checked: {_KEY_CANDIDATES}")
-
-
-def _auth_headers(method: str, path: str) -> dict:
-    private_key = _load_private_key()
-    ts = str(int(datetime.datetime.now().timestamp() * 1000))
-    msg = (ts + method.upper() + path).encode("utf-8")
-    sig = private_key.sign(
-        msg,
-        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
-        hashes.SHA256(),
-    )
-    return {
-        "KALSHI-ACCESS-KEY": API_KEY,
-        "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode("utf-8"),
-        "KALSHI-ACCESS-TIMESTAMP": ts,
-        "accept": "application/json",
-    }
+_load_private_key = auth.load_private_key
+_auth_headers = auth.rest_headers
 
 
 def kalshi_get(path: str, params: dict = None, auth: bool = False, max_retries: int = 8) -> dict:

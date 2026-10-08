@@ -1,7 +1,7 @@
 """Turn a BacktestResult (or several, across events) into plain DataFrames."""
 import pandas as pd
 
-from engine import BacktestResult
+from kalshi_backtest.engine import BacktestResult
 
 
 def fills_df(result: BacktestResult) -> pd.DataFrame:

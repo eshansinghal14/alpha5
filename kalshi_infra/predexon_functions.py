@@ -13,8 +13,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import requests
 
-import api_functions
-from keys import PREDEXON_API_KEY as API_KEY
+from kalshi_infra import api_functions
+from kalshi_infra.keys import PREDEXON_API_KEY as API_KEY
 
 BASE_URL = "https://api.predexon.com/v2"
 

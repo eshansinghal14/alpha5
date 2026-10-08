@@ -14,8 +14,8 @@ Two independent measurements:
    in that function's docstring before running it.
 
 Usage:
-    python scratch_measure_latency.py ws [duration_seconds]
-    python scratch_measure_latency.py order [n_trials]
+    python -m kalshi_infra.scratch_measure_latency ws [duration_seconds]
+    python -m kalshi_infra.scratch_measure_latency order [n_trials]
 """
 import base64
 import datetime
@@ -34,13 +34,12 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 import os
 
-import api_functions as af
-from api_functions import event_ticker_from_date, API_KEY, BASE_URL
+from kalshi_infra import api_functions as af
+from kalshi_infra.api_functions import event_ticker_from_date, API_KEY, BASE_URL
+from kalshi_infra.kalshi.auth import private_key_path
 
 WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
-WS_KEY_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "kalshi_btc_hedge", "eshan-ws-key.txt"
-)
+WS_KEY_PATH = private_key_path()
 
 
 def _ws_auth_headers():
@@ -206,4 +205,4 @@ if __name__ == "__main__":
         n = int(sys.argv[2]) if len(sys.argv) > 2 else 5
         measure_order_roundtrip(n)
     else:
-        print("Usage: python scratch_measure_latency.py [ws|order] [param]")
+        print("Usage: python -m kalshi_infra.scratch_measure_latency [ws|order] [param]")

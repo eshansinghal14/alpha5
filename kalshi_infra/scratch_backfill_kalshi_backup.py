@@ -20,9 +20,8 @@ import time
 
 import pandas as pd
 
-import api_functions as af
-import predexon_functions as pf
-
+from kalshi_infra import api_functions as af
+from kalshi_infra import predexon_functions as pf
 MAX_CONSECUTIVE_ERRORS = 5
 
 event_tickers = pf.all_cached_predexon_event_tickers()
