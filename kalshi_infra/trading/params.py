@@ -5,12 +5,14 @@ in that series' config.json. See kalshi_infra.config for the loading rules.
 """
 from __future__ import annotations
 
-from kalshi_infra.config import APPLY_NEXT_EVENT, param, section
+from kalshi_infra.config import APPLY_NEXT_EVENT, param, section  # noqa: F401
 
 
 @section
 class QuotingParams:
-    order_size: float = param("Contracts per take and per resting quote.", min=0.01, step=1.0)
+    order_lots: float = param(
+        "Contracts per take and per edge quote. Priced on edge alone; LIP plays no part.",
+        min=0.01, step=1.0)
     max_position: float = param(
         "Cap on |yes - no| PER MARKET, on effective position (fills + in-flight + resting). "
         "Lowering it does not unwind, only caps growth.", min=0, step=1.0)
@@ -50,9 +52,10 @@ class QuotingParams:
     quoting_edge: float = param(
         "Flat $ floor for a RESTING quote, in place of constant_edge (CI and lean are shared).",
         min=0, max=0.5, step=0.005)
-    max_improve_ticks: int | None = param(
-        "Max ticks a quote may sit inside the near touch (null = uncapped). Caps edge handed over "
-        "in a wide market.", min=0, step=1)
+    max_improve_ticks: int = param(
+        "Max ticks a quote may sit inside the near touch. Caps edge handed over in a wide market "
+        "(KXINX 2026-08-17 uncapped: 6% of quotes overshot best_bid+1 tick, p90 by 24c).",
+        min=0, step=1)
     requote_improve_ticks: float = param(
         "Ticks of improvement needed before cancel/replacing a still-acceptable quote; replacing "
         "forfeits queue priority.", min=0, step=1)
@@ -65,33 +68,10 @@ class QuotingParams:
 
 
 @section
-class FeeParams:
-    taker_fee_multiplier: float = param(
-        "Series taker fee multiplier in Kalshi's p(1-p) formula. Per-series fact; check the fee "
-        "schedule.", min=0, max=2, step=0.01, apply=APPLY_NEXT_EVENT)
-    maker_fee_multiplier: float = param(
-        "Series maker fee multiplier (0 on most series).", min=0, max=2, step=0.01,
-        apply=APPLY_NEXT_EVENT)
-    taker_fee_edge_multiplier: float = param(
-        "Multiple of the taker fee added to the take edge. 1.0 = breakeven after fees.",
-        min=0, max=5, step=0.1)
-
-
-@section
 class CloseParams:
-    last_phase_s: float = param(
-        "Seconds before close at which the last-phase rules below apply. 0 disables.", min=0, step=10)
-    last_phase_max_half_band: float | None = param(
-        "In the last phase, pull a market whose band half-width exceeds this (null = never).",
-        min=0, max=1, step=0.01)
-    last_phase_otm_fair_max: float | None = param(
-        "In the last phase, keep only markets whose fair is within this of 0 or 1 (null = keep all).",
-        min=0, max=0.5, step=0.001)
     real_trading_cutoff_s: float = param(
         "Disarm REAL trading this long before close (paper continues). Re-arms next event if the "
         "dashboard toggle is still on. 0 disables.", min=0, step=10)
-    close_buffer_s: float = param(
-        "Stop sending any order this long before close (venue about to reject).", min=0, step=1)
 
 
 @section
@@ -102,35 +82,9 @@ class RiskParams:
     max_signal_age_s: float = param(
         "Pull quotes and stop taking when the fair's newest input is older than this.",
         min=0.01, max=60, step=0.05)
-    near_expiry_s: float = param("Window before close where the tighter age limit applies. 0 disables.",
-                                 min=0, step=10)
-    max_signal_age_near_expiry_s: float = param("Fair age limit inside near_expiry_s.",
-                                                min=0.01, max=60, step=0.05)
     fresh_recovery_s: float = param(
         "After a stale episode, fair must stay fresh this long before quotes return (no flapping).",
         min=0, max=60, step=0.5)
-    max_book_age_s: float = param("Refuse to fill/rest against a Kalshi book with no tick in this long.",
-                                  min=1, step=5)
-    shadow_send_s: float = param(
-        "Shadow-mode decision->exchange delay, so paper fills aren't more optimistic than real. "
-        "0.034s measured warm (kalshi_backtest.execution.MEASURED_SEND_S).", min=0, step=0.005)
-    max_consecutive_order_errors: int = param(
-        "Real-order errors in a row before halting -- that's auth/balance/market state, not a "
-        "moved touch.", min=1, step=1)
-    bias_threshold: float = param(
-        "Systematic-mispricing guard: median $ outside the touch, same direction across the "
-        "ladder, that blocks trading. Set above ordinary edge (2026-08-28 basis error was ~3.2c).",
-        min=0, max=0.5, step=0.005)
-    bias_min_markets: int = param("Markets outside the touch needed before the bias guard can trip.",
-                                  min=1, step=1)
-    bias_same_side_fraction: float = param("Fraction of those that must lean the same way.",
-                                           min=0.5, max=1, step=0.05)
-    max_orders_per_s: float = param(
-        "Client-side cap on REAL orders/s for this series. Kalshi's limit is per account -- when "
-        "running several series these must sum below it.", min=0.1, step=0.5,
-        apply=APPLY_NEXT_EVENT)
-    order_timeout_s: float = param("HTTP timeout on order requests.", min=0.5, step=0.5,
-                                   apply=APPLY_NEXT_EVENT)
 
 
 @section
@@ -167,15 +121,23 @@ class KalshiWsParams:
 
 @section
 class LipSettings:
-    enabled: bool = param("Measure LIP accrual for markets with an active program.")
-    period_reward_divisor: float = param(
-        "API period_reward -> dollars. Unit undocumented; centi-cents assumed (200000 -> $20, "
-        "2026-10-06). Reconcile against a real payout.", min=1, apply=APPLY_NEXT_EVENT)
-    snapshots_per_period: int = param("Kalshi scores once per second: period length in seconds.",
-                                      min=1, apply=APPLY_NEXT_EVENT)
+    """Program parameters (target, discount, reward, period) come from Kalshi's
+    /incentive_programs per market; these only shape our own LIP quote."""
+    lip_lots: float = param(
+        "Max contracts in the separate LIP-farming quote per side. 0 disables it. Fewer are rested "
+        "when fewer earn the same reward, and never more than max_position leaves room for (a LIP "
+        "quote can fill like any other).", min=0, step=1.0)
+    prop_max_lip: float = param(
+        "Rest the LIP quote at the DEEPEST level outside the edge that still earns at least this "
+        "fraction of the best LIP/s available outside the edge. 1 = the best level; lower = deeper "
+        "and safer for less reward.", min=0, max=1, step=0.05)
+    lip_min_depth_ahead: float = param(
+        "Min contracts resting ahead of the LIP quote (better prices plus same-price queue). A "
+        "level with less is never used, and a resting LIP quote that drops below it is cancelled "
+        "first, ahead of every other order.", min=0, step=10.0)
 
 
-SHARED_SECTIONS = ("quoting", "fees", "close", "risk", "runtime", "kalshi_ws", "lip")
+SHARED_SECTIONS = ("quoting", "close", "risk", "runtime", "kalshi_ws", "lip")
 
 
 def check_strategy_config(cfg) -> None:

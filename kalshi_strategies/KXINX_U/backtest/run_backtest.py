@@ -20,6 +20,7 @@ import pandas as pd
 from kalshi_backtest import data, engine, results
 from kalshi_infra import DATA_ROOT
 from kalshi_infra.config import load
+from kalshi_infra.kalshi import fees as kfees
 from kalshi_infra.trading.fair import Fair, FairUpdate
 from kalshi_infra.trading.quoter import Quoter
 from kalshi_strategies.KXINX_U import ib_emulation as ibe
@@ -59,17 +60,19 @@ def run_one(event_ticker: str, cfg=None, *, conflate_ms: int = ibe.IB_OPTIONS_CO
     cfg = cfg or load(SpxConfig, CONFIG_PATH, series)
     # Freshness and close-time guards are wall-clock live concepts.
     cfg = types.SimpleNamespace(**{**vars(cfg), "risk": types.SimpleNamespace(
-        **{**vars(cfg.risk), "max_signal_age_s": float("inf"), "max_signal_age_near_expiry_s": float("inf"),
+        **{**vars(cfg.risk), "max_signal_age_s": float("inf"),
            "fresh_recovery_s": 0.0})})
     event_data = data.load_event_data(event_ticker, allow_predexon=allow_predexon)
     markets, events, _grid, _lo, probs_mid, _hi = signal_grid.precompute_signal(
         event_ticker, conflate_ms=conflate_ms, return_grid=True)
     ext = [(t, FairUpdate({p["ticker"]: Fair(p["prob"], p["prob_lo"], p["prob_hi"])})) for t, p in events]
     close = pd.Timestamp(min(m["close_time"] for m in markets))
-    quoter = Quoter(cfg, _BacktestModel(), close_time=close, record_debug=True)
+    # Fees as of the event (the series' schedule can change between days).
+    fee_sched = kfees.for_event(series, event_ticker, at=close)
+    quoter = Quoter(cfg, _BacktestModel(), fee_sched, close_time=close, record_debug=True)
     bt = engine.Backtest(latency=engine.LatencyModel(wire_s=data.empirical_wire_s(event_ticker)),
-                         fee_multiplier=cfg.fees.taker_fee_multiplier,
-                         maker_fee_multiplier=cfg.fees.maker_fee_multiplier,
+                         fee_multiplier=fee_sched.taker_rate,
+                         maker_fee_multiplier=fee_sched.maker_rate,
                          max_position=cfg.quoting.max_position)
     result = bt.run(quoter.__call__, event_ticker, event_data=event_data, external_events=ext)
     if verbose:
@@ -83,7 +86,7 @@ def main(argv: list[str]):
     if not argv:
         print(__doc__)
         return
-    series, events = argv[0], argv[1:] or discover_runnable_events(argv[0])
+    events = argv[1:] or discover_runnable_events(argv[0])
     out = []
     for et in events:
         try:

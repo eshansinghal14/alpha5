@@ -7,19 +7,15 @@ account has money elsewhere. Kalshi's auto-rebalancer sweeps balance toward
 the target split here every ~10s.
 
 Usage:
-    python kalshi_latency_arbs/live/shard_allocation.py                  # show
-    python kalshi_latency_arbs/live/shard_allocation.py 2=100            # crypto only
-    python kalshi_latency_arbs/live/shard_allocation.py 0=50 2=50        # SPX + crypto
-    python kalshi_latency_arbs/live/shard_allocation.py --event KXCRYPTOLEAD15M-26OCT090000
-    python kalshi_latency_arbs/live/shard_allocation.py --off            # stop rebalancing
+    python -m kalshi_infra.shard_allocation                  # show
+    python -m kalshi_infra.shard_allocation 2=100            # crypto only
+    python -m kalshi_infra.shard_allocation 0=50 2=50        # SPX + crypto
+    python -m kalshi_infra.shard_allocation --event KXCRYPTOLEAD15M-26OCT090000
+    python -m kalshi_infra.shard_allocation --off            # stop rebalancing
 """
 import argparse
-import os
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from live_orders import BALANCE_PATH, BASE_URL, KalshiOrderClient
+from kalshi_infra.kalshi.orders import BALANCE_PATH, BASE_URL, KalshiOrderClient
 
 
 def show(client: KalshiOrderClient) -> None:
@@ -44,7 +40,7 @@ def main():
     p.add_argument("--off", action="store_true", help="clear the target (disables rebalancing)")
     args = p.parse_args()
 
-    client = KalshiOrderClient()
+    client = KalshiOrderClient.from_account()
     for ev in args.event:
         print(f"{ev} trades on shard {client.exchange_index(ev)}")
     if args.off:

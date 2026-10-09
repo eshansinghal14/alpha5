@@ -12,10 +12,9 @@ The headline test is the Kalshi help page's own worked example:
 import math
 import types
 
-import pytest
-
 from kalshi_infra.trading.lip import (LipLevel, LipParams, LipTracker, levels_from_ladder,
                                       marginal_reward_rate, params_from_program, period_payout,
+                                      reward_rate,
                                       score_book)
 
 
@@ -132,19 +131,27 @@ def test_side_not_qualifying_zero_payout():
 
 
 def test_params_from_program_record():
-    # Shape of a real /incentive_programs record (2026-10-08).
+    # Shape of a real /incentive_programs record (2026-10-08); reward in centi-cents.
     p = params_from_program({"target_size_fp": "1000.00", "discount_factor_bps": 5000,
-                             "period_reward": 200000}, period_reward_divisor=10_000.0,
-                            snapshots_per_period=900)
+                             "period_reward": 200000, "start_date": "2026-10-08T21:30:00Z",
+                             "end_date": "2026-10-08T21:45:00Z", "max_reward_per_account": 50000})
     assert p == LipParams(target_size=1000.0, discount_factor=0.5, period_reward_usd=20.0,
-                          snapshots_per_period=900)
+                          snapshots_per_period=900, max_reward_usd=5.0)
 
 
 def test_levels_merge_our_quote():
-    lv = levels_from_ladder({0.40: 100.0, 0.39: 50.0}, 0.40, 5.0)
+    lv = levels_from_ladder({0.40: 100.0, 0.39: 50.0}, [(0.40, 5.0)])
     assert lv[0] == LipLevel(price=0.40, size=100.0, mine=5.0)
-    lv = levels_from_ladder({0.40: 100.0}, 0.41, 5.0)
+    lv = levels_from_ladder({0.40: 100.0}, [(0.41, 5.0)])
     assert lv[0] == LipLevel(price=0.41, size=5.0, mine=5.0)
+
+
+def test_reward_capped_per_account():
+    params = LipParams(target_size=100.0, discount_factor=0.5, period_reward_usd=900.0,
+                       snapshots_per_period=900, max_reward_usd=9.0)
+    yes = levels_from_ladder({0.40: 100.0}, [(0.40, 100.0)])
+    no = levels_from_ladder({0.55: 100.0}, [(0.55, 100.0)])
+    assert math.isclose(reward_rate(yes, no, params), 9.0 / 900)
 
 
 def test_tracker_accrues_once_per_second_on_qualifying_book():
@@ -152,7 +159,7 @@ def test_tracker_accrues_once_per_second_on_qualifying_book():
                        snapshots_per_period=900)
     ladder = types.SimpleNamespace(yes_bids={0.40: 200.0}, no_bids={0.55: 200.0})
     books = {"T": types.SimpleNamespace(ladder=ladder)}
-    quotes = {("T", "yes"): {"price": 0.40, "size": 50.0}}
+    quotes = {("T", "yes"): [(0.40, 50.0)]}
     tr = LipTracker({"T": params})
     assert tr.due(0.0)
     tr.snapshot(0.0, books, quotes)

@@ -71,7 +71,7 @@ class BacktestContext:
         return self.portfolio.position(ticker)
 
     def buy(self, ticker: str, side: str, size: float, price: float | None = None,
-            order_type: str = "limit", intent: str = "take"):
+            order_type: str = "limit", intent: str = "take", role: str = "edge"):
         """Queue a buy order. Not resolved immediately -- lands at the
         exchange after send_s + (this wakeup's own measured processing
         time), resolved there against the book as it stands at arrival, not
@@ -88,10 +88,17 @@ class BacktestContext:
         order = Order(order_id=self._engine._next_order_id(), ticker=ticker, side=side,
                        order_type=order_type, price=price, size=size, decision_time=self.time,
                        intent=intent)
+        order.role = role
         self.pending_orders.append(order)
         return order
 
-    def cancel(self, order_id: int):
+    def amend(self, order_id: int, new_size: float) -> bool:
+        """Resting-size change. The backtest has no amend message, so this is
+        modelled as unsupported: the caller falls back to cancel + new order,
+        which reaches the same back-of-queue state."""
+        return False
+
+    def cancel(self, order_id: int, force: bool = False):
         """Queue a cancel for a previously-placed order (by the id returned
         from buy()). Same send_s + measured-processing-time latency as a new
         order, resolved at the SAME arrival-time formula -- see engine.py's

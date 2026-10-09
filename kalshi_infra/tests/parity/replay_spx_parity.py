@@ -19,6 +19,7 @@ import sp_options_lag_quoting as old  # noqa: E402
 from kalshi_backtest.core import Order, Portfolio  # noqa: E402
 from kalshi_infra.trading.fair import Fair, FairUpdate  # noqa: E402
 from kalshi_infra.trading.quoter import Quoter  # noqa: E402
+from kalshi_infra.kalshi.fees import schedule  # noqa: E402
 from kalshi_infra.trading import params as P  # noqa: E402
 
 
@@ -50,7 +51,7 @@ class Ctx:
     def position(self, t):
         return self.portfolio.position(t)
 
-    def buy(self, ticker, side, size, price=None, order_type="limit", intent="take"):
+    def buy(self, ticker, side, size, price=None, order_type="limit", intent="take", role="edge"):
         self._id += 1
         o = Order(self._id, ticker, side, order_type, price, size, self.time, intent)
         self.orders.append(("buy", ticker, side, round(price, 4), intent, str(self.time)))
@@ -64,7 +65,10 @@ class Ctx:
             self.resting[o.order_id] = o
         return o
 
-    def cancel(self, oid):
+    def amend(self, oid, size):
+        return False
+
+    def cancel(self, oid, force=False):
         if self.resting.pop(oid, None) is not None:
             self.orders.append(("cancel", oid, str(self.time)))
 
@@ -82,20 +86,22 @@ class Ctx:
 
 def new_cfg(oc):
     q = P.QuotingParams(
-        order_size=oc.quote_size, max_position=oc.max_position, constant_edge=oc.constant_edge,
+        order_lots=oc.quote_size, max_position=oc.max_position, constant_edge=oc.constant_edge,
         edge_fraction=oc.edge_fraction, lean_multiplier=oc.lean_multiplier, lean_dollars=oc.lean_dollars,
         lean_exponent=oc.lean_exponent, fair_clip_eps=0.0, inflight_timeout_s=oc.inflight_timeout_s,
         take_confirm_s=0.0, max_markets=oc.max_markets, atm_hysteresis=oc.atm_hysteresis,
         enable_quoting=oc.enable_quoting, quoting_edge=oc.quoting_edge,
         max_improve_ticks=oc.max_improve_ticks, requote_improve_ticks=oc.requote_improve_ticks,
         min_quote_life_s=oc.min_quote_life_s, requote_delay_s=oc.requote_delay_s)
-    fees = P.FeeParams(taker_fee_multiplier=oc.fee_multiplier, maker_fee_multiplier=oc.maker_fee_multiplier,
-                       taker_fee_edge_multiplier=oc.taker_fee_edge_multiplier)
-    close = P.CloseParams(last_phase_s=0, last_phase_max_half_band=None, last_phase_otm_fair_max=None,
-                          real_trading_cutoff_s=0, close_buffer_s=0)
-    risk = types.SimpleNamespace(max_signal_age_s=1e9, near_expiry_s=0, max_signal_age_near_expiry_s=1e9,
-                                 fresh_recovery_s=0.0)
-    return types.SimpleNamespace(quoting=q, fees=fees, close=close, risk=risk)
+    assert oc.fee_multiplier == 0.07 and oc.maker_fee_multiplier == 0.0 and oc.taker_fee_edge_multiplier == 1.0
+    return types.SimpleNamespace(
+        quoting=q, close=P.CloseParams(real_trading_cutoff_s=0),
+        risk=P.RiskParams(max_loss_usd=1e9, max_signal_age_s=1e9, fresh_recovery_s=0.0),
+        lip=P.LipSettings(lip_lots=0.0, prop_max_lip=1.0, lip_min_depth_ahead=0.0))
+
+
+# What Kalshi reports for KXINX/KXINXU: "quadratic" x 1 -> taker 0.07, maker 0.
+FEES = schedule("quadratic", 1)
 
 
 class NullModel:
@@ -116,7 +122,7 @@ def run(series, n_rows):
     oc = old.QuotingConfig()
     assert oc.lot_size == oc.quote_size
     old_s, old_ctx = old.SPOptionsLagQuotingStrategy(oc, record_debug=True), Ctx()
-    new_s, new_ctx = Quoter(new_cfg(oc), NullModel(), close_time=None, record_debug=True), Ctx()
+    new_s, new_ctx = Quoter(new_cfg(oc), NullModel(), FEES, close_time=None, record_debug=True), Ctx()
 
     for r in df.itertuples(index=False):
         for ctx in (old_ctx, new_ctx):

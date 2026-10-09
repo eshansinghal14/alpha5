@@ -58,6 +58,24 @@ def _raise_with_body(resp) -> None:
                              response=resp)
 
 
+LIMITS_PATH = "/trade-api/v2/account/limits"
+
+# An order that hasn't returned in this long is priced off a book that no
+# longer exists; holding the executor thread just delays the next one.
+ORDER_TIMEOUT_S = 5.0
+# Env var through which kalshi_strategies.run gives each child its share of
+# the account's write budget (fraction in (0, 1]).
+WRITE_SHARE_ENV = "KALSHI_WRITE_SHARE"
+
+
+def write_budget_tokens_per_s() -> float:
+    """The account's write-token refill rate from Kalshi (tier-dependent:
+    100/s on Basic, 2026-10-09). Read at session start, so a tier upgrade
+    takes effect at the next event."""
+    from kalshi_infra.api_functions import kalshi_get
+    return float(kalshi_get(LIMITS_PATH, auth=True)["write"]["refill_rate"])
+
+
 POSITIONS_PATH = "/trade-api/v2/portfolio/positions"
 BALANCE_PATH = "/trade-api/v2/portfolio/balance"
 FILLS_PATH = "/trade-api/v2/portfolio/fills"
@@ -160,42 +178,73 @@ class KalshiOrderClient:
     (LiveEngine runs them on an executor thread) -- a ~40ms POST on the loop
     stalls both feeds and every scheduled order resolution."""
 
-    def __init__(self, max_orders_per_s: float, timeout_s: float):
-        """`max_orders_per_s`: client-side ceiling, since one signal pass can
-        trigger takes across a whole ladder and a 429'd POST still costs the
-        round trip. `timeout_s`: kept short -- an order that hasn't returned
-        is priced off a book that no longer exists."""
+    def __init__(self, tokens_per_s: float, timeout_s: float = ORDER_TIMEOUT_S):
+        """`tokens_per_s`: this process's share of the account's write budget
+        (see write_budget_tokens_per_s)."""
         self._session = requests.Session()
         self._key = auth.load_private_key()
         self._lock = threading.Lock()
-        self._recent_sends: list[float] = []
-        self.max_orders_per_s = max_orders_per_s
+        self.tokens_per_s = tokens_per_s
+        self._tokens = self._capacity()
+        self._last_refill = time.monotonic()
         self.timeout_s = timeout_s
+
+    @classmethod
+    def from_account(cls) -> "KalshiOrderClient":
+        import os
+        share = float(os.environ.get(WRITE_SHARE_ENV, "1"))
+        return cls(tokens_per_s=write_budget_tokens_per_s() * share)
+
+    @property
+    def max_orders_per_s(self) -> float:
+        return self.tokens_per_s / self.COST["order"]
 
     def _headers(self, method: str, path: str) -> dict:
         return {**auth.rest_headers(method, path, self._key), "Content-Type": "application/json"}
 
-    def allow_now(self, force: bool = False) -> bool:
-        """Claim one slot in the current one-second window, or refuse.
+    # Kalshi write-token costs (GET /account/endpoint_costs, 2026-10-09):
+    # create/amend default 10, cancel 2. The bucket refills at budget/s and
+    # holds one second of budget on the Basic tier.
+    COST = {"order": 10, "amend": 10, "cancel": 2}
 
-        Refusing rather than sleeping is deliberate: the caller is holding
-        an order priced at a touch that is already ~34ms old, and a queued
-        order arriving a second late would cross a book nobody looked at.
-        Dropping it is what the strategy would have done anyway on the next
-        tick if the edge is still there.
+    def _capacity(self) -> float:
+        # Basic tier holds one second of budget (higher tiers three; one is
+        # the safe floor for either).
+        return self.tokens_per_s
 
-        force=True claims the slot regardless -- for CANCELS, which count
-        against the same limit but must not be dropped: a cancel we refuse
-        leaves a real order resting at a price we have already decided we
-        don't want, which is strictly worse than a 429."""
+    def allow_now(self, kind: str = "order", force: bool = False) -> bool:
+        """Spend `kind`'s tokens from this process's bucket, or refuse.
+
+        Refusing rather than sleeping is deliberate: a queued order arriving
+        late would cross a book nobody looked at, and the quoter re-decides on
+        the next tick anyway.
+
+        force=True always goes through (the bucket may go negative, which
+        throttles everything after it): for cancels that MUST land -- a
+        refused cancel leaves a real order resting where we no longer want
+        it, which is strictly worse than a 429."""
+        cost = self.COST[kind]
         now = time.monotonic()
         with self._lock:
-            cutoff = now - 1.0
-            self._recent_sends = [t for t in self._recent_sends if t > cutoff]
-            if len(self._recent_sends) >= self.max_orders_per_s and not force:
+            self._tokens = min(self._capacity(),
+                               self._tokens + (now - self._last_refill) * self.tokens_per_s)
+            self._last_refill = now
+            if self._tokens < cost and not force:
                 return False
-            self._recent_sends.append(now)
+            self._tokens -= cost
             return True
+
+    def amend(self, exchange_order_id: str, order: Order, new_size: float, filled: float) -> dict:
+        """Change a resting order's size in place. Kalshi keeps queue position
+        on a decrease and sends the order to the back on an increase."""
+        yes_price = order.price if order.side == "yes" else 1.0 - order.price
+        path = f"{ORDERS_PATH}/{exchange_order_id}/amend"
+        body = {"ticker": order.ticker, "side": "bid" if order.side == "yes" else "ask",
+                "price": f"{round(yes_price, 2):.4f}", "count": f"{filled + new_size:.2f}"}
+        resp = self._session.post(BASE_URL + path, headers=self._headers("POST", path), json=body,
+                                  timeout=self.timeout_s)
+        _raise_with_body(resp)
+        return resp.json()
 
     def place_ioc(self, order: Order) -> RealFill | None:
         """Send `order` as an immediate-or-cancel take. Returns the fill, or

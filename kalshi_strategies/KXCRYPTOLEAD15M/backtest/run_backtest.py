@@ -20,7 +20,9 @@ import pandas as pd
 from kalshi_backtest import data, engine, results
 from kalshi_infra import DATA_ROOT
 from kalshi_infra.config import load
+from kalshi_infra.kalshi import fees as kfees
 from kalshi_infra.kalshi import markets as km
+from kalshi_infra.trading.lip import LipTracker, params_from_program
 from kalshi_infra.trading.fair import FairUpdate
 from kalshi_infra.trading.quoter import Quoter
 from kalshi_strategies.KXCRYPTOLEAD15M.composite import CompositeBar
@@ -103,10 +105,17 @@ def run_one(event_ticker: str, cfg=None, verbose: bool = True):
     model = _ReplayModel(ev, cfg, bus=_ReplayBus(live), coinbase=None, forecaster=fc)
     # Freshness is a wall-clock concept; recovery_s on the replay clock would block forever.
     cfg = types.SimpleNamespace(**{**vars(cfg), "risk": types.SimpleNamespace(
-        **{**vars(cfg.risk), "max_signal_age_s": math.inf, "max_signal_age_near_expiry_s": math.inf,
+        **{**vars(cfg.risk), "max_signal_age_s": math.inf,
            "fresh_recovery_s": 0.0})})
     model.cfg = cfg
-    quoter = Quoter(cfg, model, close_time=ev.close_time, record_debug=True)
+    fee_sched = kfees.for_event(ev.event_ticker.split('-')[0], ev.event_ticker, at=ev.close_time)
+    lip = None
+    try:
+        progs = km.incentive_programs(set(model.tickers))
+        lip = LipTracker({t: params_from_program(p) for t, p in progs.items()})
+    except Exception:
+        pass   # programs are only listed while active; historical events replay without LIP
+    quoter = Quoter(cfg, model, fee_sched, close_time=ev.close_time, lip=lip, record_debug=True)
 
     class _Drive:
         """Each second with a new bar: reprice and dispatch a FairUpdate."""
@@ -122,8 +131,8 @@ def run_one(event_ticker: str, cfg=None, verbose: bool = True):
 
     ticks = sorted({int(b.ts_s) for bl in live.values() for b in bl if S - 120 <= b.ts_s <= T})
     ext = [(pd.Timestamp(t, unit="s", tz="UTC"), {"kind": "tick", "ts": float(t)}) for t in ticks]
-    bt = engine.Backtest(fee_multiplier=cfg.fees.taker_fee_multiplier,
-                         maker_fee_multiplier=cfg.fees.maker_fee_multiplier,
+    bt = engine.Backtest(fee_multiplier=fee_sched.taker_rate,
+                         maker_fee_multiplier=fee_sched.maker_rate,
                          max_position=cfg.quoting.max_position)
     result = bt.run(_Drive(), event_ticker, event_data=data.load_event_data(event_ticker), external_events=ext)
     if verbose:

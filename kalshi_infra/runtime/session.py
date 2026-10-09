@@ -24,6 +24,7 @@ import traceback
 import pandas as pd
 
 from kalshi_infra.config import ConfigStore
+from kalshi_infra.kalshi import fees as kfees
 from kalshi_infra.kalshi import markets as km
 from kalshi_infra.kalshi.orders import KalshiOrderClient
 from kalshi_infra.kalshi.ws_feed import LiveKalshiFeed
@@ -113,25 +114,27 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
     date = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d")
     persist.reset_session_files(S)
 
-    lip = None
-    if cfg.lip.enabled:
-        try:
-            progs = km.incentive_programs(set(tickers))
-            lip = lipmod.LipTracker({t: lipmod.params_from_program(
-                p, period_reward_divisor=cfg.lip.period_reward_divisor,
-                snapshots_per_period=cfg.lip.snapshots_per_period) for t, p in progs.items()})
-            _log(S, f"LIP programs on {len(progs)}/{len(tickers)} markets")
-        except Exception as e:
-            _log(S, f"WARN: LIP lookup failed ({e!r}); not measuring LIP this event")
+    fee_sched = kfees.for_event(S, ev.event_ticker)
+    _log(S, f"fees from Kalshi: {fee_sched.fee_type} x{fee_sched.multiplier:g} "
+            f"(taker {fee_sched.taker_rate:g}, maker {fee_sched.maker_rate:g} x p(1-p))")
 
-    quoter = Quoter(cfg, model, close_time=ev.close_time, lip=lip, record_debug=True)
+    lip = None
     try:
-        order_client = KalshiOrderClient(max_orders_per_s=cfg.risk.max_orders_per_s,
-                                         timeout_s=cfg.risk.order_timeout_s)
+        progs = km.incentive_programs(set(tickers))
+        lip = lipmod.LipTracker({t: lipmod.params_from_program(p) for t, p in progs.items()})
+        _log(S, f"LIP programs on {len(progs)}/{len(tickers)} markets")
+    except Exception as e:
+        _log(S, f"WARN: LIP lookup failed ({e!r}); no LIP quoting or accrual this event")
+
+    quoter = Quoter(cfg, model, fee_sched, close_time=ev.close_time, lip=lip, record_debug=True)
+    try:
+        order_client = KalshiOrderClient.from_account()
+        _log(S, f"write budget {order_client.tokens_per_s:g} tokens/s "
+                f"(~{order_client.max_orders_per_s:g} orders/s) from Kalshi account limits")
     except Exception as e:
         order_client = None
         _log(S, f"WARN: no order client ({e!r}); real trading cannot be armed")
-    engine = LiveEngine(quoter, risk=cfg.risk, close=cfg.close, quoting=cfg.quoting, fees=cfg.fees,
+    engine = LiveEngine(quoter, risk=cfg.risk, quoting=cfg.quoting, fees=fee_sched,
                         order_client=order_client, event_ticker=ev.event_ticker, close_time=ev.close_time)
     engine.set_clocks(signal_age_fn=model.signal_age_s, feed_age_fn=model.feed_age_s,
                       applied_age_fn=model.applied_age_s)
@@ -310,16 +313,11 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
             await asyncio.sleep(cfg.runtime.flush_interval_s)
             now = pd.Timestamp.now(tz="UTC")
             engine.check_failsafe()
-            bias = engine.check_pricing_bias()
             blocked = engine.blocked_reason()
             # Resting quotes keep taking risk through a halt until withdrawn.
             if blocked is not None and engine.has_quotes():
                 _log(S, f"pulling quotes -- {blocked}")
                 engine.pull_quotes()
-            persist.append_bias_row(S, now.strftime("%Y-%m-%d"), {
-                "time": now.isoformat(), "n": bias.get("n"), "n_outside": bias.get("n_outside"),
-                "median_vs_mid": bias.get("median"), "median_excess": bias.get("median_excess"),
-                "same_side": bias.get("same_side"), "systematic": bias.get("systematic")})
             pnl_history.append((now, engine.current_pnl(mark="prob")
                                 + (lip.total_usd() if lip is not None else 0.0)))
             for t, pos in engine.portfolio.positions.items():

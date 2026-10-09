@@ -8,9 +8,9 @@ Run one or more Kalshi series live (shadow by default).
 
 All tuning lives in each strategy folder's config.json (edited from the
 dashboard). Several series run as one child process each -- isolation from
-each other's CPU stalls and crashes. Kalshi's order-rate limit is per
-account, so the children's risk.max_orders_per_s must sum below it; this
-launcher refuses to start if they don't.
+each other's CPU stalls and crashes. Kalshi's write-rate limit is per account
+(read from /account/limits at each event start), so each child gets an equal
+share of it.
 """
 from __future__ import annotations
 
@@ -28,9 +28,7 @@ import time
 import kalshi_strategies
 from kalshi_infra import REPO_ROOT
 from kalshi_infra.config import load
-
-# Kalshi basic-tier order-entry limit (orders/s, per account).
-ACCOUNT_ORDER_LIMIT_PER_S = 10.0
+from kalshi_infra.kalshi.orders import WRITE_SHARE_ENV
 # Wait this long after Ctrl-C for children to pull quotes before force-killing
 # (a kill skips the quote pull, so this errs long).
 SHUTDOWN_GRACE_S = 60.0
@@ -83,7 +81,8 @@ def _pump(series, proc):
 
 
 def launch_many(series_list: list[str], args) -> int:
-    env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
+    env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8",
+           WRITE_SHARE_ENV: f"{1.0 / len(series_list):.6f}"}
     procs = []
     for s in series_list:
         cmd = [sys.executable, "-u", "-m", "kalshi_strategies.run", "--series", s]
@@ -143,13 +142,8 @@ def main(argv=None):
     series_list = _parse_series(ap, args.series, reg)
 
     # Validate every config before starting anything.
-    budgets = {}
     for s in series_list:
-        cfg = load(reg[s].config_cls, reg[s].config_path, reg[s].config_key)
-        budgets[s] = cfg.risk.max_orders_per_s
-    if sum(budgets.values()) > ACCOUNT_ORDER_LIMIT_PER_S + 1e-9:
-        ap.error(f"risk.max_orders_per_s sums to {sum(budgets.values()):g}/s across {budgets}, over "
-                 f"Kalshi's {ACCOUNT_ORDER_LIMIT_PER_S:g}/s account limit -- lower them in config.json")
+        load(reg[s].config_cls, reg[s].config_path, reg[s].config_key)
 
     if len(series_list) > 1:
         if args.event_ticker:

@@ -51,6 +51,7 @@ class LipParams:
     discount_factor: float        # DF, e.g. 0.5 for 5000 bps
     period_reward_usd: float      # per-period, DOLLARS
     snapshots_per_period: int
+    max_reward_usd: float | None = None   # per-account cap for the period
 
 
 @dataclasses.dataclass
@@ -240,34 +241,130 @@ def period_payout(user_total_score: float, all_users_total_score: float,
 # Session accrual
 # ---------------------------------------------------------------------------
 
-def params_from_program(program: dict, *, period_reward_divisor: float,
-                        snapshots_per_period: int) -> LipParams:
-    """LipParams from one /incentive_programs record.
+CENTI_CENTS_PER_USD = 10_000.0   # period_reward / max_reward_per_account unit (Kalshi API docs)
 
-    `period_reward_divisor`: the API's `period_reward` unit is not documented.
-    Treated as centi-cents (200000 -> $20 per 15-min KXCRYPTOLEAD15M period,
-    2026-10-06); reconcile against a real payout before trusting the dollars.
-    """
+
+def params_from_program(program: dict) -> LipParams:
+    """LipParams from one /incentive_programs record -- everything comes
+    from Kalshi: target, discount, reward (centi-cents), period length
+    (one snapshot per second between start_date and end_date), and the
+    optional per-account cap."""
+    import pandas as pd
+    secs = (pd.Timestamp(program["end_date"]) - pd.Timestamp(program["start_date"])).total_seconds()
+    cap = program.get("max_reward_per_account")
     return LipParams(
         target_size=float(program["target_size_fp"]),
         discount_factor=float(program["discount_factor_bps"]) / 10_000.0,
-        period_reward_usd=float(program.get("period_reward") or 0.0) / period_reward_divisor,
-        snapshots_per_period=snapshots_per_period,
+        period_reward_usd=float(program.get("period_reward") or 0.0) / CENTI_CENTS_PER_USD,
+        snapshots_per_period=max(int(round(secs)), 1),
+        max_reward_usd=None if cap is None else float(cap) / CENTI_CENTS_PER_USD,
     )
 
 
-def levels_from_ladder(bids: dict[float, float], our_price: float | None,
-                       our_size: float) -> list[LipLevel]:
+def levels_from_ladder(bids: dict[float, float], ours: list[tuple[float, float]] = ()) -> list[LipLevel]:
     """One side's levels (own-side prices, best first) with our resting
-    quote marked as `mine`. At a level Kalshi already shows, our size is
-    assumed to be inside the displayed size (the ws book includes our own
-    orders); at a level it doesn't show yet, our size is the whole level."""
-    acc = {p: LipLevel(price=p, size=s) for p, s in bids.items()}
-    if our_price is not None and our_size > 0:
-        lv = acc.get(our_price)
-        acc[our_price] = (LipLevel(price=our_price, size=lv.size, mine=our_size) if lv is not None
-                          else LipLevel(price=our_price, size=our_size, mine=our_size))
-    return sorted(acc.values(), key=lambda lv: -lv.price)
+    orders `ours` [(price, size)] marked as `mine`. At a level Kalshi
+    already shows, our size is assumed to be inside the displayed size (the
+    ws book includes our own orders); at a level it doesn't show yet, our
+    size is added."""
+    acc = {p: [s, 0.0] for p, s in bids.items()}
+    for p, s in ours:
+        if s <= 0:
+            continue
+        lv = acc.setdefault(p, [0.0, 0.0])
+        lv[1] += s
+        lv[0] = max(lv[0], lv[1])
+    return sorted((LipLevel(price=p, size=v[0], mine=v[1]) for p, v in acc.items()), key=lambda lv: -lv.price)
+
+
+def others_ladder(bids: dict[float, float], ours: list[tuple[float, float]]) -> dict[float, float]:
+    """The visible ladder with our own resting size removed."""
+    out = dict(bids)
+    for p, s in ours:
+        if p in out:
+            out[p] = max(out[p] - s, 0.0)
+    return {p: s for p, s in out.items() if s > 1e-9}
+
+
+def reward_rate(yes: list[LipLevel], no: list[LipLevel], params: LipParams) -> float:
+    """Our expected $ this snapshot (= $/s), capped at the per-account limit
+    spread evenly over the period."""
+    r = score_book(yes, no, params).expected_reward_this_snapshot_usd
+    if params.max_reward_usd is not None:
+        r = min(r, params.max_reward_usd / params.snapshots_per_period)
+    return r
+
+
+@dataclasses.dataclass(frozen=True)
+class LipChoice:
+    price: float | None      # own-side price; None = no LIP quote
+    size: float
+    rate: float              # $/s our LIP quote adds at (price, size)
+    max_rate: float          # best $/s available outside the edge at full size
+    depth_ahead: float
+
+
+def choose_lip_level(*, side: str, others_yes: dict, others_no: dict,
+                     ours_yes: list, ours_no: list, params: LipParams,
+                     top_price: float | None, max_size: float, prop_max: float,
+                     min_depth_ahead: float, depth_ahead_fn) -> LipChoice:
+    """Where to rest the LIP-farming quote on `side` (own-side prices).
+
+    Candidates are every tick at or below `top_price` (the first level
+    outside the edge). The best rate over them, at `max_size`, is the
+    reference; the DEEPEST candidate that earns at least prop_max of it and
+    has at least min_depth_ahead resting ahead wins. The size is then cut to
+    the smallest whole number of lots earning the same rate (smaller is
+    strictly safer). `ours_*` are our OTHER resting orders, which stay in
+    the book while scoring."""
+    none = LipChoice(None, 0.0, 0.0, 0.0, 0.0)
+    if top_price is None or max_size < 1 or params.period_reward_usd <= 0:
+        return none
+    others = others_yes if side == "yes" else others_no
+
+    def levels(price, size):
+        y = ours_yes + ([(price, size)] if side == "yes" else [])
+        n = ours_no + ([(price, size)] if side == "no" else [])
+        return levels_from_ladder(others_yes, y), levels_from_ladder(others_no, n)
+
+    base = reward_rate(*levels(None, 0.0), params)
+
+    def rate(price, size):
+        return reward_rate(*levels(price, size), params) - base
+
+    cands = []
+    p = round(top_price, 2)
+    cum_above = sum(s for q, s in others.items() if q > p + 1e-9)
+    while p >= TICK - 1e-9:
+        # Below the level where the book already reaches target, an order
+        # no longer "helps reach the Target Size" and scores 0 -- as do all
+        # deeper ones.
+        if cum_above >= params.target_size:
+            break
+        cands.append((p, rate(p, max_size)))
+        cum_above += others.get(p, 0.0)
+        p = round(p - TICK, 2)
+    if not cands:
+        return none
+    best = max(r for _, r in cands)
+    if best <= 0:
+        return LipChoice(None, 0.0, 0.0, best, 0.0)
+    for price, r in reversed(cands):          # deepest first
+        if r + 1e-15 < prop_max * best:
+            continue
+        ahead = depth_ahead_fn(price)
+        if ahead + 1e-9 < min_depth_ahead:
+            continue
+        lo, hi = 1, int(max_size)
+        full = rate(price, hi)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if rate(price, mid) >= full - 1e-15:
+                hi = mid
+            else:
+                lo = mid + 1
+        return LipChoice(price, float(lo), rate(price, lo), best, ahead)
+    return LipChoice(None, 0.0, 0.0, best, 0.0)
 
 
 class LipTracker:
@@ -285,9 +382,9 @@ class LipTracker:
         """Kalshi snapshots once per second."""
         return self._last_snapshot_s is None or now_s - self._last_snapshot_s >= 1.0
 
-    def snapshot(self, now_s: float, books: dict, quotes: dict[tuple[str, str], dict]):
-        """`books`: ticker -> BookView (with .ladder). `quotes`: (ticker, side)
-        -> {"price", "size"} in that side's own terms."""
+    def snapshot(self, now_s: float, books: dict, ours: dict[tuple[str, str], list]):
+        """`books`: ticker -> BookView (with .ladder). `ours`: (ticker, side)
+        -> [(price, size)] of our resting orders, own-side terms."""
         self._last_snapshot_s = now_s
         for ticker, params in self.params.items():
             if params.period_reward_usd <= 0:
@@ -296,14 +393,13 @@ class LipTracker:
             ladder = getattr(book, "ladder", None) if book is not None else None
             if ladder is None:
                 continue
-            qy, qn = quotes.get((ticker, "yes")), quotes.get((ticker, "no"))
-            yes = levels_from_ladder(ladder.yes_bids, qy and qy["price"], qy["size"] if qy else 0.0)
-            no = levels_from_ladder(ladder.no_bids, qn and qn["price"], qn["size"] if qn else 0.0)
+            yes = levels_from_ladder(ladder.yes_bids, ours.get((ticker, "yes"), []))
+            no = levels_from_ladder(ladder.no_bids, ours.get((ticker, "no"), []))
             score = score_book(yes, no, params)
             self.snapshots_total[ticker] += 1
             if score.qualifies:
                 self.snapshots_qualified[ticker] += 1
-                self.accrued_usd[ticker] += score.expected_reward_this_snapshot_usd
+                self.accrued_usd[ticker] += reward_rate(yes, no, params)
 
     def total_usd(self) -> float:
         return float(sum(self.accrued_usd.values()))
@@ -324,5 +420,6 @@ class LipTracker:
 __all__ = [
     "LipParams", "LipLevel", "LipSideScore", "LipBookScore",
     "score_book", "marginal_reward_rate", "period_payout",
-    "params_from_program", "levels_from_ladder", "LipTracker",
+    "params_from_program", "levels_from_ladder", "others_ladder", "reward_rate",
+    "LipChoice", "choose_lip_level", "LipTracker",
 ]

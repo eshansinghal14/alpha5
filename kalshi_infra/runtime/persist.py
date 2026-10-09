@@ -8,8 +8,7 @@ Layout (shared by every series; the dashboard knows no series specifics):
     data/live/{series}/{date}/fills_df.parquet                      } heavy_flush_every
     data/live/{series}/{date}/pnl_df.parquet      session PnL curve } flushes
     data/live/{series}/{date}/fair_df.parquet     fair history      }
-    data/live/{series}/{date}/bias_history.csv    append-only
-    data/live/{series}/stream/{ticker}.json       per-market chart feed
+    kalshi_viz/static/{series}/{ticker}.json      per-market chart feed
 
 Every write is atomic (tmp + replace, retried on Windows sharing errors).
 `capture` runs on the event loop and only copies references; `write` does the
@@ -25,12 +24,9 @@ import traceback
 import numpy as np
 import pandas as pd
 
-from kalshi_infra import DATA_ROOT
+from kalshi_infra import DATA_ROOT, REPO_ROOT
 
-# live_v2 until the legacy runners (kalshi_main / kalshi_latency_arbs /
-# kalshi_crypto, which write data/live/) are retired, so the two never touch
-# each other's journals or control files.
-LIVE_ROOT = os.path.join(DATA_ROOT, "live_v2")
+LIVE_ROOT = os.path.join(DATA_ROOT, "live")
 STREAM_POINTS = 400            # chart points per market after decimation
 STREAM_ACTIVE_FRACTION = 0.05  # markets with < this share of the busiest market's decisions get no stream
 
@@ -40,7 +36,10 @@ def day_dir(series: str, date: str) -> str:
 
 
 def stream_dir(series: str) -> str:
-    return os.path.join(LIVE_ROOT, series, "stream")
+    """Under kalshi_viz/static so Streamlit serves it same-origin at
+    /app/static/{series}/ -- the live chart polls these without CORS or a
+    second server."""
+    return os.path.join(REPO_ROOT, "kalshi_viz", "static", series)
 
 
 def stream_filename(ticker: str) -> str:
@@ -117,7 +116,10 @@ def build_summary(*, series: str, event_ticker: str, engine, quoter, store, mode
         "quote_block_counts": dict(quoter.block_counts),
         "signal_age_s": engine.signal_age_s(), "feed_age_s": engine.feed_age_s(),
         "applied_age_s": engine.applied_age_s(), "signal_age_limit_s": engine.signal_age_limit(),
-        "bias": dict(engine.bias),
+        "fees": {"type": quoter.fees.fee_type, "multiplier": quoter.fees.multiplier,
+                 "taker_rate": quoter.fees.taker_rate, "maker_rate": quoter.fees.maker_rate},
+        "write_budget_orders_per_s": (engine.order_client.max_orders_per_s
+                                      if engine.order_client is not None else None),
         "consecutive_order_errors": engine.consecutive_order_errors,
         "pnl": {"touch": pnl_touch, "fair": pnl_fair,
                 "realized": engine.portfolio.total_realized_pnl(), "fees": engine.portfolio.total_fees(),
@@ -143,23 +145,6 @@ def build_summary(*, series: str, event_ticker: str, engine, quoter, store, mode
         "timings": timings or {},
         "extras": model.summary_extras(),
     }
-
-
-def append_bias_row(series: str, date: str, row: dict):
-    """bias_history.csv is append-only so pricing-vs-market drift over a day
-    survives restarts (summary.json only says how we price right now)."""
-    d = day_dir(series, date)
-    os.makedirs(d, exist_ok=True)
-    path = os.path.join(d, "bias_history.csv")
-    cols = ["time", "n", "n_outside", "median_vs_mid", "median_excess", "same_side", "systematic"]
-    new = not os.path.exists(path)
-    try:
-        with open(path, "a") as fh:
-            if new:
-                fh.write(",".join(cols) + "\n")
-            fh.write(",".join("" if row.get(c) is None else str(row.get(c)) for c in cols) + "\n")
-    except OSError:
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +312,7 @@ def write_streams(series: str, quote_df: pd.DataFrame, fills_df: pd.DataFrame, p
             "br": _clean(q["bid_reservation"]) if has else [], "ar": _clean(q["ask_reservation"]) if has else [],
             **_edge_bands(q),
             "qb": _clean(_col(q, "quote_bid")) if has else [], "qa": _clean(_col(q, "quote_ask")) if has else [],
+            "lb": _clean(_col(q, "lip_bid")) if has else [], "la": _clean(_col(q, "lip_ask")) if has else [],
             **{f"f{s}_{k}t": _ms(g["time"]) for (s, k), g in groups.items()},
             **{f"f{s}_{k}p": _clean(g["yes_equiv_price"]) for (s, k), g in groups.items()},
             "pos_t": _ms(f["time"]), "pos_v": [float(v) for v in sgn],

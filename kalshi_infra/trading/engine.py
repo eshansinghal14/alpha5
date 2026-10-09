@@ -55,11 +55,20 @@ import pandas as pd
 
 from kalshi_backtest.book import BookView
 from kalshi_backtest.core import Order, Portfolio, Trade
-from kalshi_backtest.execution import QueueTracker, resolve_marketable, resolve_resting
+from kalshi_backtest.data import STALE_THRESHOLD_S as MAX_BOOK_AGE_S
+from kalshi_backtest.execution import (MEASURED_SEND_S, QueueTracker, resolve_marketable,
+                                       resolve_resting)
 
-# Every tunable guard reads the strategy's RiskParams/CloseParams sections
-# (kalshi_infra.trading.params) on each check, so dashboard edits apply
-# immediately. The constants below are invariants, not tunables.
+# Tunable guards read the strategy's RiskParams on each check, so dashboard
+# edits apply immediately. The constants below are invariants, not tunables.
+
+# Shadow fills resolve after the measured one-way send latency plus the
+# dispatch's own processing time, so paper is never more optimistic than real.
+SHADOW_SEND_S = MEASURED_SEND_S
+
+# Consecutive REAL order errors before halting. Five in a row is auth,
+# balance or market state, not a moved touch.
+MAX_CONSECUTIVE_ORDER_ERRORS = 5
 
 # Slack allowed when checking a fill against its own limit price. One tick
 # covers ordinary venue rounding; anything beyond it is a units or
@@ -96,7 +105,7 @@ class LiveContext:
         return self.portfolio.position(ticker)
 
     def buy(self, ticker: str, side: str, size: float, price: float | None = None,
-            order_type: str = "limit", intent: str = "take") -> Order:
+            order_type: str = "limit", intent: str = "take", role: str = "edge") -> Order:
         """`intent="quote"` sends a RESTING order in real mode instead of an
         IOC (see core.Order and LiveEngine._resolve_arrival). Shadow mode
         resolves both the same way -- marketable fills, otherwise rests --
@@ -104,11 +113,19 @@ class LiveContext:
         order = Order(order_id=self._engine.next_order_id(), ticker=ticker, side=side,
                       order_type=order_type, price=price, size=size, decision_time=self.time,
                       intent=intent)
+        order.role = role
         self._engine.submit_order(order, self.time)
         return order
 
-    def cancel(self, order_id: int):
+    def cancel(self, order_id: int, force: bool = False):
+        """Every real cancel bypasses the write limiter (cancel_resting and
+        _cancel_blocking claim with force), so `force` is the contract, not a
+        switch here."""
         self._engine.cancel_order(order_id)
+
+    def amend(self, order_id: int, new_size: float) -> bool:
+        """Resize a resting quote in place (False if it isn't resting)."""
+        return self._engine.amend_order(order_id, new_size)
 
 
 class LiveEngine:
@@ -132,23 +149,21 @@ class LiveEngine:
     positions first) -- never by assignment.
     """
 
-    def __init__(self, strategy, *, risk, close, quoting, fees, order_client=None,
+    def __init__(self, strategy, *, risk, quoting, fees, order_client=None,
                  event_ticker: str | None = None, close_time: pd.Timestamp | None = None):
-        """`risk`/`close`/`quoting`/`fees`: the strategy's config sections,
-        held by reference so live config edits apply on the next check.
-
-        `strategy.fairs` (ticker -> Fair) is read for fair-value marking and
-        the bias guard."""
+        """`risk`/`quoting`: the strategy's config sections, held by reference
+        so live edits apply on the next check. `fees`: the event's
+        kalshi.fees.FeeSchedule. `strategy.fairs` (ticker -> Fair) is read for
+        fair-value marking."""
         self.strategy = strategy
         self.risk = risk
-        self.close = close
         self.quoting = quoting
+        self.fees = fees
         self._pending_submissions: list[Order] = []
         self.n_scheduled = 0      # placed, delay elapsed not yet -- see _flush_pending
         self.resolution_errors = 0
         self.unresolved_reasons: dict[str, int] = {}
-        self.portfolio = Portfolio(fee_multiplier=fees.taker_fee_multiplier,
-                                   maker_fee_multiplier=fees.maker_fee_multiplier)
+        self.portfolio = Portfolio(fee_multiplier=fees.taker_rate, maker_fee_multiplier=fees.maker_rate)
         self.books: dict[str, BookView] = {}
         self.queue_trackers: list[QueueTracker] = []
         self.trackers_by_id: dict[int, QueueTracker] = {}
@@ -174,8 +189,6 @@ class LiveEngine:
         self.last_audit: str | None = None
         self.last_audit_diffs: dict[str, float] = {}
         self.over_limit: dict[str, float] = {}
-        self.bias: dict = {}
-        self.bias_systematic: bool = False
         self._last_abs_position: dict[str, float] = {}
         self.blocked_counts: dict[str, int] = {}
         # (ticker, side, touch price) -> (Kalshi depth we saw, how much of it
@@ -261,13 +274,7 @@ class LiveEngine:
         return self.quoting.max_position
 
     def signal_age_limit(self) -> float:
-        """max_signal_age_s, tightened inside near_expiry_s of the close."""
-        r = self.risk
-        if self.close_time is not None and r.near_expiry_s > 0:
-            remaining = (self.close_time - pd.Timestamp.now(tz="UTC")).total_seconds()
-            if remaining <= r.near_expiry_s:
-                return min(r.max_signal_age_s, r.max_signal_age_near_expiry_s)
-        return r.max_signal_age_s
+        return self.risk.max_signal_age_s
 
     def _fair_probs(self) -> dict[str, float]:
         fairs = getattr(self.strategy, "fairs", None) or {}
@@ -360,70 +367,6 @@ class LiveEngine:
                   f"orders will be sent.")
         return self.last_audit_diffs
 
-    def check_pricing_bias(self) -> dict:
-        """Compare our fair value against every market's own touch and flag a
-        ladder-wide, same-direction offset.
-
-        Measured against the BBO, not the mid: the quantity that matters is
-        how far OUTSIDE the touch we sit, because that is exactly what the
-        strategy would cross. A market whose prob sits inside its spread
-        contributes nothing.
-
-        One market outside its touch is the edge we trade; the same offset
-        in the same direction across a whole ladder is our own pricing
-        shifted, invisible to every other guard. Gates only when large and
-        one-directional across risk.bias_min_markets; clears by itself.
-        """
-        r = self.risk
-        excess, vs_mid = [], []
-        for ticker, prob in self._fair_probs().items():
-            book = self.books.get(ticker)
-            if book is None or book.bid is None or book.ask is None:
-                continue
-            if book.ask <= book.bid:            # crossed/locked: no usable touch
-                continue
-            # Positive = our prob is BELOW the bid, i.e. we would sell yes.
-            # Negative = above the ask, i.e. we would buy yes. Zero inside.
-            if prob < book.bid:
-                excess.append(book.bid - prob)
-            elif prob > book.ask:
-                excess.append(-(prob - book.ask))
-            else:
-                excess.append(0.0)
-            vs_mid.append(prob - (book.bid + book.ask) / 2.0)
-
-        outside = [e for e in excess if abs(e) > 1e-9]
-        n_out = len(outside)
-        systematic = False
-        median_excess = None
-        same_side = 0
-        if n_out >= r.bias_min_markets:
-            ordered = sorted(outside)
-            median_excess = ordered[n_out // 2]
-            side = 1 if median_excess > 0 else -1
-            same_side = sum(1 for e in outside if (e > 0) == (side > 0))
-            systematic = (abs(median_excess) >= r.bias_threshold
-                          and same_side >= r.bias_same_side_fraction * n_out)
-
-        was = self.bias_systematic
-        self.bias_systematic = systematic
-        self.bias = {
-            "n": len(excess),
-            "n_outside": n_out,
-            "median_excess": None if median_excess is None else round(median_excess, 5),
-            "median": (round(sorted(vs_mid)[len(vs_mid) // 2], 5) if vs_mid else None),
-            "same_side": same_side,
-            "systematic": systematic,
-        }
-        if systematic and not was:
-            print(f"[live] SYSTEMATIC MISPRICING: our fair value is "
-                  f"{abs(median_excess) * 100:.2f}c outside the touch on {same_side}/{n_out} markets, "
-                  f"all the same way -- that is a pricing shift, not edge. Trading is off until it "
-                  f"clears.")
-        elif was and not systematic:
-            print("[live] systematic mispricing cleared -- trading re-enabled.")
-        return self.bias
-
     def check_failsafe(self) -> bool:
         """Trip the PnL halt if either marking convention has breached
         -max_loss_usd. Returns whether we are halted.
@@ -467,14 +410,8 @@ class LiveEngine:
             # A frozen fair against a live book is not edge -- it crosses in
             # exactly the direction that just moved against us.
             return "stale_signal"
-        if self.bias_systematic:
-            return "systematic_bias"
-        if self.consecutive_order_errors >= self.risk.max_consecutive_order_errors:
+        if self.consecutive_order_errors >= MAX_CONSECUTIVE_ORDER_ERRORS:
             return "order_error_breaker"
-        if self.close_time is not None:
-            remaining = (self.close_time - pd.Timestamp.now(tz="UTC")).total_seconds()
-            if remaining <= self.close.close_buffer_s:
-                return "event_closing"
         return None
 
     # -----------------------------------------------------------------
@@ -789,7 +726,7 @@ class LiveEngine:
         if book is None:
             self._unresolved(order, "no_book")
             return
-        if (now - book.time).total_seconds() > self.risk.max_book_age_s:
+        if (now - book.time).total_seconds() > MAX_BOOK_AGE_S:
             self._unresolved(order, "stale_book")
             return
         if self.live_trading:
@@ -908,7 +845,7 @@ class LiveEngine:
             self._unresolved(order, "real_order_error")
             print(f"[live] ERROR placing REAL order {order.order_id} "
                   f"({order.ticker} {order.side} {order.size}@{order.price}): {exc!r}")
-            if self.consecutive_order_errors >= self.risk.max_consecutive_order_errors:
+            if self.consecutive_order_errors >= MAX_CONSECUTIVE_ORDER_ERRORS:
                 print(f"[live] CIRCUIT BREAKER: {self.consecutive_order_errors} consecutive real-order "
                       f"errors -- no further orders will be sent. Fix the cause and restart.")
             return
@@ -979,13 +916,13 @@ class LiveEngine:
         (re)issues its cancel, which covers a cancel that errored earlier."""
         busy = False
         for oid, o in self.inflight_quotes.items():
-            if oid != order.order_id and o.ticker == order.ticker and o.side == order.side:
+            if oid != order.order_id and _slot(o) == _slot(order):
                 # Cancelled on arrival by _on_real_quote_result.
                 self.cancelled_ids.add(oid)
                 busy = True
         for oid, entry in list(self.real_resting.items()):
             o = entry["order"]
-            if oid != order.order_id and o.ticker == order.ticker and o.side == order.side:
+            if oid != order.order_id and _slot(o) == _slot(order):
                 self.cancelled_ids.add(oid)
                 self._cancel_real(oid)
                 busy = True
@@ -1018,7 +955,7 @@ class LiveEngine:
             self._unresolved(order, "real_quote_error")
             print(f"[live] ERROR resting REAL quote {order.order_id} "
                   f"({order.ticker} {order.side} {order.size}@{order.price}): {exc!r}")
-            if self.consecutive_order_errors >= self.risk.max_consecutive_order_errors:
+            if self.consecutive_order_errors >= MAX_CONSECUTIVE_ORDER_ERRORS:
                 print(f"[live] CIRCUIT BREAKER: {self.consecutive_order_errors} consecutive real-order "
                       f"errors -- no further orders will be sent. Fix the cause and restart.")
             return
@@ -1182,7 +1119,7 @@ class LiveEngine:
     def _cancel_blocking(self, exchange_id: str, ticker: str | None = None) -> tuple:
         """Worker thread -- touches no engine state. Returns (ok, exception)."""
         try:
-            self.order_client.allow_now(force=True)
+            self.order_client.allow_now("cancel", force=True)
             return self.order_client.cancel(exchange_id, ticker), None
         except Exception as exc:
             return None, exc
@@ -1286,7 +1223,7 @@ class LiveEngine:
                 print(f"[live] cancelling {len(resting)} resting order(s) on {self.event_ticker}")
                 for exchange_id, ticker in resting:
                     try:
-                        self.order_client.allow_now(force=True)
+                        self.order_client.allow_now("cancel", force=True)
                         self.order_client.cancel(exchange_id, ticker)
                     except Exception as exc:
                         self.failed_cancels += 1
@@ -1325,6 +1262,48 @@ class LiveEngine:
         drop = getattr(self.strategy, "drop_quote", None)
         if drop is not None:
             drop(order.order_id)
+
+    def amend_order(self, order_id: int, new_size: float) -> bool:
+        """Change a resting quote's remaining size. Real: Kalshi amend (a size
+        increase goes to the back of the queue, a decrease keeps its place).
+        Shadow: the tracker's remaining size changes; queue position is left
+        as is (conservative for an increase is not modelled -- shadow LIP
+        fills are rare by construction)."""
+        if order_id in self.cancelled_ids:
+            return False
+        tracker = self.trackers_by_id.get(order_id)
+        if tracker is not None and not tracker.done:
+            tracker.order.size = tracker.filled_qty + new_size
+        entry = self.real_resting.get(order_id)
+        if entry is None:
+            return tracker is not None and not tracker.done
+        if not self.order_client.allow_now("amend"):
+            return False
+        filled = entry["order"].size - entry["remaining"]
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        def work():
+            try:
+                return self.order_client.amend(entry["exchange_id"], entry["order"], new_size, filled), None
+            except Exception as exc:
+                return None, exc
+
+        def done(result):
+            resp, exc = result
+            if exc is not None:
+                print(f"[live] WARN: amend of resting order {order_id} failed: {exc!r}")
+                return
+            entry["remaining"] = new_size
+            entry["order"].size = filled + new_size
+
+        if loop is None:
+            done(work())
+        else:
+            loop.run_in_executor(None, work).add_done_callback(lambda f: done(f.result()))
+        return True
 
     def cancel_order(self, order_id: int):
         """Live analog of engine.py's cancel_arrival handler -- immediate,
@@ -1385,7 +1364,7 @@ class LiveEngine:
         if not self._pending_submissions:
             return
         pending, self._pending_submissions = self._pending_submissions, []
-        delay = 0.0 if self.live_trading else self.risk.shadow_send_s + processing_s
+        delay = 0.0 if self.live_trading else SHADOW_SEND_S + processing_s
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -1420,3 +1399,9 @@ class LiveEngine:
             traceback.print_exc()
         finally:
             self.n_scheduled -= 1
+
+
+def _slot(order: Order) -> tuple:
+    """One real resting order per (ticker, side, role): the edge quote and the
+    LIP quote on the same side are independent."""
+    return order.ticker, order.side, getattr(order, "role", "edge")

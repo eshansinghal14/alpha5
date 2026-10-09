@@ -10,6 +10,6 @@ kalshi_infra/logs/
 kalshi_infra/*_log.txt
 data/
 viz/static/live_*.json
-kalshi_viz/static/live_*.json
+kalshi_viz/static/
 __pycache__/
 .venv/
