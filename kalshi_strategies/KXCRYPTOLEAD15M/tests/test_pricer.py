@@ -17,7 +17,7 @@ Covered:
   * Fairs sum to 1 after shrinkage.
   * Tie handling at the degenerate V=0 limit.
 
-Run with `pytest kalshi_crypto/tests/test_pricer.py -q`.
+Run with `pytest kalshi_strategies/KXCRYPTOLEAD15M/tests/test_pricer.py -q`.
 """
 import math
 import os
@@ -26,14 +26,11 @@ import sys
 import numpy as np
 import pytest
 
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
 
-from kalshi_crypto.config import CoinRaceConfig
-from kalshi_crypto.cov_forecaster import ConstantCovForecaster
-from kalshi_crypto.pricer import CoinRacePricer, N_COINS
-from kalshi_crypto.series import START_END_AVG_S
+from kalshi_strategies.KXCRYPTOLEAD15M.tests.conftest import pricing as CoinRaceConfig
+from kalshi_strategies.KXCRYPTOLEAD15M.cov_forecaster import ConstantCovForecaster
+from kalshi_strategies.KXCRYPTOLEAD15M.pricer import CoinRacePricer, N_COINS
+from kalshi_strategies.KXCRYPTOLEAD15M.series import START_END_AVG_S
 
 
 def _pricer(sigma_per_sec=5e-4, rho=0.5, shrinkage=0.0, mc_n=20_000, seed=1):

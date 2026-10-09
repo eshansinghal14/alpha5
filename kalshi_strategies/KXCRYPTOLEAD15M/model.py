@@ -1,0 +1,252 @@
+"""
+Live Coin Race model for one KXCRYPTOLEAD15M event: Coinbase books ->
+per-coin composite mid -> settlement tracker + HAR vol forecaster -> MC
+winner probabilities -> per-market Fair.
+
+Band = prob +/- ci_vol_multiplier * theo_vol, where theo_vol is the 1-sigma
+fair move over reaction_latency_s from the bump deltas. The pricer works in
+log returns; only the SettlementTracker works in Kalshi's arithmetic returns.
+"""
+from __future__ import annotations
+
+import asyncio
+import math
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from kalshi_infra.kalshi.markets import EventInfo
+from kalshi_infra.trading.fair import Fair
+from kalshi_strategies.KXCRYPTOLEAD15M.composite import DATA_ROOT, CompositeBar, CompositeBus
+from kalshi_strategies.KXCRYPTOLEAD15M.pricer import BaseRateTracker, CoinRacePricer, FairResult
+from kalshi_strategies.KXCRYPTOLEAD15M.robust_har import RobustHarForecaster
+from kalshi_strategies.KXCRYPTOLEAD15M.series import COINS, START_END_AVG_S, coin_from_market_ticker
+from kalshi_strategies.KXCRYPTOLEAD15M.settlement_tracker import EventWindow, SettlementTracker
+from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed import FeedHealthMonitor
+from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed.coinbase import CoinbaseAdapter
+
+
+def load_composite_bars(coin: str, start_s: float, end_s: float, root: Path = DATA_ROOT) -> list[CompositeBar]:
+    """Persisted 1s bars for one coin over [start_s, end_s]."""
+    out: list[CompositeBar] = []
+    if not root.exists():
+        return out
+    for path in sorted(root.glob(f"{coin}_*.parquet")):
+        if ".corrupt-" in path.name:   # quarantined by CompositeFeed.flush
+            continue
+        try:
+            df = pd.read_parquet(path)
+        except Exception as e:
+            print(f"[KXCRYPTOLEAD15M] skipping unreadable {path.name} ({e!r})")
+            continue
+        df = df[(df["ts_s"] >= start_s) & (df["ts_s"] <= end_s)]
+        for r in df.itertuples(index=False):
+            out.append(CompositeBar(
+                coin=coin, ts_s=float(r.ts_s), price=float(r.price), utilized_depth=float(r.utilized_depth),
+                n_venues_in=int(r.n_venues_in), n_venues_dropped=int(r.n_venues_dropped),
+                is_fallback=bool(r.is_fallback),
+                fallback_mid=None if pd.isna(r.fallback_mid) else float(r.fallback_mid),
+                nowcast_count=int(r.nowcast_count)))
+    return out
+
+
+class CoinRaceModel:
+    def __init__(self, ev: EventInfo, cfg, *, bus: CompositeBus, coinbase: CoinbaseAdapter | None,
+                 forecaster=None):
+        self.cfg = cfg
+        self.event_ticker = ev.event_ticker
+        by_coin = {coin_from_market_ticker(m["ticker"]): m["ticker"] for m in ev.markets}
+        missing = [c for c in COINS if c not in by_coin]
+        if missing:
+            raise ValueError(f"{ev.event_ticker}: markets missing for {missing}")
+        self.ticker_of = {c: by_coin[c] for c in COINS}
+        self.tickers = [self.ticker_of[c] for c in COINS]
+        self.window = EventWindow(event_ticker=ev.event_ticker, S=ev.open_time.timestamp(),
+                                  T=ev.close_time.timestamp())
+        self.tracker = SettlementTracker(self.window)
+        p = cfg.pricing
+        self.forecaster = forecaster or RobustHarForecaster()
+        self.pricer = CoinRacePricer(self.forecaster, p,
+                                     base_rate=BaseRateTracker(p.base_rate_window).rate())
+        self.health = FeedHealthMonitor(soft_stale_s=p.soft_stale_s, hard_stale_s=p.hard_stale_s,
+                                        recovery_s=p.recovery_s)
+        self.bus = bus
+        self.coinbase = coinbase
+        self.result: FairResult | None = None
+        self.withheld_reason: str | None = "warming"
+        self._last_delta_s = 0.0
+        self._newest_mono = 0.0     # oldest coin's newest book under the current fair
+        self._down: list[str] = list(COINS)
+
+    # --- warmup -----------------------------------------------------------
+
+    def backfill(self) -> dict[str, str]:
+        """Seed the start TWAP and forecaster from persisted bars, so an event
+        adopted mid-window prices off real returns. Without it x = 0 and the
+        fair is a pure variance prior (2026-10-07: BTC theo 0.17 vs a 0.035
+        market). Returns per-coin start_quality."""
+        now_s = time.time()
+        bars = {c: load_composite_bars(c, now_s - self.cfg.pricing.warmup_s, self.window.T) for c in COINS}
+        self.tracker.backfill({c: [b for b in bl if b.ts_s >= self.window.S - 2 * START_END_AVG_S]
+                               for c, bl in bars.items()})
+        by_s: dict[int, dict[str, float]] = {}
+        for c, bl in bars.items():
+            for b in bl:
+                by_s.setdefault(int(b.ts_s), {})[c] = b.mid
+        for ts in sorted(by_s):
+            try:
+                self.forecaster.update(float(ts), by_s[ts])
+            except NotImplementedError:
+                break
+        return dict(self.tracker.snapshot(time.time()).start_quality)
+
+    # --- pricing ----------------------------------------------------------
+
+    def _withhold(self, reason: str):
+        self.result = None
+        self.withheld_reason = reason
+        return {t: None for t in self.tickers}
+
+    def _ingest_bars(self, now_s: float):
+        sampled = self.bus.sample_all(now_s)
+        for bar in sampled.values():
+            self.tracker.ingest(bar)
+        if sampled:
+            try:
+                self.forecaster.update(max(b.ts_s for b in sampled.values()),
+                                       {c: b.mid for c, b in sampled.items()})
+            except NotImplementedError:
+                pass
+
+    def _price(self, now_s: float, compute_delta: bool | None):
+        p = self.cfg.pricing
+        mono = time.monotonic()
+        # Health runs on the monotonic clock (VenueBook.receive_ts); wall
+        # clock vs monotonic once read every coin as 1.7e9s stale.
+        self.health.observe(self.bus.venue_books_per_coin(), now=mono)
+        self._down = self.health.down_coins(COINS, mono)
+        if self._down:
+            # The winner is a joint comparison: one DOWN coin makes every fair unknowable.
+            return self._withhold(f"coin_down:{','.join(self._down)}")
+        alarms = self.forecaster.alarms() if hasattr(self.forecaster, "alarms") else []
+        if alarms:
+            return self._withhold(f"vol_alarm:{','.join(alarms)}")
+
+        snap = self.tracker.snapshot(now_s)
+        in_window = now_s >= self.window.S
+        start_locked = in_window and all(snap.start_quality.get(c) in ("ok", "partial") for c in COINS)
+        if in_window and not start_locked:
+            return self._withhold("no_start_twap")
+        if not in_window and not p.quote_before_start:
+            return self._withhold("before_start")
+
+        books = self.bus.venue_books_per_coin()
+        newest = []
+        for c in COINS:
+            ts = [vb.receive_ts for vb in books.get(c, []) if not vb.is_resyncing]
+            newest.append(max(ts) if ts else 0.0)
+        if min(newest) <= 0 or max(newest) - min(newest) > p.max_cross_coin_skew_s:
+            return self._withhold("cross_coin_skew")
+
+        x, I = np.zeros(len(COINS)), np.zeros(len(COINS))
+        if start_locked:
+            for i, c in enumerate(COINS):
+                m, s = self.bus.mid_nowcast(c), snap.start_twap.get(c)
+                if m is None or s is None or s <= 0:
+                    return self._withhold("no_mid")
+                x[i] = math.log(m / s)
+                if snap.projected_return_log.get(c) is not None and now_s >= self.window.end_avg_begin:
+                    # Pricer wants a partial SUM over the end average, not the
+                    # partial average (passing the average double-counted it).
+                    I[i] = snap.projected_return_log[c] * snap.end_sample_count.get(c, 0) / float(START_END_AVG_S)
+        if compute_delta is None:
+            compute_delta = self.result is None or now_s - self._last_delta_s >= p.delta_refresh_s
+        self.result = self.pricer.fairs_at(x=x, I=I, tau=max(0.0, self.window.T - now_s), now_s=now_s,
+                                           S=self.window.S, T=self.window.T, start_locked=start_locked,
+                                           compute_delta=compute_delta, prev_result=self.result)
+        if compute_delta:
+            self._last_delta_s = now_s
+        self._newest_mono = min(newest)
+        self.withheld_reason = None
+        k = p.ci_vol_multiplier
+        out = {}
+        for i, c in enumerate(COINS):
+            prob, tv = float(self.result.probs[i]), float(self.result.theo_vol[i])
+            # Not clipped to [0, 1]: the band is an edge distance, and clipping
+            # would erase the edge on tail coins (fair 0.002, band 0.015).
+            out[self.ticker_of[c]] = Fair(prob=prob, lo=prob - k * tv, hi=prob + k * tv,
+                                          extras={"coin": c, "theo_vol": tv, "tau": self.result.tau,
+                                                  "phase": self.result.phase})
+        return out
+
+    # --- FairModel ----------------------------------------------------------
+
+    def reprice(self, now_s: float):
+        self._ingest_bars(now_s)
+        return self._price(now_s, None)
+
+    def on_market_event(self, ticker, now_s):
+        # ~1ms; keeps theo on the newest Coinbase book even if the reprice
+        # loop stalls under a Kalshi burst near the close.
+        if self._down:
+            return None
+        return self._price(now_s, False)
+
+    def signal_age_s(self):
+        if self.result is None or self._newest_mono <= 0:
+            return None
+        return time.monotonic() - self._newest_mono
+
+    def feed_age_s(self):
+        books = [vb.receive_ts for vbs in self.bus.venue_books_per_coin().values() for vb in vbs]
+        return None if not books else time.monotonic() - max(books)
+
+    def applied_age_s(self):
+        return self.signal_age_s()
+
+    def side_block(self, ticker, side, fair, now_s):
+        return None
+
+    def summary_extras(self) -> dict:
+        r = self.result
+        snap = self.tracker.snapshot(time.time())
+        return {
+            "phase": None if r is None else r.phase, "tau_s": snap.tau, "tau_eff": None if r is None else r.tau_eff,
+            "start_quality": dict(snap.start_quality), "withheld_reason": self.withheld_reason,
+            "fairs": None if r is None else {c: float(r.probs[i]) for i, c in enumerate(COINS)},
+            "theo_vol": None if r is None else {c: float(r.theo_vol[i]) for i, c in enumerate(COINS)},
+            "feed_health": self.health.snapshot(),
+            "vol_model": self.forecaster.diagnostics() if hasattr(self.forecaster, "diagnostics") else None,
+        }
+
+    # --- lifecycle -----------------------------------------------------------
+
+    def feed_tasks(self):
+        tasks = [self._sample_loop(), self._flush_loop()]
+        if self.coinbase is not None:
+            tasks.append(self.coinbase.run(self.bus.observe))
+        return tasks
+
+    async def _sample_loop(self):
+        """Pin per-second bars aligned to second boundaries (Kalshi's own
+        snapshots are second-aligned)."""
+        while True:
+            now = time.time()
+            try:
+                self._ingest_bars(now)
+            except Exception as e:
+                print(f"[KXCRYPTOLEAD15M] composite sampling error: {e!r}")
+            await asyncio.sleep(max(0.0, int(now) + 1 - now + 0.02))
+
+    async def _flush_loop(self):
+        while True:
+            await asyncio.sleep(self.cfg.pricing.composite_flush_s)
+            try:
+                await asyncio.get_running_loop().run_in_executor(None, self.bus.flush_all)
+            except Exception as e:
+                print(f"[KXCRYPTOLEAD15M] composite flush failed: {e!r}")
+
+    async def close(self):
+        self.bus.flush_all()

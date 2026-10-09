@@ -52,7 +52,6 @@ import math
 
 import numpy as np
 
-from .config import CoinRaceConfig
 from .cov_forecaster import CovarianceForecaster
 from .series import COINS, START_END_AVG_S, EVENT_WINDOW_S
 
@@ -78,11 +77,12 @@ class FairResult:
 
 class CoinRacePricer:
 
-    def __init__(self, forecaster: CovarianceForecaster,
-                 config: CoinRaceConfig | None = None,
+    def __init__(self, forecaster: CovarianceForecaster, config,
                  base_rate: np.ndarray | None = None):
+        """`config`: the series' CryptoPricingParams section (mc_n, mc_seed,
+        t_nu, vol_mult, shrinkage_lambda, reaction_latency_s)."""
         self.forecaster = forecaster
-        self.config = config or CoinRaceConfig()
+        self.config = config
         # Common random numbers: pre-generate ONCE at construction and
         # reuse on every tick so theo doesn't jitter on sampling noise.
         rng = np.random.default_rng(self.config.mc_seed)

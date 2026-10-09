@@ -14,11 +14,8 @@ import sys
 import pandas as pd
 import pytest
 
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
 
-from kalshi_crypto.composite import CompositeFeed, CompositeBar
+from kalshi_strategies.KXCRYPTOLEAD15M.composite import CompositeFeed, CompositeBar
 
 
 def _bar(coin: str, ts_s: float, price: float = 100.0) -> CompositeBar:
@@ -81,7 +78,7 @@ def test_flush_keeps_pending_on_write_failure(tmp_path, monkeypatch):
     bars = [_bar("BTC", 1_700_000_000.0, 100.0)]
     f._pending_disk = list(bars)
 
-    import kalshi_crypto.composite as comp
+    import kalshi_strategies.KXCRYPTOLEAD15M.composite as comp
 
     def boom(*a, **k):
         raise OSError("disk full")

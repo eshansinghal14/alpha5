@@ -37,7 +37,7 @@ import numpy as np
 from .cov_forecaster import CovarianceForecaster
 from .series import COINS
 
-ARTIFACT = Path(__file__).with_name("rv_modeling") / "har_coefs_robust.json"
+ARTIFACT = Path(__file__).with_name("research") / "har_coefs_robust.json"
 WINDOWS = (60, 900, 3600)
 RET_K = 10
 CLIP_SD = 6.0

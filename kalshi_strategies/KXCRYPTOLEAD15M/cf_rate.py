@@ -57,7 +57,7 @@ import math
 import numpy as np
 
 from .spot_feed import VenueBook
-from .config import MID_DEVIATION_FRACTION, UTILIZED_DEPTH_DEVIATION
+from .constants import MID_DEVIATION_FRACTION, UTILIZED_DEPTH_DEVIATION
 
 
 @dataclasses.dataclass

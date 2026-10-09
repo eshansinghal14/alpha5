@@ -8,12 +8,9 @@ import sys
 
 import pytest
 
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
 
-from kalshi_crypto.cf_rate import compute_cf_spot
-from kalshi_crypto.spot_feed.base import VenueBook, OrderBookLevel
+from kalshi_strategies.KXCRYPTOLEAD15M.cf_rate import compute_cf_spot
+from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed.base import VenueBook, OrderBookLevel
 
 
 def _book(price_center=100.0, size=10.0, venue="coinbase", coin="BTC",

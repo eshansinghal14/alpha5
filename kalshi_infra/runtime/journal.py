@@ -19,9 +19,7 @@ import warnings
 
 import pandas as pd
 
-from kalshi_infra import DATA_ROOT
-
-LIVE_ROOT = os.path.join(DATA_ROOT, "live")
+from kalshi_infra.runtime.persist import LIVE_ROOT
 
 STREAMS = ("bbo", "decisions", "fills")
 

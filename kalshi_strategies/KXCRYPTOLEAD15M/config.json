@@ -1,0 +1,92 @@
+{
+  "quoting": {
+    "order_size": 5.0,
+    "max_position": 15.0,
+    "constant_edge": 0.01,
+    "edge_fraction": 1.0,
+    "lean_multiplier": 1.0,
+    "lean_dollars": 0.02,
+    "lean_exponent": 2.0,
+    "fair_clip_eps": 0.001,
+    "inflight_timeout_s": 0.5,
+    "take_confirm_s": 0.75,
+    "max_markets": null,
+    "atm_hysteresis": 0,
+    "enable_quoting": true,
+    "quoting_edge": 0.005,
+    "max_improve_ticks": 1,
+    "requote_improve_ticks": 2.0,
+    "min_quote_life_s": 0.0,
+    "requote_delay_s": 1.0
+  },
+  "fees": {
+    "taker_fee_multiplier": 1.0,
+    "maker_fee_multiplier": 0.0,
+    "taker_fee_edge_multiplier": 1.0
+  },
+  "close": {
+    "last_phase_s": 150.0,
+    "last_phase_max_half_band": 0.12,
+    "last_phase_otm_fair_max": 0.005,
+    "real_trading_cutoff_s": 30.0,
+    "close_buffer_s": 10.0
+  },
+  "risk": {
+    "max_loss_usd": 80.0,
+    "max_signal_age_s": 1.5,
+    "near_expiry_s": 120.0,
+    "max_signal_age_near_expiry_s": 0.75,
+    "fresh_recovery_s": 2.0,
+    "max_book_age_s": 60.0,
+    "shadow_send_s": 0.034,
+    "max_consecutive_order_errors": 5,
+    "bias_threshold": 0.03,
+    "bias_min_markets": 5,
+    "bias_same_side_fraction": 0.8,
+    "max_orders_per_s": 5.0,
+    "order_timeout_s": 5.0
+  },
+  "runtime": {
+    "reprice_interval_s": 0.5,
+    "flush_interval_s": 3.0,
+    "heavy_flush_every": 10,
+    "max_debug_rows": 40000,
+    "audit_interval_s": 5.0,
+    "quote_fill_poll_s": 1.0,
+    "control_poll_s": 1.0,
+    "rollover_poll_s": 30.0,
+    "rollover_fast_poll_s": 2.0,
+    "rollover_fast_window_s": 120.0,
+    "close_check_s": 1.0,
+    "close_grace_s": 1.0
+  },
+  "kalshi_ws": {
+    "resync_interval_s": 900.0,
+    "reconnect_delay_s": 3.0,
+    "recv_timeout_s": 15.0,
+    "open_timeout_s": 15.0
+  },
+  "lip": {
+    "enabled": true,
+    "period_reward_divisor": 10000.0,
+    "snapshots_per_period": 900
+  },
+  "pricing": {
+    "mc_n": 20000,
+    "mc_seed": 20260815,
+    "t_nu": 5.0,
+    "vol_mult": 1.0,
+    "shrinkage_lambda": 0.0,
+    "base_rate_window": 500,
+    "ci_vol_multiplier": 1.5,
+    "reaction_latency_s": 0.05,
+    "delta_refresh_s": 0.5,
+    "max_cross_coin_skew_s": 1.0,
+    "quote_before_start": false,
+    "soft_stale_s": 3.0,
+    "hard_stale_s": 15.0,
+    "recovery_s": 5.0,
+    "warmup_s": 14400.0,
+    "composite_flush_s": 30.0
+  }
+}

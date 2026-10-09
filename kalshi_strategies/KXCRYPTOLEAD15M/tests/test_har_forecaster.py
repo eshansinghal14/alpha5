@@ -15,15 +15,12 @@ import sys
 import numpy as np
 import pytest
 
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
 
-from kalshi_crypto.har_forecaster import (HarCovarianceForecaster,
+from kalshi_strategies.KXCRYPTOLEAD15M.har_forecaster import (HarCovarianceForecaster,
                                            HAR_COEFFS, FITTED_HORIZONS_S,
                                            HAR_WINDOWS_S, load_fit_artifact)
-from kalshi_crypto.cov_forecaster import DEFAULT_ANNUAL_VOL, DEFAULT_CORRELATION
-from kalshi_crypto.series import COINS
+from kalshi_strategies.KXCRYPTOLEAD15M.cov_forecaster import DEFAULT_ANNUAL_VOL, DEFAULT_CORRELATION
+from kalshi_strategies.KXCRYPTOLEAD15M.series import COINS
 
 
 SIGMA_REF_SQ = {c: (DEFAULT_ANNUAL_VOL[c] / math.sqrt(365.25 * 86400.0)) ** 2

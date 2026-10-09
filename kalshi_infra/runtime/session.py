@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import functools
+import sys
 import time
 import traceback
 
@@ -270,7 +271,12 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
 
     def _write(state):
         t0 = time.perf_counter()
-        persist.write(state)
+        try:
+            persist.write(state)
+        except Exception:
+            _log(S, f"WARN: snapshot write failed (heavy={state['heavy']}):")
+            traceback.print_exc()
+            sys.stdout.flush()
         try:
             jr.write(state.get("journal"))
         except Exception:

@@ -10,11 +10,8 @@ read so the emitted VenueBook is always uncrossed.
 import os
 import sys
 
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
 
-from kalshi_crypto.spot_feed.coinbase import _ProductBook, MAX_BOOK_LEVELS
+from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed.coinbase import _ProductBook, MAX_BOOK_LEVELS
 
 
 def _emit(pb):

@@ -7,13 +7,10 @@ import sys
 
 import pytest
 
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
 
-from kalshi_crypto.composite import CompositeBar
-from kalshi_crypto.settlement_tracker import EventWindow, SettlementTracker
-from kalshi_crypto.series import COINS
+from kalshi_strategies.KXCRYPTOLEAD15M.composite import CompositeBar
+from kalshi_strategies.KXCRYPTOLEAD15M.settlement_tracker import EventWindow, SettlementTracker
+from kalshi_strategies.KXCRYPTOLEAD15M.series import COINS
 
 
 def _bar(coin, ts_s, price):

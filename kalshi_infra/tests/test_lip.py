@@ -10,17 +10,13 @@ The headline test is the Kalshi help page's own worked example:
     Price increases our share proportionally.
 """
 import math
-import os
-import sys
+import types
 
 import pytest
 
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
-
-from kalshi_crypto.lip_scorer import (LipParams, LipLevel, score_book,
-                                       marginal_reward_rate, period_payout)
+from kalshi_infra.trading.lip import (LipLevel, LipParams, LipTracker, levels_from_ladder,
+                                      marginal_reward_rate, params_from_program, period_payout,
+                                      score_book)
 
 
 def test_help_page_payout_example():
@@ -133,3 +129,34 @@ def test_side_not_qualifying_zero_payout():
     s = score_book(yes_levels, no_levels, params)
     assert not s.qualifies
     assert s.expected_reward_this_snapshot_usd == 0.0
+
+
+def test_params_from_program_record():
+    # Shape of a real /incentive_programs record (2026-10-08).
+    p = params_from_program({"target_size_fp": "1000.00", "discount_factor_bps": 5000,
+                             "period_reward": 200000}, period_reward_divisor=10_000.0,
+                            snapshots_per_period=900)
+    assert p == LipParams(target_size=1000.0, discount_factor=0.5, period_reward_usd=20.0,
+                          snapshots_per_period=900)
+
+
+def test_levels_merge_our_quote():
+    lv = levels_from_ladder({0.40: 100.0, 0.39: 50.0}, 0.40, 5.0)
+    assert lv[0] == LipLevel(price=0.40, size=100.0, mine=5.0)
+    lv = levels_from_ladder({0.40: 100.0}, 0.41, 5.0)
+    assert lv[0] == LipLevel(price=0.41, size=5.0, mine=5.0)
+
+
+def test_tracker_accrues_once_per_second_on_qualifying_book():
+    params = LipParams(target_size=100.0, discount_factor=0.5, period_reward_usd=9.0,
+                       snapshots_per_period=900)
+    ladder = types.SimpleNamespace(yes_bids={0.40: 200.0}, no_bids={0.55: 200.0})
+    books = {"T": types.SimpleNamespace(ladder=ladder)}
+    quotes = {("T", "yes"): {"price": 0.40, "size": 50.0}}
+    tr = LipTracker({"T": params})
+    assert tr.due(0.0)
+    tr.snapshot(0.0, books, quotes)
+    assert not tr.due(0.5) and tr.due(1.0)
+    # Kalshi's ladder already includes our resting size: 50 of 200 = 0.25 yes share.
+    assert math.isclose(tr.accrued_usd["T"], 0.25 * 9.0 / 900)
+    assert tr.qualifying_fraction("T") == 1.0

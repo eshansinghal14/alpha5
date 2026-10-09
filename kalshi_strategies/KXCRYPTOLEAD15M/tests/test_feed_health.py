@@ -15,13 +15,10 @@ import sys
 
 import pytest
 
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
 
-from kalshi_crypto.spot_feed.health import FeedHealthMonitor, OK, DEGRADED, DOWN
-from kalshi_crypto.spot_feed.base import VenueBook, OrderBookLevel
-from kalshi_crypto.series import COINS
+from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed.health import FeedHealthMonitor, OK, DEGRADED, DOWN
+from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed.base import VenueBook, OrderBookLevel
+from kalshi_strategies.KXCRYPTOLEAD15M.series import COINS
 
 
 def _book(coin: str, receive_ts: float, *, resyncing=False, one_sided=False,

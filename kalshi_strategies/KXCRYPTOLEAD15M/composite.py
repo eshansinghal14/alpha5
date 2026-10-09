@@ -28,6 +28,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from kalshi_infra import DATA_ROOT as _DATA_ROOT
+
 from .cf_rate import compute_cf_spot, CFSpotResult
 from .spot_feed import VenueBook
 from .series import COINS
@@ -58,7 +60,7 @@ class CompositeBar:
         return self.fallback_mid if self.fallback_mid is not None else self.price
 
 
-DATA_ROOT = Path("data") / "kalshi_crypto" / "composite"
+DATA_ROOT = Path(_DATA_ROOT) / "kalshi_crypto" / "composite"
 
 
 class CompositeFeed:

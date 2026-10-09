@@ -13,15 +13,12 @@ import numpy as np
 import pandas as pd
 import pytest
 
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
 
-from kalshi_crypto.config import CoinRaceConfig
-from kalshi_crypto.pricer import CoinRacePricer
-from kalshi_crypto.robust_har import RobustHarForecaster
+from kalshi_strategies.KXCRYPTOLEAD15M.tests.conftest import pricing as CoinRaceConfig
+from kalshi_strategies.KXCRYPTOLEAD15M.pricer import CoinRacePricer
+from kalshi_strategies.KXCRYPTOLEAD15M.robust_har import RobustHarForecaster
 
-REF = os.path.join(_PROJECT_ROOT, "kalshi_crypto", "rv_modeling", "vol_fix_reference")
+REF = os.path.join(os.path.dirname(__file__), "..", "research", "vol_fix_reference")
 GOLD = json.load(open(os.path.join(REF, "golden_cases.json")))
 COINS = GOLD["coins"]
 

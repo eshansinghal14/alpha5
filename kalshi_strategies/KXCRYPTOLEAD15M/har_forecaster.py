@@ -107,7 +107,7 @@ _SECONDS_PER_YEAR = 365.25 * 86400.0
 
 # Default artifact location. fit_har.py writes here.
 _DEFAULT_ARTIFACT = (Path(os.path.dirname(os.path.abspath(__file__)))
-                     / "rv_modeling" / "har_fit.json")
+                     / "research" / "har_fit.json")
 
 
 def _default_sigma_ref_sq() -> dict[str, float]:

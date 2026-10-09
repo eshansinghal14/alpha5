@@ -259,8 +259,9 @@ def params_from_program(program: dict, *, period_reward_divisor: float,
 def levels_from_ladder(bids: dict[float, float], our_price: float | None,
                        our_size: float) -> list[LipLevel]:
     """One side's levels (own-side prices, best first) with our resting
-    quote merged in. Our size is added to the visible book because Kalshi's
-    ladder as we reconstruct it may not yet include our own order."""
+    quote marked as `mine`. At a level Kalshi already shows, our size is
+    assumed to be inside the displayed size (the ws book includes our own
+    orders); at a level it doesn't show yet, our size is the whole level."""
     acc = {p: LipLevel(price=p, size=s) for p, s in bids.items()}
     if our_price is not None and our_size > 0:
         lv = acc.get(our_price)

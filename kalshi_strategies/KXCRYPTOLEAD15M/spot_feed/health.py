@@ -32,7 +32,7 @@ import dataclasses
 import time
 
 from .base import VenueBook
-from ..config import STALENESS_MS_DEFAULT
+from ..constants import STALENESS_MS_DEFAULT
 
 OK = "ok"
 DEGRADED = "degraded"

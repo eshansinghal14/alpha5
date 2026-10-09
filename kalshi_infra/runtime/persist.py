@@ -27,7 +27,10 @@ import pandas as pd
 
 from kalshi_infra import DATA_ROOT
 
-LIVE_ROOT = os.path.join(DATA_ROOT, "live")
+# live_v2 until the legacy runners (kalshi_main / kalshi_latency_arbs /
+# kalshi_crypto, which write data/live/) are retired, so the two never touch
+# each other's journals or control files.
+LIVE_ROOT = os.path.join(DATA_ROOT, "live_v2")
 STREAM_POINTS = 400            # chart points per market after decimation
 STREAM_ACTIVE_FRACTION = 0.05  # markets with < this share of the busiest market's decisions get no stream
 
