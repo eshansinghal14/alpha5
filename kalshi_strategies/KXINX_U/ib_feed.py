@@ -1,60 +1,39 @@
 """
 Live SPXW option feed over Interactive Brokers TWS/Gateway.
 
-Interface consumed by run_live.py's signal loop:
-
-    class LiveIBFeed:
-        def __init__(self, event_ticker: str, tickers: list[str] | None = None)
-        book: LiveOptionBook   # call_strikes, put_strikes (np.ndarray);
-                               # snapshot_arrays() -> 6-tuple
-        def drain(self) -> int
-        def records_per_s(self) -> float
-        def seconds_since_record(self) -> float   # feed liveness
-        def seconds_since_applied(self) -> float  # loop drain lag
-        async def run(self) -> None
-
 ib_async dispatches ticks on the same asyncio loop as drain() and the
-signal loop, so there is no thread hand-off. See docs/ib-migration.md.
+pricing loop, so there is no thread hand-off. See docs/ib-migration.md.
 """
 import asyncio
 import collections
-import os
-import sys
+import dataclasses
 import time
 import traceback
 
 import numpy as np
 
-_INFRA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "kalshi_infra")
-if _INFRA_DIR not in sys.path:
-    sys.path.insert(0, _INFRA_DIR)
+from kalshi_infra import ib_functions as ibf
+from kalshi_infra import keys
 
-import keys
-import ib_functions as ibf
+_RATE_WINDOW_S = 10.0     # tick-rate averaging window for records_per_s() (display only)
 
 
-_RATE_WINDOW_S = 10.0     # tick-rate averaging window for records_per_s()
-_RECONNECT_DELAY_S = 3.0  # matches live_kalshi_ws's RECONNECT_DELAY_S
-
-# Liquidity-pull hold, the live counterpart of the backtest's
-# latency_arbs_functions.hold_through_wide_spread (same defaults: 3min
-# trailing median, 3x, 300ms settle). Without it one option's momentary
-# spread blowout went straight into Breeden-Litzenberger: measured
-# 2026-10-08 on KXINX's 36 contracts, 98 episodes/min of spread >3x median
-# (p50 125ms), which drove B7737's band to [0.12, 0.53] and moved our quote
-# 20c for a fraction of a second.
-HOLD_BASELINE_S = 180.0
-HOLD_MULTIPLIER = 3.0
-HOLD_SETTLE_S = 0.3
-HOLD_MIN_SAMPLES = 5      # backtest: min_periods=5 grid points
-_SPREAD_SAMPLE_S = 2.0    # one baseline sample per contract per 2s -- the backtest's grid step
+@dataclasses.dataclass(frozen=True)
+class HoldParams:
+    """Liquidity-pull hold, the live counterpart of the backtest's
+    grid_pricing.hold_through_wide_spread. Values come from config."""
+    baseline_s: float
+    multiplier: float
+    settle_s: float
+    min_samples: int
+    sample_s: float
 
 
 class _SpreadHold:
     """Per-contract hold state. The baseline is a trailing median of the
-    spread sampled at most every _SPREAD_SAMPLE_S, so it means the same
-    thing as the backtest's (a median over 2s grid points, not over every
-    raw tick, which would weight busy moments more)."""
+    spread sampled at most every sample_s, so it means the same thing as the
+    backtest's (a median over grid points, not over every raw tick, which
+    would weight busy moments more)."""
     __slots__ = ("samples", "last_sample_t", "held_bid", "held_ask", "calm_since")
 
     def __init__(self):
@@ -64,11 +43,11 @@ class _SpreadHold:
         self.held_ask = np.nan
         self.calm_since: float | None = None
 
-    def baseline(self, now: float) -> float:
-        cutoff = now - HOLD_BASELINE_S
+    def baseline(self, now: float, hp: HoldParams) -> float:
+        cutoff = now - hp.baseline_s
         while self.samples and self.samples[0][0] < cutoff:
             self.samples.popleft()
-        if len(self.samples) < HOLD_MIN_SAMPLES:
+        if len(self.samples) < hp.min_samples:
             return np.nan
         return float(np.median([s for _, s in self.samples]))
 
@@ -80,11 +59,12 @@ class LiveOptionBook:
     without racing an incoming tick.
 
     Stores the HELD bid/ask (see _SpreadHold): while a contract's spread is
-    abnormally wide, or hasn't been continuously normal for HOLD_SETTLE_S,
+    abnormally wide, or hasn't been continuously normal for hold.settle_s,
     it keeps reporting its last normal quote. A one-sided quote is a pull
     too and is held the same way."""
 
-    def __init__(self, call_strikes: np.ndarray, put_strikes: np.ndarray):
+    def __init__(self, call_strikes: np.ndarray, put_strikes: np.ndarray, hold: HoldParams):
+        self.hold = hold
         self.call_strikes = np.asarray(call_strikes, dtype=float)
         self.put_strikes = np.asarray(put_strikes, dtype=float)
         n_c, n_p = len(self.call_strikes), len(self.put_strikes)
@@ -125,21 +105,22 @@ class LiveOptionBook:
     def _apply_hold(self, h: _SpreadHold, bid: float, ask: float, now: float) -> tuple[float, float]:
         two_sided = not (np.isnan(bid) or np.isnan(ask))
         spread = ask - bid if two_sided else np.nan
-        base = h.baseline(now)
+        hp = self.hold
+        base = h.baseline(now, hp)
         # Baseline excludes the current tick, like the backtest's shift(1).
-        if two_sided and now - h.last_sample_t >= _SPREAD_SAMPLE_S:
+        if two_sided and now - h.last_sample_t >= hp.sample_s:
             h.samples.append((now, spread))
             h.last_sample_t = now
         if np.isnan(base):
             # Not enough history to judge -- pass through (backtest does the same).
             h.held_bid, h.held_ask, h.calm_since = bid, ask, now
             return bid, ask
-        anomalous = (not two_sided) or spread > HOLD_MULTIPLIER * base
+        anomalous = (not two_sided) or spread > hp.multiplier * base
         if anomalous:
             h.calm_since = None
         elif h.calm_since is None:
             h.calm_since = now
-        settled = h.calm_since is not None and now - h.calm_since >= HOLD_SETTLE_S
+        settled = h.calm_since is not None and now - h.calm_since >= hp.settle_s
         if settled or np.isnan(h.held_bid):
             h.held_bid, h.held_ask = bid, ask
             return bid, ask
@@ -170,11 +151,11 @@ def _check_budget(event_ticker: str, strikes) -> None:
                          f"{ibf.IB_MARKET_DATA_LINES}-line budget; pass fewer `tickers`")
 
 
-def _rebuild_book(old: "LiveOptionBook | None", contracts) -> "LiveOptionBook":
+def _rebuild_book(old: "LiveOptionBook | None", contracts, hold: HoldParams) -> "LiveOptionBook":
     """Book over `contracts`' strikes, carrying quotes and hold state over
     from `old` for any strike it already had."""
     book = LiveOptionBook(np.asarray(sorted({float(c.strike) for c in contracts if c.right == "C"})),
-                          np.asarray(sorted({float(c.strike) for c in contracts if c.right == "P"})))
+                          np.asarray(sorted({float(c.strike) for c in contracts if c.right == "P"})), hold)
     if old is None:
         return book
     for right, new_idx, old_idx, nb, na, ob, oa in (
@@ -194,11 +175,13 @@ class LiveIBFeed:
     event's bucket boundaries. `tickers` optionally scopes to the ATM
     subset (same convention as the backtest's scoped SPXW cache)."""
 
-    def __init__(self, event_ticker: str, tickers: list[str] | None = None,
-                 client_id: int | None = None):
+    def __init__(self, event_ticker: str, tickers: list[str] | None, *, client_id: int,
+                 hold: HoldParams, reconnect_delay_s: float):
         self.event_ticker = event_ticker
+        self.hold = hold
+        self.reconnect_delay_s = reconnect_delay_s
         self._tickers_arg = tickers
-        self._client_id = keys.IB_CLIENT_ID if client_id is None else client_id
+        self._client_id = client_id
 
         resolved = ibf.resolve_event_strikes(event_ticker, tickers=tickers)
         self.markets = resolved["markets"]
@@ -209,7 +192,7 @@ class LiveIBFeed:
         # Rebuilt in _connect_and_subscribe once we know which strikes IB
         # actually qualified -- a $5 neighbor past the chain's edge may not
         # exist, and the sides can end up with different strike sets.
-        self.book = LiveOptionBook(self._initial_strikes.copy(), self._initial_strikes.copy())
+        self.book = LiveOptionBook(self._initial_strikes.copy(), self._initial_strikes.copy(), hold)
 
         self._ib_mod = ibf._import_ib()
         ibf.quiet_ib_logging()
@@ -240,7 +223,7 @@ class LiveIBFeed:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                print(f"[live_ib_feed] WARN: IB session dropped; reconnecting in {_RECONNECT_DELAY_S}s:")
+                print(f"[ib_feed] WARN: IB session dropped; reconnecting in {self.reconnect_delay_s}s:")
                 traceback.print_exc()
             finally:
                 try:
@@ -253,10 +236,10 @@ class LiveIBFeed:
                 self._subs.clear()
             if self._stop:
                 break
-            await asyncio.sleep(_RECONNECT_DELAY_S)
+            await asyncio.sleep(self.reconnect_delay_s)
 
     async def _connect_and_subscribe(self) -> None:
-        print(f"[live_ib_feed] connecting to IB at {keys.IB_HOST}:{keys.IB_PORT} "
+        print(f"[ib_feed] connecting to IB at {keys.IB_HOST}:{keys.IB_PORT} "
               f"(clientId={self._client_id})")
         await self._ib.connectAsync(
             host=keys.IB_HOST, port=keys.IB_PORT, clientId=self._client_id,
@@ -271,14 +254,14 @@ class LiveIBFeed:
                 f"{self.expiry}. The 0DTE chain may not be listed yet, or "
                 f"the account may lack the OPRA subscription."
             )
-        print(f"[live_ib_feed] IB qualified {len(qualified)}/{2 * len(self._initial_strikes)} "
+        print(f"[ib_feed] IB qualified {len(qualified)}/{2 * len(self._initial_strikes)} "
               f"SPXW contracts for {self.expiry}; subscribing...")
-        self.book = _rebuild_book(None, qualified)
+        self.book = _rebuild_book(None, qualified, self.hold)
         self._subs.clear()
         self._conid_to_slot.clear()
         for c in qualified:
             self._subscribe(c)
-        print(f"[live_ib_feed] subscribed to {len(self._subs)} contracts "
+        print(f"[ib_feed] subscribed to {len(self._subs)} contracts "
               f"({len(self.book.call_strikes)} call strikes, {len(self.book.put_strikes)} put strikes)")
 
     async def _qualify(self, strikes) -> list:
@@ -319,7 +302,7 @@ class LiveIBFeed:
             kept = [c for c, _ in self._subs.values() if float(c.strike) not in drop_strikes]
             for c in new_contracts:
                 self._subscribe(c)
-            self.book = _rebuild_book(self.book, kept + new_contracts)
+            self.book = _rebuild_book(self.book, kept + new_contracts, self.hold)
             for cid in [cid for cid, (c, _) in self._subs.items() if float(c.strike) in drop_strikes]:
                 c, _ = self._subs.pop(cid)
                 self._conid_to_slot.pop(cid, None)
@@ -329,7 +312,7 @@ class LiveIBFeed:
                     pass
             self.scope_tickers = list(tickers)
             self._initial_strikes = want
-            print(f"[live_ib_feed] rescoped: +{len(add)} -{len(drop_strikes)} strikes -> "
+            print(f"[ib_feed] rescoped: +{len(add)} -{len(drop_strikes)} strikes -> "
                   f"{len(self._subs)} contracts ({self.book.call_strikes.min():.0f}-"
                   f"{self.book.call_strikes.max():.0f})")
             return True

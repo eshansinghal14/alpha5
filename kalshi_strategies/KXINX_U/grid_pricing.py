@@ -13,17 +13,14 @@ kalshi_infra/predexon_functions.py -- nothing here makes a network call.
 """
 import datetime
 import os
-import sys
 
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "kalshi_infra"))
-import databento_functions as dbf
-import ib_emulation as ibe
-import predexon_functions as pf
-
-import pricing
+from kalshi_infra import databento_functions as dbf
+from kalshi_infra import predexon_functions as pf
+from kalshi_strategies.KXINX_U import bl_pricing as pricing
+from kalshi_strategies.KXINX_U import ib_emulation as ibe
 
 
 class ComputationAborted(Exception):

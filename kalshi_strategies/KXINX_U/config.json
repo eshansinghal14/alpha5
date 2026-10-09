@@ -1,0 +1,190 @@
+{
+  "KXINX": {
+    "quoting": {
+      "order_size": 1.0,
+      "max_position": 10.0,
+      "constant_edge": 0.01,
+      "edge_fraction": 1.0,
+      "lean_multiplier": 1.0,
+      "lean_dollars": 0.02,
+      "lean_exponent": 2.0,
+      "fair_clip_eps": 0.0,
+      "inflight_timeout_s": 0.5,
+      "take_confirm_s": 0.0,
+      "max_markets": 5,
+      "atm_hysteresis": 2,
+      "enable_quoting": true,
+      "quoting_edge": 0.005,
+      "max_improve_ticks": 1,
+      "requote_improve_ticks": 2.0,
+      "min_quote_life_s": 2.0,
+      "requote_delay_s": 1.0
+    },
+    "fees": {
+      "taker_fee_multiplier": 0.07,
+      "maker_fee_multiplier": 0.0,
+      "taker_fee_edge_multiplier": 1.0
+    },
+    "close": {
+      "last_phase_s": 0.0,
+      "last_phase_max_half_band": null,
+      "last_phase_otm_fair_max": null,
+      "real_trading_cutoff_s": 0.0,
+      "close_buffer_s": 10.0
+    },
+    "risk": {
+      "max_loss_usd": 80.0,
+      "max_signal_age_s": 0.2,
+      "near_expiry_s": 0.0,
+      "max_signal_age_near_expiry_s": 0.2,
+      "fresh_recovery_s": 0.0,
+      "max_book_age_s": 60.0,
+      "shadow_send_s": 0.034,
+      "max_consecutive_order_errors": 5,
+      "bias_threshold": 0.03,
+      "bias_min_markets": 5,
+      "bias_same_side_fraction": 0.8,
+      "max_orders_per_s": 5.0,
+      "order_timeout_s": 5.0
+    },
+    "runtime": {
+      "reprice_interval_s": 0.02,
+      "flush_interval_s": 3.0,
+      "heavy_flush_every": 10,
+      "max_debug_rows": 20000,
+      "audit_interval_s": 5.0,
+      "quote_fill_poll_s": 1.0,
+      "control_poll_s": 1.0,
+      "rollover_poll_s": 300.0,
+      "rollover_fast_poll_s": 300.0,
+      "rollover_fast_window_s": 0.0,
+      "close_check_s": 15.0,
+      "close_grace_s": 60.0
+    },
+    "kalshi_ws": {
+      "resync_interval_s": 900.0,
+      "reconnect_delay_s": 3.0,
+      "recv_timeout_s": 15.0,
+      "open_timeout_s": 15.0
+    },
+    "lip": {
+      "enabled": true,
+      "period_reward_divisor": 10000.0,
+      "snapshots_per_period": 900
+    },
+    "pricing": {
+      "event_suffix": "H1600",
+      "event_open_et": "09:00",
+      "rescope_check_s": 10.0,
+      "round_decimals": 3,
+      "hold_baseline_s": 180.0,
+      "hold_multiplier": 3.0,
+      "hold_settle_s": 0.3,
+      "hold_min_samples": 5,
+      "hold_sample_s": 2.0,
+      "ib_reconnect_delay_s": 3.0,
+      "noise_jump": 0.02,
+      "noise_revert_frac": 0.5,
+      "noise_max_rate": 0.05,
+      "noise_window": 200,
+      "noise_min_samples": 40,
+      "ib_client_id_offset": 0,
+      "scope_margin_buckets": 1,
+      "rescope_drift_buckets": 2
+    }
+  },
+  "KXINXU": {
+    "quoting": {
+      "order_size": 1.0,
+      "max_position": 10.0,
+      "constant_edge": 0.01,
+      "edge_fraction": 1.0,
+      "lean_multiplier": 1.0,
+      "lean_dollars": 0.02,
+      "lean_exponent": 2.0,
+      "fair_clip_eps": 0.0,
+      "inflight_timeout_s": 0.5,
+      "take_confirm_s": 0.0,
+      "max_markets": 5,
+      "atm_hysteresis": 2,
+      "enable_quoting": true,
+      "quoting_edge": 0.005,
+      "max_improve_ticks": 1,
+      "requote_improve_ticks": 2.0,
+      "min_quote_life_s": 2.0,
+      "requote_delay_s": 1.0
+    },
+    "fees": {
+      "taker_fee_multiplier": 0.07,
+      "maker_fee_multiplier": 0.0,
+      "taker_fee_edge_multiplier": 1.0
+    },
+    "close": {
+      "last_phase_s": 0.0,
+      "last_phase_max_half_band": null,
+      "last_phase_otm_fair_max": null,
+      "real_trading_cutoff_s": 0.0,
+      "close_buffer_s": 10.0
+    },
+    "risk": {
+      "max_loss_usd": 80.0,
+      "max_signal_age_s": 0.2,
+      "near_expiry_s": 0.0,
+      "max_signal_age_near_expiry_s": 0.2,
+      "fresh_recovery_s": 0.0,
+      "max_book_age_s": 60.0,
+      "shadow_send_s": 0.034,
+      "max_consecutive_order_errors": 5,
+      "bias_threshold": 0.03,
+      "bias_min_markets": 5,
+      "bias_same_side_fraction": 0.8,
+      "max_orders_per_s": 5.0,
+      "order_timeout_s": 5.0
+    },
+    "runtime": {
+      "reprice_interval_s": 0.02,
+      "flush_interval_s": 3.0,
+      "heavy_flush_every": 10,
+      "max_debug_rows": 20000,
+      "audit_interval_s": 5.0,
+      "quote_fill_poll_s": 1.0,
+      "control_poll_s": 1.0,
+      "rollover_poll_s": 300.0,
+      "rollover_fast_poll_s": 300.0,
+      "rollover_fast_window_s": 0.0,
+      "close_check_s": 15.0,
+      "close_grace_s": 60.0
+    },
+    "kalshi_ws": {
+      "resync_interval_s": 900.0,
+      "reconnect_delay_s": 3.0,
+      "recv_timeout_s": 15.0,
+      "open_timeout_s": 15.0
+    },
+    "lip": {
+      "enabled": true,
+      "period_reward_divisor": 10000.0,
+      "snapshots_per_period": 900
+    },
+    "pricing": {
+      "event_suffix": "H1600",
+      "event_open_et": "09:00",
+      "rescope_check_s": 10.0,
+      "round_decimals": 3,
+      "hold_baseline_s": 180.0,
+      "hold_multiplier": 3.0,
+      "hold_settle_s": 0.3,
+      "hold_min_samples": 5,
+      "hold_sample_s": 2.0,
+      "ib_reconnect_delay_s": 3.0,
+      "noise_jump": 0.02,
+      "noise_revert_frac": 0.5,
+      "noise_max_rate": 0.05,
+      "noise_window": 200,
+      "noise_min_samples": 40,
+      "ib_client_id_offset": 1,
+      "scope_margin_buckets": 4,
+      "rescope_drift_buckets": 3
+    }
+  }
+}

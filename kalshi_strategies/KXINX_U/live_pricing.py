@@ -15,16 +15,9 @@ prob_above_bounds_from_splines directly on a single (1, n_strikes) row is
 already just as correct (those functions were already row-count-agnostic)
 and avoids paying for grid bookkeeping this doesn't need.
 """
-import os
-import sys
-
 import numpy as np
 
-_ARBS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-if _ARBS_DIR not in sys.path:
-    sys.path.insert(0, _ARBS_DIR)
-
-import pricing
+from kalshi_strategies.KXINX_U import bl_pricing as pricing
 
 
 def compute_live_bucket_probs(

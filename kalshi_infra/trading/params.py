@@ -166,7 +166,7 @@ class KalshiWsParams:
 
 
 @section
-class LipParams:
+class LipSettings:
     enabled: bool = param("Measure LIP accrual for markets with an active program.")
     period_reward_divisor: float = param(
         "API period_reward -> dollars. Unit undocumented; centi-cents assumed (200000 -> $20, "

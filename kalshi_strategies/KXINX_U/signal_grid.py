@@ -18,19 +18,13 @@ whole reason this lives in its own file rather than inside either
 strategy's module.
 """
 import datetime
-import os
-import sys
 from collections import deque
 
 import pandas as pd
 
-_INFRA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "kalshi_infra")
-if _INFRA_DIR not in sys.path:
-    sys.path.insert(0, _INFRA_DIR)
-
-import databento_functions as dbf
-import latency_arbs_functions as laf
-import ib_emulation as ibe
+from kalshi_infra import databento_functions as dbf
+from kalshi_strategies.KXINX_U import grid_pricing as laf
+from kalshi_strategies.KXINX_U import ib_emulation as ibe
 
 
 # A Kalshi event may only be priced off options expiring at the same moment.
