@@ -4,7 +4,7 @@ above/below a given level at expiry -- i.e. the option-market-implied
 version of a KXINX bucket probability -- from SPXW 0DTE option quotes:
 
 1. **Model-free (Breeden-Litzenberger)** -- prob_above_finite_diff. Used by
-   latency_arbs_functions.bucket_probabilities. P(S_T > K) = -dC/dK
+   grid_pricing.bucket_probabilities. P(S_T > K) = -dC/dK
    (equivalently 1 - dP/dK from puts), estimated as a discrete finite
    difference of the quoted price-vs-strike curve. No volatility, no
    time-to-expiry, no assumption about how variance accrues through the
@@ -311,7 +311,7 @@ def nan_safe_min_max(vals: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
     NaN is the correct answer for it -- "we have no estimate here", which
     callers already handle by skipping the bucket (see
-    live_signal.compute_live_bucket_probs's own NaN check). This computes
+    live_pricing.compute_live_bucket_probs's own NaN check). This computes
     that explicitly rather than suppressing the warning, so the
     all-NaN-means-unknown contract is visible in the code instead of being
     an incidental property of numpy's reduction behaviour.

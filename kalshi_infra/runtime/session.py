@@ -4,10 +4,14 @@ forever. Series-agnostic -- the series contributes only its config and an
 EventModel (see runtime.series).
 
 Per event:
-    model feeds  ->  model.reprice  ->  FairUpdate dispatch  ->  Quoter  ->  LiveEngine
+    model feeds  ->  wakeup  ->  model.reprice  ->  FairUpdate dispatch  ->  Quoter  ->  LiveEngine
     Kalshi ws    ->  book/trade dispatch (same Quoter, re-evaluates that market)
 plus background loops: config hot-reload, arm/disarm, position audit,
-quote-fill poll, snapshot flush, close watch. All cadences from config.
+quote-fill poll, snapshot flush.
+
+Rollover is scheduled, not polled: Kalshi lists upcoming events with their
+open_time/close_time, so the session sleeps to the next event's start and
+runs each event until its close_time.
 
 Modes: shadow (default) simulates fills; real sends orders. Arming
 reconciles positions against Kalshi first; disarming pulls every quote.
@@ -39,8 +43,22 @@ from kalshi_infra.trading.params import check_strategy_config
 from kalshi_infra.trading.quoter import Quoter
 
 
+FLUSH_INTERVAL_S = 3.0      # summary.json; a heavy flush measured p95 ~640ms (2026-10-09), so not per update
+HEAVY_FLUSH_EVERY = 10      # every Nth flush also rewrites the parquets and chart streams
+MAX_DEBUG_ROWS = 20_000     # heavy-flush cost scales with this; the oldest half is thinned past it
+AUDIT_INTERVAL_S = 5.0
+REPRICE_IDLE_S = 1.0        # reprice even without new inputs, so time decay and withhold states advance
+CLOSE_GRACE_S = 1.0
+NO_EVENT_RETRY_S = 300.0    # nothing listed yet (e.g. KXINX lists the next day's event after the close)
+RETRY_S = 30.0              # failed lookup or failed event
+
+
 def _log(series: str, msg: str):
     print(f"[{series}] {msg}", flush=True)
+
+
+def _now() -> pd.Timestamp:
+    return pd.Timestamp.now(tz="UTC")
 
 
 def _prune(seq: list, cap: int | None):
@@ -61,12 +79,9 @@ async def session_loop(series: Series, *, live_trading: bool, carry_arm: bool,
          + (f" [{series.config_key}]" if series.config_key else ""))
     trading = TradingModeWatcher(series.ticker)
     armed = live_trading
-    last_event = None
-    last_ended = 0.0
+    done: set[str] = set()
+    rolled = False
     while True:
-        rt = store.config.runtime
-        poll_s = (rt.rollover_fast_poll_s if time.monotonic() - last_ended < rt.rollover_fast_window_s
-                  else rt.rollover_poll_s)
         for c in store.poll():
             _log(series.ticker, f"config: {c}")
         for c in store.apply_pending():
@@ -75,32 +90,43 @@ async def session_loop(series: Series, *, live_trading: bool, carry_arm: bool,
             if event_ticker:
                 ev = km.event(event_ticker)
             else:
-                ev = series.pick_event(km.open_events(series.ticker), store.config,
-                                       pd.Timestamp.now(tz="UTC"))
+                listed = [e for e in km.upcoming_events(series.ticker) if e.event_ticker not in done]
+                ev = series.pick_event(listed, store.config)
         except Exception as e:
-            _log(series.ticker, f"event lookup failed ({e!r}); retrying in {poll_s:.0f}s")
-            await asyncio.sleep(poll_s)
+            _log(series.ticker, f"event lookup failed ({e!r}); retrying in {RETRY_S:.0f}s")
+            await asyncio.sleep(RETRY_S)
             continue
-        if ev is None or ev.event_ticker == last_event:
-            await asyncio.sleep(poll_s)
+        if ev is None:
+            _log(series.ticker, f"no upcoming event listed; checking again in {NO_EVENT_RETRY_S:.0f}s")
+            await asyncio.sleep(NO_EVENT_RETRY_S)
             continue
-        last_event = ev.event_ticker
+        start = series.trade_from(ev, store.config)
+        wait_s = 0.0 if start is None else (start - _now()).total_seconds()
+        if wait_s > 0:
+            _log(series.ticker, f"next: {ev.event_ticker}, trading from {start.isoformat()} "
+                                f"(in {wait_s:.0f}s)")
+            # Capped so a config edit or a rescheduled event is picked up on
+            # long waits (KXINX overnight). The re-lookup after the sleep also
+            # refreshes the market list, which can grow before the open.
+            await asyncio.sleep(min(wait_s, NO_EVENT_RETRY_S))
+            continue
+        done.add(ev.event_ticker)
         _log(series.ticker, f"trading {ev.event_ticker}"
-             + ("  (carrying REAL TRADING over)" if armed and carry_arm and last_ended else ""))
+             + ("  (carrying REAL TRADING over)" if armed and carry_arm and rolled else ""))
         try:
             armed = await run_event(series, ev, store, trading, live_trading=armed)
         except asyncio.CancelledError:
             raise
         except Exception:
-            _log(series.ticker, f"{ev.event_ticker} failed; retrying after {rt.rollover_poll_s:.0f}s:")
+            _log(series.ticker, f"{ev.event_ticker} failed; retrying after {RETRY_S:.0f}s:")
             traceback.print_exc()
-            last_event = None
-            await asyncio.sleep(rt.rollover_poll_s)
+            done.discard(ev.event_ticker)
+            await asyncio.sleep(RETRY_S)
             continue
         if event_ticker:
             return
         armed = armed and carry_arm
-        last_ended = time.monotonic()
+        rolled = True
 
 
 async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
@@ -182,15 +208,21 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
         engine.on_trade(ticker, trade, now)
         engine.dispatch(trade, now)
 
-    ws = cfg.kalshi_ws
-    kalshi = LiveKalshiFeed(tickers, on_quote, on_trade, label=S, resync_interval_s=ws.resync_interval_s,
-                            reconnect_delay_s=ws.reconnect_delay_s, recv_timeout_s=ws.recv_timeout_s,
-                            open_timeout_s=ws.open_timeout_s)
+    kalshi = LiveKalshiFeed(tickers, on_quote, on_trade, label=S)
 
     # --- loops ---
+    wake = asyncio.Event()
+    model.set_wakeup(wake.set)
+
     async def reprice_loop():
+        """Reprices as soon as the model has new inputs; a burst that lands
+        during one reprice is coalesced into the next."""
         while True:
-            await asyncio.sleep(cfg.runtime.reprice_interval_s)
+            try:
+                await asyncio.wait_for(wake.wait(), REPRICE_IDLE_S)
+            except asyncio.TimeoutError:
+                pass
+            wake.clear()
             try:
                 t0 = time.perf_counter()
                 fairs = model.reprice(time.time())
@@ -235,7 +267,7 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
     async def audit_loop():
         """The one guard that uses Kalshi's own positions instead of our ledger."""
         while True:
-            await asyncio.sleep(cfg.runtime.audit_interval_s)
+            await asyncio.sleep(AUDIT_INTERVAL_S)
             if not engine.live_trading:
                 continue
             try:
@@ -310,7 +342,7 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
 
     async def flush_loop():
         while True:
-            await asyncio.sleep(cfg.runtime.flush_interval_s)
+            await asyncio.sleep(FLUSH_INTERVAL_S)
             now = pd.Timestamp.now(tz="UTC")
             engine.check_failsafe()
             blocked = engine.blocked_reason()
@@ -325,23 +357,22 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
                 if f is not None:
                     pnl_by_ticker.setdefault(t, collections.deque(maxlen=4000)).append(
                         (now, pos.unrealized_pnl(f.prob, f.prob)))
-            _prune(quoter.debug_log, cfg.runtime.max_debug_rows)
-            _prune(fair_history, cfg.runtime.max_debug_rows)
+            _prune(quoter.debug_log, MAX_DEBUG_ROWS)
+            _prune(fair_history, MAX_DEBUG_ROWS)
             if flush_busy[0]:
                 continue   # overwrite-in-place: skipping beats queueing
             flush_n[0] += 1
             # Heavy on the first flush so the dashboard finds every file at once.
-            state = _snapshot(heavy=(flush_n[0] % cfg.runtime.heavy_flush_every == 1
-                                     or cfg.runtime.heavy_flush_every == 1), now=now)
+            state = _snapshot(heavy=flush_n[0] % HEAVY_FLUSH_EVERY == 1, now=now)
             flush_busy[0] = True
             asyncio.get_running_loop().run_in_executor(None, _write, state).add_done_callback(_done)
 
     async def until_close():
-        while True:
-            await asyncio.sleep(cfg.runtime.close_check_s)
-            rem = remaining_s()
-            if rem is not None and rem <= -cfg.runtime.close_grace_s:
-                return
+        if ev.close_time is None:
+            raise RuntimeError(f"{ev.event_ticker}: Kalshi lists no close_time")
+        # Re-armed each pass in case the clock jumps (sleep is monotonic).
+        while (rem := remaining_s()) > -CLOSE_GRACE_S:
+            await asyncio.sleep(rem + CLOSE_GRACE_S)
 
     _log(S, f"starting feeds for {ev.event_ticker} ({len(tickers)} markets, "
             f"{'REAL ORDERS' if engine.live_trading else 'shadow'})")

@@ -1,7 +1,7 @@
 """
 Databento API functions -- tick-level (cmbp-1 top-of-book) historical S&P 500
 options quotes, via the OPRA.PILLAR dataset. Used to compare against Kalshi
-KXINX range-market BBO in kalshi_latency_arbs (does Kalshi's quote lag the
+KXINX range-market BBO in kalshi_strategies/KXINX_U (does Kalshi's quote lag the
 options-implied probability, or vice versa?).
 
 Schema is "cmbp-1", not the plain "mbp-1" used on single-venue datasets like
@@ -571,7 +571,7 @@ def bracket_listed_strikes(boundaries: set[float], listed_strikes: list[float]) 
     fetched here. `listed_strikes` must already be sorted ascending.
     Shared by load_kxinx_event_option_quotes (historical SPXW) and by
     the live feed's own subscription-symbol selection
-    (kalshi_latency_arbs/live/live_ib_feed.py) -- identical
+    (kalshi_strategies/KXINX_U/ib_feed.py) -- identical
     bracket-selection logic regardless of whether the caller then fetches
     historical ticks or subscribes live."""
     wanted = set()
@@ -690,7 +690,7 @@ def load_kxinx_event_option_quotes(
     close_time.
 
     The nearest strike plus its immediate listed-strike neighbors on both
-    sides (typically $5 apart) -- pricing (latency_arbs_functions.
+    sides (typically $5 apart) -- pricing (grid_pricing.
     bucket_probabilities) is model-free, a discrete finite difference of
     the quoted price-vs-strike curve, so it needs tight, actually-adjacent
     strikes to differentiate against, not a coarser bracket 2-3 boundaries

@@ -1,4 +1,6 @@
-"""Full-engine parity: legacy SPOptionsLagQuotingStrategy (from the
+"""Reference-only: compares against the pre-reorg code in the alpha5_legacy git
+worktree (commit 0a82f3c; recreate with `git worktree add ../alpha5_legacy 0a82f3c`).
+Full-engine parity: legacy SPOptionsLagQuotingStrategy (from the
 alpha5_legacy worktree) vs the new Quoter, same cached day, same engine.
 
     python kalshi_infra/tests/parity/backtest_spx_parity.py KXINX-26AUG27H1600

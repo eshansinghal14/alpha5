@@ -27,7 +27,7 @@ their visible time (to wake the strategy, since finding out a trade printed
 is itself delayed by wire_s like any other market data).
 
 Cancellation (ctx.cancel(order_id), for a strategy that requotes -- e.g.
-kalshi_latency_arbs/spxw_kxinx/sp_options_lag_quoting.py) reuses the exact same
+kalshi_infra/trading/quoter.py) reuses the exact same
 send_s + measured-processing-time latency and arrival-time formula as a new
 order (see BacktestContext.cancel/'cancel_arrival' below): a cancel is just
 another message to the exchange, equally subject to the round-trip. A
@@ -381,7 +381,7 @@ class Backtest:
                     # A take that is no longer marketable on arrival EXPIRES --
                     # it does not rest. Live sends every take
                     # time_in_force="immediate_or_cancel" (see
-                    # live_orders.place_ioc), so an unfilled take simply never
+                    # kalshi.orders.place_ioc), so an unfilled take simply never
                     # exists there; resting it here invented an order live
                     # could not have.
                     #

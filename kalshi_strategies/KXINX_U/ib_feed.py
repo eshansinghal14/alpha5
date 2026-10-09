@@ -207,6 +207,7 @@ class LiveIBFeed:
         self._last_tick_t = time.monotonic()
         self._last_apply_t = time.monotonic()
         self._pending: list[tuple[float, str, float, float, float]] = []
+        self.on_tick_hook = None    # called after each queued tick (the runtime's reprice wakeup)
 
         self._connected = False
         self._stop = False
@@ -331,6 +332,8 @@ class LiveIBFeed:
         self._pending.append((strike, right, ticker.bid, ticker.ask, now))
         self._tick_times.append(now)
         self._last_tick_t = now
+        if self.on_tick_hook is not None:
+            self.on_tick_hook()
 
     def drain(self) -> int:
         """Apply pending ticks to the book. Returns N applied (not N

@@ -20,14 +20,39 @@ class EventInfo:
     markets: list[dict]
 
 
+def _markets(series: str, status: str) -> list[dict]:
+    out, cursor = [], None
+    while True:
+        params = {"series_ticker": series, "status": status, "limit": 1000}
+        if cursor:
+            params["cursor"] = cursor
+        data = kalshi_get("/trade-api/v2/markets", params=params)
+        batch = data.get("markets", [])
+        out.extend(batch)
+        cursor = data.get("cursor")
+        if not cursor or not batch:
+            return out
+
+
 def open_events(series: str) -> list[EventInfo]:
-    """Open events of `series`, soonest close first. Kalshi keeps a market
-    "open" for a few seconds past close_time, so already-closed events are
-    dropped here -- otherwise a just-ended event is picked again at rollover."""
-    data = kalshi_get("/trade-api/v2/markets",
-                      params={"series_ticker": series, "status": "open", "limit": 1000})
+    """Open events of `series`, soonest close first."""
+    return _group(_markets(series, "open"))
+
+
+def upcoming_events(series: str) -> list[EventInfo]:
+    """Open and listed-but-unopened events, soonest close first. Each
+    carries Kalshi's scheduled open_time/close_time, so the session can
+    sleep to the next open instead of polling for it. The API takes one
+    status per call (a comma list is a 400)."""
+    return _group(_markets(series, "open") + _markets(series, "unopened"))
+
+
+def _group(markets: list[dict]) -> list[EventInfo]:
+    """Kalshi keeps a market "open" for a few seconds past close_time, so
+    already-closed events are dropped -- otherwise a just-ended event is
+    picked again at rollover."""
     by_event: dict[str, list[dict]] = {}
-    for m in data.get("markets", []):
+    for m in markets:
         by_event.setdefault(m["event_ticker"], []).append(m)
     now = pd.Timestamp.now(tz="UTC")
     out = []

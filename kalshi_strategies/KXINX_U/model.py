@@ -112,6 +112,9 @@ class SpxEventModel:
         self._last_ok_mono = time.monotonic()
         return out
 
+    def set_wakeup(self, fn):
+        self.ib.on_tick_hook = fn
+
     def on_market_event(self, ticker, now_s):
         return None
 

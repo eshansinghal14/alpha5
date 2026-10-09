@@ -1,19 +1,16 @@
 """
-Markout analysis for sp_options_lag_quoting.py: for every real fill the
-strategy took, marks its P&L against the Kalshi market's own mid price
-`MARKOUT_WINDOW_S` seconds later -- a standard "did we get picked off"
-diagnostic for a take-only strategy (see sp_options_lag_quoting.py's module
-docstring for why it's take-only: every fill is a taker cross by
-construction, so markout is exactly the question "was the edge we thought
-we saw at fill time still real a bit later, or did the market immediately
-prove us wrong").
+Markout analysis for the KXINX/KXINXU backtest: for every fill, marks its
+P&L against the Kalshi market's own mid price `MARKOUT_WINDOW_S` seconds
+later -- the standard "did we get picked off" diagnostic: was the edge we
+thought we saw at fill time still real a bit later, or did the market
+immediately prove us wrong.
 
 Plots the N worst `MARKOUT_WINDOW_S`-second markouts (10 minutes by
 default): the fills that, in hindsight, look most like we traded right
 before the market moved hard against the side we just took. Each plot
 overlays BOTH of this strategy's two price sources -- Kalshi's own BBO
 (bid/ask band + mid) and the SPXW option-implied probability + its
-confidence band (from latency_arbs_functions.bucket_probabilities_ci via
+confidence band (from grid_pricing.bucket_probabilities_ci via
 precompute_atm_signal) -- around the fill, since the whole strategy thesis
 is that the option side leads Kalshi's own quote; a bad markout plot is the
 direct, visual way to see whether that lead actually existed at the moment
@@ -40,18 +37,15 @@ Also plots, across the whole session:
     rather than a lone PNG -- the trades most responsible for the session's
     worst drawdown points, right alongside the chart that shows them.
 
-All plots for a given event_ticker land in analysis/{event_ticker}/ (see
+All plots for a given event_ticker land in analysis_outputs/{event_ticker}/ (see
 day_dir) -- one folder per backtest day, not ticker-suffixed flat files.
 generate_day_plots() produces the always-on set (position_over_day.png,
-pnl_over_day.png, drawdown.pdf) and is called automatically by
-run_backtest.run_one() after every backtest run (see its `auto_plot` param)
--- so a plain backtest leaves a visual record without a separate manual
-step. Standalone per-trade markout PNGs (plot_worst_markouts) and a
+pnl_over_day.png, drawdown.pdf). Standalone per-trade markout PNGs (plot_worst_markouts) and a
 standalone drawdown PNG (plot_drawdown) remain available for callers who
 want those specifically instead of the combined PDF.
 
-Usage (from this folder, or with it on sys.path):
-    python markout_analysis.py [event_ticker ...] [n]
+Usage:
+    python -m kalshi_strategies.KXINX_U.backtest.markout_analysis [event_ticker ...] [n]
 Defaults to KXINX-26AUG18H1600, n=5. One or more event tickers may be
 passed (one full run per ticker); a trailing all-digit argument is read as
 n instead of a ticker.
@@ -59,22 +53,14 @@ n instead of a ticker.
 import os
 import sys
 
-_ANALYSIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_STRATEGY_DIR = os.path.join(_ANALYSIS_DIR, "..")
-_BACKTEST_DIR = os.path.join(_STRATEGY_DIR, "..", "..", "kalshi_backtest")
-for _p in (_STRATEGY_DIR, _BACKTEST_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import pandas as pd
 from matplotlib.backends.backend_pdf import PdfPages
 
-import data
-import engine
-import results
-import sp_options_lag_quoting as strat
+from kalshi_backtest import data, results
+
+_ANALYSIS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "analysis_outputs")
 
 # ---- house palette, matching kalshi_quoting_arbs/quoting_arb_lib.py ----
 PLOT_BG = "#fcfcfb"
@@ -607,7 +593,7 @@ def day_dir(event_ticker: str) -> str:
 
 
 def generate_day_plots(result, event_data, event_ticker: str, signal_events: list[tuple] | None = None,
-                        config: "strat.QuotingConfig | None" = None,
+                        max_position: float | None = None,
                         out_dir: str | None = None, n_worst_markouts: int = 5,
                         prob_grid: pd.DataFrame | None = None) -> dict[str, str | None]:
     """The plots every backtest run should leave behind, automatically:
@@ -631,7 +617,6 @@ def generate_day_plots(result, event_data, event_ticker: str, signal_events: lis
     if out_dir is None:
         out_dir = day_dir(event_ticker)
     os.makedirs(out_dir, exist_ok=True)
-    max_position = config.max_position if config is not None else None
 
     position_path = plot_position_over_day(
         result, event_ticker, max_position=max_position,
@@ -647,13 +632,11 @@ def generate_day_plots(result, event_data, event_ticker: str, signal_events: lis
 
 
 def main(event_ticker: str, n: int = 5):
-    config = strat.QuotingConfig()
+    from kalshi_strategies.KXINX_U import signal_grid
+    from kalshi_strategies.KXINX_U.backtest.run_backtest import run_one
+    result, quoter, probs_mid = run_one(event_ticker, verbose=False)
     event_data = data.load_event_data(event_ticker)
-    markets, signal_events, _grid, _lo, probs_mid, _hi = strat.precompute_signal(
-        event_ticker, return_grid=True)
-    strategy = strat.SPOptionsLagQuotingStrategy(config)
-    bt = engine.Backtest()
-    result = bt.run(strategy.__call__, event_ticker, event_data=event_data, external_events=signal_events)
+    _m, signal_events = signal_grid.precompute_signal(event_ticker)
 
     out_dir = day_dir(event_ticker)
 
@@ -669,7 +652,8 @@ def main(event_ticker: str, n: int = 5):
     # see generate_day_plots's docstring. No separate plot_worst_markouts
     # call here: its PNGs would just duplicate the PDF's own pages.
     generate_day_plots(result, event_data, event_ticker, signal_events=signal_events,
-                        config=config, out_dir=out_dir, n_worst_markouts=n, prob_grid=probs_mid)
+                        max_position=quoter.cfg.quoting.max_position, out_dir=out_dir,
+                        n_worst_markouts=n, prob_grid=probs_mid)
 
 
 if __name__ == "__main__":

@@ -26,7 +26,7 @@ from kalshi_strategies.KXINX_U import ib_emulation as ibe
 class ComputationAborted(Exception):
     """Raised by bucket_probabilities_ci (via its optional `should_abort`
     callback) when a caller has signaled this computation is no longer
-    wanted partway through -- e.g. viz/data_loader.py's dashboard, where
+    wanted partway through -- e.g. kalshi_viz's dashboard, where
     switching to a different day mid-load left the OLD day's ~6-fit
     pricing pass (confirmed directly: tens of seconds to low minutes)
     running to completion in the background for a result nobody would
@@ -63,7 +63,7 @@ def load_event(event_ticker: str, underlying: str = "SPXW", tickers: list[str] =
 
     Pass include_kalshi_ticks=False to skip the Predexon orderbook fetch/read
     entirely (no live call, no cache read) -- for a caller (e.g.
-    sp_options_lag_quoting.precompute_atm_signal) that never actually reads
+    signal_grid.precompute_atm_signal) that never actually reads
     `kalshi_ticks` and wants zero Predexon involvement, not just a cached
     one.
     """
@@ -370,7 +370,7 @@ def bucket_probabilities_ci(
     returns True, instead of running the remaining (wasted) fits to
     completion. None (the default) skips these checks entirely, so every
     existing caller that doesn't pass it is completely unaffected. See
-    viz/data_loader.py for the one caller that does, and
+    kalshi_viz for the one caller that does, and
     ComputationAborted's own docstring for why.
 
     Returns (probs_lo, probs, probs_hi). `probs` matches

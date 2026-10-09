@@ -79,6 +79,24 @@ class CoinRaceModel:
         self._last_delta_s = 0.0
         self._newest_mono = 0.0     # oldest coin's newest book under the current fair
         self._down: list[str] = list(COINS)
+        self._wake = None
+        # A mid has moved since the last _price, so the fair lags its inputs.
+        self._dirty = True
+
+    def set_wakeup(self, fn):
+        self._wake = fn
+
+    def _on_book(self, vb):
+        """Coinbase callback. Wakes the reprice only when the coin's mid
+        moves: level2 sends ~64 msg/s across the five coins but the mid
+        changes ~4.6/s (2026-10-09), and the mid is the only per-message
+        input to pricing."""
+        before = self.bus.mid_nowcast(vb.coin) if vb.coin in self.bus.feeds else None
+        self.bus.observe(vb)
+        if self.bus.mid_nowcast(vb.coin) != before:
+            self._dirty = True
+            if self._wake is not None:
+                self._wake()
 
     # --- warmup -----------------------------------------------------------
 
@@ -169,6 +187,7 @@ class CoinRaceModel:
         if compute_delta:
             self._last_delta_s = now_s
         self._newest_mono = min(newest)
+        self._dirty = False
         self.withheld_reason = None
         k = p.ci_vol_multiplier
         out = {}
@@ -195,8 +214,18 @@ class CoinRaceModel:
         return self._price(now_s, False)
 
     def signal_age_s(self):
+        """Age of the oldest coin's data under the current fair. While no mid
+        has moved since the fair was computed, the fair is still exact, so
+        the age follows the books' live freshness (advanced by every message
+        on the connection) instead of freezing at the last reprice."""
         if self.result is None or self._newest_mono <= 0:
             return None
+        if not self._dirty:
+            books = self.bus.venue_books_per_coin()
+            live = [max((vb.receive_ts for vb in books.get(c, []) if not vb.is_resyncing), default=0.0)
+                    for c in COINS]
+            if min(live) > 0:
+                return time.monotonic() - min(live)
         return time.monotonic() - self._newest_mono
 
     def feed_age_s(self):
@@ -226,7 +255,7 @@ class CoinRaceModel:
     def feed_tasks(self):
         tasks = [self._sample_loop(), self._flush_loop()]
         if self.coinbase is not None:
-            tasks.append(self.coinbase.run(self.bus.observe))
+            tasks.append(self.coinbase.run(self._on_book))
         return tasks
 
     async def _sample_loop(self):

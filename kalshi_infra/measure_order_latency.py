@@ -98,7 +98,7 @@ DEFAULT_MAX_SPREAD = 0.10
 
 def current_event_ticker(series: str = "KXINX") -> str:
     """The open `series` event closing soonest -- the hourly bucket actually
-    trading right now. Same rule as kalshi_latency_arbs/live/run_live.py's
+    trading right now. Same rule as kalshi_infra/runtime/session.py's
     resolve_live_event_ticker (duplicated rather than imported to keep this
     diagnostic standalone/dependency-free w.r.t. the strategy package)."""
     data = af.kalshi_get("/trade-api/v2/markets",

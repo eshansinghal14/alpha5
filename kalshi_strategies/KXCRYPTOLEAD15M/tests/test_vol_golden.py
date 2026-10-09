@@ -1,5 +1,5 @@
 """
-Golden cases from rv_modeling/vol_fix_reference (Oct 1 2026, 10:00-12:00
+Golden cases from research/vol_fix_reference (Oct 1 2026, 10:00-12:00
 UTC Coinbase mids): our online RobustHarForecaster must reproduce the
 reference features and rates to ~1e-6, and CoinRacePricer the reference
 fairs (200k t5 draws) to within MC tolerance, given the same inputs.

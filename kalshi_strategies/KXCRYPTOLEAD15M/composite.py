@@ -213,7 +213,7 @@ class CompositeFeed:
                         os.replace(path, quarantine)
                     except OSError:
                         pass
-                    print(f"[kalshi_crypto] composite: {path.name} unreadable "
+                    print(f"[KXCRYPTOLEAD15M] composite: {path.name} unreadable "
                           f"({e!r}); quarantined to {quarantine.name}, "
                           f"starting a fresh file")
             tmp = path.with_suffix(f".tmp-{os.getpid()}.parquet")

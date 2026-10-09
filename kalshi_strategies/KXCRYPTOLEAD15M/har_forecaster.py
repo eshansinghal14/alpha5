@@ -3,11 +3,11 @@ SUPERSEDED by robust_har.RobustHarForecaster (not wired into live or
 backtest). Kept for its tests and as the record of the first fit: raw 1 s
 features, a fixed 60s/300s/900s coefficient set and a hard-coded HYPE 1.13
 scale, which on the CF-replica composite over-forecast every coin and HYPE
-~16x (rv_modeling/vol_fix_reference/README.md).
+~16x (research/vol_fix_reference/README.md).
 
 HAR-based realized-vol forecaster for the Coin Race pricer.
 
-Model (from kalshi_crypto/rv_modeling/Realized-Vol Model for Kalshi Coin
+Model (from kalshi_strategies/KXCRYPTOLEAD15M/research/Realized-Vol Model for Kalshi Coin
 Race.ipynb, §7, pooled across coins):
 
     log sigma^2_h = a_h + b_1m * log RV_1m + b_15m * log RV_15m + b_1h * log RV_1h
@@ -16,13 +16,13 @@ Race.ipynb, §7, pooled across coins):
 Two modes:
 
 1. **Fitted mode (preferred).** Load the artifact produced by
-   `kalshi_crypto/rv_modeling/fit_har.py`:
+   `kalshi_strategies/KXCRYPTOLEAD15M/research/fit_har.py`:
 
        intercept[h], feature_mean[h], slopes[h], coin_scale[coin]
 
    This reproduces the notebook's exact fit on 113,760 training rows.
    The forecaster reads the artifact at construction; file lives at
-   `kalshi_crypto/rv_modeling/har_fit.json`.
+   `kalshi_strategies/KXCRYPTOLEAD15M/research/har_fit.json`.
 
 2. **Fixed-point mode (fallback).** When the artifact is missing, pin
    the intercept so that in a steady-state regime where
@@ -253,7 +253,7 @@ class HarCovarianceForecaster(CovarianceForecaster):
     usual.
 
     By default loads the fitted artifact at
-    `kalshi_crypto/rv_modeling/har_fit.json`; falls back to fixed-point
+    `kalshi_strategies/KXCRYPTOLEAD15M/research/har_fit.json`; falls back to fixed-point
     mode if it's missing. Pass `fit_artifact=None, force_fallback=True`
     to force fixed-point for tests.
     """

@@ -11,7 +11,8 @@ import os
 import sys
 
 
-from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed.coinbase import _ProductBook, MAX_BOOK_LEVELS
+from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed.coinbase import (CoinbaseAdapter, _ProductBook,
+                                                                  MAX_BOOK_LEVELS)
 
 
 def _emit(pb):
@@ -104,6 +105,20 @@ def test_emitted_book_is_depth_capped_but_keeps_the_touch():
     assert vb.asks[0].price < vb.asks[-1].price
     # Raw dict keeps every level for future updates.
     assert len(pb.bids) == n and len(pb.asks) == n
+
+
+def test_any_message_freshens_every_synced_book():
+    """A quiet product's book is current as long as the shared connection
+    is delivering; the view the composite holds must see that too."""
+    ad = CoinbaseAdapter(coins=["BTC", "HYPE"])
+    for c in ("BTC", "HYPE"):
+        ad._books[c].apply_snapshot(bids=[(1.0, 1)], asks=[(1.1, 1)])
+        ad._books[c].last_receive_ts = 1.0
+    held = ad.latest("HYPE")
+    ad._books["BTC"].is_resyncing = True
+    ad._mark_fresh(9.0)
+    assert ad._books["HYPE"].last_receive_ts == 9.0 and held.receive_ts == 9.0
+    assert ad._books["BTC"].last_receive_ts == 1.0   # resyncing: not vouched for
 
 
 def test_custom_max_levels_param():

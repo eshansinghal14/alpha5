@@ -60,12 +60,16 @@ def test_describe():
     assert names["inner.cap"]["nullable"] and names["inner.scope"]["apply"] == APPLY_NEXT_EVENT
 
 
+_MTIME = [time.time()]
+
+
 def _write(path, doc):
     with open(path, "w") as fh:
         json.dump(doc, fh)
-    # Filesystem mtime resolution: make sure the store sees a change.
-    t = time.time() + 2
-    os.utime(path, (t, t))
+    # Strictly increasing mtimes: the store only reloads on a newer mtime, and
+    # two writes in one filesystem tick would otherwise look identical.
+    _MTIME[0] += 2
+    os.utime(path, (_MTIME[0], _MTIME[0]))
 
 
 def test_store_live_pending_and_reject(tmp_path):

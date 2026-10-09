@@ -1,6 +1,51 @@
 # Change log
 
-Reverse chronological. One section per material change.
+Reverse chronological. One section per material change. Entries before
+2026-10-09 name paths that no longer exist (see the reorg entry).
+
+## 2026-10-09 — Reorg: kalshi_strategies + generic runtime + kalshi_viz
+
+**Layout.** `kalshi_crypto/`, `kalshi_latency_arbs/`, `kalshi_main/` and
+`viz/` are removed. Pricing lives in `kalshi_strategies/<FOLDER>/`
+(`KXINX_U` serves KXINX and KXINXU; `KXCRYPTOLEAD15M`); everything else is
+shared in `kalshi_infra/` (`kalshi/`, `trading/`, `runtime/`). One launcher:
+`python -m kalshi_strategies.run --series ...`. One dashboard:
+`streamlit run kalshi_viz/app.py`. All code is packages imported from the
+repo root (no `sys.path` inserts); loose `kalshi_infra` scripts now run as
+`python -m kalshi_infra.<script>`. See [live-trading.md](live-trading.md)
+and [adding-a-strategy.md](adding-a-strategy.md).
+
+**Config.** `config_override.json` and CLI tuning flags are gone. Each
+strategy folder has a tracked `config.json`, loaded strictly with no code
+defaults, edited by the dashboard and hot-reloaded (live fields now,
+`next_event` fields at rollover).
+
+**From Kalshi instead of config:**
+- Fees, per event (series fee type/multiplier + event overrides). Measured
+  on this account: 216 KXINX/KXINXU taker fills → 0.07·p(1−p); 10
+  KXCRYPTOLEAD15M maker fills → 0. **Crypto taker fee changed from 1.0 to
+  0.07·p(1−p):** the old crypto code read Kalshi's "multiplier 1" as the
+  rate itself, so it demanded ~14× the real fee before taking.
+- LIP program terms (target, discount, reward in centi-cents, period
+  length, per-account cap).
+- Write-rate budget (`/account/limits`), split evenly across running series.
+
+**One quoter for every series** (`trading/quoter.py`). Replay against the
+old SPX strategy: identical orders and fills on 150k recorded decisions per
+series and on full backtest days (KXINX/KXINXU-26AUG27H1600). Behaviour
+choices: SPX lean formula for both; `take_confirm_s` and
+`min_quote_life_s` per series (crypto 0.75 / 0, SPX 0 / 2.0).
+
+**New: LIP-farming quote** (`lip.lip_lots`, `prop_max_lip`,
+`lip_min_depth_ahead`), separate from the edge quote (`quoting.order_lots`,
+renamed from `quote_size`/`lot_size`). See live-trading.md § Quoting.
+
+**Removed:** the crypto last-phase pull rules, the 10s pre-close order
+stop, the near-expiry signal-age limit, the ladder-wide bias halt, and the
+fees / most close / most risk parameters. Shadow send latency (34ms
+measured) and the 5-error breaker are now fixed constants.
+
+**Rollback:** commit `0a82f3c` is the full pre-reorg tree.
 
 ## 2026-10-08 — Quote churn, IB scope, shadow fills
 

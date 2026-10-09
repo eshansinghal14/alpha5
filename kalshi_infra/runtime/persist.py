@@ -3,9 +3,9 @@ Snapshot writer: the hand-off from a running session to kalshi_viz.
 
 Layout (shared by every series; the dashboard knows no series specifics):
 
-    data/live/{series}/{date}/summary.json        every flush_interval_s
+    data/live/{series}/{date}/summary.json        every session.FLUSH_INTERVAL_S
     data/live/{series}/{date}/quote_df.parquet    decision log      } every
-    data/live/{series}/{date}/fills_df.parquet                      } heavy_flush_every
+    data/live/{series}/{date}/fills_df.parquet                      } HEAVY_FLUSH_EVERY
     data/live/{series}/{date}/pnl_df.parquet      session PnL curve } flushes
     data/live/{series}/{date}/fair_df.parquet     fair history      }
     kalshi_viz/static/{series}/{ticker}.json      per-market chart feed

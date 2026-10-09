@@ -7,14 +7,27 @@ here.
 
 ## Index
 
+- [`live-trading.md`](live-trading.md) — how a live session works: layout,
+  config, what comes from Kalshi, modes, guards, quoting (edge + LIP
+  quotes), rate limit, rollover.
+- [`adding-a-strategy.md`](adding-a-strategy.md) — the contract a new
+  `kalshi_strategies/<FOLDER>` implements.
 - [`CHANGES.md`](CHANGES.md) — reverse-chronological change log. Add
   one dated section per material change; keep entries short, link to
   deeper write-ups here.
 - [`ib-migration.md`](ib-migration.md) — switch of the live options
   stream from Databento ES-daily to IB SPXW (2026-10-05). Live-feed
   architecture, IB contract spec, line budget.
-- [`live-trading.md`](live-trading.md) — overall run_live architecture:
-  guards, modes, rollover, dashboard integration.
+
+## Quick start
+
+```
+python -m kalshi_strategies.run --series KXINX KXINXU KXCRYPTOLEAD15M   # shadow
+streamlit run kalshi_viz/app.py
+python -m pytest kalshi_infra/tests kalshi_strategies -q
+```
+
+All commands run from the repo root.
 
 ## Adding a doc
 

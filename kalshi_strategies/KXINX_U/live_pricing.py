@@ -1,9 +1,9 @@
 """
-Live, single-snapshot counterpart to latency_arbs_functions.bucket_probabilities_ci
+Live, single-snapshot counterpart to grid_pricing.bucket_probabilities_ci
 -- same Breeden-Litzenberger math, same floor/cap combination arithmetic
 (transcribed verbatim below), but evaluated against ONE current live
 quote snapshot instead of a whole day's precomputed grid. Pure
-computation, no I/O: callers (live_ib_feed.py) own the actual
+computation, no I/O: callers (ib_feed.py) own the actual
 network/state-tracking side.
 
 Deliberately NOT bucket_probabilities_ci itself: that function's

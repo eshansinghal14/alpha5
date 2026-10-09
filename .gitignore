@@ -9,7 +9,6 @@ kalshi_infra/kalshi-ws-keypair.pem
 kalshi_infra/logs/
 kalshi_infra/*_log.txt
 data/
-viz/static/live_*.json
 kalshi_viz/static/
 __pycache__/
 .venv/

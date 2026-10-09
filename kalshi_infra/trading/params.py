@@ -89,34 +89,10 @@ class RiskParams:
 
 @section
 class RuntimeParams:
-    reprice_interval_s: float = param("Pricing loop cadence.", min=0.005, step=0.01, apply=APPLY_NEXT_EVENT)
-    flush_interval_s: float = param("summary.json cadence (dashboard poll).", min=0.5, step=0.5)
-    heavy_flush_every: int = param("Every Nth flush also rewrites the parquet/chart files.", min=1, step=1)
-    max_debug_rows: int | None = param(
-        "In-memory decision log cap; oldest half is thinned past it (null = unbounded).", min=1000, step=1000)
-    audit_interval_s: float = param("Position audit against Kalshi while armed.", min=1, step=1)
     quote_fill_poll_s: float = param(
         "Fills-endpoint poll for resting quotes; must stay within the audit's one-interval "
         "tolerance for resting size.", min=0.2, step=0.1)
     control_poll_s: float = param("config.json / trading_mode.json poll.", min=0.2, step=0.1)
-    rollover_poll_s: float = param("Idle poll for the next event.", min=1, step=5)
-    rollover_fast_poll_s: float = param("Poll right after an event ends.", min=0.5, step=0.5)
-    rollover_fast_window_s: float = param("How long after an event ends the fast poll applies.",
-                                          min=0, step=10)
-    close_check_s: float = param("How often to check whether the event has closed.", min=0.5, step=0.5)
-    close_grace_s: float = param("Keep running this long after close so the final snapshot lands.",
-                                 min=0, step=1)
-
-
-@section
-class KalshiWsParams:
-    resync_interval_s: float = param(
-        "Reconnect this often for fresh snapshots (deltas drift; must stay < 1800s book age guard).",
-        min=60, max=1799, step=60, apply=APPLY_NEXT_EVENT)
-    reconnect_delay_s: float = param("Pause before reconnecting.", min=0.1, step=0.5, apply=APPLY_NEXT_EVENT)
-    recv_timeout_s: float = param("recv() wait before re-checking the resync timer.", min=1, step=1,
-                                  apply=APPLY_NEXT_EVENT)
-    open_timeout_s: float = param("Websocket connect timeout.", min=1, step=1, apply=APPLY_NEXT_EVENT)
 
 
 @section
@@ -137,7 +113,7 @@ class LipSettings:
         "first, ahead of every other order.", min=0, step=10.0)
 
 
-SHARED_SECTIONS = ("quoting", "close", "risk", "runtime", "kalshi_ws", "lip")
+SHARED_SECTIONS = ("quoting", "close", "risk", "runtime", "lip")
 
 
 def check_strategy_config(cfg) -> None:

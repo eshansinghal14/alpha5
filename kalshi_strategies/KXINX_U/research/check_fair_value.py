@@ -8,28 +8,24 @@ F = K + C - P per strike, which should agree across strikes if the
 option book is coherent.
 
 Usage:
-    python check_fair_value.py --series KXINX [--seconds 60] [--interval-s 5]
+    python -m kalshi_strategies.KXINX_U.research.check_fair_value --series KXINX [--seconds 60]
 """
 import argparse
 import asyncio
-import os
 import statistics
-import sys
 
 import numpy as np
+import pandas as pd
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in (os.path.join(_HERE, ".."), os.path.join(_HERE, "..", "..", "kalshi_infra"), _HERE):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-import databento_functions as dbf
-import ib_functions as ibf
-import keys
-from api_functions import kalshi_get
-from live_ib_feed import LiveIBFeed
-from live_signal import compute_live_bucket_probs
-from run_live import resolve_live_event_ticker
+from kalshi_infra import databento_functions as dbf
+from kalshi_infra import keys
+from kalshi_infra.api_functions import kalshi_get
+from kalshi_infra.config import load
+from kalshi_infra.kalshi import markets as km
+from kalshi_strategies.KXINX_U import _pick_event
+from kalshi_strategies.KXINX_U.config import CONFIG_PATH, SpxConfig
+from kalshi_strategies.KXINX_U.ib_feed import HoldParams, LiveIBFeed
+from kalshi_strategies.KXINX_U.live_pricing import compute_live_bucket_probs
 
 
 def _kalshi_bbo(event_ticker: str) -> dict[str, tuple[float, float]]:
@@ -57,10 +53,17 @@ def _parity_forwards(book) -> list[tuple[float, float]]:
 
 
 async def main(series: str, seconds: float, interval_s: float):
-    event = resolve_live_event_ticker(series)
-    scope = dbf.select_event_buckets(event, ibf.DEFAULT_ATM_BUCKETS[series])
-    feed = LiveIBFeed(event, tickers=scope,
-                      client_id=keys.IB_CLIENT_ID + 10 + ibf.CLIENT_ID_OFFSET[series])
+    cfg = load(SpxConfig, CONFIG_PATH, series)
+    ev = _pick_event(km.open_events(series), cfg)
+    if ev is None:
+        raise SystemExit(f"no tradeable {series} event right now")
+    event, p = ev.event_ticker, cfg.pricing
+    scope = dbf.select_event_buckets(event, cfg.quoting.max_markets or 5)
+    # +10 so this never collides with a running session's clientId.
+    feed = LiveIBFeed(event, tickers=scope, client_id=keys.IB_CLIENT_ID + 10 + p.ib_client_id_offset,
+                      hold=HoldParams(p.hold_baseline_s, p.hold_multiplier, p.hold_settle_s,
+                                      p.hold_min_samples, p.hold_sample_s),
+                      reconnect_delay_s=p.ib_reconnect_delay_s)
     print(f"[fair] {event}: scoped to {len(scope)} ATM buckets")
     task = asyncio.create_task(feed.run())
     loop = asyncio.get_running_loop()

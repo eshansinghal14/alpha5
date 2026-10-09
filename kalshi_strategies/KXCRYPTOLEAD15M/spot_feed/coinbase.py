@@ -26,7 +26,7 @@ inspecting the ladder can see what it used to look like.
 
 Logging convention: `print("[spot/coinbase] ...")` for operational events
 (connect, reconnect, gap), matching the project's `print("[kalshi-ws]...")`
-style in live_kalshi_ws.py. Not using stdlib logging because this adapter
+style in kalshi_infra/kalshi/ws_feed.py. Not using stdlib logging because this adapter
 runs inside the same asyncio event loop as the Kalshi feed, and consistent
 operator-visible output beats structured logging that lands in a separate
 file.
@@ -46,11 +46,10 @@ from .base import VenueBook, VenueAdapter, OrderBookLevel
 from ..series import COINBASE_PRODUCTS
 
 WS_URL = "wss://advanced-trade-ws.coinbase.com"
-RECONNECT_DELAY_S = 2.0
-# Coinbase pings keep the socket alive; this is just a receive timeout so
-# a wedged socket is noticed. 20s because the level2 channel has quiet
-# minutes on low-volume products (notably HYPE).
-RECV_TIMEOUT_S = 20.0
+RECONNECT_DELAY_S = 1.0
+# The heartbeats channel sends one message per second on the connection,
+# so a silent socket is dead well before this.
+RECV_TIMEOUT_S = 5.0
 # Coinbase ships the FULL level2 book in the first `snapshot` message per
 # product. For a 5-product subscription including BTC-USD, that first
 # frame has been observed at ~1.03 MB (2026-10-06) -- over the
@@ -194,12 +193,31 @@ class CoinbaseAdapter(VenueAdapter):
         # (wall - exch - offset_min) is how long a message sat in OUR
         # buffers. See _data_age.
         self._offsets: collections.deque[tuple[float, float]] = collections.deque()
+        # Last view handed out per coin; its receive_ts is advanced in place
+        # by _mark_fresh, since the composite holds on to these objects.
+        self._views: dict[str, VenueBook] = {}
 
     def latest(self, coin: str) -> VenueBook | None:
         pb = self._books.get(coin)
         if pb is None or pb.last_receive_ts == 0.0:
             return None
-        return pb.to_venue_book(self.venue, COINBASE_PRODUCTS[coin], coin)
+        vb = pb.to_venue_book(self.venue, COINBASE_PRODUCTS[coin], coin)
+        self._views[coin] = vb
+        return vb
+
+    def _mark_fresh(self, as_of: float):
+        """Every product shares one in-order connection, so a message on
+        ANY of them proves every synced book is current as of `as_of`. A
+        per-product clock read a quiet HYPE book (>1s between changes, ~4x
+        a minute on 2026-10-09) as stale and tripped the cross-coin skew
+        withhold while its book was in fact current."""
+        for coin, pb in self._books.items():
+            if pb.is_resyncing or pb.last_receive_ts == 0.0:
+                continue
+            pb.last_receive_ts = as_of
+            vb = self._views.get(coin)
+            if vb is not None:
+                vb.receive_ts = as_of
 
     def deep_book(self, coin: str) -> VenueBook | None:
         """Full MAX_BOOK_LEVELS view for the once-a-second CF replica."""
@@ -217,7 +235,10 @@ class CoinbaseAdapter(VenueAdapter):
                         "channel": "level2",
                         "product_ids": product_ids,
                     }))
-                    print(f"[spot/coinbase] subscribed level2 to {product_ids}")
+                    # 1/s on the same connection: proves liveness when no
+                    # book changes (see _mark_fresh).
+                    await ws.send(json.dumps({"type": "subscribe", "channel": "heartbeats"}))
+                    print(f"[spot/coinbase] subscribed level2 + heartbeats to {product_ids}")
                     # Sequence tracking. The level2 channel's own docs
                     # ("guarantees delivery of all updates") PLUS the
                     # overview's warning that TCP can still drop frames
@@ -249,12 +270,10 @@ class CoinbaseAdapter(VenueAdapter):
                         now = time.monotonic()
                         self._last_any_msg_ts = now
                         d = json.loads(raw)
-                        # Coinbase wraps l2 payloads inside {"channel":"l2_data","events":[...]}.
-                        # Subscribe confirms arrive as {"channel":"subscriptions"} -- skip.
-                        if d.get("channel") == "subscriptions":
-                            continue
-                        if d.get("channel") != "l2_data":
-                            continue
+                        # The counter spans every channel on the connection
+                        # (subscriptions, heartbeats, l2_data), so it is
+                        # checked before filtering; skipping non-l2 messages
+                        # first logged a false gap after every one of them.
                         seq = d.get("sequence_num")
                         if seq is not None and last_seq is not None:
                             if seq <= last_seq:
@@ -268,8 +287,16 @@ class CoinbaseAdapter(VenueAdapter):
                                     gaps_logged += 1
                         if seq is not None:
                             last_seq = seq
-                        for event in d.get("events", []) or []:
-                            await self._handle_event(event, now, d.get("timestamp"), seq, on_update)
+                        channel = d.get("channel")
+                        if channel not in ("l2_data", "heartbeats"):
+                            continue
+                        exch_ts = _parse_iso_ts(d["timestamp"]) if d.get("timestamp") else None
+                        mono = time.monotonic()
+                        as_of = mono - self._data_age(exch_ts, mono)
+                        if channel == "l2_data":
+                            for event in d.get("events", []) or []:
+                                await self._handle_event(event, as_of, exch_ts, seq, on_update)
+                        self._mark_fresh(as_of)
             except (OSError, websockets.ConnectionClosed) as e:
                 print(f"[spot/coinbase] connection error ({e!r}); retrying in {RECONNECT_DELAY_S}s")
             except Exception as e:
@@ -301,7 +328,7 @@ class CoinbaseAdapter(VenueAdapter):
         q.append((mono_now, off))
         return max(0.0, off - q[0][1])
 
-    async def _handle_event(self, event: dict, now: float, msg_ts: str | None,
+    async def _handle_event(self, event: dict, as_of: float, exch_ts: float | None,
                             seq: int | None,
                             on_update: Callable[[VenueBook], Awaitable[None] | None]):
         product_id = event.get("product_id")
@@ -323,18 +350,18 @@ class CoinbaseAdapter(VenueAdapter):
                                 float(change["new_quantity"]))
         else:
             return
-        pb.last_exchange_ts = _parse_iso_ts(msg_ts) if msg_ts else None
+        pb.last_exchange_ts = exch_ts
         # receive_ts is the monotonic time the data was FRESH at our edge:
         # processing time minus however long it sat queued. Feed health,
         # the theo kill switch and the cross-coin skew guard all read it.
-        mono = time.monotonic()
-        pb.last_receive_ts = mono - self._data_age(pb.last_exchange_ts, mono)
+        pb.last_receive_ts = as_of
         pb.last_seq = seq
         # Per message: a THIN view (top PER_MSG_LEVELS) -- enough for the
         # mid, feed health and phantom-cross pruning. The 1000-level view
         # the CF replica wants is built once a second via deep_book().
-        result = on_update(pb.to_venue_book(self.venue, product_id, coin,
-                                            max_levels=PER_MSG_LEVELS))
+        vb = pb.to_venue_book(self.venue, product_id, coin, max_levels=PER_MSG_LEVELS)
+        self._views[coin] = vb
+        result = on_update(vb)
         if asyncio.iscoroutine(result):
             await result
 

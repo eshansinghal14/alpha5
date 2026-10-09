@@ -23,8 +23,8 @@ Artifact schema (JSON):
     }
 
 Usage:
-    python kalshi_crypto/rv_modeling/fit_har.py
-      -> writes kalshi_crypto/rv_modeling/har_fit.json
+    python kalshi_strategies/KXCRYPTOLEAD15M/research/fit_har.py
+      -> writes kalshi_strategies/KXCRYPTOLEAD15M/research/har_fit.json
 """
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ import numpy as np
 import pandas as pd
 
 _HERE = Path(os.path.dirname(os.path.abspath(__file__)))
-_PROJECT = _HERE.parents[1]
+_PROJECT = _HERE.parents[2]   # research/ -> KXCRYPTOLEAD15M/ -> kalshi_strategies/ -> repo
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 

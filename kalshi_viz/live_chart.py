@@ -105,16 +105,12 @@ def build_live_html(series: str, market: str, json_url: str, x_start_ms: float, 
                 line_dash="dashdot", alpha=0.6, legend_label="LIP quote (bid)")
         p1.step(x="t", y="la", source=src["quote"], mode="after", color=PINK, line_width=1.0,
                 line_dash="dashdot", alpha=0.6, legend_label="LIP quote (ask)")
-    for name, color, marker, label in (("fy_m", GREEN, "circle", "quoted (bought yes)"),
-                                       ("fn_m", PINK, "circle", "quoted (sold / bought no)"),
-                                       ("fy_t", GREEN, "x", "took (bought yes)"),
-                                       ("fn_t", PINK, "x", "took (sold / bought no)")):
-        if marker == "circle":
-            p1.scatter(x="t", y="p", source=src[name], size=8, marker=marker, fill_color=color,
-                       line_color="white", line_width=0.5, legend_label=label)
-        else:
-            p1.scatter(x="t", y="p", source=src[name], size=10, marker=marker, line_color=color,
-                       line_width=2, legend_label=label)
+    # Fills: circle = maker (quoted), x = taker (took); green = bought yes, pink = sold / bought no.
+    for name, color in (("fy_m", GREEN), ("fn_m", PINK)):
+        p1.scatter(x="t", y="p", source=src[name], size=8, marker="circle", fill_color=color,
+                   line_color="white", line_width=0.5)
+    for name, color in (("fy_t", GREEN), ("fn_t", PINK)):
+        p1.scatter(x="t", y="p", source=src[name], size=10, marker="x", line_color=color, line_width=2)
     _legend(p1)
 
     p2 = _fig(xr, 200, f"{market}: net position")

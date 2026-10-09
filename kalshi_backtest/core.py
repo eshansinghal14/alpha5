@@ -39,7 +39,7 @@ class Trade:
     opposite of taker_side. NOT the yes price: execution.QueueTracker matches
     a resting order to a print by plain equality against that order's own
     side price, so the two have to agree. Both producers convert (see
-    data.load_trades and live_kalshi_ws)."""
+    data.load_trades and kalshi.ws_feed)."""
     ticker: str
     time: pd.Timestamp
     price: float
@@ -179,7 +179,7 @@ class Portfolio:
     def record_fill(self, order: Order, price: float, size: float, time: pd.Timestamp, liquidity: str,
                     fee: float | None = None) -> Fill:
         """`fee` overrides the modelled kalshi_fee -- pass it when the venue
-        reported the real one (live trading does; see live_orders.RealFill),
+        reported the real one (live trading does; see kalshi.orders.RealFill),
         since kalshi_fee's multiplier is an unverified default."""
         if fee is None:
             mult = self.fee_multiplier if liquidity == "taker" else self.maker_fee_multiplier

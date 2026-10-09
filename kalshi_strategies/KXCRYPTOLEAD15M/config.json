@@ -28,24 +28,8 @@
     "fresh_recovery_s": 2.0
   },
   "runtime": {
-    "reprice_interval_s": 0.5,
-    "flush_interval_s": 3.0,
-    "heavy_flush_every": 10,
-    "max_debug_rows": 40000,
-    "audit_interval_s": 5.0,
     "quote_fill_poll_s": 1.0,
-    "control_poll_s": 1.0,
-    "rollover_poll_s": 30.0,
-    "rollover_fast_poll_s": 2.0,
-    "rollover_fast_window_s": 120.0,
-    "close_check_s": 1.0,
-    "close_grace_s": 1.0
-  },
-  "kalshi_ws": {
-    "resync_interval_s": 900.0,
-    "reconnect_delay_s": 3.0,
-    "recv_timeout_s": 15.0,
-    "open_timeout_s": 15.0
+    "control_poll_s": 1.0
   },
   "lip": {
     "lip_lots": 100.0,

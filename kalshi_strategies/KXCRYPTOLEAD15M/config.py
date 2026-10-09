@@ -4,8 +4,8 @@ from __future__ import annotations
 import os
 
 from kalshi_infra.config import APPLY_NEXT_EVENT, param, section
-from kalshi_infra.trading.params import (CloseParams, KalshiWsParams, LipSettings,
-                                         QuotingParams, RiskParams, RuntimeParams)
+from kalshi_infra.trading.params import (CloseParams, LipSettings, QuotingParams, RiskParams,
+                                         RuntimeParams)
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
@@ -58,6 +58,5 @@ class CryptoConfig:
     close: CloseParams
     risk: RiskParams
     runtime: RuntimeParams
-    kalshi_ws: KalshiWsParams
     lip: LipSettings
     pricing: CryptoPricingParams

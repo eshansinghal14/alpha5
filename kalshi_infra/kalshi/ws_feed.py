@@ -17,33 +17,27 @@ from kalshi_infra.kalshi import auth
 
 WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
 
+# Kalshi sends orderbook_snapshot only on subscribe, so a long-lived
+# connection accumulates delta-only state and drifts (44+ min observed, see
+# kalshi_backtest/book.py). A timed reconnect re-supplies snapshots before
+# BookView's MAX_SNAPSHOT_AGE_S guard blanks the book, so this must stay below it.
+RESYNC_INTERVAL_S = 900.0
+RECONNECT_DELAY_S = 1.0
+RECV_TIMEOUT_S = 5.0     # only bounds how late the resync timer is checked
+OPEN_TIMEOUT_S = 15.0
+assert RESYNC_INTERVAL_S < MAX_SNAPSHOT_AGE_S
+
 
 class LiveKalshiFeed:
     """`on_quote(BookView)` / `on_trade(ticker, Trade)` fire synchronously
-    on this coroutine's task.
+    on this coroutine's task."""
 
-    `resync_interval_s`: Kalshi sends orderbook_snapshot only on subscribe,
-    so a long-lived connection accumulates delta-only state and drifts (44+
-    min observed, see kalshi_backtest/book.py). A timed reconnect re-supplies
-    snapshots before BookView's MAX_SNAPSHOT_AGE_S guard blanks the book, so
-    this must stay below it.
-    """
-
-    def __init__(self, tickers: list[str], on_quote, on_trade, *, label: str,
-                 resync_interval_s: float, reconnect_delay_s: float, recv_timeout_s: float,
-                 open_timeout_s: float):
-        if resync_interval_s >= MAX_SNAPSHOT_AGE_S:
-            raise ValueError(f"resync_interval_s {resync_interval_s} must be < "
-                             f"MAX_SNAPSHOT_AGE_S {MAX_SNAPSHOT_AGE_S}")
+    def __init__(self, tickers: list[str], on_quote, on_trade, *, label: str):
         self._tickers = list(tickers)
         self._on_quote = on_quote
         self._on_trade = on_trade
         self._books: dict[str, L2Book] = {t: L2Book(t) for t in self._tickers}
         self.label = label
-        self.resync_interval_s = resync_interval_s
-        self.reconnect_delay_s = reconnect_delay_s
-        self.recv_timeout_s = recv_timeout_s
-        self.open_timeout_s = open_timeout_s
         self.n_reconnects = 0
         self.n_seq_gaps = 0
         self.last_msg_mono: float | None = None
@@ -69,21 +63,21 @@ class LiveKalshiFeed:
         while True:
             try:
                 async with websockets.connect(WS_URL, additional_headers=auth.ws_headers(),
-                                              open_timeout=self.open_timeout_s) as ws:
+                                              open_timeout=OPEN_TIMEOUT_S) as ws:
                     for channel in ("orderbook_delta", "trade"):
                         await ws.send(json.dumps({
                             "id": sub_id, "cmd": "subscribe",
                             "params": {"channels": [channel], "market_tickers": self._tickers},
                         }))
                         sub_id += 1
-                    resync_at = time.monotonic() + self.resync_interval_s
+                    resync_at = time.monotonic() + RESYNC_INTERVAL_S
                     # Per-connection counter shared across tickers; a jump means
                     # a dropped message and unverifiable ladders, so reconnect
                     # for fresh snapshots.
                     last_seq = None
                     while time.monotonic() <= resync_at:
                         try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=self.recv_timeout_s)
+                            raw = await asyncio.wait_for(ws.recv(), timeout=RECV_TIMEOUT_S)
                         except asyncio.TimeoutError:
                             continue
                         self.last_msg_mono = time.monotonic()
@@ -101,7 +95,7 @@ class LiveKalshiFeed:
                         self._handle_message(d)
             except (websockets.ConnectionClosed, OSError) as e:
                 print(f"[{self.label}] kalshi ws connection error ({e!r}); reconnecting")
-                await asyncio.sleep(self.reconnect_delay_s)
+                await asyncio.sleep(RECONNECT_DELAY_S)
             self.n_reconnects += 1
 
     def _emit_book(self, book: L2Book):

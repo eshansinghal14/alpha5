@@ -86,6 +86,29 @@ def test_cross_coin_skew_withholds():
     assert all(f is None for f in fairs.values()) and m.withheld_reason == "cross_coin_skew"
 
 
+def test_wakeup_only_on_mid_change_and_age_follows_live_books():
+    now = time.time()
+    m = _model(now, recovery_s=0.0)
+    woke = []
+    m.set_wakeup(lambda: woke.append(1))
+    mono = time.monotonic()
+    for c in COINS:
+        m._on_book(_book(c, mono - 5.0))
+    m.reprice(now)
+    n = len(woke)
+    m._on_book(_book("BTC", mono))            # same mid: no wakeup
+    assert len(woke) == n
+    # Fair is current (no mid moved), so its age tracks the books, which a
+    # heartbeat freshens in place.
+    for vbs in m.bus.venue_books_per_coin().values():
+        for vb in vbs:
+            vb.receive_ts = time.monotonic()
+    assert m.signal_age_s() < 0.5
+    m._on_book(_book("BTC", time.monotonic(), 1.01))   # mid moved
+    assert len(woke) == n + 1
+    assert m.signal_age_s() >= 4.9            # dirty: age of the inputs under the fair
+
+
 def test_signal_age_is_oldest_coins_newest_book():
     now = time.time()
     m = _model(now, recovery_s=0.0)

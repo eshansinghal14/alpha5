@@ -1,7 +1,10 @@
 # Live options feed: Databento ES → IB SPXW
 
 **Date:** 2026-10-05
-**Scope:** Live trading (`run_live.py`) only. Backtest unaffected.
+**Scope:** Live trading only. Backtest unaffected.
+
+*Paths updated after the 2026-10-09 reorg: the feed is now
+`kalshi_strategies/KXINX_U/ib_feed.py`, driven by `KXINX_U/model.py`.*
 
 ## What changed
 
@@ -39,11 +42,11 @@ Databento's cmbp-1 OPRA pull remains the only practical bulk source.
 
 ## Interface the live feed satisfies
 
-`run_live.py`'s signal loop expects:
+`KXINX_U/model.py` expects:
 
 ```python
 class LiveIBFeed:
-    def __init__(self, event_ticker: str, tickers: list[str] | None = None)
+    def __init__(self, event_ticker, tickers, *, client_id, hold: HoldParams, reconnect_delay_s)
     book: LiveOptionBook   # has call_strikes, put_strikes (np.ndarray),
                            # snapshot_arrays() -> 6-tuple (mid/bid/ask x call/put)
     def drain(self) -> int           # applies buffered ticks; returns N
@@ -53,7 +56,8 @@ class LiveIBFeed:
     async def run(self) -> None               # keeps the client alive
 ```
 
-See `kalshi_latency_arbs/live/live_ib_feed.py` for the implementation.
+See `kalshi_strategies/KXINX_U/ib_feed.py` for the implementation. Hold
+and reconnect values come from the `pricing` section of `KXINX_U/config.json`.
 
 ## IB contract specification
 
@@ -118,11 +122,10 @@ is dialing — `127.0.0.1` for the common case.
 
 ## Reconnect behavior
 
-`LiveIBFeed.run()` reconnects on dropped socket with a 3s delay
-(matches `live_kalshi_ws.RECONNECT_DELAY_S`). During the gap,
-`seconds_since_record` climbs; `MAX_SIGNAL_AGE_S = 0.2s` in
-`live_context.py` means the engine's staleness guard will halt trading
-well before the reconnect lands.
+`LiveIBFeed.run()` reconnects on a dropped socket after
+`pricing.ib_reconnect_delay_s`. During the gap no reprice succeeds, so
+signal age climbs past `risk.max_signal_age_s` (0.2s for SPX) and the
+quoter stops taking and pulls quotes well before the reconnect lands.
 
 ## Gotchas
 
@@ -179,10 +182,10 @@ below Kalshi's bid the whole run, and Kalshi's own book had nearly
 crossed there (0.50/0.51). The tight parity forward says the option book
 is internally consistent, so this looks like a real disagreement, not a
 data problem. That's what the strategy trades on, but **watch it**: if it
-persists across sessions, it's a model bias. `check_pricing_bias` in
-`live_context.py` halts at a 3¢ median that's on the same side.
+persists across sessions, it's a model bias. (The ladder-wide bias halt
+that used to guard this was removed in the 2026-10-09 reorg.)
 
-**Shadow run** (`run_live.run`, KXINX, 75s): connects, subscribes 36
+**Shadow run** (pre-reorg `run_live.run`, KXINX, 75s): connects, subscribes 36
 contracts, no guard trips, signal age ~0.09s (guard: 0.2s), bias
 check `systematic=false`, and it shuts down cleanly on cancel.
 

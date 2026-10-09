@@ -1,4 +1,6 @@
-"""Replay a recorded SPX decision journal through the legacy strategy and the
+"""Reference-only: compares against the pre-reorg code in the alpha5_legacy git
+worktree (commit 0a82f3c; recreate with `git worktree add ../alpha5_legacy 0a82f3c`).
+Replay a recorded SPX decision journal through the legacy strategy and the
 new generic Quoter with an identical toy fill model; compare orders + logs."""
 import dataclasses
 import glob

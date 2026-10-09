@@ -1,6 +1,6 @@
 """
 Fit the fill-intensity model and dump the JSON artifact the live quoter
-loads (kalshi_crypto/fill_intensity.json).
+loads (kalshi_strategies/KXCRYPTOLEAD15M/fill_intensity.json).
 
 Estimates `lambda_side(tau, p)` -- the per-second-per-market rate at which
 resting orders at the front of a side's queue get filled -- from Kalshi
@@ -28,10 +28,10 @@ as (#markets) * (bucket width in seconds), since every market is live
 across the whole 0..900s tau range -- exact enough for a rate estimate.
 
 Usage:
-    python kalshi_crypto/rv_modeling/fit_fill_intensity.py
+    python kalshi_strategies/KXCRYPTOLEAD15M/research/fit_fill_intensity.py
       [--series KXBTC15M]        # source trades (default: KXCRYPTOLEAD15M,
                                  #   falls back to KXBTC15M if empty)
-      -> writes kalshi_crypto/fill_intensity.json
+      -> writes kalshi_strategies/KXCRYPTOLEAD15M/fill_intensity.json
 """
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ import numpy as np
 import pandas as pd
 
 _HERE = Path(os.path.dirname(os.path.abspath(__file__)))
-_PROJECT = _HERE.parents[1]
+_PROJECT = _HERE.parents[2]   # research/ -> KXCRYPTOLEAD15M/ -> kalshi_strategies/ -> repo
 
 # Bucket edges. tau in seconds-to-close; a 15-minute (900s) event, finer
 # near the close where fills accelerate. price in cents/dollars 0..1,
@@ -55,7 +55,7 @@ _PROJECT = _HERE.parents[1]
 TAU_EDGES = [30.0, 60.0, 120.0, 300.0, 600.0]          # -> 6 tau buckets
 PRICE_EDGES = [0.05, 0.10, 0.20, 0.35, 0.50, 0.70]     # -> 7 price buckets
 
-ARTIFACT = _PROJECT / "kalshi_crypto" / "fill_intensity.json"
+ARTIFACT = _HERE.parent / "fill_intensity.json"
 DEFAULT_SERIES = "KXCRYPTOLEAD15M"
 FALLBACK_SERIES = "KXBTC15M"   # structurally identical 15m crypto series
 

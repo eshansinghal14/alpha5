@@ -33,8 +33,8 @@ class FairModel(Protocol):
     """What a series' pricing must provide to the generic runtime."""
 
     def reprice(self, now_s: float) -> dict[str, Fair | None] | None:
-        """Called every runtime.reprice_interval_s. Return the fairs to
-        dispatch, or None when nothing changed (no new inputs)."""
+        """Called after new inputs arrive (see EventModel.set_wakeup). Return
+        the fairs to dispatch, or None when nothing changed."""
 
     def on_market_event(self, ticker: str, now_s: float) -> dict[str, Fair | None] | None:
         """Called on every Kalshi book/trade wakeup, before acting. Return

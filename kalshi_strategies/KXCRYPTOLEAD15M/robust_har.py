@@ -1,7 +1,7 @@
 """
 Production vol / correlation forecaster for the Coin Race pricer.
 
-Online port of the reference pipeline in rv_modeling/vol_fix_reference/
+Online port of the reference pipeline in research/vol_fix_reference/
 (rv2.rv_features, pricer_ref.HAR, pricer_ref.corr_series), which was shown
 calibrated on two held-out days and to match or beat the Kalshi mid's log
 loss at every time-remaining bucket. Feed it the venue TOP-OF-BOOK MID
@@ -11,7 +11,7 @@ loss at every time-remaining bucket. Feed it the venue TOP-OF-BOOK MID
     taken at every 1 s offset, each clipped at 6x a lagged EWMA sd
     (900 s half-life). One 30 bp glitch inflates the forecast ~1.5x
     instead of ~5.7x with raw 1 s returns.
-  * HAR: rv_modeling/har_coefs_robust.json, fitted for h = 30..900 s on
+  * HAR: research/har_coefs_robust.json, fitted for h = 30..900 s on
     those features. `rate_per_s(h)` interpolates log-rate in log h, so the
     pricer can ask for the horizon that is actually left.
   * Correlation: causal EWMA of 60 s returns sampled every 10 s, 4 h half-

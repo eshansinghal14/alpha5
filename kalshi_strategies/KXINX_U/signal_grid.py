@@ -3,10 +3,9 @@ Shared SPXW-implied signal computation: option-implied probability +
 confidence band + call/put parity divergence for whichever market in a
 Kalshi event is currently closest to 50/50, sampled across the whole
 session. This is the "pricing computation" layer both quoting strategies
-(spxw_kxinx/sp_options_lag_quoting.py, for KXINX's two-sided range buckets,
-and spxw_kxinxu/kxinxu_lag_quoting.py, for KXINXU's single-sided
+(KXINX's two-sided range buckets and KXINXU's single-sided
 "S&P >= threshold" ladder) build on -- neither the model
-(latency_arbs_functions.bucket_probabilities_ci, Breeden-Litzenberger,
+(grid_pricing.bucket_probabilities_ci, Breeden-Litzenberger,
 model-free) nor this "pick whichever market is closest to ATM" logic cares
 which market shape it's fed: bucket_probabilities_ci already handles a
 floor-only market (KXINXU's shape) exactly the same way it handles KXINX's
@@ -188,7 +187,7 @@ def compute_prob_grid(
     option-implied probability is a genuine, continuous quantity computed
     straight from the option chain regardless of whether that market
     happened to be ATM at any given moment. Split out specifically for the
-    dashboard (viz/data_loader.py) to plot ONE selected market's implied
+    dashboard (kalshi_viz) to plot ONE selected market's implied
     probability continuously across the whole session -- confirmed
     directly that precompute_atm_signal's own reduced `events` output is
     NOT suitable for that: it only contains entries for whichever ticker
@@ -280,7 +279,7 @@ def precompute_signal(
     the strategy's edge test is per-market either way, so there is nothing to
     gain by pre-selecting one "current" market -- and pre-selecting one costs
     a rollover state machine in the strategy (see
-    sp_options_lag_quoting.py's module docstring on why that was removed).
+    kalshi_infra/trading/quoter.py's module docstring on why that was removed).
 
     Deduped PER TICKER rather than globally: a market emits an event only
     when its OWN (prob, prob_lo, prob_hi), rounded to `round_decimals`,
@@ -339,11 +338,11 @@ def precompute_signal(
             }))
     if noise.dropped:
         worst = sorted(noise.dropped.items(), key=lambda kv: -kv[1])[:5]
-        print(f"  [spxw_signal] suppressed {len(noise.dropped)} noisy market(s) "
+        print(f"  [signal_grid] suppressed {len(noise.dropped)} noisy market(s) "
               f"(spike-and-revert > {noise.max_rate:.0%}): "
               + ", ".join(f"{k.split('-')[-1]}({v})" for k, v in worst))
     if noise.warming:
-        print(f"  [spxw_signal] withheld {sum(noise.warming.values())} tick(s) across "
+        print(f"  [signal_grid] withheld {sum(noise.warming.values())} tick(s) across "
               f"{len(noise.warming)} market(s) still under {noise.min_samples} ticks of history")
 
     # The engine pushes these onto a time-ordered heap, but sorting here
@@ -381,7 +380,7 @@ def precompute_atm_signal(
 
     return_grid=True additionally returns the full (grid, probs_lo,
     probs_mid, probs_hi) this function already computes internally (see
-    compute_prob_grid) -- for a caller (viz/data_loader.py) that ALSO
+    compute_prob_grid) -- for a caller (kalshi_viz) that ALSO
     wants the continuous per-market grid and would otherwise have to call
     compute_prob_grid a second time, redoing the same ~6 spline fits this
     function just did. Confirmed directly that redundant second pass was
@@ -391,7 +390,7 @@ def precompute_atm_signal(
 
     Everything a quoting strategy needs from the option side, precomputed
     off the cached Databento SPXW quotes for `event_ticker` (via
-    compute_prob_grid -> latency_arbs_functions.load_event) -- no live
+    compute_prob_grid -> grid_pricing.load_event) -- no live
     network calls, matching load_event's own docstring. Works the same for
     any Kalshi event whose markets carry floor_strike/cap_strike (KXINX's
     two-sided range buckets, KXINXU's single-sided floor-only ladder, or

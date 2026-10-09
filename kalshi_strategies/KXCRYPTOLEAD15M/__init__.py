@@ -8,8 +8,9 @@ from kalshi_strategies.KXCRYPTOLEAD15M.config import CONFIG_PATH, CryptoConfig
 TICKER = "KXCRYPTOLEAD15M"
 
 
-def _pick_event(events, cfg, now):
-    """Soonest-closing open event: the series rolls every 15 minutes."""
+def _pick_event(events, cfg):
+    """Soonest-closing event: the series rolls every 15 minutes, each
+    opening at the previous one's close."""
     return events[0] if events else None
 
 

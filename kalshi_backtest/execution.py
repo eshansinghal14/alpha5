@@ -67,7 +67,7 @@ MEASURED_SEND_S = 0.034
 #             Databento's own ts_recv (see databento_functions), so it's
 #             baked into the grid timestamps this delay is applied to.
 #   ~0.0075s  our own pricing computation (median, measured over 300 runs of
-#             live_signal.compute_live_bucket_probs + pick_atm_signal on a
+#             live_pricing.compute_live_bucket_probs + pick_atm_signal on a
 #             real 29-strike / 30-bucket event; p95 9.5ms).
 # The Databento leg is a network-RTT estimate rather than an end-to-end
 # feed measurement -- refine it with a live-feed timestamp comparison if the

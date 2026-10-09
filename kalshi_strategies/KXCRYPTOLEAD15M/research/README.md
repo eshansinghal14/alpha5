@@ -1,3 +1,7 @@
+> **Historical (pre-2026-10-09 reorg).** Paths and run commands below refer to the
+> removed `kalshi_crypto/` package. Current layout: `kalshi_strategies/KXCRYPTOLEAD15M/`;
+> run with `python -m kalshi_strategies.run --series KXCRYPTOLEAD15M`. See `docs/live-trading.md`.
+
 # kalshi_crypto -- Coin Race 15m Market Maker
 
 Market-making for Kalshi's `KXCRYPTOLEAD15M` series. Primary objective:

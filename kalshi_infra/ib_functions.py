@@ -176,7 +176,7 @@ def resolve_event_strikes(event_ticker: str, tickers: list[str] | None = None) -
     strikes = sorted(bracket_listed_strikes(boundaries, listed))
 
     return {
-        "markets": all_markets,     # every bucket -- passed to live_signal
+        "markets": all_markets,     # every bucket -- passed to live_pricing
         "scoped_markets": markets,  # the tickers-scoped subset
         "expiry": expiry,
         "strikes": strikes,

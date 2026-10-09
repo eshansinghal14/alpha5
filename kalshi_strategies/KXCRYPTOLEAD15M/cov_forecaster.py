@@ -118,12 +118,12 @@ class PlaceholderForecaster(CovarianceForecaster):
 
     def forecast_cov(self, t0, t1):
         raise NotImplementedError(
-            "no covariance model wired -- see kalshi_crypto/cov_forecaster.py. "
+            "no covariance model wired -- see kalshi_strategies/KXCRYPTOLEAD15M/cov_forecaster.py. "
             "Use ConstantCovForecaster for tests/smoke runs.")
 
     def forecast_cov_rate(self, t):
         raise NotImplementedError(
-            "no covariance model wired -- see kalshi_crypto/cov_forecaster.py.")
+            "no covariance model wired -- see kalshi_strategies/KXCRYPTOLEAD15M/cov_forecaster.py.")
 
 
 class ConstantCovForecaster(CovarianceForecaster):

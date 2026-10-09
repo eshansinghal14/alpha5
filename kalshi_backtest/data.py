@@ -38,7 +38,7 @@ KALSHI_WS_ROOT = os.path.join(_DATA_ROOT, "kalshi_ws")
 SOURCE_PRIORITY = ["kalshi_ws", "predexon", "kalshi_1min"]
 
 # Shared by engine.Backtest (refuses to fill/rest an order against a book
-# this stale) and viz/data_loader.py (masks the Kalshi bid/ask line out
+# this stale) and kalshi_viz (masks the Kalshi bid/ask line out
 # during a stretch this stale, rather than drawing a misleading flat
 # line) -- one definition, so the two can't silently drift apart. See
 # engine.Backtest.__init__'s own docstring for the real incident (a

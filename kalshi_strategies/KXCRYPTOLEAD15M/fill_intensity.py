@@ -43,7 +43,7 @@ So the LIP credit per contract is reward_rate_per_s * E[rest], which:
 
 Artifact
 --------
-`fill_intensity.json` (fitted by rv_modeling/fit_fill_intensity.py from
+`fill_intensity.json` (fitted by research/fit_fill_intensity.py from
 data/kalshi_ws/{SERIES}/trades + raw_ob_ticks). Absent -> a fixed-rate
 fallback whose single lambda is operator-plausible, so the pricer still
 gets a finite, non-degenerate credit before any fit exists.

@@ -21,7 +21,7 @@ the time actually left (h = tau), and R the slow EWMA correlation:
     In-window (now >= S, tau >= 60)    x             tau - 40
     Last minute (u = tau < 60)         I + (u/60) x  u^3 / 10800
 
-Matches rv_modeling/vol_fix_reference/pricer_ref.py (validated against
+Matches research/vol_fix_reference/pricer_ref.py (validated against
 Kalshi settlement and the market mid) and its golden cases.
 
 Derivations (kept in comments next to the arithmetic):

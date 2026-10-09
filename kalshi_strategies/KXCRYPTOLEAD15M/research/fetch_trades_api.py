@@ -19,8 +19,8 @@ Field mapping REST -> WS schema:
   * ts_ms from the trade time.
 
 Usage:
-    python kalshi_crypto/rv_modeling/fetch_trades_api.py            # last ~N events
-    python kalshi_crypto/rv_modeling/fetch_trades_api.py --max-events 400
+    python kalshi_strategies/KXCRYPTOLEAD15M/research/fetch_trades_api.py            # last ~N events
+    python kalshi_strategies/KXCRYPTOLEAD15M/research/fetch_trades_api.py --max-events 400
       -> writes data/kalshi_ws/KXCRYPTOLEAD15M/trades/{event}.parquet
 """
 from __future__ import annotations
@@ -33,13 +33,13 @@ from pathlib import Path
 import pandas as pd
 
 _HERE = Path(os.path.dirname(os.path.abspath(__file__)))
-_PROJECT = _HERE.parents[1]
+_PROJECT = _HERE.parents[2]   # research/ -> KXCRYPTOLEAD15M/ -> kalshi_strategies/ -> repo
 _INFRA = _PROJECT / "kalshi_infra"
 for _p in (_PROJECT, _INFRA):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from kalshi_crypto.series import SERIES_TICKER, COINS, coin_from_market_ticker
+from kalshi_strategies.KXCRYPTOLEAD15M.series import SERIES_TICKER, COINS, coin_from_market_ticker
 
 OUT_DIR = _PROJECT / "data" / "kalshi_ws" / SERIES_TICKER / "trades"
 
