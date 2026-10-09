@@ -5,14 +5,13 @@ Layout (shared by every series; the dashboard knows no series specifics):
 
     data/live/{series}/{date}/summary.json        every session.FLUSH_INTERVAL_S
     data/live/{series}/{date}/quote_df.parquet    decision log      } every
-    data/live/{series}/{date}/fills_df.parquet                      } HEAVY_FLUSH_EVERY
+    data/live/{series}/{date}/fills_df.parquet                      } writer.HEAVY_INTERVAL_S
     data/live/{series}/{date}/pnl_df.parquet      session PnL curve } flushes
     data/live/{series}/{date}/fair_df.parquet     fair history      }
     kalshi_viz/static/{series}/{ticker}.json      per-market chart feed
 
 Every write is atomic (tmp + replace, retried on Windows sharing errors).
-`capture` runs on the event loop and only copies references; `write` does the
-pandas/IO on a worker thread.
+`write` runs in the writer process (runtime.writer), never the trading one.
 """
 from __future__ import annotations
 
@@ -26,7 +25,10 @@ import pandas as pd
 
 from kalshi_infra import DATA_ROOT, REPO_ROOT
 
-LIVE_ROOT = os.path.join(DATA_ROOT, "live")
+# Env overrides let a test session run beside the live ones without sharing
+# files (the writer is a separate process, so module patching can't reach it).
+LIVE_ROOT = os.environ.get("ALPHA5_LIVE_ROOT") or os.path.join(DATA_ROOT, "live")
+_STREAM_ROOT = os.environ.get("ALPHA5_STREAM_ROOT") or os.path.join(REPO_ROOT, "kalshi_viz", "static")
 STREAM_POINTS = 400            # chart points per market after decimation
 STREAM_ACTIVE_FRACTION = 0.05  # markets with < this share of the busiest market's decisions get no stream
 
@@ -39,7 +41,7 @@ def stream_dir(series: str) -> str:
     """Under kalshi_viz/static so Streamlit serves it same-origin at
     /app/static/{series}/ -- the live chart polls these without CORS or a
     second server."""
-    return os.path.join(REPO_ROOT, "kalshi_viz", "static", series)
+    return os.path.join(_STREAM_ROOT, series)
 
 
 def stream_filename(ticker: str) -> str:
@@ -150,20 +152,6 @@ def build_summary(*, series: str, event_ticker: str, engine, quoter, store, mode
 # ---------------------------------------------------------------------------
 # Capture / write
 # ---------------------------------------------------------------------------
-
-def capture(*, series: str, summary: dict, quoter, engine, pnl_history: list, fair_history: list,
-            pnl_by_ticker: dict, now: pd.Timestamp, heavy: bool) -> dict:
-    """Cheap, on-loop: copy references only. Lists are append-only from the
-    loop, so a shallow copy is safe to iterate off it."""
-    return {
-        "series": series, "date": now.strftime("%Y-%m-%d"), "heavy": heavy, "summary": summary,
-        "debug_log": list(quoter.debug_log) if heavy else None,
-        "fills": list(engine.portfolio.fills) if heavy else None,
-        "pnl_history": list(pnl_history) if heavy else None,
-        "fair_history": list(fair_history) if heavy else None,
-        "pnl_by_ticker": {k: list(v) for k, v in pnl_by_ticker.items()} if heavy else None,
-    }
-
 
 WRITE_PHASES: dict = {}
 

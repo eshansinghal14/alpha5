@@ -39,7 +39,7 @@ import pandas as pd
 
 from kalshi_infra.kalshi.venue import MAX_PRICE, MIN_PRICE, TICK
 from kalshi_infra.trading.fair import Fair, FairUpdate
-from kalshi_infra.trading.lip import LipTracker, choose_lip_level, others_ladder
+from kalshi_infra.trading.lip import LipTracker, _scored_prefix, choose_lip_level, others_ladder
 
 EDGE, LIP = "edge", "lip"
 
@@ -66,9 +66,13 @@ class Quoter:
         self._atm_set: set[str] = set()
         self._take_since: dict[tuple[str, str], float] = {}
         self._take_last: dict[tuple[str, str], float] = {}
-        self._fresh_since: float | None = None
+        # Fresh "since forever" until a stale episode: the recovery hold is
+        # for flapping, and applying it at event start held every crypto
+        # rollover ~2s stale with good data (2026-10-09).
+        self._fresh_since: float | None = float("-inf")
         self.block_counts: dict[str, int] = {}
         self.debug_log: list[dict] = []
+        self._lip_cache: dict[tuple[str, str], tuple] = {}
 
     # ------------------------------------------------------------------
     # Engine interface
@@ -499,9 +503,19 @@ class Quoter:
         mine = {s: [(p, z) for p, z in ours.get((ticker, s), [])] for s in ("yes", "no")}
         if live is not None:
             mine[side] = [(p, z) for p, z in mine[side] if not (abs(p - live["price"]) < 1e-9 and z == live["size"])]
-        others_yes = others_ladder(ladder.yes_bids, ours.get((ticker, "yes"), []))
-        others_no = others_ladder(ladder.no_bids, ours.get((ticker, "no"), []))
+        others_yes = _scored_prefix(others_ladder(ladder.yes_bids, ours.get((ticker, "yes"), [])),
+                                    params.target_size)
+        others_no = _scored_prefix(others_ladder(ladder.no_bids, ours.get((ticker, "no"), [])),
+                                   params.target_size)
         others = others_yes if side == "yes" else others_no
+        # The choice is a pure function of these; most Kalshi deltas land
+        # outside the scored prefix and change none of them.
+        key = (top, max_size, lc.prop_max_lip, lc.lip_min_depth_ahead, params,
+               tuple(others_yes.items()), tuple(others_no.items()),
+               tuple(mine["yes"]), tuple(mine["no"]))
+        hit = self._lip_cache.get((ticker, side))
+        if hit is not None and hit[0] == key:
+            return hit[1]
 
         def depth_ahead(price):
             # Everything better than us plus the whole same-price queue: we
@@ -510,10 +524,12 @@ class Quoter:
             ahead = sum(z for p, z in others.items() if p >= price - 1e-9)
             return ahead + sum(z for p, z in mine[side] if p >= price - 1e-9)
 
-        return choose_lip_level(side=side, others_yes=others_yes, others_no=others_no,
-                                ours_yes=mine["yes"], ours_no=mine["no"], params=params,
-                                top_price=top, max_size=max_size, prop_max=lc.prop_max_lip,
-                                min_depth_ahead=lc.lip_min_depth_ahead, depth_ahead_fn=depth_ahead)
+        choice = choose_lip_level(side=side, others_yes=others_yes, others_no=others_no,
+                                  ours_yes=mine["yes"], ours_no=mine["no"], params=params,
+                                  top_price=top, max_size=max_size, prop_max=lc.prop_max_lip,
+                                  min_depth_ahead=lc.lip_min_depth_ahead, depth_ahead_fn=depth_ahead)
+        self._lip_cache[(ticker, side)] = (key, choice)
+        return choice
 
     # ------------------------------------------------------------------
     # Logging

@@ -277,6 +277,18 @@ def levels_from_ladder(bids: dict[float, float], ours: list[tuple[float, float]]
     return sorted((LipLevel(price=p, size=v[0], mine=v[1]) for p, v in acc.items()), key=lambda lv: -lv.price)
 
 
+def _scored_prefix(bids: dict[float, float], target: float) -> dict[float, float]:
+    """Best-first levels up to and including the one where cumulative size
+    reaches `target`; all of them if it never does."""
+    out, cum = {}, 0.0
+    for p in sorted(bids, reverse=True):
+        out[p] = bids[p]
+        cum += bids[p]
+        if cum >= target:
+            break
+    return out
+
+
 def others_ladder(bids: dict[float, float], ours: list[tuple[float, float]]) -> dict[float, float]:
     """The visible ladder with our own resting size removed."""
     out = dict(bids)
@@ -320,17 +332,43 @@ def choose_lip_level(*, side: str, others_yes: dict, others_no: dict,
     none = LipChoice(None, 0.0, 0.0, 0.0, 0.0)
     if top_price is None or max_size < 1 or params.period_reward_usd <= 0:
         return none
+    # Exact, not an approximation: adding our size only makes a side reach
+    # Target sooner, so levels past where the others alone reach it are
+    # never scored. Scoring the full ladder (hundreds of levels, re-sorted
+    # per candidate) was ~40% of the crypto event loop on 2026-10-09.
+    others_yes = _scored_prefix(others_yes, params.target_size)
+    others_no = _scored_prefix(others_no, params.target_size)
     others = others_yes if side == "yes" else others_no
+    ours_side = ours_yes if side == "yes" else ours_no
+    # Only `side` changes between candidates: score the other side once, and
+    # build each candidate's ladder from one pre-merged one.
+    fixed = _score_side(levels_from_ladder(others_no, ours_no) if side == "yes"
+                        else levels_from_ladder(others_yes, ours_yes), params)
+    merged = {p: [s, 0.0] for p, s in others.items()}
+    for p, s in ours_side:
+        if s > 0:
+            lv = merged.setdefault(p, [0.0, 0.0])
+            lv[1] += s
+            lv[0] = max(lv[0], lv[1])
+    rps = params.period_reward_usd / max(params.snapshots_per_period, 1)
+    cap = None if params.max_reward_usd is None else params.max_reward_usd / params.snapshots_per_period
 
-    def levels(price, size):
-        y = ours_yes + ([(price, size)] if side == "yes" else [])
-        n = ours_no + ([(price, size)] if side == "no" else [])
-        return levels_from_ladder(others_yes, y), levels_from_ladder(others_no, n)
+    def _rate_with(price, size):
+        acc = merged
+        if price is not None and size > 0:
+            acc = dict(merged)
+            cur = acc.get(price)
+            mine = (cur[1] if cur else 0.0) + size
+            acc[price] = [max(cur[0] if cur else 0.0, mine), mine]
+        sc = _score_side(sorted((LipLevel(p, v[0], v[1]) for p, v in acc.items()),
+                                key=lambda lv: -lv.price), params)
+        r = (sc.our_share + fixed.our_share) * rps if (sc.qualifies and fixed.qualifies) else 0.0
+        return r if cap is None else min(r, cap)
 
-    base = reward_rate(*levels(None, 0.0), params)
+    base = _rate_with(None, 0.0)
 
     def rate(price, size):
-        return reward_rate(*levels(price, size), params) - base
+        return _rate_with(price, size) - base
 
     cands = []
     p = round(top_price, 2)

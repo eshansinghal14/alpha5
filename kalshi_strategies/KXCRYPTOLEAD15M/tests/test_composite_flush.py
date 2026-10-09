@@ -89,6 +89,23 @@ def test_flush_keeps_pending_on_write_failure(tmp_path, monkeypatch):
     assert f._pending_disk == bars        # retained for the next cadence
 
 
+def test_hourly_files_and_legacy_daily_load_together(tmp_path):
+    from kalshi_strategies.KXCRYPTOLEAD15M.model import load_composite_bars
+    t0 = pd.Timestamp("2026-10-09 10:59:58", tz="UTC").timestamp()
+    f = CompositeFeed("BTC", persist=True, persist_dir=tmp_path)
+    f._pending_disk = [_bar("BTC", t0 + i, 100.0 + i) for i in range(4)]
+    f.flush()
+    assert sorted(p.name for p in tmp_path.glob("BTC_*.parquet")) == [
+        "BTC_2026-10-09_10.parquet", "BTC_2026-10-09_11.parquet"]
+    # A legacy daily file overlapping one second, plus a leftover tmp file.
+    legacy = pd.read_parquet(tmp_path / "BTC_2026-10-09_10.parquet").iloc[[0]]
+    legacy.to_parquet(tmp_path / "BTC_2026-10-09.parquet", index=False)
+    (tmp_path / "BTC_2026-10-09_11.tmp-1.parquet").write_bytes(b"junk")
+    bars = load_composite_bars("BTC", t0 - 10, t0 + 10, root=tmp_path)
+    assert [b.ts_s for b in bars] == [t0 + i for i in range(4)]
+    assert load_composite_bars("BTC", t0 + 5, t0 + 10, root=tmp_path) == []
+
+
 def test_no_tmp_files_left_after_success(tmp_path):
     f = CompositeFeed("BTC", persist=True, persist_dir=tmp_path)
     f._pending_disk = [_bar("BTC", 1_700_000_000.0, 100.0)]

@@ -109,6 +109,34 @@ def test_wakeup_only_on_mid_change_and_age_follows_live_books():
     assert m.signal_age_s() >= 4.9            # dirty: age of the inputs under the fair
 
 
+def test_spot_feed_carries_state_across_events():
+    """The session feed outlives events: a new event's model sees the same
+    forecaster/health, gets wakeups once attached, and its tracker is seeded
+    from bars sampled while it was being built."""
+    from kalshi_strategies.KXCRYPTOLEAD15M.live_feed import SpotFeed
+    now = time.time()
+    cfg = config(recovery_s=0.0)
+    spot = SpotFeed(cfg, persist=False)
+    spot.forecaster = ConstantCovForecaster()
+    spot.forecaster_warmed = True
+    a = CoinRaceModel(_event(now - 300, now + 600), cfg, spot=spot)
+    spot.attach(a)
+    woke = []
+    a.set_wakeup(lambda: woke.append("a"))
+    mono = time.monotonic()
+    for c in COINS:
+        spot._on_book(_book(c, mono))
+    assert woke and a.forecaster is spot.forecaster and a.health is spot.health
+    spot.detach(a)
+    b = CoinRaceModel(_event(now - 60, now + 840), cfg, spot=spot)
+    spot.sample(now - 30)      # lands in b's start window while b is unattached
+    spot.attach(b)
+    b.set_wakeup(lambda: woke.append("b"))
+    spot._on_book(_book("BTC", mono, 1.01))
+    assert woke[-1] == "b"
+    assert any(bar.ts_s == int(now - 30) for bar in b.tracker._bars["BTC"])
+
+
 def test_signal_age_is_oldest_coins_newest_book():
     now = time.time()
     m = _model(now, recovery_s=0.0)

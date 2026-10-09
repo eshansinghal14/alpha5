@@ -160,6 +160,18 @@ def test_stale_signal_pulls_quotes_and_logs_reason():
     assert q.debug_log[-1]["block_bid"] == "stale_signal" and q.block_counts["stale_signal"] == 1
 
 
+def test_fresh_recovery_applies_after_a_stale_episode_not_at_start():
+    c = cfg()
+    c.risk = P.RiskParams(max_loss_usd=80.0, max_signal_age_s=1.0, fresh_recovery_s=60.0)
+    m = Model()
+    q = Quoter(c, m, FREE, close_time=None)
+    assert not q.signal_stale()
+    m.age = 5.0
+    assert q.signal_stale()
+    m.age = 0.0
+    assert q.signal_stale()          # inside the recovery hold
+
+
 def test_series_side_block_vetoes_one_side():
     m = Model()
     m.block[("A", "yes")] = "series_says_no"

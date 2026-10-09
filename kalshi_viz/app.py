@@ -46,6 +46,14 @@ def _registry():
     return registry()
 
 
+@st.cache_data(max_entries=64, show_spinner=False)
+def _chart_html(series, market, t0_ms, max_position, quoting):
+    """~0.7s of Bokeh per build; shared across browser tabs. The x end is
+    t0 + 1s: the chart's own poller moves it to now on its first fetch."""
+    return build_live_html(series, market, stream_url(series, market), t0_ms, t0_ms + 1000,
+                           max_position, quoting)
+
+
 def _ms(v):
     return "n/a" if v is None else f"{v * 1000:,.0f} ms"
 
@@ -87,6 +95,10 @@ def _render_guards(s: dict):
     if cs.get("pending"):
         st.caption("Pending next event: " + ", ".join(f"{k}={v}" for k, v in cs["pending"].items()))
 
+    problem = (s.get("extras") or {}).get("feed_problem")
+    if problem:
+        st.error(f"📡 Signal feed: {problem}")
+
     c = st.columns(4)
     age, lim = s.get("signal_age_s"), s.get("signal_age_limit_s")
     c[0].metric("Signal age", _ms(age), delta="STALE" if age is not None and lim and age > lim else None,
@@ -97,11 +109,6 @@ def _render_guards(s: dict):
                 delta_color="off")
     c[3].metric("LIP accrued", f"${pnl.get('lip_accrued', 0):.2f}",
                 help="Expected LIP reward from the scoring replica (program terms from Kalshi).")
-    fees, wb = s.get("fees") or {}, s.get("write_budget_orders_per_s")
-    if fees:
-        st.caption(f"Kalshi fees: {fees.get('type')} x{fees.get('multiplier')} "
-                   f"(taker {fees.get('taker_rate')}, maker {fees.get('maker_rate')} x p(1-p))"
-                   + (f" · write budget ~{wb:g} orders/s" if wb else ""))
 
     qb, eb = s.get("quote_block_counts") or {}, s.get("blocked_counts") or {}
     if qb or eb:
@@ -118,6 +125,8 @@ def _markets(day) -> list[str]:
     sess = day.summary.get("session_started")
     if sess and "time" in q.columns:
         q = q[pd.to_datetime(q["time"], utc=True) >= pd.Timestamp(sess)]
+    if q.empty:
+        return sorted(traded)
     counts = q.groupby("ticker").size()
     active = set(counts[counts >= ACTIVE_MIN_FRACTION * counts.max()].index) if len(counts) else set()
     if "atm_tradeable" in q.columns:
@@ -169,9 +178,8 @@ def _render_series(series: str, spec):
         del st.session_state[k]
     if key not in st.session_state:
         t0 = pd.Timestamp(sess) if sess else pd.Timestamp.now(tz="UTC") - pd.Timedelta(minutes=15)
-        st.session_state[key] = build_live_html(
-            series, market, stream_url(series, market), t0.value // 10**6,
-            pd.Timestamp.now(tz="UTC").value // 10**6, q.get("max_position"), bool(q.get("enable_quoting")))
+        st.session_state[key] = _chart_html(series, market, t0.value // 10**6, q.get("max_position"),
+                                            bool(q.get("enable_quoting")))
     st.caption(f"Chart updates itself every {POLL_MS / 1000:.1f}s -- pan/zoom freely.")
     components.html(st.session_state[key], height=900, scrolling=True)
     with st.expander("Fills (this market)"):

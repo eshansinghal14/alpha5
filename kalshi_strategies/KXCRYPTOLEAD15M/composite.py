@@ -13,7 +13,7 @@ output used only for quoting responsiveness.
 
 Persistence (section 2.1, "Persist everything"): raw ticks are already
 caught by the adapters as they call back; this module appends 1s bars to
-`data/kalshi_crypto/composite/{coin}.parquet`, rotated daily. Hot path
+`data/kalshi_crypto/composite/{coin}_{date}_{HH}.parquet`, one per hour. Hot path
 keeps them in memory; disk writes happen on `flush()` to avoid taking a
 GIL hit every second.
 """
@@ -61,6 +61,35 @@ class CompositeBar:
 
 
 DATA_ROOT = Path(_DATA_ROOT) / "kalshi_crypto" / "composite"
+
+
+def bar_filename(coin: str, hour: pd.Timestamp) -> str:
+    """{coin}_{YYYY-MM-DD}_{HH}.parquet. Older files are daily,
+    {coin}_{YYYY-MM-DD}.parquet; readers handle both."""
+    return f"{coin}_{hour.strftime('%Y-%m-%d')}_{hour.strftime('%H')}.parquet"
+
+
+def bar_files(coin: str, start_s: float, end_s: float, root: Path = DATA_ROOT) -> list[Path]:
+    """Files that can hold bars in [start_s, end_s], by name alone."""
+    lo = pd.Timestamp(start_s, unit="s", tz="UTC")
+    hi = pd.Timestamp(end_s, unit="s", tz="UTC")
+    out = []
+    for path in sorted(root.glob(f"{coin}_*.parquet")):
+        if ".tmp-" in path.name:   # a flush interrupted before its replace
+            continue
+        parts = path.stem.split("_")
+        try:
+            day = pd.Timestamp(parts[1], tz="UTC")
+            if len(parts) == 2:
+                first, last = day, day + pd.Timedelta(days=1)
+            else:
+                first = day + pd.Timedelta(hours=int(parts[2]))
+                last = first + pd.Timedelta(hours=1)
+        except (IndexError, ValueError):
+            continue
+        if first <= hi and last > lo:
+            out.append(path)
+    return out
 
 
 class CompositeFeed:
@@ -165,7 +194,7 @@ class CompositeFeed:
 
     def flush(self) -> int:
         """Append any pending bars to parquet. Returns the number of
-        bars written. Rotates daily (one file per UTC date).
+        bars written. Rotates hourly (see bar_filename).
 
         Done on a cadence by the caller -- NOT every bar -- because
         `to_parquet` is CPU-bound pandas work (holds the GIL) and this is
@@ -192,12 +221,12 @@ class CompositeFeed:
         rows = [dataclasses.asdict(b) for b in self._pending_disk]
         df = pd.DataFrame(rows)
         df["ts"] = pd.to_datetime(df["ts_s"], unit="s", utc=True)
-        # One file per UTC date -- 86400 rows/day/coin is ~a few MB; one
-        # file per month would need an append path pandas doesn't give
-        # us without reading the whole file in.
+        # One file per UTC hour: each flush re-reads and rewrites the file it
+        # appends to, and a whole day's file reached 86ms per coin by 15:00
+        # UTC (2026-10-09), on a thread that holds the trading loop's GIL.
         written = 0
-        for date, chunk in df.groupby(df["ts"].dt.date):
-            path = self._persist_dir / f"{self.coin}_{date.isoformat()}.parquet"
+        for hour, chunk in df.groupby(df["ts"].dt.floor("h")):
+            path = self._persist_dir / bar_filename(self.coin, hour)
             if path.exists():
                 try:
                     old = pd.read_parquet(path)

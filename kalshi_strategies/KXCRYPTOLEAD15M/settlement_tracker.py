@@ -100,6 +100,8 @@ class SettlementTracker:
         # one source or the gap between sources shows up as a fake lead.
         self.window = window
         self._bars: dict[str, list[CompositeBar]] = {c: [] for c in COINS}
+        self._n_ingested = 0
+        self._cache: tuple | None = None
 
     def ingest(self, bar: CompositeBar):
         if bar.coin not in self._bars:
@@ -111,6 +113,7 @@ class SettlementTracker:
         if bar.ts_s < w.start_avg_begin - 5 or bar.ts_s >= w.T + 1:
             return
         self._bars[bar.coin].append(bar)
+        self._n_ingested += 1
 
     def backfill(self, bars_by_coin: dict[str, list[CompositeBar]]):
         """Seed from previously-persisted bars (section 3: "If we start up
@@ -125,6 +128,20 @@ class SettlementTracker:
                 self.ingest(b)
 
     def snapshot(self, now_s: float) -> SettlementSnapshot:
+        """Only `tau` depends on sub-second time (the windows are whole
+        seconds), so the scan over every bar is cached per (bar count,
+        second); it was ~11% of the event loop when run on every price."""
+        # Every comparison is against whole-second S, T and bar stamps, so
+        # results are constant on each open interval (k, k+1); an exact
+        # integer now_s sits on a boundary and gets its own key.
+        key = (self._n_ingested, math.floor(now_s), float(now_s).is_integer())
+        if self._cache is not None and self._cache[0] == key:
+            return dataclasses.replace(self._cache[1], tau=max(0.0, self.window.T - now_s))
+        snap = self._snapshot(now_s)
+        self._cache = (key, snap)
+        return snap
+
+    def _snapshot(self, now_s: float) -> SettlementSnapshot:
         w = self.window
         start_twap: dict[str, float | None] = {}
         start_quality: dict[str, str] = {}

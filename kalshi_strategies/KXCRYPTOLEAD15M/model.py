@@ -19,7 +19,7 @@ import pandas as pd
 
 from kalshi_infra.kalshi.markets import EventInfo
 from kalshi_infra.trading.fair import Fair
-from kalshi_strategies.KXCRYPTOLEAD15M.composite import DATA_ROOT, CompositeBar, CompositeBus
+from kalshi_strategies.KXCRYPTOLEAD15M.composite import DATA_ROOT, CompositeBar, CompositeBus, bar_files
 from kalshi_strategies.KXCRYPTOLEAD15M.pricer import BaseRateTracker, CoinRacePricer, FairResult
 from kalshi_strategies.KXCRYPTOLEAD15M.robust_har import RobustHarForecaster
 from kalshi_strategies.KXCRYPTOLEAD15M.series import COINS, START_END_AVG_S, coin_from_market_ticker
@@ -33,15 +33,18 @@ def load_composite_bars(coin: str, start_s: float, end_s: float, root: Path = DA
     out: list[CompositeBar] = []
     if not root.exists():
         return out
-    for path in sorted(root.glob(f"{coin}_*.parquet")):
-        if ".corrupt-" in path.name:   # quarantined by CompositeFeed.flush
-            continue
+    frames = []
+    for path in bar_files(coin, start_s, end_s, root):
         try:
             df = pd.read_parquet(path)
         except Exception as e:
             print(f"[KXCRYPTOLEAD15M] skipping unreadable {path.name} ({e!r})")
             continue
-        df = df[(df["ts_s"] >= start_s) & (df["ts_s"] <= end_s)]
+        frames.append(df[(df["ts_s"] >= start_s) & (df["ts_s"] <= end_s)])
+    if frames:
+        # A day written by both the old daily and the new hourly layout
+        # holds some seconds twice.
+        df = pd.concat(frames, ignore_index=True).drop_duplicates("ts_s", keep="last").sort_values("ts_s")
         for r in df.itertuples(index=False):
             out.append(CompositeBar(
                 coin=coin, ts_s=float(r.ts_s), price=float(r.price), utilized_depth=float(r.utilized_depth),
@@ -53,8 +56,11 @@ def load_composite_bars(coin: str, start_s: float, end_s: float, root: Path = DA
 
 
 class CoinRaceModel:
-    def __init__(self, ev: EventInfo, cfg, *, bus: CompositeBus, coinbase: CoinbaseAdapter | None,
-                 forecaster=None):
+    def __init__(self, ev: EventInfo, cfg, *, bus: CompositeBus | None = None,
+                 coinbase: CoinbaseAdapter | None = None, forecaster=None, spot=None):
+        """Live: pass `spot` (a session-lifetime live_feed.SpotFeed), which
+        supplies the bus, Coinbase feed, forecaster and health monitor.
+        Tests/backtest: pass `bus` (and optionally `forecaster`) instead."""
         self.cfg = cfg
         self.event_ticker = ev.event_ticker
         by_coin = {coin_from_market_ticker(m["ticker"]): m["ticker"] for m in ev.markets}
@@ -67,11 +73,16 @@ class CoinRaceModel:
                                   T=ev.close_time.timestamp())
         self.tracker = SettlementTracker(self.window)
         p = cfg.pricing
+        self.spot = spot
+        if spot is not None:
+            bus, coinbase, forecaster = spot.bus, spot.coinbase, spot.forecaster
+            self.health = spot.health
+        else:
+            self.health = FeedHealthMonitor(soft_stale_s=p.soft_stale_s, hard_stale_s=p.hard_stale_s,
+                                            recovery_s=p.recovery_s)
         self.forecaster = forecaster or RobustHarForecaster()
         self.pricer = CoinRacePricer(self.forecaster, p,
                                      base_rate=BaseRateTracker(p.base_rate_window).rate())
-        self.health = FeedHealthMonitor(soft_stale_s=p.soft_stale_s, hard_stale_s=p.hard_stale_s,
-                                        recovery_s=p.recovery_s)
         self.bus = bus
         self.coinbase = coinbase
         self.result: FairResult | None = None
@@ -94,9 +105,12 @@ class CoinRaceModel:
         before = self.bus.mid_nowcast(vb.coin) if vb.coin in self.bus.feeds else None
         self.bus.observe(vb)
         if self.bus.mid_nowcast(vb.coin) != before:
-            self._dirty = True
-            if self._wake is not None:
-                self._wake()
+            self._mid_moved()
+
+    def _mid_moved(self):
+        self._dirty = True
+        if self._wake is not None:
+            self._wake()
 
     # --- warmup -----------------------------------------------------------
 
@@ -104,11 +118,12 @@ class CoinRaceModel:
         """Seed the start TWAP and forecaster from persisted bars, so an event
         adopted mid-window prices off real returns. Without it x = 0 and the
         fair is a pure variance prior (2026-10-07: BTC theo 0.17 vs a 0.035
-        market). Returns per-coin start_quality."""
+        market). Returns per-coin start_quality. Live sessions use
+        backfill_start instead (the session's SpotFeed owns the forecaster)."""
         now_s = time.time()
+        since = self.window.S - 2 * START_END_AVG_S
         bars = {c: load_composite_bars(c, now_s - self.cfg.pricing.warmup_s, self.window.T) for c in COINS}
-        self.tracker.backfill({c: [b for b in bl if b.ts_s >= self.window.S - 2 * START_END_AVG_S]
-                               for c, bl in bars.items()})
+        self.tracker.backfill({c: [b for b in bl if b.ts_s >= since] for c, bl in bars.items()})
         by_s: dict[int, dict[str, float]] = {}
         for c, bl in bars.items():
             for b in bl:
@@ -120,6 +135,23 @@ class CoinRaceModel:
                 break
         return dict(self.tracker.snapshot(time.time()).start_quality)
 
+    def start_window_since(self) -> float:
+        return self.window.S - 2 * START_END_AVG_S
+
+    def backfill_start(self, mem_bars: dict[str, list[CompositeBar]]) -> dict[str, str]:
+        """Seed only the settlement tracker. `mem_bars` are the session's
+        in-memory bars from start_window_since(); disk fills in only when
+        the session started after that (the next event's start average is
+        the previous event's last minute, already in memory). Safe off the
+        loop: nothing else touches this model's tracker until feed_tasks()."""
+        since = self.start_window_since()
+        if any(not bl or bl[0].ts_s > since + 1 for bl in mem_bars.values()):
+            disk = {c: load_composite_bars(c, since, self.window.T) for c in COINS}
+        else:
+            disk = {}
+        self.tracker.backfill({c: disk.get(c, []) + mem_bars.get(c, []) for c in COINS})
+        return dict(self.tracker.snapshot(time.time()).start_quality)
+
     # --- pricing ----------------------------------------------------------
 
     def _withhold(self, reason: str):
@@ -128,6 +160,9 @@ class CoinRaceModel:
         return {t: None for t in self.tickers}
 
     def _ingest_bars(self, now_s: float):
+        if self.spot is not None:
+            self.spot.sample(now_s)
+            return
         sampled = self.bus.sample_all(now_s)
         for bar in sampled.values():
             self.tracker.ingest(bar)
@@ -207,9 +242,11 @@ class CoinRaceModel:
         return self._price(now_s, None)
 
     def on_market_event(self, ticker, now_s):
-        # ~1ms; keeps theo on the newest Coinbase book even if the reprice
-        # loop stalls under a Kalshi burst near the close.
-        if self._down:
+        # Keeps theo on the newest Coinbase mid if the reprice task is queued
+        # behind a Kalshi burst. Only when a mid has actually moved: pricing
+        # on every Kalshi delta (~37/s, 2026-10-09) was 56% of the event loop
+        # and starved the Coinbase reader into stale_signal.
+        if self._down or not self._dirty:
             return None
         return self._price(now_s, False)
 
@@ -242,6 +279,8 @@ class CoinRaceModel:
         r = self.result
         snap = self.tracker.snapshot(time.time())
         return {
+            "feed_problem": (None if self.withheld_reason in (None, "before_start")
+                             else f"fair withheld: {self.withheld_reason}"),
             "phase": None if r is None else r.phase, "tau_s": snap.tau, "tau_eff": None if r is None else r.tau_eff,
             "start_quality": dict(snap.start_quality), "withheld_reason": self.withheld_reason,
             "fairs": None if r is None else {c: float(r.probs[i]) for i, c in enumerate(COINS)},
@@ -253,6 +292,12 @@ class CoinRaceModel:
     # --- lifecycle -----------------------------------------------------------
 
     def feed_tasks(self):
+        if self.spot is not None:
+            # The session's feed keeps running across events; attach() routes
+            # its bars and wakeups here.
+            self.spot.ensure_running()
+            self.spot.attach(self)
+            return []
         tasks = [self._sample_loop(), self._flush_loop()]
         if self.coinbase is not None:
             tasks.append(self.coinbase.run(self._on_book))
@@ -278,4 +323,20 @@ class CoinRaceModel:
                 print(f"[KXCRYPTOLEAD15M] composite flush failed: {e!r}")
 
     async def close(self):
+        if self.spot is not None:
+            self.spot.detach(self)
+            return
         self.bus.flush_all()
+
+
+def warm_forecaster(cfg, until_s: float) -> RobustHarForecaster:
+    """A forecaster replayed over the persisted warmup window. Built fresh so
+    it can run off the loop while the live one keeps sampling."""
+    f = RobustHarForecaster()
+    by_s: dict[int, dict[str, float]] = {}
+    for c in COINS:
+        for b in load_composite_bars(c, until_s - cfg.pricing.warmup_s, until_s):
+            by_s.setdefault(int(b.ts_s), {})[c] = b.mid
+    for ts in sorted(by_s):
+        f.update(float(ts), by_s[ts])
+    return f

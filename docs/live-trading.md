@@ -12,20 +12,28 @@ kalshi_infra/runtime/session.py   rollover + per-event loops (series-agnostic)
 kalshi_infra/trading/quoter.py    edge, takes, edge quotes, LIP quote (series-agnostic)
 kalshi_infra/trading/engine.py    order resolution: shadow fills or real Kalshi orders
 kalshi_infra/kalshi/              auth, REST, websocket feed, orders, fees, markets
-kalshi_infra/runtime/persist.py   snapshot files the dashboard reads
+kalshi_infra/runtime/writer.py    writer process: snapshots, chart streams, journal
+kalshi_infra/runtime/persist.py   snapshot file formats the dashboard reads
 kalshi_viz/app.py                 dashboard (reads only; never launches a session)
 ```
 
 Per event the data path is:
 
 ```
-series feeds -> model.reprice -> FairUpdate --+
-Kalshi ws    -> book / trade --------------+--+--> Quoter -> LiveEngine -> shadow fill | Kalshi
+series feeds -> wakeup -> model.reprice -> FairUpdate --+
+Kalshi ws    -> book / trade ------------------------+--+--> Quoter -> LiveEngine -> shadow fill | Kalshi
 ```
 
-Background loops: config hot-reload, arm/disarm, position audit,
-quote-fill poll, snapshot flush, close watch. All cadences come from the
-series' `config.json` `runtime` section.
+Repricing is event-driven: the model wakes the reprice loop when a pricing
+input changes (crypto: a coin's mid; SPX: an IB tick), and a burst is
+coalesced into one reprice. Background loops: config hot-reload, arm/disarm,
+position audit, quote-fill poll, a 1s flush to the writer. Only
+`quote_fill_poll_s` and `control_poll_s` are configurable; the rest are
+constants in `session.py` / `writer.py` / `kalshi/ws_feed.py`.
+
+The trading process never serialises anything: it ships new rows to the
+writer process once a second. On a thread, the pandas/parquet work held the
+GIL long enough to stall the loop past `max_signal_age_s`.
 
 ## Running
 
@@ -36,8 +44,13 @@ python -m kalshi_strategies.run --series KXINXU --live-trading                  
 streamlit run kalshi_viz/app.py
 ```
 
-Several series run as separate processes so one series' CPU stalls (SPX
-reprice 12–19ms, crypto heavy flush seconds) or crash can't stall another.
+Several series run as separate processes so one series' CPU stalls or
+crash can't stall another.
+
+If the dashboard shows "📡 Signal feed: IB Gateway reports broken ...", the
+gateway has lost its own link to IB (codes 2110/2103/2157) while our socket
+to it stays up. Nothing on our side fixes that; re-login or restart IB
+Gateway. The feed reconnects by itself after 60s without ticks.
 
 ## Config
 
@@ -82,7 +95,7 @@ paper continues, and the next event re-arms if the toggle is still on.
 | Trigger | Effect |
 |---|---|
 | PnL ≤ −`risk.max_loss_usd` on the worse of touch / fair marking | halt (one-way for the session); quotes pulled |
-| Fair inputs older than `risk.max_signal_age_s` | no takes, quotes pulled; resumes after `fresh_recovery_s` of freshness |
+| Fair inputs older than `risk.max_signal_age_s` | no takes, quotes pulled; resumes after `fresh_recovery_s` of freshness (not applied at event start) |
 | 5 consecutive real-order errors | halt new orders (auth/balance/market state) |
 | Ledger disagrees with Kalshi `/positions` (audit) | halt |
 | Fill outside its own limit price | halt (units / side-convention bug) |
@@ -123,19 +136,28 @@ are dropped (the quoter re-decides next tick); cancels always go through.
 
 ## Snapshot files
 
-`data/live/{series}/{date}/`: `summary.json` every `flush_interval_s`;
-`quote_df` / `fills_df` / `pnl_df` / `fair_df` parquets every
-`heavy_flush_every` flushes; `journal/` append-only parts that survive
-restarts and arming. Per-market chart streams go to
-`kalshi_viz/static/{series}/` so Streamlit serves them same-origin.
+`data/live/{series}/{date}/`: `summary.json` every second;
+`quote_df` / `fills_df` / `pnl_df` / `fair_df` parquets and the chart
+streams every 3s when anything changed; `journal/` append-only parts
+(every 30s) that survive restarts and arming. The dashboard reads the
+session snapshot, not the decisions journal (that reaches hundreds of MB a
+day). Per-market chart streams go to `kalshi_viz/static/{series}/` so
+Streamlit serves them same-origin.
 
 ## Rollover
 
-One process trades the series' current event, then the next. Each event
-gets a fresh engine, quoter, ledger and LIP tracker; armed state carries
-over unless `--no-carry-arm`. Which event is "current" is the series'
-`pick_event` (KXINX/KXINXU: the 16:00 ET daily close after
-`pricing.event_open_et`; crypto: soonest close).
+Scheduled, not polled: Kalshi lists upcoming events with their
+`open_time` / `close_time`, so the session picks the next event, sleeps to
+`series.trade_from` (crypto: Kalshi's open; KXINX/KXINXU:
+`pricing.event_open_et` on the close day), and runs it to `close_time`. The
+next event and its fees/write limits are prefetched 30s before close; LIP
+programs are looked up at the open, concurrently with trading.
+
+Each event gets a fresh engine, quoter, ledger and LIP tracker; armed state
+carries over unless `--no-carry-arm`. Crypto's Coinbase feed, composite
+bars, vol forecaster and feed health live for the whole process
+(`KXCRYPTOLEAD15M/live_feed.py`), so an event goes live within a fraction
+of a second of its open.
 
 ## Deliberately not built
 

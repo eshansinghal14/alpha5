@@ -21,7 +21,6 @@ from __future__ import annotations
 import asyncio
 import collections
 import functools
-import sys
 import time
 import traceback
 
@@ -32,10 +31,10 @@ from kalshi_infra.kalshi import fees as kfees
 from kalshi_infra.kalshi import markets as km
 from kalshi_infra.kalshi.orders import KalshiOrderClient
 from kalshi_infra.kalshi.ws_feed import LiveKalshiFeed
-from kalshi_infra.runtime import journal as jr
 from kalshi_infra.runtime import persist
 from kalshi_infra.runtime.control import TradingModeWatcher
 from kalshi_infra.runtime.series import Series
+from kalshi_infra.runtime.writer import DecisionLog, SnapshotWriter
 from kalshi_infra.trading import lip as lipmod
 from kalshi_infra.trading.engine import LiveEngine
 from kalshi_infra.trading.fair import FairUpdate
@@ -43,12 +42,11 @@ from kalshi_infra.trading.params import check_strategy_config
 from kalshi_infra.trading.quoter import Quoter
 
 
-FLUSH_INTERVAL_S = 3.0      # summary.json; a heavy flush measured p95 ~640ms (2026-10-09), so not per update
-HEAVY_FLUSH_EVERY = 10      # every Nth flush also rewrites the parquets and chart streams
-MAX_DEBUG_ROWS = 20_000     # heavy-flush cost scales with this; the oldest half is thinned past it
+FLUSH_INTERVAL_S = 1.0      # rows shipped to the writer process; serialising happens there
 AUDIT_INTERVAL_S = 5.0
 REPRICE_IDLE_S = 1.0        # reprice even without new inputs, so time decay and withhold states advance
 CLOSE_GRACE_S = 1.0
+PREFETCH_BEFORE_CLOSE_S = 30.0
 NO_EVENT_RETRY_S = 300.0    # nothing listed yet (e.g. KXINX lists the next day's event after the close)
 RETRY_S = 30.0              # failed lookup or failed event
 
@@ -61,18 +59,28 @@ def _now() -> pd.Timestamp:
     return pd.Timestamp.now(tz="UTC")
 
 
-def _prune(seq: list, cap: int | None):
-    """Halve the oldest half past `cap`: keeps the full span at reduced
-    resolution (the chart decimates anyway)."""
-    if cap is None or len(seq) <= cap:
-        return
-    half = len(seq) // 2
-    seq[:half] = seq[:half:2]
+_DECISION_FIELDS = ("market_bid", "market_ask", "prob_raw", "prob_lo", "prob_hi", "net_position",
+                    "eff_yes", "eff_no", "bid_final", "ask_final", "quote_bid", "quote_ask",
+                    "lip_bid", "lip_ask", "block_bid", "block_ask", "atm_tradeable")
+
+
+def _decision_key(row: dict) -> tuple:
+    return tuple(row.get(k) for k in _DECISION_FIELDS)
 
 
 async def session_loop(series: Series, *, live_trading: bool, carry_arm: bool,
                        event_ticker: str | None = None):
     """`event_ticker` names a one-off event (no rollover)."""
+    writer = SnapshotWriter(series.ticker)
+    try:
+        await _session_loop(series, writer, live_trading=live_trading, carry_arm=carry_arm,
+                            event_ticker=event_ticker)
+    finally:
+        writer.stop()
+
+
+async def _session_loop(series: Series, writer: SnapshotWriter, *, live_trading: bool, carry_arm: bool,
+                        event_ticker: str | None):
     store = ConfigStore(series.config_cls, series.config_path, series.config_key)
     check_strategy_config(store.config)
     _log(series.ticker, f"config loaded from {series.config_path}"
@@ -81,17 +89,23 @@ async def session_loop(series: Series, *, live_trading: bool, carry_arm: bool,
     armed = live_trading
     done: set[str] = set()
     rolled = False
+    nxt: dict = {}     # filled by run_event's prefetch with the next event's lookups
     while True:
         for c in store.poll():
             _log(series.ticker, f"config: {c}")
         for c in store.apply_pending():
             _log(series.ticker, f"config (next-event change applied): {c}")
+        loop = asyncio.get_running_loop()
         try:
+            # Off the loop: a session-lifetime feed (crypto spot) keeps
+            # running between events.
             if event_ticker:
-                ev = km.event(event_ticker)
+                ev = await loop.run_in_executor(None, km.event, event_ticker)
+            elif nxt.get("event") is not None and nxt["event"].event_ticker not in done:
+                ev = nxt["event"]
             else:
-                listed = [e for e in km.upcoming_events(series.ticker) if e.event_ticker not in done]
-                ev = series.pick_event(listed, store.config)
+                listed = await loop.run_in_executor(None, km.upcoming_events, series.ticker)
+                ev = series.pick_event([e for e in listed if e.event_ticker not in done], store.config)
         except Exception as e:
             _log(series.ticker, f"event lookup failed ({e!r}); retrying in {RETRY_S:.0f}s")
             await asyncio.sleep(RETRY_S)
@@ -109,12 +123,17 @@ async def session_loop(series: Series, *, live_trading: bool, carry_arm: bool,
             # long waits (KXINX overnight). The re-lookup after the sleep also
             # refreshes the market list, which can grow before the open.
             await asyncio.sleep(min(wait_s, NO_EVENT_RETRY_S))
+            if wait_s > NO_EVENT_RETRY_S:
+                nxt = {}
             continue
         done.add(ev.event_ticker)
         _log(series.ticker, f"trading {ev.event_ticker}"
              + ("  (carrying REAL TRADING over)" if armed and carry_arm and rolled else ""))
+        prep, nxt = nxt, {}
         try:
-            armed = await run_event(series, ev, store, trading, live_trading=armed)
+            armed = await run_event(series, ev, store, trading, writer, live_trading=armed,
+                                    prep=prep.get("prep"),
+                                    next_slot=None if event_ticker else nxt, done=done)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -129,54 +148,76 @@ async def session_loop(series: Series, *, live_trading: bool, carry_arm: bool,
         rolled = True
 
 
+async def _prepare(S: str, ev: km.EventInfo) -> dict:
+    """The event's Kalshi REST lookups, concurrently and off the loop: run
+    in sequence on the loop they were ~2.3s (LIP alone 1.5s, 2026-10-09)
+    during which no feed was read."""
+    loop = asyncio.get_running_loop()
+    tickers = {m["ticker"] for m in ev.markets}
+    fees, progs, client = await asyncio.gather(
+        loop.run_in_executor(None, _guarded, kfees.for_event, S, ev.event_ticker),
+        loop.run_in_executor(None, _guarded, km.incentive_programs, tickers),
+        loop.run_in_executor(None, _guarded, KalshiOrderClient.from_account))
+    return {"event_ticker": ev.event_ticker, "fees": fees, "lip": progs, "order_client": client}
+
+
+def _guarded(fn, *a):
+    try:
+        return fn(*a), None
+    except Exception as e:
+        return None, e
+
+
 async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
-                    trading: TradingModeWatcher, *, live_trading: bool) -> bool:
+                    trading: TradingModeWatcher, writer: SnapshotWriter, *, live_trading: bool,
+                    prep: dict | None = None, next_slot: dict | None = None,
+                    done: set | None = None) -> bool:
     """Trade one event until it closes. Returns whether real trading was
-    armed at the end (carried into the next event)."""
+    armed at the end (carried into the next event). `prep` is this event's
+    _prepare() result if it was fetched ahead of time; `next_slot` receives
+    the next event and its _prepare() shortly before this one closes."""
     S = series.ticker
     cfg = store.config
-    model = await series.build_model(ev, cfg)
+    if prep is None or prep["event_ticker"] != ev.event_ticker:
+        prep_task = asyncio.create_task(_prepare(S, ev))
+        model = await series.build_model(ev, cfg)
+        prep = await prep_task
+    else:
+        model = await series.build_model(ev, cfg)
     tickers = list(model.tickers)
-    date = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d")
-    persist.reset_session_files(S)
+    writer.start_event(pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d"))
+    lip_pending = "lip" not in prep
 
-    fee_sched = kfees.for_event(S, ev.event_ticker)
+    fee_sched, err = prep["fees"]
+    if err is not None:
+        raise RuntimeError(f"fee lookup failed: {err!r}") from err
     _log(S, f"fees from Kalshi: {fee_sched.fee_type} x{fee_sched.multiplier:g} "
             f"(taker {fee_sched.taker_rate:g}, maker {fee_sched.maker_rate:g} x p(1-p))")
 
-    lip = None
-    try:
-        progs = km.incentive_programs(set(tickers))
-        lip = lipmod.LipTracker({t: lipmod.params_from_program(p) for t, p in progs.items()})
+    def _lip_from(res):
+        progs, err = res
+        if err is not None:
+            _log(S, f"WARN: LIP lookup failed ({err!r}); no LIP quoting or accrual this event")
+            return None
+        progs = {t: p for t, p in progs.items() if t in set(tickers)}
         _log(S, f"LIP programs on {len(progs)}/{len(tickers)} markets")
-    except Exception as e:
-        _log(S, f"WARN: LIP lookup failed ({e!r}); no LIP quoting or accrual this event")
+        return lipmod.LipTracker({t: lipmod.params_from_program(p) for t, p in progs.items()})
 
+    lip = None if lip_pending else _lip_from(prep["lip"])
     quoter = Quoter(cfg, model, fee_sched, close_time=ev.close_time, lip=lip, record_debug=True)
-    try:
-        order_client = KalshiOrderClient.from_account()
+    order_client, err = prep["order_client"]
+    if err is None:
         _log(S, f"write budget {order_client.tokens_per_s:g} tokens/s "
                 f"(~{order_client.max_orders_per_s:g} orders/s) from Kalshi account limits")
-    except Exception as e:
-        order_client = None
-        _log(S, f"WARN: no order client ({e!r}); real trading cannot be armed")
+    else:
+        _log(S, f"WARN: no order client ({err!r}); real trading cannot be armed")
     engine = LiveEngine(quoter, risk=cfg.risk, quoting=cfg.quoting, fees=fee_sched,
                         order_client=order_client, event_ticker=ev.event_ticker, close_time=ev.close_time)
     engine.set_clocks(signal_age_fn=model.signal_age_s, feed_age_fn=model.feed_age_s,
                       applied_age_fn=model.applied_age_s)
 
-    journal = jr.DayJournal(S, date)
-    quoter.debug_log = jr.JournalingList(journal.record_decision)
-    pnl_history: list[tuple] = []
-    fair_history: list[dict] = []
-    pnl_by_ticker: dict[str, collections.deque] = {}
-
-    def on_reset():
-        pnl_history.clear()
-        fair_history.clear()
-        pnl_by_ticker.clear()
-        persist.reset_session_files(S)
-    engine.add_session_reset_hook(on_reset)
+    quoter.debug_log = DecisionLog(writer, _decision_key)
+    engine.add_session_reset_hook(writer.reset_session)
 
     def remaining_s() -> float | None:
         return None if ev.close_time is None else (ev.close_time - pd.Timestamp.now(tz="UTC")).total_seconds()
@@ -188,7 +229,7 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
     if live_trading and not inside_real_cutoff():
         engine.set_live_trading(True)
 
-    timings = {k: collections.deque(maxlen=400) for k in ("reprice", "dispatch", "flush", "loop_lag")}
+    timings = {k: collections.deque(maxlen=400) for k in ("reprice", "dispatch", "loop_lag")}
 
     def _stat(d):
         if not d:
@@ -199,7 +240,7 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
 
     # --- Kalshi ---
     def on_quote(book):
-        journal.record_bbo(book)
+        writer.bbo(book)
         engine.update_book(book)
         engine.dispatch(book, pd.Timestamp.now(tz="UTC"))
 
@@ -232,8 +273,7 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
                 now = pd.Timestamp.now(tz="UTC")
                 for t, f in fairs.items():
                     if f is not None:
-                        fair_history.append({"time": now, "ticker": t, "prob": f.prob,
-                                             "prob_lo": f.lo, "prob_hi": f.hi})
+                        writer.fair({"time": now, "ticker": t, "prob": f.prob, "prob_lo": f.lo, "prob_hi": f.hi})
                 t1 = time.perf_counter()
                 engine.dispatch(FairUpdate(fairs), now)
                 timings["dispatch"].append(time.perf_counter() - t1)
@@ -301,71 +341,56 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
             await asyncio.sleep(probe)
             timings["loop_lag"].append(max(0.0, time.perf_counter() - t0 - probe))
 
-    flush_busy = [False]
-    flush_n = [0]
-
-    def _write(state):
-        t0 = time.perf_counter()
-        try:
-            persist.write(state)
-        except Exception:
-            _log(S, f"WARN: snapshot write failed (heavy={state['heavy']}):")
-            traceback.print_exc()
-            sys.stdout.flush()
-        try:
-            jr.write(state.get("journal"))
-        except Exception:
-            _log(S, "WARN: journal write failed:")
-            traceback.print_exc()
-        return time.perf_counter() - t0
-
-    def _done(fut):
-        flush_busy[0] = False
-        try:
-            timings["flush"].append(fut.result())
-        except Exception:
-            _log(S, "WARN: snapshot write failed:")
-            traceback.print_exc()
-
-    def _snapshot(heavy: bool, now):
+    def _flush(now):
+        writer.pnl(now, engine.current_pnl(mark="prob") + (lip.total_usd() if lip is not None else 0.0))
+        for t, pos in engine.portfolio.positions.items():
+            f = quoter.fairs.get(t)
+            if f is not None:
+                writer.pnl_ticker(t, now, pos.unrealized_pnl(f.prob, f.prob))
         summary = persist.build_summary(series=S, event_ticker=ev.event_ticker, engine=engine,
                                         quoter=quoter, store=store, model=model, now=now,
-                                        timings={**{k: _stat(v) for k, v in timings.items()},
-                                                 "write_phases_ms": dict(persist.WRITE_PHASES)})
-        state = persist.capture(series=S, summary=summary, quoter=quoter, engine=engine,
-                                pnl_history=pnl_history, fair_history=fair_history,
-                                pnl_by_ticker=pnl_by_ticker, now=now, heavy=heavy)
-        if heavy:
-            journal.record_fills(engine.portfolio.fills, engine.live_trading)
-            state["journal"] = journal.capture()
-        return state
+                                        timings={k: _stat(v) for k, v in timings.items()})
+        writer.flush(summary, engine.portfolio.fills, engine.live_trading)
 
     async def flush_loop():
         while True:
             await asyncio.sleep(FLUSH_INTERVAL_S)
-            now = pd.Timestamp.now(tz="UTC")
-            engine.check_failsafe()
-            blocked = engine.blocked_reason()
-            # Resting quotes keep taking risk through a halt until withdrawn.
-            if blocked is not None and engine.has_quotes():
-                _log(S, f"pulling quotes -- {blocked}")
-                engine.pull_quotes()
-            pnl_history.append((now, engine.current_pnl(mark="prob")
-                                + (lip.total_usd() if lip is not None else 0.0)))
-            for t, pos in engine.portfolio.positions.items():
-                f = quoter.fairs.get(t)
-                if f is not None:
-                    pnl_by_ticker.setdefault(t, collections.deque(maxlen=4000)).append(
-                        (now, pos.unrealized_pnl(f.prob, f.prob)))
-            _prune(quoter.debug_log, MAX_DEBUG_ROWS)
-            _prune(fair_history, MAX_DEBUG_ROWS)
-            if flush_busy[0]:
-                continue   # overwrite-in-place: skipping beats queueing
-            flush_n[0] += 1
-            # Heavy on the first flush so the dashboard finds every file at once.
-            state = _snapshot(heavy=flush_n[0] % HEAVY_FLUSH_EVERY == 1, now=now)
-            flush_busy[0] = True
-            asyncio.get_running_loop().run_in_executor(None, _write, state).add_done_callback(_done)
+            try:
+                engine.check_failsafe()
+                blocked = engine.blocked_reason()
+                # Resting quotes keep taking risk through a halt until withdrawn.
+                if blocked is not None and engine.has_quotes():
+                    _log(S, f"pulling quotes -- {blocked}")
+                    engine.pull_quotes()
+                _flush(pd.Timestamp.now(tz="UTC"))
+            except Exception:
+                _log(S, "WARN: flush failed:")
+                traceback.print_exc()
+
+    async def prefetch_next():
+        """The next event is already listed with its schedule; fetching it and
+        its fees/LIP/limits now means the open isn't spent on REST."""
+        if next_slot is None or ev.close_time is None:
+            return
+        await asyncio.sleep(max(0.0, remaining_s() - PREFETCH_BEFORE_CLOSE_S))
+        try:
+            listed = await asyncio.get_running_loop().run_in_executor(None, km.upcoming_events, S)
+            nxt_ev = series.pick_event([e for e in listed if e.event_ticker not in (done or set())
+                                        and e.event_ticker != ev.event_ticker], store.config)
+            if nxt_ev is None:
+                return
+            start = series.trade_from(nxt_ev, store.config)
+            if start is not None and (start - ev.close_time).total_seconds() > PREFETCH_BEFORE_CLOSE_S:
+                return   # not back-to-back (KXINX overnight): limits/LIP could change by then
+            next_slot["event"] = nxt_ev
+            prep = await _prepare(S, nxt_ev)
+            # A series' LIP programs are created when the event opens, so an
+            # early lookup finds none (2026-10-09: 0/5 markets); it's redone
+            # at the start, concurrently with everything else.
+            prep.pop("lip")
+            next_slot["prep"] = prep
+        except Exception as e:
+            _log(S, f"WARN: next-event prefetch failed ({e!r}); it will be looked up at rollover")
 
     async def until_close():
         if ev.close_time is None:
@@ -374,10 +399,19 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
         while (rem := remaining_s()) > -CLOSE_GRACE_S:
             await asyncio.sleep(rem + CLOSE_GRACE_S)
 
+    async def lip_lookup():
+        """Trading starts without LIP rather than waiting ~1.5s on it; the
+        LIP quote and accrual begin once the programs are known."""
+        if not lip_pending:
+            return
+        res = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: _guarded(km.incentive_programs, set(tickers)))
+        quoter.lip = _lip_from(res)
+
     _log(S, f"starting feeds for {ev.event_ticker} ({len(tickers)} markets, "
             f"{'REAL ORDERS' if engine.live_trading else 'shadow'})")
     coros = [kalshi.run(), *model.feed_tasks(), reprice_loop(), control_loop(), audit_loop(),
-             quote_fill_loop(), lag_probe(), flush_loop()]
+             quote_fill_loop(), lag_probe(), flush_loop(), prefetch_next(), lip_lookup()]
     tasks = [asyncio.create_task(c) for c in coros]
     try:
         await until_close()
@@ -404,7 +438,8 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
         except Exception:
             traceback.print_exc()
         try:
-            _write(_snapshot(heavy=True, now=pd.Timestamp.now(tz="UTC")))
+            _flush(pd.Timestamp.now(tz="UTC"))
+            writer.end_event()
         except Exception:
             _log(S, "WARN: final snapshot failed:")
             traceback.print_exc()

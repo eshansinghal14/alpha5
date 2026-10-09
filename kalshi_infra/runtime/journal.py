@@ -10,8 +10,8 @@ whatever is on disk, so the day survives both. Snapshot = live view;
 journal = record.
 
 BBO is journaled unconditionally, so a quiet stretch reads as "market, no
-action" rather than missing data. Buffers drain on the event loop (capture)
-and serialise on a worker thread (write).
+action" rather than missing data. Lives in the writer process
+(runtime.writer), off the trading loop.
 """
 import glob
 import os
@@ -157,6 +157,19 @@ def read_journal(series: str, date: str, stream: str, out_root: str = None) -> p
     fails to read is skipped rather than raised on -- the newest one can be
     mid-write, and the day's history is worth more than its last 30s."""
     parts = sorted(glob.glob(os.path.join(journal_dir(series, date, out_root), stream, "part-*.parquet")))
+    if not parts:
+        return pd.DataFrame()
+    # One dataset read is ~10x faster than a read_parquet per part (106
+    # fills parts: 1.1s -> ~0.1s); fall back to per-part only when one part
+    # is unreadable or the parts' schemas disagree.
+    try:
+        import pyarrow.dataset as ds
+        df = ds.dataset(parts, format="parquet").to_table().to_pandas()
+        if "time" in df.columns:
+            df = df.sort_values("time").reset_index(drop=True)
+        return df
+    except Exception:
+        pass
     frames = []
     for path in parts:
         try:

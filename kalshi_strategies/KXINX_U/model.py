@@ -131,7 +131,8 @@ class SpxEventModel:
         return None
 
     def summary_extras(self) -> dict:
-        return {"ib_ticks_per_s": self.ib.records_per_s(), "ib_held_ticks": self.ib.book.n_held,
+        return {"feed_problem": self.ib.gateway_problem(), "ib_farms": dict(self.ib.farm_status),
+                "ib_ticks_per_s": self.ib.records_per_s(), "ib_held_ticks": self.ib.book.n_held,
                 "ib_scope": list(self.ib.scope_tickers or []),
                 "noise_dropped": dict(self.noise.dropped), "noise_warming": len(self.noise.warming)}
 

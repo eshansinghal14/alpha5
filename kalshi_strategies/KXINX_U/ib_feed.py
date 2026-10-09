@@ -16,6 +16,9 @@ from kalshi_infra import ib_functions as ibf
 from kalshi_infra import keys
 
 _RATE_WINDOW_S = 10.0     # tick-rate averaging window for records_per_s() (display only)
+# 30+ SPXW lines tick several times a second in RTH; a minute of silence is
+# a dead subscription, not a quiet market.
+SILENT_RECONNECT_S = 60.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -211,6 +214,11 @@ class LiveIBFeed:
 
         self._connected = False
         self._stop = False
+        # Gateway-side outages arrive as error codes, not disconnects: the
+        # socket stays up and ticks just stop (2026-10-09: 2103 usfarm broken
+        # for hours, both SPX sessions stale with no other symptom).
+        self.farm_status: dict[str, str] = {}
+        self._ib.errorEvent += self._on_error
 
     async def run(self) -> None:
         """Connect, subscribe, and keep the IB client alive until cancelled.
@@ -221,6 +229,13 @@ class LiveIBFeed:
                 await self._connect_and_subscribe()
                 while self._ib.isConnected() and not self._stop:
                     await asyncio.sleep(1.0)
+                    # A farm outage leaves the socket up with no ticks. IB
+                    # usually restores the farm on its own but the dropped
+                    # subscriptions don't always resume, so reconnect.
+                    if self.seconds_since_record() > SILENT_RECONNECT_S:
+                        print(f"[ib_feed] no ticks for {self.seconds_since_record():.0f}s "
+                              f"({self.gateway_problem() or 'gateway reports no fault'}); reconnecting")
+                        break
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -242,11 +257,16 @@ class LiveIBFeed:
     async def _connect_and_subscribe(self) -> None:
         print(f"[ib_feed] connecting to IB at {keys.IB_HOST}:{keys.IB_PORT} "
               f"(clientId={self._client_id})")
+        # Market data only: the default startup also syncs positions, orders,
+        # executions and account updates, each of which times out when the
+        # gateway's server link is down (2026-10-09) and none of which we use.
         await self._ib.connectAsync(
             host=keys.IB_HOST, port=keys.IB_PORT, clientId=self._client_id,
             account=keys.IB_ACCOUNT or "", readonly=keys.IB_READONLY,
+            fetchFields=self._ib_mod.StartupFetchNONE,
         )
         self._connected = True
+        self._last_tick_t = time.monotonic()   # the silence watchdog runs from (re)connect
 
         qualified = await self._qualify(self._initial_strikes)
         if not qualified:
@@ -334,6 +354,30 @@ class LiveIBFeed:
         self._last_tick_t = now
         if self.on_tick_hook is not None:
             self.on_tick_hook()
+
+    _FARM_CODES = {1100: ("server", "broken"), 1101: ("server", "ok"), 1102: ("server", "ok"),
+                   2110: ("server", "broken"), 2103: ("market_data", "broken"),
+                   2104: ("market_data", "ok"), 2108: ("market_data", "inactive"),
+                   2157: ("sec_def", "broken"), 2158: ("sec_def", "ok")}
+
+    def _on_error(self, req_id, code, msg, *_):
+        hit = self._FARM_CODES.get(code)
+        if hit is None:
+            return
+        farm, state = hit
+        if self.farm_status.get(farm) != state:
+            print(f"[ib_feed] IB {farm} connection {state} ({code}: {msg})", flush=True)
+        self.farm_status[farm] = state
+
+    def gateway_problem(self) -> str | None:
+        """Why IB can't be delivering, per the gateway itself; None if it
+        reports nothing wrong."""
+        if not self._connected:
+            return "not connected to IB Gateway"
+        bad = [f for f, s in self.farm_status.items() if s == "broken"]
+        if bad:
+            return "IB Gateway reports broken: " + ", ".join(sorted(bad)) + " (re-login/restart the gateway)"
+        return None
 
     def drain(self) -> int:
         """Apply pending ticks to the book. Returns N applied (not N
