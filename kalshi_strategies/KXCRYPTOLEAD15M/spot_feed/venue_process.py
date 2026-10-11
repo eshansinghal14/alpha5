@@ -127,6 +127,7 @@ def _child_main(plan: dict[str, list[str]]):
             time.time() - (time.monotonic() - vb.receive_ts), vb.exchange_ts, vb.is_resyncing)
 
     perp_rows: list[dict] = []
+    perp_usd: dict[tuple[str, str], tuple] = {}
 
     def on_print(coin, t, as_of, exch_ts, kind):
         if kind in PERP_BURST_USD_1S:
@@ -136,12 +137,15 @@ def _child_main(plan: dict[str, list[str]]):
                                   "size": float(t["size"]), "side": t.get("side"),
                                   "trade_id": str(t.get("trade_id"))})
             except (KeyError, TypeError, ValueError):
-                pass
-            # Recorded here, in the child, rather than shipped: at Binance's
-            # sweep rates (thousands/s) shipping them loads the trading loop at
-            # the worst moment. Only calibrated coins are shipped for bursts.
-            if coin not in PERP_BURST_USD_1S[kind]:
                 return
+            # Shipped as one notional sum per (venue, coin) per ship, not per
+            # print: Binance sweeps run to thousands of prints/s, and the burst
+            # detector only needs the dollar total.
+            k = (kind, coin)
+            agg = perp_usd.get(k)
+            wall = time.time() - (time.monotonic() - as_of)
+            perp_usd[k] = (wall, (agg[1] if agg else 0.0) + perp_rows[-1]["price"] * perp_rows[-1]["size"], exch_ts)
+            return
         prints.append((kind, coin, t, time.time() - (time.monotonic() - as_of), exch_ts))
 
     async def record_perps():
@@ -176,6 +180,11 @@ def _child_main(plan: dict[str, list[str]]):
             books, ps = list(latest.values()), prints
             latest.clear()
             prints = []
+            # Same 5-tuple shape as a print, with the batch's notional as a
+            # size-1 "print" at price=usd, so the parent needs no new path.
+            for (kind, coin), (wall, usd, exch_ts) in perp_usd.items():
+                ps.append((kind, coin, {"price": usd, "size": 1.0, "trade_id": None, "side": None}, wall, exch_ts))
+            perp_usd.clear()
             try:
                 _write_frame(out, (books, ps, alive()))
             except (BrokenPipeError, OSError):

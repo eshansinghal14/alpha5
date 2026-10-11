@@ -87,8 +87,11 @@ The arm switch is `data/live/{series}/trading_mode.json`, separate from
 tweak. Only a request written after the process started counts — a
 leftover `live_trading: true` must not re-arm on startup.
 
-`close.real_trading_cutoff_s` disarms real trading that long before close;
-paper continues, and the next event re-arms if the toggle is still on.
+`trading_time` bounds when real orders may go out in each event:
+`real_trading_delay_s` holds them for that long after the event's scheduled
+open, and `real_trading_cutoff_s` disarms that long before close. Paper
+continues throughout, and real trading resumes on its own (after the delay,
+or at the next event) if the toggle is still on.
 
 ## Guards
 

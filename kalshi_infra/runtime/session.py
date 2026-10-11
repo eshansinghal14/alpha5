@@ -264,9 +264,19 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
     def remaining_s() -> float | None:
         return None if ev.close_time is None else (ev.close_time - pd.Timestamp.now(tz="UTC")).total_seconds()
 
+    # Without a scheduled open, count from when this process took the event.
+    opened_at = ev.open_time if ev.open_time is not None else pd.Timestamp.now(tz="UTC")
+
     def inside_real_cutoff() -> bool:
-        cut, rem = cfg.close.real_trading_cutoff_s, remaining_s()
+        cut, rem = cfg.trading_time.real_trading_cutoff_s, remaining_s()
         return cut > 0 and rem is not None and rem <= cut
+
+    def inside_real_delay() -> bool:
+        d = cfg.trading_time.real_trading_delay_s
+        return d > 0 and (pd.Timestamp.now(tz="UTC") - opened_at).total_seconds() < d
+
+    def outside_trading_time() -> bool:
+        return inside_real_cutoff() or inside_real_delay()
 
     # What the dashboard asked for, kept apart from what the engine is doing:
     # the cutoff disarm is temporary, and returning the engine's state made
@@ -274,12 +284,15 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
     arm = {"want": live_trading, "retry_at": 0.0}
 
     def reconcile_arm():
-        if engine.live_trading and (not arm["want"] or inside_real_cutoff()):
-            if arm["want"]:
-                _log(S, f"real trading OFF: within {cfg.close.real_trading_cutoff_s:g}s of close; "
+        if engine.live_trading and (not arm["want"] or outside_trading_time()):
+            if arm["want"] and inside_real_cutoff():
+                _log(S, f"real trading OFF: within {cfg.trading_time.real_trading_cutoff_s:g}s of close; "
                         f"paper continues, re-arms next event")
+            elif arm["want"]:
+                _log(S, f"real trading OFF: within {cfg.trading_time.real_trading_delay_s:g}s of open; "
+                        f"paper continues, arms once the delay passes")
             engine.set_live_trading(False)
-        elif (arm["want"] and not engine.live_trading and not inside_real_cutoff()
+        elif (arm["want"] and not engine.live_trading and not outside_trading_time()
               and not engine.halted and time.monotonic() >= arm["retry_at"]):
             if not engine.set_live_trading(True):
                 arm["retry_at"] = time.monotonic() + RETRY_S
@@ -359,6 +372,8 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
                     arm["want"], arm["retry_at"] = want, 0.0
                     if want and inside_real_cutoff():
                         _log(S, "arm request held: inside real_trading_cutoff_s, arms next event")
+                    elif want and inside_real_delay():
+                        _log(S, "arm request held: inside real_trading_delay_s, arms once it passes")
                 reconcile_arm()
                 if want is not None:
                     _log(S, f"trading mode requested live={want}, in effect live={engine.live_trading}")

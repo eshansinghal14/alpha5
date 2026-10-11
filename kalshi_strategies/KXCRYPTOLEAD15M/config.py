@@ -4,8 +4,8 @@ from __future__ import annotations
 import os
 
 from kalshi_infra.config import APPLY_NEXT_EVENT, param, section
-from kalshi_infra.trading.params import (CloseParams, LipSettings, QuotingParams, RiskParams,
-                                         RuntimeParams)
+from kalshi_infra.trading.params import (LipSettings, QuotingParams, RiskParams, RuntimeParams,
+                                         TradingTimeParams)
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
@@ -63,12 +63,17 @@ class CryptoPricingParams:
                             "(1h RV window + 1h correlation seed + slack).", min=0, step=600,
                             apply=APPLY_NEXT_EVENT)
     composite_flush_s: float = param("Persist 1s composite bars this often.", min=1, step=5)
+    kalshi_start_offset_events: int = param(
+        "Once Kalshi publishes the start value (single-coin 15M expiration_value), price off it, "
+        "shifted onto our mid's level by the mean offset over this many previous boundaries. "
+        "8 on 59 events 2026-10-11: BTC-HYPE gap error 0.89 -> 0.73bp. 0 = our own start TWAP.",
+        min=0, step=1, apply=APPLY_NEXT_EVENT)
 
 
 @section
 class CryptoConfig:
     quoting: QuotingParams
-    close: CloseParams
+    trading_time: TradingTimeParams
     risk: RiskParams
     runtime: RuntimeParams
     lip: LipSettings

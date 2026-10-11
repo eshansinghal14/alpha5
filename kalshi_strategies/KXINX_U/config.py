@@ -5,8 +5,8 @@ from __future__ import annotations
 import os
 
 from kalshi_infra.config import APPLY_NEXT_EVENT, param, section
-from kalshi_infra.trading.params import (CloseParams, LipSettings, QuotingParams, RiskParams,
-                                         RuntimeParams)
+from kalshi_infra.trading.params import (LipSettings, QuotingParams, RiskParams, RuntimeParams,
+                                         TradingTimeParams)
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
@@ -62,7 +62,7 @@ class SpxPricingParams:
 @section
 class SpxConfig:
     quoting: QuotingParams
-    close: CloseParams
+    trading_time: TradingTimeParams
     risk: RiskParams
     runtime: RuntimeParams
     lip: LipSettings

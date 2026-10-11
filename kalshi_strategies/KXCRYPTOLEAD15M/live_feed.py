@@ -16,7 +16,8 @@ import atexit
 import time
 
 from kalshi_strategies.KXCRYPTOLEAD15M.composite import CompositeBus
-from kalshi_strategies.KXCRYPTOLEAD15M.prints import (AUTO_SOURCES, HL_BURST_USD_1S, PERP_BURST_USD_1S, REFRESH_S,
+from kalshi_strategies.KXCRYPTOLEAD15M.prints import (AUTO_SOURCES, HL_BURST_USD_1S, PERP_BURST_USD_1S, PERP_SOURCES,
+                                                       REFRESH_S,
                                                        SAMPLE_S, BurstCalibrator, BurstDetector, PrintLog,
                                                        seed_rows)
 from kalshi_strategies.KXCRYPTOLEAD15M.robust_har import RobustHarForecaster
@@ -90,7 +91,8 @@ class SpotFeed:
         self.n_bursts = 0
         # Coinbase falls back to config.json's burst_usd_1s until calibrated.
         self.calib = {"coinbase": BurstCalibrator(COINS, p.burst_usd_1s),
-                      "hyperliquid": BurstCalibrator(COINS, HL_BURST_USD_1S)}
+                      "hyperliquid": BurstCalibrator(COINS, HL_BURST_USD_1S),
+                      **{v: BurstCalibrator(COINS, None) for v in PERP_SOURCES}}
         self._calib_seeded = not persist        # tests: nothing on disk to seed from
         self._calib_tasks: list[asyncio.Task] = []
 
@@ -117,7 +119,7 @@ class SpotFeed:
         self._calib_seeded = True
 
     async def _calib_sample_loop(self):
-        detectors = {"coinbase": self.bursts, "hyperliquid": self.hl_bursts}
+        detectors = {"coinbase": self.bursts, "hyperliquid": self.hl_bursts, **self.perp_bursts}
         while True:
             await asyncio.sleep(SAMPLE_S)
             if not self._calib_seeded:
@@ -141,14 +143,17 @@ class SpotFeed:
             price, size = float(t["price"]), float(t["size"])
         except (KeyError, TypeError, ValueError):
             return
-        self.prints.add(coin, t.get("trade_id"), price, size, t.get("side"), exch_ts, venue=venue)
-        if venue == "coinbase":
+        if venue in self.perp_bursts:
+            # A batch notional, not a real print (venue_process ships sums);
+            # the child already persisted the real prints to perp_prints/.
+            usd_1s = self.perp_bursts[venue].add(coin, price * size, as_of)
+            thr = self._threshold(venue, coin)
+        elif venue == "coinbase":
+            self.prints.add(coin, t.get("trade_id"), price, size, t.get("side"), exch_ts, venue=venue)
             usd_1s = self.bursts.add(coin, price * size, as_of)
             thr = self._threshold("coinbase", coin)
-        elif venue in self.perp_bursts:
-            usd_1s = self.perp_bursts[venue].add(coin, price * size, as_of)
-            thr = PERP_BURST_USD_1S[venue].get(coin)
         else:
+            self.prints.add(coin, t.get("trade_id"), price, size, t.get("side"), exch_ts, venue=venue)
             # Perp and spot share one window: a sweep often hits both.
             usd_1s = self.hl_bursts.add(coin, price * size, as_of)
             thr = self._threshold("hyperliquid", coin)

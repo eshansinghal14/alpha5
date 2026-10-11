@@ -35,6 +35,25 @@ def test_projected_returns_fill_unformed_end_with_last_bar_per_source():
     assert math.isclose(tr.projected_returns(now, "cf")["BTC"], 0.02, abs_tol=1e-12)
 
 
+def test_kalshi_start_override_replaces_mid_start_only():
+    S, T = 1_000_000.0, 1_000_900.0
+    tr = SettlementTracker(EventWindow(event_ticker="E", S=S, T=T))
+    for ts in range(int(S - 60), int(S)):
+        for c in COINS:
+            tr.ingest(_bar(c, float(ts), 100.0))
+    for ts in range(int(T - 60), int(T - 30)):
+        for c in COINS:
+            tr.ingest(_bar(c, float(ts), 101.0))
+    tr.set_start_override({"BTC": 99.0})              # partial: ignored
+    assert tr.snapshot(T - 30).start_quality["BTC"] == "ok"
+    tr.set_start_override({c: 100.5 for c in COINS})
+    snap = tr.snapshot(T - 30)
+    assert snap.start_quality["BTC"] == "kalshi" and snap.start_twap["BTC"] == 100.5
+    assert math.isclose(tr.projected_returns(T - 30, "mid")["BTC"], 101.0 / 100.5 - 1, abs_tol=1e-12)
+    # The CF cross-check keeps its own start.
+    assert math.isclose(tr.projected_returns(T - 30, "cf")["BTC"], 0.01, abs_tol=1e-12)
+
+
 def test_basic_winner():
     """BTC up 0.1%, others flat -> BTC wins."""
     S, T = 1_000_000.0, 1_000_900.0

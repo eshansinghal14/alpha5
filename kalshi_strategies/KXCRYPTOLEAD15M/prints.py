@@ -30,12 +30,11 @@ WINDOW_S = 1.0
 # so a cold start errs toward pulling less, not more.
 HL_BURST_USD_1S = {"BTC": 200_700, "ETH": 625_400, "SOL": 13_100, "XRP": 5_000, "HYPE": 39_800}
 
-# Offshore perp trailing-1s notional (USD) that pulls quotes. Empty until
-# calibrated: a venue with no entry for a coin only records prints and never
-# trips. Derive each from the p99.5 of data/kalshi_crypto/venue_prints once
-# it holds a day of that venue -- these perps trade 10-50x Coinbase volume,
-# so Coinbase's thresholds would trip constantly.
-PERP_BURST_USD_1S: dict[str, dict[str, float]] = {"binance_perp": {}, "bybit_perp": {}, "okx_perp": {}}
+# Offshore perps. No static fallback: each stays record-only until its own
+# BurstCalibrator has MIN_CALIB_S of live samples. These trade 10-50x Coinbase
+# volume, so borrowing Coinbase's or Hyperliquid's numbers would trip constantly.
+PERP_SOURCES = ("binance_perp", "bybit_perp", "okx_perp")
+PERP_BURST_USD_1S: dict[str, dict[str, float]] = {v: {} for v in PERP_SOURCES}
 
 
 # Auto-calibration: each source's burst threshold is the BURST_QUANTILE of its
@@ -50,9 +49,10 @@ CALIB_WINDOW_S = 2 * 3600.0
 SAMPLE_S = 0.25
 MIN_CALIB_S = 1800.0
 REFRESH_S = 60.0
-# Sources whose thresholds self-calibrate. The offshore perps stay record-only:
-# each extra tripping source adds its own pull time on top.
-AUTO_SOURCES = ("coinbase", "hyperliquid")
+# Sources whose thresholds self-calibrate. Each adds its own ~0.5% of trips on
+# top: simulated over 2026-10-11 ~18:00-21:00 UTC, the perps took the share of
+# time quotes are pulled from 5.7% (Coinbase + Hyperliquid) to 9.0%.
+AUTO_SOURCES = ("coinbase", "hyperliquid", *PERP_SOURCES)
 
 
 class BurstDetector:
@@ -136,6 +136,8 @@ def seed_rows(source: str, coins, now_wall: float, root: Path = PRINTS_ROOT) -> 
     """Calibration samples for `source` over the last CALIB_WINDOW_S, rebuilt
     from the hourly print files. Off the loop."""
     lo = now_wall - CALIB_WINDOW_S
+    if source in PERP_SOURCES:
+        return _seed_perp_rows(source, coins, lo, now_wall)
     hours = pd.date_range(pd.Timestamp(lo, unit="s", tz="UTC").floor("h"),
                           pd.Timestamp(now_wall, unit="s", tz="UTC").floor("h"), freq="h")
     cols = {}
@@ -163,6 +165,37 @@ def seed_rows(source: str, coins, now_wall: float, root: Path = PRINTS_ROOT) -> 
         return np.zeros((0, len(coins)))
     m = pd.DataFrame(cols).reindex(columns=list(coins)).fillna(0.0)
     return m.values
+
+
+PERP_PRINTS_ROOT = Path(_DATA_ROOT) / "kalshi_crypto" / "perp_prints"
+
+
+def _seed_perp_rows(source: str, coins, lo: float, hi: float) -> np.ndarray:
+    """Same grid as seed_rows, from venue_process's perp_prints/{day}/ parts.
+    Parts are named by write time in ms, so only the window's are read."""
+    days = {pd.Timestamp(t, unit="s", tz="UTC").strftime("%Y-%m-%d") for t in (lo, hi)}
+    parts = [p for d in sorted(days) for p in (PERP_PRINTS_ROOT / d).glob("*.parquet")
+             if p.stem.isdigit() and int(p.stem) / 1e3 >= lo]
+    if not parts:
+        return np.zeros((0, len(coins)))
+    fr = []
+    for p in parts:
+        try:
+            fr.append(pd.read_parquet(p, columns=["recv_ts", "venue", "coin", "price", "size"]))
+        except Exception:
+            continue
+    if not fr:
+        return np.zeros((0, len(coins)))
+    df = pd.concat(fr, ignore_index=True)
+    df = df[(df.venue == source) & (df.recv_ts >= lo)]
+    if df.empty:
+        return np.zeros((0, len(coins)))
+    b = int(round(WINDOW_S / SAMPLE_S))
+    cols = {}
+    for c, g in df.groupby("coin"):
+        usd = pd.Series((g.price * g["size"]).values, index=pd.to_datetime(g.recv_ts, unit="s"))
+        cols[c] = usd.resample(f"{int(SAMPLE_S * 1000)}ms").sum().rolling(b, min_periods=1).sum()
+    return pd.DataFrame(cols).reindex(columns=list(coins)).fillna(0.0).sort_index().values
 
 
 class PrintLog:

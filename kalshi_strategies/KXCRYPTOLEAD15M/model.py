@@ -20,6 +20,7 @@ import pandas as pd
 from kalshi_infra.kalshi.markets import EventInfo
 from kalshi_infra.trading.fair import Fair
 from kalshi_strategies.KXCRYPTOLEAD15M.composite import DATA_ROOT, CompositeBar, CompositeBus, bar_files
+from kalshi_strategies.KXCRYPTOLEAD15M.kalshi_start import kalshi_values, level_offsets
 from kalshi_strategies.KXCRYPTOLEAD15M.pricer import BaseRateTracker, CoinRacePricer, FairResult
 from kalshi_strategies.KXCRYPTOLEAD15M.robust_har import RobustHarForecaster
 from kalshi_strategies.KXCRYPTOLEAD15M.series import (APPLY_BASIS_SD, BASIS_SD_BP, COINS, START_END_AVG_S,
@@ -27,6 +28,12 @@ from kalshi_strategies.KXCRYPTOLEAD15M.series import (APPLY_BASIS_SD, BASIS_SD_B
 from kalshi_strategies.KXCRYPTOLEAD15M.settlement_tracker import EventWindow, SettlementTracker
 from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed import FeedHealthMonitor
 from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed.coinbase import CoinbaseAdapter
+
+
+# Kalshi published 21:45 values within seconds of the boundary (2026-10-11
+# check); poll every few seconds and give up after 2 min.
+KALSHI_START_POLL_S = 3.0
+KALSHI_START_GIVE_UP_S = 120.0
 
 
 def load_composite_bars(coin: str, start_s: float, end_s: float, root: Path = DATA_ROOT) -> list[CompositeBar]:
@@ -142,6 +149,69 @@ class CoinRaceModel:
     def start_window_since(self) -> float:
         return self.window.S - 2 * START_END_AVG_S
 
+    @staticmethod
+    def _mids(coin: str, lo: float, hi: float) -> dict[float, float]:
+        """Persisted 1s mids over [lo, hi). Disk only: bars older than the
+        session's memory are what the offset needs, and the composite flush
+        (composite_flush_s) has written everything before S long since."""
+        return {b.ts_s: b.mid for b in load_composite_bars(coin, lo, hi) if b.ts_s < hi}
+
+    def fetch_kalshi_start(self) -> dict[str, float] | None:
+        """Kalshi-published start, moved onto our mid's level (kalshi_start).
+        Blocking network + disk: call off the loop. None until Kalshi has
+        published all five values or when there's too little history for the
+        offset; the TWAP start stays in force then."""
+        n = self.cfg.pricing.kalshi_start_offset_events
+        if n <= 0:
+            return None
+        S = self.window.S
+        anchors = {}
+        # Recomputed while any coin lacks history: the previous boundary's
+        # bars may not have been flushed yet (level_offsets caches the rest).
+        offs = getattr(self, "_kalshi_offs", None)
+        if offs is None or any(v is None for v in offs.values()):
+            self._kalshi_offs = level_offsets(S, n, self._mids)
+        offs = self._kalshi_offs
+        for c in COINS:
+            vals = kalshi_values(c, S, S)
+            if S not in vals or offs.get(c) is None:
+                return None
+            anchors[c] = vals[S] * math.exp(offs[c])
+        return anchors
+
+    async def kalshi_start_loop(self):
+        """Poll for Kalshi's start value after S; adopt it once, then stop."""
+        loop = asyncio.get_running_loop()
+        if self.cfg.pricing.kalshi_start_offset_events <= 0:
+            return
+        if time.time() < self.window.S:
+            # A cold start reads ~12h of bars (~20s); do it before S so the
+            # anchor lands seconds after Kalshi publishes, not 20s later.
+            try:
+                await loop.run_in_executor(None, self.fetch_kalshi_start)
+            except Exception as e:
+                print(f"[KXCRYPTOLEAD15M] kalshi start offsets failed ({e!r}); retrying after S", flush=True)
+                self._kalshi_offs = None
+        while time.time() < self.window.S + 2:
+            await asyncio.sleep(1.0)
+        deadline = self.window.S + KALSHI_START_GIVE_UP_S
+        while time.time() < min(deadline, self.window.T - START_END_AVG_S):
+            try:
+                anchors = await loop.run_in_executor(None, self.fetch_kalshi_start)
+            except Exception as e:
+                print(f"[KXCRYPTOLEAD15M] kalshi start fetch failed ({e!r}); retrying", flush=True)
+                anchors = None
+            if anchors:
+                old = self.tracker.snapshot(time.time()).start_twap
+                self.tracker.set_start_override(anchors)
+                moved = {c: round((anchors[c] / old[c] - 1) * 1e4, 2) for c in COINS if old.get(c)}
+                print(f"[KXCRYPTOLEAD15M] start anchored on Kalshi values (bp vs our TWAP): {moved}", flush=True)
+                self._mid_moved()
+                return
+            await asyncio.sleep(KALSHI_START_POLL_S)
+        print(f"[KXCRYPTOLEAD15M] Kalshi start not available for {self.event_ticker}; pricing on our TWAP",
+              flush=True)
+
     def backfill_start(self, mem_bars: dict[str, list[CompositeBar]]) -> dict[str, str]:
         """Seed only the settlement tracker. `mem_bars` are the session's
         in-memory bars from start_window_since(); disk fills in only when
@@ -211,7 +281,7 @@ class CoinRaceModel:
 
         snap = self.tracker.snapshot(now_s)
         in_window = now_s >= self.window.S
-        start_locked = in_window and all(snap.start_quality.get(c) in ("ok", "partial") for c in COINS)
+        start_locked = in_window and all(snap.start_quality.get(c) in ("ok", "partial", "kalshi") for c in COINS)
         if in_window and not start_locked:
             return self._withhold("no_start_twap")
         if not in_window and not p.quote_before_start:
@@ -341,7 +411,7 @@ class CoinRaceModel:
             # its bars and wakeups here.
             self.spot.ensure_running()
             self.spot.attach(self)
-            return []
+            return [self.kalshi_start_loop()]
         tasks = [self._sample_loop(), self._flush_loop()]
         if self.coinbase is not None:
             tasks.append(self.coinbase.run(self._on_book))

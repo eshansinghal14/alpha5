@@ -103,6 +103,17 @@ class SettlementTracker:
         self._n_ingested = 0
         self._cache: tuple | None = None
         self._proj_cache: tuple | None = None
+        # coin -> start anchor from Kalshi's published value (see kalshi_start).
+        # Replaces our own start TWAP once set; all five or none, so the race
+        # never compares a Kalshi-anchored coin to a TWAP-anchored one.
+        self.start_override: dict[str, float] = {}
+
+    def set_start_override(self, anchors: dict[str, float]):
+        if set(anchors) != set(COINS) or any(not (v > 0) for v in anchors.values()):
+            return
+        self.start_override = dict(anchors)
+        self._cache = None
+        self._proj_cache = None
 
     def ingest(self, bar: CompositeBar):
         if bar.coin not in self._bars:
@@ -173,6 +184,9 @@ class SettlementTracker:
                 else:
                     start_quality[coin] = "ok"
                     start_twap[coin] = float(np.mean(start_prices))
+                if coin in self.start_override:
+                    start_quality[coin] = "kalshi"
+                    start_twap[coin] = self.start_override[coin]
 
             # End window: ts in [T-60, now) if we're inside the last minute.
             end_prices = [b.mid for b in bars
@@ -225,7 +239,9 @@ class SettlementTracker:
             last = get(max(seen, key=lambda b: b.ts_s))
             n = min(len(end), START_END_AVG_S)
             end_avg = (sum(end[:n]) + (START_END_AVG_S - n) * last) / START_END_AVG_S
-            s = float(np.mean(start))
+            # The anchor is on the mid's level, so only the "mid" source uses it;
+            # the CF replica keeps its own start for the basis-tie cross-check.
+            s = self.start_override[coin] if source == "mid" and coin in self.start_override else float(np.mean(start))
             out[coin] = None if s <= 0 else end_avg / s - 1.0
         self._proj_cache = (key, out)
         return out

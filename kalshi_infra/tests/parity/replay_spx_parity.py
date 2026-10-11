@@ -103,7 +103,7 @@ def new_cfg(oc):
         requote_delay_s=oc.requote_delay_s)
     assert oc.fee_multiplier == 0.07 and oc.maker_fee_multiplier == 0.0 and oc.taker_fee_edge_multiplier == 1.0
     return types.SimpleNamespace(
-        quoting=q, close=P.CloseParams(real_trading_cutoff_s=0),
+        quoting=q, trading_time=P.TradingTimeParams(real_trading_delay_s=0, real_trading_cutoff_s=0),
         risk=P.RiskParams(max_loss_usd=1e9, max_signal_age_s=1e9, fresh_recovery_s=0.0),
         lip=P.LipSettings(enable_lip_quoting=False, lip_lots=0.0, prop_max_lip=1.0, lip_min_depth_ahead=0.0, lip_hold_s=1.0))
 

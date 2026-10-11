@@ -23,7 +23,8 @@
       "requote_delay_s": 1.0,
       "order_lots": 1.0
     },
-    "close": {
+    "trading_time": {
+      "real_trading_delay_s": 0.0,
       "real_trading_cutoff_s": 0.0
     },
     "risk": {
@@ -87,7 +88,8 @@
       "requote_delay_s": 1.0,
       "order_lots": 1.0
     },
-    "close": {
+    "trading_time": {
+      "real_trading_delay_s": 0.0,
       "real_trading_cutoff_s": 0.0
     },
     "risk": {

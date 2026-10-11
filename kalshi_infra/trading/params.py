@@ -88,7 +88,13 @@ class QuotingParams:
 
 
 @section
-class CloseParams:
+class TradingTimeParams:
+    """When in each event REAL orders may go out. Outside it paper trading
+    continues and the arm request is kept, so real trading resumes on its own."""
+    real_trading_delay_s: float = param(
+        "Hold REAL trading this long after the event opens (paper continues). Counted from "
+        "Kalshi's scheduled open, so a process started mid-event isn't delayed again. 0 disables.",
+        min=0, step=10)
     real_trading_cutoff_s: float = param(
         "Disarm REAL trading this long before close (paper continues). Re-arms next event if the "
         "dashboard toggle is still on. 0 disables.", min=0, step=10)
@@ -140,7 +146,7 @@ class LipSettings:
         "Safety cancels (depth ahead, edge, stale, LIP off) are never held.", min=0, max=60, step=0.5)
 
 
-SHARED_SECTIONS = ("quoting", "close", "risk", "runtime", "lip")
+SHARED_SECTIONS = ("quoting", "trading_time", "risk", "runtime", "lip")
 
 
 def check_strategy_config(cfg) -> None:

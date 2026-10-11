@@ -80,8 +80,8 @@ def _render_toggle(series: str, s: dict):
     if st.session_state[key] != requested:
         st.warning("Waiting for the process to pick up the request.")
     elif requested and not active:
-        st.warning("Armed, but not sending real orders yet -- inside close.real_trading_cutoff_s "
-                   "(re-arms at the next event), halted, or the arm failed (retried; see the process log).")
+        st.warning("Armed, but not sending real orders yet -- outside trading_time (the delay after open "
+                   "or the cutoff before close), halted, or the arm failed (retried; see the process log).")
     if (s.get("real") or {}).get("n_errors"):
         st.warning(f"{s['real']['n_errors']} real order error(s) -- see the process log.")
 

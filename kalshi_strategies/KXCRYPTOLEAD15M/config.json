@@ -22,12 +22,13 @@
     "requote_delay_s": 0.5,
     "order_lots": 0.5
   },
-  "close": {
+  "trading_time": {
+    "real_trading_delay_s": 10.0,
     "real_trading_cutoff_s": 30.0
   },
   "risk": {
     "max_loss_usd": 80.0,
-    "max_signal_age_s": 0.4,
+    "max_signal_age_s": 0.25,
     "fresh_recovery_s": 0.5
   },
   "runtime": {
@@ -66,6 +67,7 @@
     "hard_stale_s": 15.0,
     "recovery_s": 5.0,
     "warmup_s": 14400.0,
-    "composite_flush_s": 30.0
+    "composite_flush_s": 30.0,
+    "kalshi_start_offset_events": 8
   }
 }
