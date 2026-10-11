@@ -48,7 +48,7 @@ $ip = aws ec2 describe-instances --region $Region --instance-ids $id `
 "instance $id ($Type, $Region) at $ip; SSH allowed only from $myIp"
 "key: $keyPath"
 "next:"
-"  ssh -i `"$keyPath`" ubuntu@$ip 'bash -s' < deploy/bootstrap.sh"
+"  ssh -i `"$keyPath`" ubuntu@$ip 'curl -fsSL https://raw.githubusercontent.com/eshansinghal14/alpha5/ec2-live/deploy/bootstrap.sh | bash -s ec2-live'"
 "  powershell -File deploy\push_secrets.ps1 -Host ubuntu@$ip -Key `"$keyPath`""
 "  ssh -i `"$keyPath`" ubuntu@$ip 'sudo systemctl enable --now alpha5-crypto alpha5-dashboard'"
 "  dashboard: ssh -i `"$keyPath`" -N -L 8502:127.0.0.1:8502 ubuntu@$ip  then open http://localhost:8502"
