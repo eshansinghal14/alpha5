@@ -66,6 +66,21 @@ ORDER_TIMEOUT_S = 5.0
 # Env var through which kalshi_strategies.run gives each child its share of
 # the account's write budget (fraction in (0, 1]).
 WRITE_SHARE_ENV = "KALSHI_WRITE_SHARE"
+# Share of the write budget we actually spend (see KalshiOrderClient.__init__).
+WRITE_HEADROOM = 0.8
+
+
+def _client_id(order: Order) -> str:
+    cid = getattr(order, "client_order_id", None)
+    if cid is None:
+        cid = str(uuid.uuid4())
+        order.client_order_id = cid
+    return cid
+
+
+def http_status(exc) -> int | None:
+    resp = getattr(exc, "response", None)
+    return getattr(resp, "status_code", None)
 
 
 def write_budget_tokens_per_s() -> float:
@@ -185,15 +200,43 @@ class KalshiOrderClient:
         self._key = auth.load_private_key()
         self._lock = threading.Lock()
         self.tokens_per_s = tokens_per_s
+        # Metered below Kalshi's own limit: our bucket debits at send, Kalshi's
+        # at arrival, and bursts sized to exactly the limit drew 429s at arm
+        # time (2026-10-09, a 100-token Basic bucket).
+        self._rate = tokens_per_s * WRITE_HEADROOM
         self._tokens = self._capacity()
         self._last_refill = time.monotonic()
         self.timeout_s = timeout_s
+        self.n_rate_limited = 0
+        # Write-budget accounting by (kind, reason): spent tokens and call
+        # counts, refusals, and 429s. See usage().
+        self._spent: dict[tuple, list] = {}
+        self._refused: dict[tuple, int] = {}
+        self._429: dict[str, int] = {}
+        self._t0 = time.monotonic()
 
     @classmethod
-    def from_account(cls) -> "KalshiOrderClient":
+    def from_account(cls, shard: int | None = None) -> "KalshiOrderClient":
+        """`shard`: the exchange_index every write is pinned to (see
+        _shard_field). This process's share of the budget comes from
+        WRITE_SHARE_ENV, which kalshi_strategies.run sets per SHARD: series on
+        different shards don't share a bucket."""
         import os
         share = float(os.environ.get(WRITE_SHARE_ENV, "1"))
-        return cls(tokens_per_s=write_budget_tokens_per_s() * share)
+        c = cls(tokens_per_s=write_budget_tokens_per_s() * share)
+        c.shard = shard
+        return c
+
+    # Exchange shard every order write is pinned to, or None to auto-route.
+    # Per GET /getting_started/rate_limits (2026-10-10): a single create,
+    # amend or cancel with exchange_index >= 1 bills only that shard's write
+    # bucket, each carrying the full tier budget; exchange_index 0 bills the
+    # unscoped bucket; an auto-routed write (no index) bills EVERY shard's
+    # bucket. Batch writes always bill the unscoped bucket.
+    shard: int | None = None
+
+    def _shard_field(self) -> dict:
+        return {} if self.shard is None else {"exchange_index": int(self.shard)}
 
     @property
     def max_orders_per_s(self) -> float:
@@ -210,9 +253,57 @@ class KalshiOrderClient:
     def _capacity(self) -> float:
         # Basic tier holds one second of budget (higher tiers three; one is
         # the safe floor for either).
-        return self.tokens_per_s
+        return self._rate
 
-    def allow_now(self, kind: str = "order", force: bool = False) -> bool:
+    def note_rate_limited(self, reason: str = "unknown"):
+        """Kalshi said 429: its bucket is emptier than ours thinks. Empty
+        ours so the next writes wait for real refill."""
+        with self._lock:
+            self._tokens = min(self._tokens, 0.0)
+            self._last_refill = time.monotonic()
+            self.n_rate_limited += 1
+            self._429[reason] = self._429.get(reason, 0) + 1
+
+    def usage(self) -> dict:
+        """Write-budget spend since construction (or reset_usage): per
+        "kind:reason", calls, tokens and tokens/s, plus refusals and 429s.
+        `share` is of the budget we let ourselves spend (WRITE_HEADROOM x
+        this process's share)."""
+        with self._lock:
+            el = max(1e-9, time.monotonic() - self._t0)
+            spent = {f"{k}:{r}": {"calls": n, "tokens": t, "tokens_per_s": round(t / el, 2),
+                                  "share": round(t / el / self._rate, 4) if self._rate else None}
+                     for (k, r), (n, t) in sorted(self._spent.items(), key=lambda kv: -kv[1][1])}
+            total = sum(t for _, t in self._spent.values())
+            return {"elapsed_s": round(el, 1), "budget_tokens_per_s": round(self._rate, 2),
+                    "total_tokens": total, "total_tokens_per_s": round(total / el, 2),
+                    "utilization": round(total / el / self._rate, 4) if self._rate else None,
+                    "by_reason": spent,
+                    "refused": {f"{k}:{r}": n for (k, r), n in sorted(self._refused.items(), key=lambda kv: -kv[1])},
+                    "http_429": dict(self._429)}
+
+    def reset_usage(self):
+        with self._lock:
+            self._spent, self._refused, self._429 = {}, {}, {}
+            self._t0 = time.monotonic()
+
+    def tokens_now(self) -> float:
+        """Tokens currently in this process's bucket (may be negative after a
+        forced cancel). Spends nothing."""
+        now = time.monotonic()
+        with self._lock:
+            return min(self._capacity(), self._tokens + (now - self._last_refill) * self._rate)
+
+    def can_afford(self, kind: str = "order", reserve: float = 0.0) -> bool:
+        """Would `kind` be allowed now with `reserve` tokens left over?
+        Spends nothing. Lets the quoter skip building an order the bucket
+        would refuse."""
+        now = time.monotonic()
+        with self._lock:
+            tokens = min(self._capacity(), self._tokens + (now - self._last_refill) * self._rate)
+        return tokens >= self.COST[kind] + reserve
+
+    def allow_now(self, kind: str = "order", force: bool = False, reason: str = "untagged") -> bool:
         """Spend `kind`'s tokens from this process's bucket, or refuse.
 
         Refusing rather than sleeping is deliberate: a queued order arriving
@@ -227,20 +318,31 @@ class KalshiOrderClient:
         now = time.monotonic()
         with self._lock:
             self._tokens = min(self._capacity(),
-                               self._tokens + (now - self._last_refill) * self.tokens_per_s)
+                               self._tokens + (now - self._last_refill) * self._rate)
             self._last_refill = now
             if self._tokens < cost and not force:
+                self._refused[(kind, reason)] = self._refused.get((kind, reason), 0) + 1
                 return False
             self._tokens -= cost
+            rec = self._spent.setdefault((kind, reason), [0, 0.0])
+            rec[0] += 1
+            rec[1] += cost
             return True
 
-    def amend(self, exchange_order_id: str, order: Order, new_size: float, filled: float) -> dict:
-        """Change a resting order's size in place. Kalshi keeps queue position
-        on a decrease and sends the order to the back on an increase."""
-        yes_price = order.price if order.side == "yes" else 1.0 - order.price
+    def amend(self, exchange_order_id: str, order: Order, new_size: float, filled: float,
+              price: float | None = None) -> dict:
+        """Change a resting order's size and/or price (`price` in the order's
+        own side terms; None keeps it). Kalshi keeps queue position only on a
+        pure size decrease; a price change goes to the back of the queue.
+        One amend costs 10 tokens, the same as one create -- so a reprice is
+        half the cost of cancel (2) + create (10) and never leaves the side
+        unquoted in between."""
+        px = order.price if price is None else price
+        yes_price = px if order.side == "yes" else 1.0 - px
         path = f"{ORDERS_PATH}/{exchange_order_id}/amend"
         body = {"ticker": order.ticker, "side": "bid" if order.side == "yes" else "ask",
-                "price": f"{round(yes_price, 2):.4f}", "count": f"{filled + new_size:.2f}"}
+                "price": f"{round(yes_price, 2):.4f}", "count": f"{filled + new_size:.2f}",
+                **self._shard_field()}
         resp = self._session.post(BASE_URL + path, headers=self._headers("POST", path), json=body,
                                   timeout=self.timeout_s)
         _raise_with_body(resp)
@@ -298,8 +400,11 @@ class KalshiOrderClient:
             "count": f"{order.size:.2f}",
             "price": f"{round(yes_price, 2):.4f}",
             "self_trade_prevention_type": "taker_at_cross",
-            "client_order_id": str(uuid.uuid4()),
+            # Kept on the order: a create that timed out on our side may still
+            # rest at Kalshi, and this id is the only way to find it again.
+            "client_order_id": _client_id(order),
             "time_in_force": time_in_force,
+            **self._shard_field(),
         }
         path = ORDERS_PATH
         resp = self._session.post(BASE_URL + path, headers=self._headers("POST", path),
@@ -315,15 +420,16 @@ class KalshiOrderClient:
         entirely normal.
 
         V2 cancel (DELETE /portfolio/events/orders/{id}), the pair of the v2
-        create; `market_ticker` lets Kalshi route to the right exchange shard
-        (an order id alone can't). Without a ticker it falls back to the v1
-        path, which still serves cancels but is slated for deprecation."""
-        if market_ticker:
-            path = f"{ORDERS_PATH}/{exchange_order_id}"
-            params = {"market_ticker": market_ticker}
-        else:
-            path = f"/trade-api/v2/portfolio/orders/{exchange_order_id}"
-            params = None
+        create. With the client's shard set, it's sent with that
+        exchange_index (billed to that shard's own bucket); otherwise
+        `market_ticker` auto-routes it, which bills EVERY shard's bucket."""
+        if not market_ticker:
+            # The v1 path costs 10 tokens to the v2 path's 2 (endpoint_costs,
+            # 2026-10-10) and can't route to a non-zero shard. Every caller has
+            # the ticker; fail loudly rather than silently pay 5x.
+            raise ValueError(f"cancel {exchange_order_id}: market_ticker is required")
+        path = f"{ORDERS_PATH}/{exchange_order_id}"
+        params = {"market_ticker": market_ticker, **self._shard_field()}
         resp = self._session.delete(BASE_URL + path, headers=self._headers("DELETE", path),
                                     params=params, timeout=self.timeout_s)
         if resp.status_code == 404:
@@ -331,9 +437,32 @@ class KalshiOrderClient:
         _raise_with_body(resp)
         return True
 
+    def queue_positions(self, event_ticker: str) -> dict[str, float]:
+        """exchange order id -> contracts ahead of it AT ITS OWN PRICE (price-
+        time priority) for every resting order in the event. Verified live
+        2026-10-11: excludes better-priced levels (a 0.84 order behind 151 at
+        0.85 reported 120 = the queue at 0.84 only). A GET, so read bucket."""
+        path = "/trade-api/v2/portfolio/orders/queue_positions"
+        resp = self._session.get(BASE_URL + path, headers=self._headers("GET", path),
+                                 params={"event_ticker": event_ticker}, timeout=self.timeout_s)
+        resp.raise_for_status()
+        return {q["order_id"]: float(q.get("queue_position_fp") or 0.0)
+                for q in resp.json().get("queue_positions", []) if q.get("order_id")}
+
+    def find_by_client_id(self, event_ticker: str, client_order_id: str) -> tuple[str, str] | None:
+        """(exchange order id, ticker) of our RESTING order with this client
+        id, or None. For a create whose response never came back."""
+        for oid, ticker, cid in self._resting(event_ticker):
+            if cid == client_order_id:
+                return oid, ticker
+        return None
+
     def resting_orders(self, event_ticker: str, max_pages: int = 10) -> list[tuple[str, str]]:
-        """(exchange order id, market ticker) for every order this account
-        still has resting in `event_ticker`, oldest first.
+        return [(oid, t) for oid, t, _ in self._resting(event_ticker, max_pages)]
+
+    def _resting(self, event_ticker: str, max_pages: int = 10) -> list[tuple[str, str, str | None]]:
+        """(exchange order id, market ticker, client order id) for every order
+        this account still has resting in `event_ticker`, oldest first.
 
         Ground truth for "is anything of ours left on the book", which our
         own map of live quotes cannot answer after a crash or a restart --
@@ -355,7 +484,7 @@ class KalshiOrderClient:
             for o in batch:
                 ticker = o.get("ticker") or o.get("market_ticker") or ""
                 if ticker.startswith(event_ticker) and o.get("order_id"):
-                    out.append((o["order_id"], ticker))
+                    out.append((o["order_id"], ticker, o.get("client_order_id")))
             cursor = data.get("cursor")
             if not cursor or not batch:
                 break

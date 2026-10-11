@@ -98,8 +98,14 @@ class CompositeFeed:
     the 1s bars to parquet."""
 
     def __init__(self, coin: str, history_s: int = 3600,
-                 persist: bool = True, persist_dir: Path = DATA_ROOT):
+                 persist: bool = True, persist_dir: Path = DATA_ROOT,
+                 venues: tuple[str, ...] | None = None, venue_stale_s: float | None = None):
+        """`venues`: which venues' books form the mid (None = every venue
+        observed). `venue_stale_s`: a venue whose book is older than this
+        leaves the median until it updates again."""
         self.coin = coin
+        self.venues = None if venues is None else tuple(venues)
+        self.venue_stale_s = venue_stale_s
         self._venue_books: dict[str, VenueBook] = {}
         self._bars: collections.deque[CompositeBar] = collections.deque(maxlen=history_s)
         self._nowcast: CFSpotResult | None = None
@@ -122,15 +128,14 @@ class CompositeFeed:
         stale to use; the nowcast itself should not flicker to None on a
         single bad book and strand the pricer -- a DEGRADED coin is
         priced off exactly this last-good value."""
-        if vb.coin != self.coin:
+        if vb.coin != self.coin or (self.venues is not None and vb.venue not in self.venues):
             return
         self._venue_books[vb.venue] = vb
         # Per message only the MID is needed (the pricing series). The CF
         # replica is depth-weighted over hundreds of levels and only feeds
         # diagnostics, so it runs once a second in sample(). Running it on
         # every message was ~4ms x ~85 msg/s of event-loop time.
-        mids = [b.mid() for b in self._venue_books.values()
-                if not b.is_resyncing and b.mid() is not None]
+        mids = [b.mid() for b in self._live_books(vb.receive_ts)]
         if mids:
             m = float(np.median(mids))
             self._mid = m
@@ -141,6 +146,28 @@ class CompositeFeed:
                 n_venues_in=len(mids), n_venues_dropped=len(self._venue_books) - len(mids),
                 drop_reasons={}, fallback_median_mid=m, is_fallback=prev is None)
         self._nowcast_count += 1
+
+    def _live_books(self, now_mono: float) -> list[VenueBook]:
+        """Synced, two-sided books fresh enough to price on. A venue dropping
+        out shifts the median by its basis (a few tenths of a bp across
+        the constituents, recorder 2026-10-11) -- small next to keeping a
+        frozen book in."""
+        out = []
+        for b in self._venue_books.values():
+            if b.is_resyncing or b.mid() is None:
+                continue
+            if self.venue_stale_s is not None and now_mono - b.receive_ts > self.venue_stale_s:
+                continue
+            out.append(b)
+        return out
+
+    def touch(self, venue: str, receive_ts: float):
+        """The venue's connection is live and its book unchanged: advance the
+        book's freshness in place (the parent-side analog of
+        CoinbaseAdapter._mark_fresh, for books from the venue process)."""
+        b = self._venue_books.get(venue)
+        if b is not None and receive_ts > b.receive_ts:
+            b.receive_ts = receive_ts
 
     def nowcast(self) -> CFSpotResult | None:
         """Latest composite price given the latest known venue books, no
@@ -165,7 +192,9 @@ class CompositeFeed:
         second_s = int(now_s)
         if self._bar_last_second_s is not None and second_s <= self._bar_last_second_s:
             return None
-        res = compute_cf_spot(self.coin, list(self._venue_books.values()))
+        import time as _time
+        books = self._live_books(_time.monotonic()) if self.venue_stale_s is not None else list(self._venue_books.values())
+        res = compute_cf_spot(self.coin, books)
         if res is None:
             # No sample this second -- do not advance last_second_s so
             # the next tick can try again inside the same second if a
@@ -261,10 +290,19 @@ class CompositeBus:
     right feed by `vb.coin`."""
 
     def __init__(self, coins=COINS, persist: bool = True,
-                 persist_dir: Path = DATA_ROOT):
+                 persist_dir: Path = DATA_ROOT, venues: dict[str, tuple] | None = None,
+                 venue_stale_s: float | None = None):
+        """`venues`: coin -> venues forming that coin's mid (missing = all)."""
+        venues = venues or {}
         self.feeds: dict[str, CompositeFeed] = {
-            c: CompositeFeed(c, persist=persist, persist_dir=persist_dir) for c in coins
+            c: CompositeFeed(c, persist=persist, persist_dir=persist_dir, venues=venues.get(c),
+                             venue_stale_s=venue_stale_s) for c in coins
         }
+
+    def touch(self, venue: str, coin: str, receive_ts: float):
+        feed = self.feeds.get(coin)
+        if feed is not None:
+            feed.touch(venue, receive_ts)
 
     def observe(self, vb: VenueBook):
         feed = self.feeds.get(vb.coin)

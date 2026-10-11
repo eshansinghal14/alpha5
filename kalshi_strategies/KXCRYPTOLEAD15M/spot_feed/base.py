@@ -47,6 +47,9 @@ class VenueBook:
     # pipeline uses them to drop out-of-order deltas. None if the venue
     # doesn't publish them.
     seq: int | None = None
+    # A newer trade printed outside the bid/ask above, so the book is behind
+    # the matching engine; mid() reports this price until the book catches up.
+    trade_px: float | None = None
 
     def best_bid(self) -> float | None:
         return self.bids[0].price if self.bids else None
@@ -55,6 +58,15 @@ class VenueBook:
         return self.asks[0].price if self.asks else None
 
     def mid(self) -> float | None:
+        """Pricing mid: a held through-the-touch print if any, else book_mid."""
+        if self.trade_px is not None:
+            return self.trade_px
+        return self.book_mid()
+
+    def book_mid(self) -> float | None:
+        """Top-of-book mid, ignoring trades. What the 1s bars (and so the
+        settlement averages) are built from: the index Kalshi settles on is
+        book-based, so a held print must not leak into it."""
         bb, ba = self.best_bid(), self.best_ask()
         if bb is None or ba is None:
             return None

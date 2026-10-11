@@ -28,6 +28,32 @@ def request_trading_mode(series: str, live_trading: bool):
                        "requested_at": pd.Timestamp.now(tz="UTC").isoformat()})
 
 
+STOP_PATH = os.path.join(LIVE_ROOT, "STOP.json")
+
+
+def request_stop_all(reason: str):
+    """Tell every running series process to disarm and exit."""
+    atomic_write_json(STOP_PATH, {"reason": reason, "requested_at": pd.Timestamp.now(tz="UTC").isoformat()})
+
+
+class StopWatcher:
+    """`poll()` returns the stop reason once a STOP written after startup
+    appears, else None. Mtime-seeded like TradingModeWatcher, so a STOP left
+    by a previous run doesn't kill the next one."""
+
+    def __init__(self):
+        self._mtime = os.path.getmtime(STOP_PATH) if os.path.exists(STOP_PATH) else 0.0
+
+    def poll(self) -> str | None:
+        try:
+            if os.path.getmtime(STOP_PATH) <= self._mtime:
+                return None
+            with open(STOP_PATH) as fh:
+                return str(json.load(fh).get("reason") or "stop requested")
+        except (OSError, json.JSONDecodeError):
+            return None
+
+
 class TradingModeWatcher:
     """Process side. `poll()` returns the newly requested state, or None."""
 

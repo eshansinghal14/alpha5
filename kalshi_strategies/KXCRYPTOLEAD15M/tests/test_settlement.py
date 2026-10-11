@@ -20,6 +20,21 @@ def _bar(coin, ts_s, price):
                         fallback_mid=price, nowcast_count=1)
 
 
+def test_projected_returns_fill_unformed_end_with_last_bar_per_source():
+    S, T = 1_000_000.0, 1_000_900.0
+    tr = SettlementTracker(EventWindow(event_ticker="E", S=S, T=T))
+    for ts in range(int(S - 60), int(S)):
+        for c in COINS:
+            tr.ingest(_bar(c, float(ts), 100.0))
+    # 30s into the end average: mid at 101, replica at 102.
+    for ts in range(int(T - 60), int(T - 30)):
+        for c in COINS:
+            tr.ingest(CompositeBar(c, float(ts), 102.0, 1.0, 1, 0, False, 101.0, 1))
+    now = T - 30
+    assert math.isclose(tr.projected_returns(now, "mid")["BTC"], 0.01, abs_tol=1e-12)
+    assert math.isclose(tr.projected_returns(now, "cf")["BTC"], 0.02, abs_tol=1e-12)
+
+
 def test_basic_winner():
     """BTC up 0.1%, others flat -> BTC wins."""
     S, T = 1_000_000.0, 1_000_900.0

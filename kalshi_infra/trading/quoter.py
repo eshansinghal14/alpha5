@@ -1,5 +1,5 @@
 """
-Generic quoter: turns per-market `Fair`s into takes and resting quotes.
+Generic quoter: turns per-market `Fair`s into takes and a DESIRED quote ladder.
 
 One instance per event, used as the engine's strategy callable (live via
 LiveEngine, backtest via kalshi_backtest.engine.Backtest -- both provide the
@@ -10,23 +10,28 @@ Per market and side, every decision is:
 
     d       = distance from fair to the band edge (prob - lo buying, hi - prob selling)
     ci      = edge_fraction * d
-    lean    = (lean_multiplier * d + lean_dollars) * ratio ** lean_exponent
-              ratio = effective position / max_position, only on the side that GROWS it
+    lean    = (lean_multiplier * d + lean_dollars) * sign(ratio) * |ratio| ** lean_exponent
+              ratio = effective position / max_position, signed toward the side that GROWS it;
+              negative on the reducing side, where the edge then floors at 0
     take    : prob - (constant_edge + ci + lean + taker_fee) >= ask
-    quote   : prob - (quoting_edge  + ci + lean + maker_fee) -> first tick outside,
-              capped max_improve_ticks inside the near touch and a tick inside the far one
+    quote   : prob - (constant_edge + quoting_edge + ci + lean + maker_fee) -> edge limit
 
-Fees are Kalshi's own for this event (kalshi.fees.FeeSchedule). Each term is
-non-negative, so a reservation never lands on the wrong side of fair.
-Effective position = fills + takes sent within inflight_timeout_s + our
-resting quotes on that side (2026-08-28: 60% of same-ticker fills landed
-inside one round trip of the previous one, so ignoring in-flight size let a
-market run flat -> cap with zero lean charged).
+Fees are Kalshi's own for this event (kalshi.fees.FeeSchedule). The edge before
+fees is floored at 0, so a reservation never lands on the wrong side of fair.
+Effective position = fills + takes sent within inflight_timeout_s + every
+live quote on that side (2026-08-28: 60% of same-ticker fills landed inside
+one round trip of the previous one, so ignoring in-flight size let a market
+run flat -> cap with zero lean charged).
 
-Two resting orders per side:
-  * the EDGE quote (order_lots) -- priced on edge alone;
-  * the LIP quote (lip_lots) -- exists only to earn LIP, resting at or
-    outside the edge quote's reservation (see _manage_lip).
+Takes go straight to ctx.buy (top priority, never budgeted). Quotes do NOT:
+the quoter publishes, per side, a ladder of up to quote_levels_behind
+consecutive ticks starting at the first tick outside the quote reservation
+(capped max_improve_ticks inside the near touch -- the touch net of our own
+orders -- and a tick inside the far touch), via ctx.set_quote_ladder. The
+engine's OrderManager decides what to actually send, in priority order and
+from what the write bucket holds above quoting.cancels_token. A LIP quote
+per side, when lip.enable_lip_quoting is on, goes through the same manager
+at a lower priority (ctx.set_lip_quote). See order_manager.py.
 
 Anything that stops a side from trading records a reason string in the
 decision log (`block_bid` / `block_ask`) and counts it in `block_counts`.
@@ -39,9 +44,8 @@ import pandas as pd
 
 from kalshi_infra.kalshi.venue import MAX_PRICE, MIN_PRICE, TICK
 from kalshi_infra.trading.fair import Fair, FairUpdate
-from kalshi_infra.trading.lip import LipTracker, _scored_prefix, choose_lip_level, others_ladder
-
-EDGE, LIP = "edge", "lip"
+from kalshi_infra.trading.lip import LipTracker, choose_lip_level, others_ladder
+from kalshi_infra.trading.order_manager import Desired, LipTarget
 
 
 class Quoter:
@@ -49,7 +53,8 @@ class Quoter:
                  lip: LipTracker | None = None, record_debug: bool = True):
         """`cfg`: the series config (.quoting, .risk, .lip; held by reference
         so live edits apply). `model`: the series' FairModel. `fees`: the
-        event's kalshi.fees.FeeSchedule."""
+        event's kalshi.fees.FeeSchedule. `lip`: accrual tracker only -- LIP
+        quoting is off until it's rebuilt on the order manager."""
         self.cfg = cfg
         self.model = model
         self.fees = fees
@@ -59,8 +64,6 @@ class Quoter:
 
         self.fairs: dict[str, Fair | None] = {}
         self._sent: dict[tuple[str, str], list[tuple[pd.Timestamp, float]]] = {}
-        # (ticker, side, role) -> {"order_id", "price", "size", "placed"}; price in that side's terms.
-        self._quotes: dict[tuple[str, str, str], dict] = {}
         self._quote_block_until: dict[tuple[str, str], pd.Timestamp] = {}
         self._fills_seen = 0
         self._atm_set: set[str] = set()
@@ -72,43 +75,33 @@ class Quoter:
         self._fresh_since: float | None = float("-inf")
         self.block_counts: dict[str, int] = {}
         self.debug_log: list[dict] = []
-        self._lip_cache: dict[tuple[str, str], tuple] = {}
+        # Our live quotes as last reported by the ctx, per (ticker, side):
+        # [(price, remaining)]. Used for risk and to net our size out of the book.
+        self._ours: dict[tuple[str, str], list[tuple[float, float]]] = {}
+        # The part of _ours Kalshi's book actually shows (acked, at the price
+        # the book has them). Only this is netted out of the displayed ladder.
+        self._shown: dict[tuple[str, str], list[tuple[float, float]]] = {}
+        self._own_in_book = False
+        self._skipped_deep = 0   # ladder levels left out by skip_quote_depth_ahead
+        # Our live LIP quote per (ticker, side): (price, remaining) or None.
+        self._lip_live: dict[tuple[str, str], tuple[float, float] | None] = {}
 
     # ------------------------------------------------------------------
     # Engine interface
     # ------------------------------------------------------------------
 
-    def live_quote_order_ids(self) -> list[int]:
-        return [q["order_id"] for q in self._quotes.values()]
-
-    def clear_quotes(self):
-        """Forget quotes WITHOUT cancelling -- the engine has just cancelled them."""
-        self._quotes.clear()
-
-    def drop_quote(self, order_id: int):
-        """Forget a quote that never reached the book (rate limit, guard,
-        reject). Without this the quoter prices against a phantom order and,
-        since it only requotes when the level moves, leaves the market bare."""
-        for key, q in list(self._quotes.items()):
-            if q["order_id"] == order_id:
-                del self._quotes[key]
-                return
-
     def resting_by_side(self) -> dict[tuple[str, str], list[tuple[float, float]]]:
-        """(ticker, side) -> [(price, size)] of every resting quote, for LIP scoring."""
-        out: dict[tuple[str, str], list] = {}
-        for (t, s, _), q in self._quotes.items():
-            out.setdefault((t, s), []).append((q["price"], q["size"]))
+        """(ticker, side) -> [(price, size)] of every live quote, edge and
+        LIP, for LIP scoring."""
+        out = {k: list(v) for k, v in self._ours.items() if v}
+        for k, v in self._lip_live.items():
+            if v is not None:
+                out.setdefault(k, []).append(v)
         return out
 
     def __call__(self, ctx):
-        # Across all tickers: a quote fills whenever someone crosses it,
-        # unrelated to whatever woke us. Keyed on having quotes, not on
-        # enable_quoting, so turning quoting off still retires what rests.
-        if self._quotes:
-            self._sync_quote_fills(ctx)
-        else:
-            self._fills_seen = len(ctx.portfolio.fills)
+        self._own_in_book = bool(getattr(ctx, "own_orders_in_book", False))
+        self._sync_quote_fills(ctx)
 
         now_s = ctx.time.timestamp()
         evt = ctx.last_event
@@ -137,23 +130,16 @@ class Quoter:
     # ------------------------------------------------------------------
 
     def _sync_quote_fills(self, ctx):
-        """Retire any quote of ours that traded and start its side's requote
-        delay. Read off the portfolio's fill list -- the one signal identical
-        in backtest and live. Resets when the list shrinks (arming swaps in a
-        fresh Portfolio)."""
+        """Start a side's requote delay when one of our quotes trades. Read off
+        the portfolio's fill list -- the one signal identical in backtest and
+        live. Resets when the list shrinks (arming swaps in a fresh Portfolio)."""
         fills = ctx.portfolio.fills
         if len(fills) < self._fills_seen:
             self._fills_seen = 0
-        if len(fills) == self._fills_seen:
-            return
-        by_order = {q["order_id"]: key for key, q in self._quotes.items()}
+        delay = pd.Timedelta(seconds=self.cfg.quoting.requote_delay_s)
         for f in fills[self._fills_seen:]:
-            key = by_order.pop(f.order_id, None)
-            if key is None:
-                continue
-            self._quotes.pop(key, None)
-            ctx.cancel(f.order_id)   # any partial-fill remainder
-            self._quote_block_until[key[:2]] = f.time + pd.Timedelta(seconds=self.cfg.quoting.requote_delay_s)
+            if f.liquidity == "maker":
+                self._quote_block_until[(f.ticker, f.side)] = f.time + delay
         self._fills_seen = len(fills)
 
     def _inflight(self, ticker: str, side: str, now: pd.Timestamp) -> float:
@@ -168,9 +154,20 @@ class Quoter:
         self._sent[key] = recent
         return sum(s for _, s in recent)
 
-    def _resting(self, ticker: str, side: str, role: str | None = None) -> float:
-        return sum(q["size"] for (t, s, r), q in self._quotes.items()
-                   if t == ticker and s == side and (role is None or r == role))
+    def _refresh_ours(self, ctx, ticker: str):
+        """Our live quotes (risk) and the subset Kalshi's book shows (netting
+        our size out of the displayed ladder), per side."""
+        get = getattr(ctx, "quote_ladder", None)
+        shown = getattr(ctx, "quotes_on_book", None)
+        lipq = getattr(ctx, "lip_quote", None)
+        for side in ("yes", "no"):
+            self._ours[(ticker, side)] = list(get(ticker, side)) if get is not None else []
+            self._lip_live[(ticker, side)] = lipq(ticker, side) if lipq is not None else None
+            self._shown[(ticker, side)] = (list(shown(ticker, side)) if shown is not None
+                                           else list(self._ours[(ticker, side)]))
+
+    def _resting(self, ticker: str, side: str) -> float:
+        return sum(z for _, z in self._ours.get((ticker, side), []))
 
     def _block(self, reason: str):
         self.block_counts[reason] = self.block_counts.get(reason, 0) + 1
@@ -237,6 +234,7 @@ class Quoter:
         book = ctx.book(ticker)
         market_bid = book.bid if book is not None else None
         market_ask = book.ask if book is not None else None
+        self._refresh_ours(ctx, ticker)
 
         gate = None
         if fair is None:
@@ -244,10 +242,14 @@ class Quoter:
         elif self.signal_stale():
             gate = self._block("stale_signal")
         if gate is not None:
-            self._manage_quotes(ctx, ticker, None, None, now, None)
-            self._manage_lip(ctx, ticker, book, None, None, now)
+            for side in ("yes", "no"):
+                self._publish(ctx, ticker, side, None)
+                self._publish_lip(ctx, ticker, side, None)    # a stale fill is the big adverse one
             if self.record_debug:
-                self._log_row(ctx, now, ticker, None, market_bid, market_ask, block=gate)
+                # The fair still exists under a stale_signal block; logging it
+                # as None drew a theo gap on every block (~12% of rows,
+                # 2026-10-10). The edge bands still gap: nothing was priced.
+                self._log_row(ctx, now, ticker, fair, market_bid, market_ask, block=gate)
             return
 
         eps = q.fair_clip_eps
@@ -260,6 +262,7 @@ class Quoter:
         net = pos.yes_qty - pos.no_qty
         max_pos = q.max_position
         inflight_yes, inflight_no = self._inflight(ticker, "yes", now), self._inflight(ticker, "no", now)
+        # Every live quote level counts: a fast move can fill all of them.
         resting_yes, resting_no = self._resting(ticker, "yes"), self._resting(ticker, "no")
         eff_yes = net + inflight_yes + resting_yes
         eff_no = net - inflight_no - resting_no
@@ -267,13 +270,21 @@ class Quoter:
         def _ratio(x):
             return 0.0 if max_pos <= 0 else max(-1.0, min(1.0, x / max_pos))
 
-        lean_bid = (q.lean_multiplier * d_lo + q.lean_dollars) * max(_ratio(eff_yes), 0.0) ** q.lean_exponent
-        lean_ask = (q.lean_multiplier * d_hi + q.lean_dollars) * max(-_ratio(eff_no), 0.0) ** q.lean_exponent
+        def _signed(r):
+            return math.copysign(abs(r) ** q.lean_exponent, r)
+
+        # Signed lean: positive grows the edge on the side that adds to the
+        # position, negative cuts it on the side that reduces it. Unsigned, the
+        # reducing side asked the full edge at the cap and sat a median 9c
+        # behind the touch, unquoted 53% of the time (KXCRYPTOLEAD15M 2026-10-11).
+        lean_bid = (q.lean_multiplier * d_lo + q.lean_dollars) * _signed(_ratio(eff_yes))
+        lean_ask = (q.lean_multiplier * d_hi + q.lean_dollars) * _signed(-_ratio(eff_no))
 
         fee_bid = self.fees.taker(market_ask) if market_ask is not None else 0.0
         fee_ask = self.fees.taker(market_bid) if market_bid is not None else 0.0
-        bid_edge = q.constant_edge + ci_bid + lean_bid + fee_bid
-        ask_edge = q.constant_edge + ci_ask + lean_ask + fee_ask
+        # Floored at 0 before the fee: a negative lean may bring a side to fair, never past it.
+        bid_edge = max(q.constant_edge + ci_bid + lean_bid, 0.0) + fee_bid
+        ask_edge = max(q.constant_edge + ci_ask + lean_ask, 0.0) + fee_ask
         bid_res, ask_res = prob - bid_edge, prob + ask_edge
 
         block_bid = block_ask = None
@@ -287,8 +298,11 @@ class Quoter:
         if block_ask and block_ask != block_bid:
             self._block(block_ask)
 
-        cap_yes = eff_yes < max_pos - 1e-9
-        cap_no = eff_no > -max_pos + 1e-9
+        # Takes are capped on fills + in-flight takes only: a resting quote
+        # isn't position yet, and counting the whole ladder here would stop us
+        # taking a clear edge just because we're also bidding.
+        cap_yes = net + inflight_yes < max_pos - 1e-9
+        cap_no = net - inflight_no > -max_pos + 1e-9
 
         key_b, key_a = (ticker, "take_yes"), (ticker, "take_no")
         want_b = block_bid is None and market_ask is not None and bid_res >= market_ask and cap_yes
@@ -310,22 +324,36 @@ class Quoter:
                     order_type="limit")
             self._sent.setdefault((ticker, "no"), []).append((now, q.order_lots))
 
-        # Quotes: quoting_edge replaces constant_edge (a rest and a cross are
-        # different risks); CI and lean are shared. Maker fee, priced at the
-        # pre-fee reservation.
-        q_base_bid = q.quoting_edge + ci_bid + lean_bid
-        q_base_ask = q.quoting_edge + ci_ask + lean_ask
+        # Quotes: the take edge minus the taker fee, plus quoting_edge on top
+        # (a resting quote is picked off by whoever is faster). Maker fee,
+        # priced at the pre-fee reservation.
+        q_base_bid = max(q.constant_edge + q.quoting_edge + ci_bid + lean_bid, 0.0)
+        q_base_ask = max(q.constant_edge + q.quoting_edge + ci_ask + lean_ask, 0.0)
         mfee_bid = self.fees.maker(prob - q_base_bid)
         mfee_ask = self.fees.maker(prob + q_base_ask)
         qres_bid = prob - (q_base_bid + mfee_bid)
         qres_ask = prob + (q_base_ask + mfee_ask)
 
         quoting = q.enable_quoting
+        qblock = getattr(self.model, "quote_block", None)
+        quote_gate = qblock(ticker, now_s) if qblock is not None else None
+        if quote_gate:
+            self._block(quote_gate)
+            quoting = False
         res_b = qres_bid if (quoting and block_bid is None) else None
         res_a = qres_ask if (quoting and block_ask is None) else None
-        quote_bid, quote_ask = self._manage_quotes(ctx, ticker, res_b, res_a, now, prob,
-                                                   market_bid=market_bid, market_ask=market_ask, net=net)
-        lip_bid, lip_ask = self._manage_lip(ctx, ticker, book, res_b, res_a, now, net=net)
+        ladder = getattr(book, "ladder", None) if book is not None else None
+        out, lips = {}, {}
+        for side, res in (("yes", res_b), ("no", res_a)):
+            d = self._ladder(ticker, side, res, market_bid, market_ask, ladder, net, now)
+            self._publish(ctx, ticker, side, d)
+            out[side] = d
+            lips[side] = self._lip_target(ticker, side, res, book, ladder, net)
+            self._publish_lip(ctx, ticker, side, lips[side])
+        quote_bid = _top_yes("yes", out["yes"])
+        quote_ask = _top_yes("no", out["no"])
+        lip_bid = None if lips["yes"] is None else lips["yes"].price
+        lip_ask = None if lips["no"] is None else round(1.0 - lips["no"].price, 2)
 
         if self.record_debug:
             self._log_row(ctx, now, ticker, fair, market_bid, market_ask, prob=prob,
@@ -337,199 +365,186 @@ class Quoter:
                           resting_yes=resting_yes, resting_no=resting_no,
                           cap_yes=cap_yes, cap_no=cap_no, mfee_bid=mfee_bid, mfee_ask=mfee_ask,
                           qres_bid=qres_bid, qres_ask=qres_ask, quote_bid=quote_bid, quote_ask=quote_ask,
-                          lip_bid=lip_bid, lip_ask=lip_ask, block_bid=block_bid, block_ask=block_ask)
+                          lip_bid=lip_bid, lip_ask=lip_ask, block_bid=block_bid, block_ask=block_ask,
+                          n_levels_bid=len(out["yes"].prices) if out["yes"] else 0,
+                          n_levels_ask=len(out["no"].prices) if out["no"] else 0)
 
     # ------------------------------------------------------------------
-    # Edge quotes
+    # Quote ladder
     # ------------------------------------------------------------------
 
-    def _room(self, ticker, side, net, now, exclude_role):
-        """Position room for a new quote on `side`, counting takes in flight
-        and our OTHER resting quotes on that side."""
-        other = self._resting(ticker, side) - self._resting(ticker, side, exclude_role)
-        if side == "yes":
-            return self.cfg.quoting.max_position - (net + self._inflight(ticker, "yes", now) + other)
-        return self.cfg.quoting.max_position + (net - self._inflight(ticker, "no", now) - other)
+    @staticmethod
+    def _publish(ctx, ticker, side, d: Desired | None):
+        pub = getattr(ctx, "set_quote_ladder", None)
+        if pub is not None:
+            pub(ticker, side, d)
 
-    def _manage_quotes(self, ctx, ticker, res_bid, res_ask, now, prob, *,
-                       market_bid=None, market_ask=None, net=None):
-        """Bring both sides' edge quotes in line with the reservations (None =
-        don't quote that side). Returns the (bid, ask) quoted, YES terms.
-        Cancel-then-replace, one order per side."""
-        q = self.cfg.quoting
-        if net is None:
-            pos = ctx.position(ticker)
-            net = pos.yes_qty - pos.no_qty
-        # No usable touch on either side: nothing to cap against, so withdraw
-        # rather than rest blind. One-sided books are fine.
-        have_touch = market_bid is not None or market_ask is not None
-        want = {}
-        for side, res in (("yes", res_bid), ("no", res_ask)):
-            ok = res is not None and have_touch and self._room(ticker, side, net, now, EDGE) >= q.order_lots - 1e-9
-            want[side] = self._desired(side, res, market_bid, market_ask, (ticker, side), now) if ok else None
-        improve = q.requote_improve_ticks * TICK
-        for side, w in want.items():
-            key = (ticker, side, EDGE)
-            live = self._quotes.get(key)
-            if live is not None:
-                if w is None:
-                    stale = True
-                else:
-                    inside = live["price"] > w + 1e-9           # now inside the edge we demand
-                    chase = (w - live["price"]) >= improve - 1e-9  # level ran far enough to be worth queue
-                    stale = inside or chase
-                    young = now - live["placed"] < pd.Timedelta(seconds=q.min_quote_life_s)
-                    if stale and young and not _past_fair(side, live["price"], prob):
-                        stale = False
-                if stale:
-                    ctx.cancel(live["order_id"])
-                    self._quotes.pop(key, None)
-                    live = None
-            if live is None and w is not None:
-                order = ctx.buy(ticker=ticker, side=side, size=q.order_lots, price=w,
-                                order_type="limit", intent="quote", role=EDGE)
-                self._quotes[key] = {"order_id": order.order_id, "price": w, "size": q.order_lots,
-                                     "placed": now}
-        yq, nq = self._quotes.get((ticker, "yes", EDGE)), self._quotes.get((ticker, "no", EDGE))
-        return (None if yq is None else yq["price"], None if nq is None else round(1.0 - nq["price"], 2))
+    @staticmethod
+    def _publish_lip(ctx, ticker, side, t: LipTarget | None):
+        pub = getattr(ctx, "set_lip_quote", None)
+        if pub is not None:
+            pub(ticker, side, t)
 
-    def _desired(self, side, reservation, market_bid, market_ask, key, now) -> float | None:
-        """Resting price in that side's own terms, or None. First tick
-        OUTSIDE the reservation (rounding to nearest would put half our
-        quotes inside the edge), at most max_improve_ticks inside the near
-        touch, and a tick inside the far touch so it never crosses -- if it
-        were marketable, the take test already priced that with the taker fee."""
-        until = self._quote_block_until.get(key)
-        if until is not None and now < until:
+    # ------------------------------------------------------------------
+    # LIP quote
+    # ------------------------------------------------------------------
+
+    def _lip_target(self, ticker, side, res, book, ladder, net) -> LipTarget | None:
+        """Where the one LIP quote on this side should rest, or None.
+
+        Levels: every tick at or below the first tick outside the quote
+        reservation (never inside the edge) and a tick inside the far touch.
+        Among them, choose_lip_level takes the deepest earning >= prop_max_lip
+        of the best LIP $/s that has >= lip_min_depth_ahead resting ahead --
+        ALL size counts, ours included (it counts toward the reference price
+        too). Our current LIP quote's own size is left out of "ahead" at its
+        price, since it's what's being placed. Size: up to lip_lots minus the
+        position on this side and minus our resting edge size here."""
+        lc = self.cfg.lip
+        params = self.lip.params.get(ticker) if self.lip is not None else None
+        if (res is None or params is None or ladder is None or not lc.enable_lip_quoting
+                or lc.lip_lots < 1 or book is None):
             return None
-        top = _first_outside(side, reservation)
-        n = self.cfg.quoting.max_improve_ticks
-        yes = top if side == "yes" else round(1.0 - top, 2)
+        held = net if side == "yes" else -net
+        room = lc.lip_lots - max(held, 0.0) - self._resting(ticker, side)
+        max_size = math.floor(room + 1e-9)
+        if max_size < 1:
+            return None
+        top = _first_outside(side, res)
+        far = book.ask if side == "yes" else (None if book.bid is None else 1.0 - book.bid)
+        if far is not None:
+            top = min(top, round(far - TICK, 2))
+        if top < MIN_PRICE:
+            return None
+        live = self._lip_live.get((ticker, side))
+        ours = {s: list(self._shown.get((ticker, s), [])) if self._own_in_book else
+                [(p, z) for p, z in self._ours.get((ticker, s), [])] for s in ("yes", "no")}
+        if live is not None:
+            # Our LIP quote is the order being placed: score and count depth
+            # without it, or it would always see itself ahead.
+            lp, lz = live
+            ours[side] = [(p, z) for p, z in ours[side] if not (abs(p - lp) < 1e-9 and abs(z - lz) < 1e-9)]
+        displayed = {"yes": dict(ladder.yes_bids), "no": dict(ladder.no_bids)}
+        others = {s: others_ladder(displayed[s], ours[s]) if self._own_in_book else displayed[s]
+                  for s in ("yes", "no")}
+        everyone = displayed[side] if self._own_in_book else _add(displayed[side], ours[side])
+
+        def depth_ahead(price):
+            return sum(z for p, z in everyone.items() if p >= price - 1e-9)
+
+        choice = choose_lip_level(side=side, others_yes=others["yes"], others_no=others["no"],
+                                  ours_yes=ours["yes"], ours_no=ours["no"], params=params,
+                                  top_price=top, max_size=max_size, prop_max=lc.prop_max_lip,
+                                  min_depth_ahead=lc.lip_min_depth_ahead, depth_ahead_fn=depth_ahead)
+        if choice.price is None:
+            return None
+        return LipTarget(choice.price, choice.size)
+
+    def _others_bids(self, ticker, side, ladder) -> dict | None:
+        """Other participants' bids on one side, own-side prices: the displayed
+        ladder minus our quotes the book actually shows (real mode only -- in
+        shadow and backtest the feed never contains our orders). None without
+        a ladder."""
+        if ladder is None:
+            return None
+        bids = ladder.yes_bids if side == "yes" else ladder.no_bids
+        if not self._own_in_book:
+            return dict(bids)
+        return others_ladder(bids, self._shown.get((ticker, side), []))
+
+    def _others_touch(self, ticker, side, market_bid, market_ask, ladder):
+        """Near touch net of our own resting size, YES terms; None if nobody
+        else is on that side. Capping against the displayed touch let a quote
+        that WAS the touch step over itself one tick per decision (27% of
+        write spend, 2026-10-10)."""
+        shown = market_bid if side == "yes" else market_ask
+        if ladder is None or not self._own_in_book:
+            return shown
+        others = self._others_bids(ticker, side, ladder)
+        if not others:
+            return None
+        best = max(others)
+        return round(best, 2) if side == "yes" else round(1.0 - best, 2)
+
+    def _ladder(self, ticker, side, res, market_bid, market_ask, ladder, net, now) -> Desired:
+        """The levels this side should have resting, own-side terms, best
+        first. Empty (edge_limit None) when the side may not be quoted.
+
+        A level with more than skip_quote_depth_ahead of OTHERS' size at its
+        price or better is left out: deep behind the touch it almost never
+        fills, so creating it only spends budget, and as the queue in front
+        grows and shrinks it would be added and dropped over and over. Only
+        new levels are affected -- the manager never cancels a quote for
+        going deep."""
+        q = self.cfg.quoting
+        if res is None or (market_bid is None and market_ask is None):
+            return Desired([], q.order_lots, None, 0.0)
+        until = self._quote_block_until.get((ticker, side))
+        edge_limit = _first_outside(side, res)
+        # Room for resting size under max_position, counting fills and
+        # in-flight takes. Every level counts (all can fill together).
         if side == "yes":
-            if market_bid is not None:
-                yes = min(yes, market_bid + n * TICK)
+            room = q.max_position - (net + self._inflight(ticker, "yes", now))
+        else:
+            room = q.max_position + (net - self._inflight(ticker, "no", now))
+        room = max(room, 0.0)
+        ahead = self._max_ahead_price(ticker, side, market_bid, market_ask, ladder)
+        if until is not None and now < until:
+            # Recently hit: keep what's up (still outside the edge), add nothing.
+            return Desired([], q.order_lots, edge_limit, room, ahead)
+        top = self._top_price(ticker, side, res, market_bid, market_ask, ladder)
+        if top is None:
+            return Desired([], q.order_lots, edge_limit, room, ahead)
+        n = max(int(q.quote_levels_behind), 0) + 1
+        cap = q.skip_quote_depth_ahead
+        others = self._others_bids(ticker, side, ladder) if cap is not None else None
+        prices = []
+        for i in range(n):
+            p = round(top - i * TICK, 2)
+            if p < MIN_PRICE - 1e-9:
+                break
+            if others is not None and sum(z for px, z in others.items() if px >= p - 1e-9) > cap + 1e-9:
+                self._skipped_deep += 1
+                break                               # every deeper level has at least as much ahead
+            prices.append(p)
+        return Desired(prices, q.order_lots, edge_limit, room, ahead)
+
+    def _max_ahead_price(self, ticker, side, market_bid, market_ask, ladder) -> float | None:
+        """Highest own-side price a resting quote may keep relative to OTHERS'
+        touch: their best + max_improve_ticks, the same limit new quotes are
+        placed under. None when nobody else is bidding (nothing to be ahead
+        of). Touch flickers are filtered by the order manager's grace period
+        (quote_ahead_grace_s), not by extra slack here."""
+        near = self._others_touch(ticker, side, market_bid, market_ask, ladder)
+        if near is None:
+            return None
+        near_own = near if side == "yes" else round(1.0 - near, 2)
+        return round(near_own + self.cfg.quoting.max_improve_ticks * TICK, 2)
+
+    def _top_price(self, ticker, side, res, market_bid, market_ask, ladder) -> float | None:
+        """Best level in own-side terms: first tick outside the reservation
+        (rounding to nearest would put half our quotes inside the edge), at
+        most max_improve_ticks inside the near touch (net of our own orders),
+        and a tick inside the far touch so it never crosses -- a marketable
+        price is the take test's job, which charges the taker fee."""
+        n = self.cfg.quoting.max_improve_ticks
+        top = _first_outside(side, res)
+        yes = top if side == "yes" else round(1.0 - top, 2)
+        near = self._others_touch(ticker, side, market_bid, market_ask, ladder)
+        if side == "yes":
+            if near is not None:
+                yes = min(yes, near + n * TICK)
             if market_ask is not None:
                 yes = min(yes, market_ask - TICK)
         else:
-            if market_ask is not None:
-                yes = max(yes, market_ask - n * TICK)
+            if near is not None:
+                yes = max(yes, near - n * TICK)
             if market_bid is not None:
                 yes = max(yes, market_bid + TICK)
         yes = round(yes, 2)
         if not (MIN_PRICE <= yes <= MAX_PRICE):
             return None
         return yes if side == "yes" else round(1.0 - yes, 2)
-
-    # ------------------------------------------------------------------
-    # LIP quote
-    # ------------------------------------------------------------------
-
-    def _manage_lip(self, ctx, ticker, book, res_bid, res_ask, now, *, net=None):
-        """Rest up to lip_lots per side purely for LIP, every decision:
-
-        1. Levels considered: every tick at or outside the edge quote's own
-           reservation (first tick outside it, own-side terms), never inside
-           the far touch.
-        2. The best LIP $/s over those levels is the reference; we take the
-           DEEPEST level earning >= prop_max_lip of it that has at least
-           lip_min_depth_ahead resting ahead of us (better prices plus the
-           whole same-price queue -- we always join at the back).
-        3. Size is cut to the fewest lots earning the same reward.
-        4. Same level: amend the size (Kalshi sends an increase to the back
-           of the queue; a decrease is done as cancel + new order, so the
-           quote always sits at the back). Different level: cancel + new.
-
-        Safety cancels -- no fair, no level, too little depth ahead -- go out
-        first with force (they bypass the write-rate limiter). Returns the
-        (bid, ask) LIP prices quoted, YES terms."""
-        lc = self.cfg.lip
-        params = self.lip.params.get(ticker) if self.lip is not None else None
-        ladder = getattr(book, "ladder", None) if book is not None else None
-        out = {}
-        for side, res in (("yes", res_bid), ("no", res_ask)):
-            key = (ticker, side, LIP)
-            live = self._quotes.get(key)
-            choice = None
-            if (res is not None and params is not None and ladder is not None and lc.lip_lots >= 1
-                    and self.cfg.quoting.enable_quoting):
-                choice = self._lip_choice(ticker, side, res, book, ladder, params, live, net, now)
-            if choice is None or choice.price is None:
-                if live is not None:
-                    ctx.cancel(live["order_id"], force=True)   # safety cancel: never rate-limited
-                    self._quotes.pop(key, None)
-                out[side] = None
-                continue
-            if live is not None and abs(live["price"] - choice.price) < 1e-9:
-                if abs(choice.size - live["size"]) > 1e-9:
-                    if choice.size > live["size"] and ctx.amend(live["order_id"], choice.size):
-                        live["size"] = choice.size      # increase: Kalshi moves it to the back
-                    else:
-                        # A decrease would KEEP priority (and amend may be
-                        # unavailable): cancel + new order to stay at the back.
-                        ctx.cancel(live["order_id"])
-                        self._quotes.pop(key, None)
-                        live = None
-            elif live is not None:
-                ctx.cancel(live["order_id"])
-                self._quotes.pop(key, None)
-                live = None
-            if live is None:
-                order = ctx.buy(ticker=ticker, side=side, size=choice.size, price=choice.price,
-                                order_type="limit", intent="quote", role=LIP)
-                self._quotes[key] = {"order_id": order.order_id, "price": choice.price,
-                                     "size": choice.size, "placed": now}
-            q = self._quotes[key]
-            out[side] = q["price"] if side == "yes" else round(1.0 - q["price"], 2)
-        return out.get("yes"), out.get("no")
-
-    def _lip_choice(self, ticker, side, res, book, ladder, params, live, net, now):
-        lc = self.cfg.lip
-        if self._quote_block_until.get((ticker, side)) is not None and now < self._quote_block_until[(ticker, side)]:
-            return None
-        if net is None:
-            net = 0.0
-        room = self._room(ticker, side, net, now, LIP)
-        max_size = math.floor(min(lc.lip_lots, room) + 1e-9)
-        if max_size < 1:
-            return None
-        top = _first_outside(side, res)
-        # Never at or through the far touch: own-side price below 1 - opposite best.
-        far = book.ask if side == "yes" else (None if book.bid is None else 1.0 - book.bid)
-        if far is not None:
-            top = min(top, round(far - TICK, 2))
-        if top < MIN_PRICE:
-            return None
-        ours = self.resting_by_side()
-        mine = {s: [(p, z) for p, z in ours.get((ticker, s), [])] for s in ("yes", "no")}
-        if live is not None:
-            mine[side] = [(p, z) for p, z in mine[side] if not (abs(p - live["price"]) < 1e-9 and z == live["size"])]
-        others_yes = _scored_prefix(others_ladder(ladder.yes_bids, ours.get((ticker, "yes"), [])),
-                                    params.target_size)
-        others_no = _scored_prefix(others_ladder(ladder.no_bids, ours.get((ticker, "no"), [])),
-                                   params.target_size)
-        others = others_yes if side == "yes" else others_no
-        # The choice is a pure function of these; most Kalshi deltas land
-        # outside the scored prefix and change none of them.
-        key = (top, max_size, lc.prop_max_lip, lc.lip_min_depth_ahead, params,
-               tuple(others_yes.items()), tuple(others_no.items()),
-               tuple(mine["yes"]), tuple(mine["no"]))
-        hit = self._lip_cache.get((ticker, side))
-        if hit is not None and hit[0] == key:
-            return hit[1]
-
-        def depth_ahead(price):
-            # Everything better than us plus the whole same-price queue: we
-            # always join at the back. Our own edge quote counts -- it trades
-            # before us too.
-            ahead = sum(z for p, z in others.items() if p >= price - 1e-9)
-            return ahead + sum(z for p, z in mine[side] if p >= price - 1e-9)
-
-        choice = choose_lip_level(side=side, others_yes=others_yes, others_no=others_no,
-                                  ours_yes=mine["yes"], ours_no=mine["no"], params=params,
-                                  top_price=top, max_size=max_size, prop_max=lc.prop_max_lip,
-                                  min_depth_ahead=lc.lip_min_depth_ahead, depth_ahead_fn=depth_ahead)
-        self._lip_cache[(ticker, side)] = (key, choice)
-        return choice
 
     # ------------------------------------------------------------------
     # Logging
@@ -562,6 +577,7 @@ class Quoter:
             "quoting_edge": self.cfg.quoting.quoting_edge,
             "quote_bid_reservation": v.get("qres_bid"), "quote_ask_reservation": v.get("qres_ask"),
             "quote_bid": v.get("quote_bid"), "quote_ask": v.get("quote_ask"),
+            "n_levels_bid": v.get("n_levels_bid"), "n_levels_ask": v.get("n_levels_ask"),
             "lip_bid": v.get("lip_bid"), "lip_ask": v.get("lip_ask"),
             "block_bid": block or v.get("block_bid"), "block_ask": block or v.get("block_ask"),
             "atm_tradeable": ticker in self._atm_set if self.cfg.quoting.max_markets else True,
@@ -574,17 +590,23 @@ class Quoter:
         self.debug_log.append(row)
 
 
+def _add(bids: dict, ours: list) -> dict:
+    """`bids` with our size added (shadow: the feed never shows our orders)."""
+    out = dict(bids)
+    for p, z in ours:
+        out[p] = out.get(p, 0.0) + z
+    return out
+
+
+def _top_yes(side: str, d: Desired | None) -> float | None:
+    """The ladder's best level in YES terms, for the log/chart."""
+    if d is None or not d.prices:
+        return None
+    return d.prices[0] if side == "yes" else round(1.0 - d.prices[0], 2)
+
+
 def _first_outside(side: str, reservation: float) -> float:
     """First tick at or outside the reservation, in `side`'s own price terms."""
     if side == "yes":
         return round(math.floor(reservation / TICK + 1e-9) * TICK, 2)
     return round(1.0 - math.ceil(reservation / TICK - 1e-9) * TICK, 2)
-
-
-def _past_fair(side: str, price: float, prob: float | None) -> bool:
-    """Resting quote (own-side terms) at or beyond fair. Unknown fair counts
-    as past it, so the quote is replaced."""
-    if prob is None or math.isnan(prob):
-        return True
-    f = prob if side == "yes" else 1.0 - prob
-    return price >= f - 1e-9

@@ -20,6 +20,13 @@ import time
 import traceback
 
 HEAVY_INTERVAL_S = 3.0      # parquets + chart streams; the dashboard chart polls every 1.5s
+# The next heavy write waits at least this multiple of the last one's duration:
+# the heavy write reached 1.1-1.7 s per pass (2026-10-11), keeping the writer
+# busy half the time at a fixed 3 s and competing with the trading process for
+# CPU. Caps the writer at ~1/HEAVY_DUTY of a core; dashboard staleness grows only
+# when the box is already loaded.
+HEAVY_DUTY = 3.0
+HEAVY_INTERVAL_MAX_S = 15.0
 JOURNAL_INTERVAL_S = 30.0   # one immutable part file per stream per this
 MAX_DEBUG_ROWS = 20_000     # heavy-write cost scales with this; the oldest half is thinned past it
 MAX_HISTORY_ROWS = 20_000
@@ -35,13 +42,15 @@ def _thin(seq: list, cap: int):
 
 
 class _Event:
-    def __init__(self, series: str, date: str):
+    def __init__(self, series: str, date: str, tickers: list | None = None):
         from kalshi_infra.runtime import journal as jr
         self.series, self.date = series, date
+        self.tickers = list(tickers or [])
         self.journal = jr.DayJournal(series, date)
         self.decisions: list[dict] = []
         self.fills: list = []
         self.fair: list[dict] = []
+        self.bbo: list[dict] = []
         self.pnl: list[tuple] = []
         self.pnl_by_ticker: dict[str, list] = {}
         self.summary: dict | None = None
@@ -51,6 +60,7 @@ class _Event:
         self.decisions.clear()
         self.fills.clear()
         self.fair.clear()
+        self.bbo.clear()
         self.pnl.clear()
         self.pnl_by_ticker.clear()
         self.dirty = True
@@ -61,6 +71,8 @@ class _Event:
             self.journal.record_decision(r)
         for r in d["bbo"]:
             self.journal._buf["bbo"].append(r)
+        self.bbo.extend(d["bbo"])
+        _thin(self.bbo, MAX_HISTORY_ROWS)
         self.fair.extend(d["fair"])
         self.pnl.extend(d["pnl"])
         for t, rows in d["pnl_by_ticker"].items():
@@ -74,13 +86,14 @@ class _Event:
         for rows in self.pnl_by_ticker.values():
             _thin(rows, 4000)
         self.summary = d["summary"]
-        if d["decisions"] or d["fills"] or d["fair"] or d["pnl"]:
+        if d["decisions"] or d["fills"] or d["fair"] or d["pnl"] or d["bbo"]:
             self.dirty = True
 
     def state(self, heavy: bool) -> dict:
         return {"series": self.series, "date": self.date, "heavy": heavy, "summary": self.summary,
                 "debug_log": self.decisions, "fills": self.fills, "pnl_history": self.pnl,
-                "fair_history": self.fair, "pnl_by_ticker": self.pnl_by_ticker}
+                "fair_history": self.fair, "pnl_by_ticker": self.pnl_by_ticker,
+                "bbo_history": self.bbo, "tickers": self.tickers}
 
 
 _HEAVY_PHASES: dict = {}
@@ -111,9 +124,20 @@ def _write_journal(ev: _Event):
 
 
 def _main(q: mp.Queue, series: str):
+    import signal
+    # Ctrl-C reaches every process on the console. The trading process owns
+    # shutdown (it sends "stop" after pulling quotes); a writer killed by the
+    # same Ctrl-C left the parent blocked on its queue at exit (2026-10-09).
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, signal.SIG_IGN)
+    # Lowest priority: the trading process must never wait on this one for CPU.
+    from kalshi_infra.runtime.priority import set_priority
+    set_priority("below_normal")
     from kalshi_infra.runtime import persist
     ev: _Event | None = None
     last_heavy = last_journal = 0.0
+    heavy_gap = HEAVY_INTERVAL_S
 
     def guarded(fn, what):
         try:
@@ -145,7 +169,7 @@ def _main(q: mp.Queue, series: str):
                     guarded(_write_heavy, "final snapshot")
                     guarded(_write_journal, "journal write")
                 persist.reset_session_files(series)
-                ev = _Event(series, payload["date"])
+                ev = _Event(series, payload["date"], payload.get("tickers"))
                 last_heavy = 0.0
                 last_journal = time.monotonic()
             elif ev is None:
@@ -163,9 +187,10 @@ def _main(q: mp.Queue, series: str):
                 stop = True
         if ev is not None:
             now = time.monotonic()
-            if ev.dirty and now - last_heavy >= HEAVY_INTERVAL_S:
+            if ev.dirty and now - last_heavy >= heavy_gap:
                 guarded(_write_heavy, "snapshot write")
                 last_heavy = time.monotonic()
+                heavy_gap = min(max(HEAVY_INTERVAL_S, HEAVY_DUTY * (last_heavy - now)), HEAVY_INTERVAL_MAX_S)
             elif summary_due:
                 guarded(_write_summary, "summary write")
             if now - last_journal >= JOURNAL_INTERVAL_S:
@@ -187,6 +212,8 @@ class SnapshotWriter:
         self._q = None
         self._proc = None
         self._date = None
+        self._tickers: list = []
+        self._stopping = False
         self._spawn()
         self._clear_buffers()
         self._last_bbo: dict[str, tuple] = {}
@@ -195,6 +222,10 @@ class SnapshotWriter:
 
     def _spawn(self):
         self._q = self._ctx.Queue()
+        # Exit must never wait on undelivered snapshots: by default a Queue's
+        # feeder thread is joined at interpreter exit, which blocks forever
+        # once the reader is gone.
+        self._q.cancel_join_thread()
         self._proc = self._ctx.Process(target=_main, args=(self._q, self.series), daemon=True,
                                        name=f"writer-{self.series}")
         self._proc.start()
@@ -204,6 +235,8 @@ class SnapshotWriter:
         self._pnl_by_ticker: dict[str, list] = {}
 
     def _put(self, msg):
+        if self._stopping:
+            return
         if not self._proc.is_alive():
             # The writer only affects what the dashboard sees; trading goes
             # on, but say so and bring it back.
@@ -211,17 +244,19 @@ class SnapshotWriter:
                   flush=True)
             self._spawn()
             if self._date is not None:
-                self._q.put(("start", {"date": self._date}))
+                self._q.put(("start", {"date": self._date, "tickers": self._tickers}))
         self._q.put(msg)
 
     # --- per event ---
-    def start_event(self, date: str):
-        self._date = date
+    def start_event(self, date: str, tickers: list):
+        """`tickers`: every market of the event, so each gets a chart from
+        the first write, before any decision or book update."""
+        self._date, self._tickers = date, list(tickers)
         self._clear_buffers()
         self._last_bbo.clear()
         self._last_decision.clear()
         self._fills_sent = 0
-        self._put(("start", {"date": date}))
+        self._put(("start", {"date": date, "tickers": self._tickers}))
 
     def reset_session(self):
         self._clear_buffers()
@@ -233,11 +268,29 @@ class SnapshotWriter:
         self._put(("end", None))
 
     def stop(self):
+        """Final snapshot if the writer is alive; never blocks shutdown
+        longer than STOP_TIMEOUT_S, and never respawns a dead writer."""
+        if self._stopping:
+            return
+        self._stopping = True
         try:
-            self._put(("stop", None))
-            self._proc.join(STOP_TIMEOUT_S)
-        except Exception:
-            traceback.print_exc()
+            if self._proc.is_alive():
+                self._q.put(("stop", None))
+                self._proc.join(STOP_TIMEOUT_S)
+            if self._proc.is_alive():
+                self._proc.terminate()
+                self._proc.join(2)
+        except BaseException:
+            # Shutdown path: a second Ctrl-C here must still exit.
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+        finally:
+            try:
+                self._q.close()
+            except Exception:
+                pass
 
     # --- hot path ---
     def decision(self, row: dict, key: tuple):

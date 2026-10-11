@@ -73,7 +73,8 @@ def run_one(event_ticker: str, cfg=None, *, conflate_ms: int = ibe.IB_OPTIONS_CO
     bt = engine.Backtest(latency=engine.LatencyModel(wire_s=data.empirical_wire_s(event_ticker)),
                          fee_multiplier=fee_sched.taker_rate,
                          maker_fee_multiplier=fee_sched.maker_rate,
-                         max_position=cfg.quoting.max_position)
+                         max_position=cfg.quoting.max_position,
+                         cancels_token=cfg.quoting.cancels_token)
     result = bt.run(quoter.__call__, event_ticker, event_data=event_data, external_events=ext)
     if verbose:
         print(f"=== {event_ticker} ({event_data.source}/{event_data.fidelity}, {len(ext)} fair updates) ===")

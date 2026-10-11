@@ -102,6 +102,7 @@ class SettlementTracker:
         self._bars: dict[str, list[CompositeBar]] = {c: [] for c in COINS}
         self._n_ingested = 0
         self._cache: tuple | None = None
+        self._proj_cache: tuple | None = None
 
     def ingest(self, bar: CompositeBar):
         if bar.coin not in self._bars:
@@ -202,6 +203,32 @@ class SettlementTracker:
             projected_return_pct=proj_pct,
             projected_return_log=proj_log,
         )
+
+    def projected_returns(self, now_s: float, source: str) -> dict[str, float | None]:
+        """Arithmetic return per coin if each coin's last bar before `now_s`
+        held for the rest of the end average. `source` is "mid" (the pricing
+        series) or "cf" (the CF replica, `CompositeBar.price`). None for a coin
+        with no start average or no bar yet."""
+        key = (self._n_ingested, math.floor(now_s), float(now_s).is_integer(), source)
+        if self._proj_cache is not None and self._proj_cache[0] == key:
+            return self._proj_cache[1]
+        w = self.window
+        get = (lambda b: b.mid) if source == "mid" else (lambda b: b.price)
+        out: dict[str, float | None] = {}
+        for coin in COINS:
+            start = [get(b) for b in self._bars[coin] if w.start_avg_begin <= b.ts_s < w.S]
+            seen = [b for b in self._bars[coin] if b.ts_s < now_s]
+            if not start or not seen:
+                out[coin] = None
+                continue
+            end = [get(b) for b in seen if b.ts_s >= w.end_avg_begin]
+            last = get(max(seen, key=lambda b: b.ts_s))
+            n = min(len(end), START_END_AVG_S)
+            end_avg = (sum(end[:n]) + (START_END_AVG_S - n) * last) / START_END_AVG_S
+            s = float(np.mean(start))
+            out[coin] = None if s <= 0 else end_avg / s - 1.0
+        self._proj_cache = (key, out)
+        return out
 
     def finalize(self, now_s: float) -> "SettlementOutcome | None":
         """Called at `now_s >= T`. Returns the authoritative replica of

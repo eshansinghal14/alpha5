@@ -28,14 +28,41 @@ OPEN_TIMEOUT_S = 15.0
 assert RESYNC_INTERVAL_S < MAX_SNAPSHOT_AGE_S
 
 
+def parse_ws_fill(msg: dict) -> dict | None:
+    """A `fill` channel message as KalshiOrderClient.fills' dict, or None if
+    it can't be read. Price is in `outcome_side` terms (what the fill left us
+    holding), the same convention the REST fills use; the WS message carries
+    only the yes price, so a no fill is 1 - yes."""
+    try:
+        side = msg["outcome_side"]
+        yes = float(msg["yes_price_dollars"])
+        size = float(msg["count_fp"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if side not in ("yes", "no") or size <= 0:
+        return None
+    ts = msg.get("ts_ms")
+    return {"ticker": msg.get("market_ticker"), "side": side,
+            "price": yes if side == "yes" else round(1.0 - yes, 4), "size": size,
+            "fee": float(msg.get("fee_cost") or 0.0),
+            "time": None if ts is None else pd.Timestamp(int(ts), unit="ms", tz="UTC"),
+            "liquidity": "taker" if msg.get("is_taker") else "maker",
+            "order_id": msg.get("order_id"), "trade_id": msg.get("trade_id")}
+
+
 class LiveKalshiFeed:
     """`on_quote(BookView)` / `on_trade(ticker, Trade)` fire synchronously
     on this coroutine's task."""
 
-    def __init__(self, tickers: list[str], on_quote, on_trade, *, label: str):
+    def __init__(self, tickers: list[str], on_quote, on_trade, *, label: str, on_fill=None):
+        """`on_fill(dict)` (optional): OUR fills from the authenticated `fill`
+        channel, in KalshiOrderClient.fills' dict shape. Only fills on these
+        tickers are delivered."""
         self._tickers = list(tickers)
         self._on_quote = on_quote
         self._on_trade = on_trade
+        self._on_fill = on_fill
+        self.n_fills = 0
         self._books: dict[str, L2Book] = {t: L2Book(t) for t in self._tickers}
         self.label = label
         self.n_reconnects = 0
@@ -64,7 +91,8 @@ class LiveKalshiFeed:
             try:
                 async with websockets.connect(WS_URL, additional_headers=auth.ws_headers(),
                                               open_timeout=OPEN_TIMEOUT_S) as ws:
-                    for channel in ("orderbook_delta", "trade"):
+                    channels = ("orderbook_delta", "trade") + (("fill",) if self._on_fill else ())
+                    for channel in channels:
                         await ws.send(json.dumps({
                             "id": sub_id, "cmd": "subscribe",
                             "params": {"channels": [channel], "market_tickers": self._tickers},
@@ -109,6 +137,12 @@ class LiveKalshiFeed:
         ticker = msg.get("market_ticker")
         book = self._books.get(ticker)
         if book is None:
+            return
+        if mtype == "fill":
+            f = parse_ws_fill(msg)
+            if f is not None and self._on_fill is not None:
+                self.n_fills += 1
+                self._on_fill(f)
             return
         if mtype == "orderbook_snapshot":
             now = pd.Timestamp.now(tz="UTC")

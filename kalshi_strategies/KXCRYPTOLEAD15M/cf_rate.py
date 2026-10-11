@@ -108,7 +108,7 @@ def compute_cf_spot(
             drop_reasons[vb.venue] = "resyncing"; continue
         if vb.is_one_sided():
             drop_reasons[vb.venue] = "one_sided"; continue
-        m = vb.mid()
+        m = vb.book_mid()
         if m is None or not math.isfinite(m):
             drop_reasons[vb.venue] = "no_mid"; continue
         if vb.is_crossed():
@@ -135,7 +135,7 @@ def compute_cf_spot(
         median_mid = float(np.median([m for _, m in mids]))
         kept: list[VenueBook] = []
         for vb in good:
-            m = vb.mid()
+            m = vb.book_mid()
             if abs(m - median_mid) / median_mid > mid_deviation_fraction:
                 drop_reasons[vb.venue] = f"outlier(dev={abs(m - median_mid) / median_mid:.3%})"
                 continue

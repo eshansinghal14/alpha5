@@ -1,40 +1,45 @@
 {
   "quoting": {
-    "max_position": 15.0,
-    "constant_edge": 0.01,
+    "max_position": 5.0,
+    "constant_edge": 0.04,
     "edge_fraction": 1.0,
     "lean_multiplier": 1.0,
     "lean_dollars": 0.02,
     "lean_exponent": 2.0,
     "fair_clip_eps": 0.001,
     "inflight_timeout_s": 0.5,
-    "take_confirm_s": 0.75,
+    "take_confirm_s": 0.5,
     "max_markets": null,
     "atm_hysteresis": 0,
     "enable_quoting": true,
-    "quoting_edge": 0.005,
-    "max_improve_ticks": 1,
-    "requote_improve_ticks": 2.0,
-    "min_quote_life_s": 0.0,
-    "requote_delay_s": 1.0,
-    "order_lots": 5.0
+    "quoting_edge": 0.0,
+    "max_improve_ticks": 2,
+    "quote_levels_behind": 1,
+    "skip_quote_depth_ahead": null,
+    "quote_keep_inside": 0.01,
+    "quote_ahead_grace_s": 1.0,
+    "cancels_token": 20.0,
+    "requote_delay_s": 0.5,
+    "order_lots": 0.5
   },
   "close": {
     "real_trading_cutoff_s": 30.0
   },
   "risk": {
     "max_loss_usd": 80.0,
-    "max_signal_age_s": 1.5,
-    "fresh_recovery_s": 2.0
+    "max_signal_age_s": 0.4,
+    "fresh_recovery_s": 0.5
   },
   "runtime": {
     "quote_fill_poll_s": 1.0,
     "control_poll_s": 1.0
   },
   "lip": {
-    "lip_lots": 100.0,
-    "prop_max_lip": 0.8,
-    "lip_min_depth_ahead": 50.0
+    "enable_lip_quoting": false,
+    "lip_lots": 20.0,
+    "prop_max_lip": 0.7,
+    "lip_min_depth_ahead": 150.0,
+    "lip_hold_s": 0.5
   },
   "pricing": {
     "mc_n": 20000,
@@ -47,6 +52,15 @@
     "reaction_latency_s": 0.05,
     "delta_refresh_s": 0.5,
     "max_cross_coin_skew_s": 1.0,
+    "basis_tie_gap": 7.5e-05,
+    "burst_usd_1s": {
+      "BTC": 69300,
+      "ETH": 30000,
+      "SOL": 11100,
+      "XRP": 17200,
+      "HYPE": 3650
+    },
+    "burst_hold_s": 1.5,
     "quote_before_start": false,
     "soft_stale_s": 3.0,
     "hard_stale_s": 15.0,

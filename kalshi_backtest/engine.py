@@ -61,6 +61,7 @@ class BacktestContext:
     _engine: "Backtest"
     pending_orders: list = dataclasses.field(default_factory=list)
     pending_cancels: list = dataclasses.field(default_factory=list)
+    pending_ladders: list = dataclasses.field(default_factory=list)
 
     def book(self, ticker: str) -> BookView | None:
         """The strategy's own (delayed) view of `ticker`'s book -- reflects
@@ -98,6 +99,27 @@ class BacktestContext:
         which reaches the same back-of-queue state."""
         return False
 
+    def set_quote_ladder(self, ticker: str, side: str, desired):
+        """The quoter's desired quote ladder (see kalshi_infra.trading.
+        order_manager). Applied by the run loop's OrderManager after this
+        wakeup returns, so its creates/cancels get the same latency as orders."""
+        self.pending_ladders.append((ticker, side, desired))
+
+    def quote_ladder(self, ticker: str, side: str) -> list[tuple[float, float]]:
+        om = self._engine._om
+        return om.ladder(ticker, side) if om is not None else []
+
+    def set_lip_quote(self, ticker: str, side: str, target):
+        """The quoter's LIP target for one side; applied with the ladders."""
+        self.pending_ladders.append((ticker, side, ("lip", target)))
+
+    def lip_quote(self, ticker: str, side: str):
+        om = self._engine._om
+        q = om.lip_quote(ticker, side) if om is not None else None
+        return None if q is None else (q.price, q.remaining)
+
+    own_orders_in_book = False   # replayed books never contain our orders
+
     def cancel(self, order_id: int, force: bool = False):
         """Queue a cancel for a previously-placed order (by the id returned
         from buy()). Same send_s + measured-processing-time latency as a new
@@ -130,7 +152,8 @@ class Backtest:
     def __init__(self, latency: LatencyModel | None = None, fee_multiplier: float = 0.07,
                  maker_fee_multiplier: float | None = None, max_position: float | None = None,
                  stale_threshold_s: float = STALE_THRESHOLD_S,
-                 max_snapshot_age_s: float = MAX_SNAPSHOT_AGE_S):
+                 max_snapshot_age_s: float = MAX_SNAPSHOT_AGE_S,
+                 cancels_token: float | None = None):
         """stale_threshold_s: an order never fills or rests against a book
         whose true_books[ticker].time (the true time of the LAST REAL tick
         applied to it -- see book.py's BookView) is more than this many
@@ -162,8 +185,15 @@ class Backtest:
         matches yes+no=1). stale_threshold_s above catches "we stopped
         hearing from the feed entirely"; this catches "the feed kept
         talking but our own ladder quietly diverged from truth" --
-        a different failure mode needing a different guard."""
+        a different failure mode needing a different guard.
+
+        cancels_token: tokens quote creates/moves must leave in the modelled
+        write bucket (Basic tier, 80/s with headroom, on SIMULATED time) for
+        cancels. Needed only by strategies that publish a quote ladder
+        (ctx.set_quote_ladder); None = unmetered."""
         self.latency = latency or LatencyModel()
+        self.cancels_token = cancels_token
+        self._om = None
         self.fee_multiplier = fee_multiplier
         self.maker_fee_multiplier = maker_fee_multiplier
         # Only used to DETECT a breach after the fact (see run()'s
@@ -264,6 +294,43 @@ class Backtest:
         trackers_by_id: dict[int, QueueTracker] = {}
         cancelled_ids: set = set()
 
+        # Quote ladder: the same OrderManager live uses, on the sim clock. Its
+        # creates/cancels become order_arrival / cancel_arrival events with the
+        # normal latency; acks/cancel confirmations come back at arrival.
+        from kalshi_infra.trading import order_manager as om_mod
+        sim = {"t": None}
+
+        class _Ex:
+            def __init__(s):
+                s.pending = []
+
+            def next_order_id(s):
+                return self._next_order_id()
+
+            def create(s, q):
+                order = Order(order_id=q.order_id, ticker=q.ticker, side=q.side, order_type="limit",
+                              price=q.price, size=q.size, decision_time=sim["t"], intent="quote")
+                order.role = q.role
+                s.pending.append(("create", order))
+                return True
+
+            def cancel(s, q, reason):
+                s.pending.append(("cancel", q.order_id))
+
+            def amend(s, q, price, remaining):
+                s.pending.append(("amend", (q.order_id, price, q.filled + remaining)))
+                return True
+
+            def bucket_tokens(s):
+                return None
+
+        ex = _Ex()
+        # Same modelled account bucket as live shadow (Basic tier with headroom).
+        self._om = om_mod.OrderManager(ex, cancels_token=self.cancels_token or 0.0,
+                                       clock=lambda: sim["t"].timestamp() if sim["t"] is not None else 0.0,
+                                       sim_bucket_tokens_per_s=80.0 if self.cancels_token is not None else None)
+        quote_orders: dict[int, Order] = {}
+
         # -- book-maintenance events: update true_books/ladders, silently (no wakeup) --
         for ticker, rows in event_data.raw_ws.items():
             for row in rows:
@@ -294,8 +361,26 @@ class Backtest:
         for true_time, ext_payload in (external_events or []):
             self._push(self.latency.signal_visible_time(true_time), "wakeup", ("external", None, ext_payload))
 
+        def _flush_ladder_writes(at, processing_s=0.0):
+            """Send the manager's queued writes: they reach the exchange at
+            `at` plus send latency. Also covers writes made outside a wakeup
+            (a cancel on the ack of an order cancelled in flight)."""
+            arr = self.latency.arrival_time(at, processing_s)
+            for what, x in ex.pending:
+                if what == "create":
+                    all_orders.append(x)
+                    quote_orders[x.order_id] = x
+                    self._push(arr, "order_arrival", x)
+                elif what == "amend":
+                    self._push(arr, "amend_arrival", x)
+                else:
+                    self._push(arr, "cancel_arrival", x)
+            ex.pending.clear()
+
         while self._heap:
             time, _, kind, payload = heapq.heappop(self._heap)
+            if ex.pending:
+                _flush_ladder_writes(time)
 
             if kind == "raw_ws_row":
                 ticker, row = payload
@@ -320,6 +405,7 @@ class Backtest:
                     fill = tracker.on_trade(trade)
                     if fill is not None:
                         portfolio.record_fill(tracker.order, fill.price, fill.size, time, fill.liquidity)
+                        self._om.on_fill(tracker.order.order_id, fill.size)
                         _note_breach(tracker.order.ticker)
 
             elif kind == "wakeup":
@@ -339,27 +425,41 @@ class Backtest:
                     visible_books[evt_payload.ticker] = BookView.from_quote(evt_payload, ladder=None)
                 ctx = BacktestContext(time=time, last_event=evt_payload, event_ticker=event_ticker,
                                        portfolio=portfolio, _visible_books=visible_books, _engine=self)
+                sim["t"] = time
                 t0 = _walltime.perf_counter()
                 strategy_fn(ctx)
                 processing_s = _walltime.perf_counter() - t0
+                arrival = self.latency.arrival_time(time, processing_s)
                 for order in ctx.pending_orders:
                     all_orders.append(order)
-                    arrival = self.latency.arrival_time(time, processing_s)
                     self._push(arrival, "order_arrival", order)
                 for order_id in ctx.pending_cancels:
-                    arrival = self.latency.arrival_time(time, processing_s)
                     self._push(arrival, "cancel_arrival", order_id)
+                # Ladder: cancels it implies first, then budgeted creates.
+                for ticker_, side_, d in ctx.pending_ladders:
+                    if isinstance(d, tuple) and d and d[0] == "lip":
+                        self._om.set_lip(ticker_, side_, d[1])
+                    else:
+                        self._om.set_desired(ticker_, side_, d)
+                self._om.pump()
+                _flush_ladder_writes(time, processing_s)
 
             elif kind == "order_arrival":
                 order = payload
+                is_ladder = order.order_id in quote_orders
                 if order.order_id in cancelled_ids:
                     # cancel for this order reached the exchange first (only
                     # possible in a pathological latency edge case -- see
                     # ctx.cancel's docstring) -- never resolve or rest it.
+                    if is_ladder:
+                        self._om.on_created(order.order_id, f"bt-{order.order_id}")
+                        self._om.on_cancel_done(order.order_id)
                     continue
                 true_book = true_books.get(order.ticker)
                 if true_book is None:
                     _unresolved(order, "no_book")
+                    if is_ladder:
+                        self._om.on_create_failed(order.order_id, rejected=False)
                     continue
                 if (time - true_book.time).total_seconds() > self.stale_threshold_s:
                     # Book hasn't had a REAL tick in too long (see
@@ -367,11 +467,23 @@ class Backtest:
                     # fill or rest against it, same treatment as an
                     # entirely-missing book just above.
                     _unresolved(order, "stale_book")
+                    if is_ladder:
+                        self._om.on_create_failed(order.order_id, rejected=False)
                     continue
                 fill = resolve_marketable(order, true_book)
                 if fill is not None:
                     portfolio.record_fill(order, fill.price, fill.size, time, fill.liquidity)
                     _note_breach(order.ticker)
+                    if is_ladder:
+                        # Crossed on arrival; any remainder rests.
+                        rem = order.size - fill.size
+                        if rem > 1e-9:
+                            tr = resolve_resting(order, true_book)
+                            tr.filled_qty = fill.size
+                            if tr.known:
+                                queue_trackers.append(tr)
+                                trackers_by_id[order.order_id] = tr
+                        self._om.on_created(order.order_id, f"bt-{order.order_id}", filled=fill.size)
                     continue
                 if order.order_type == "market":
                     # marketable check failed (empty book) and market orders can't rest
@@ -409,9 +521,39 @@ class Backtest:
                     # wasn't hit, which reads as "quoting doesn't work here"
                     # rather than "quoting was never simulated here".
                     _unresolved(order, "no_l2_depth")
+                    if is_ladder:
+                        # Tracked as resting anyway, so the ladder doesn't
+                        # re-create it on every wakeup; it just can't fill.
+                        self._om.on_created(order.order_id, f"bt-{order.order_id}")
                 else:
                     queue_trackers.append(tracker)
                     trackers_by_id[order.order_id] = tracker
+                    if is_ladder:
+                        self._om.on_created(order.order_id, f"bt-{order.order_id}")
+
+            elif kind == "amend_arrival":
+                # A price amend: the order loses its queue place and rejoins at
+                # the back of the new price's queue -- what Kalshi does.
+                order_id, price, total = payload
+                order = quote_orders.get(order_id)
+                if order is None or order_id in cancelled_ids:
+                    self._om.on_amended(order_id, ok=False, gone=order_id in cancelled_ids)
+                    continue
+                old = trackers_by_id.get(order_id)
+                if old is None or old.done:
+                    self._om.on_amended(order_id, ok=False, gone=True)   # filled before it landed
+                    continue
+                old.cancelled = True
+                order.price = price
+                order.size = total
+                true_book = true_books.get(order.ticker)
+                tr = resolve_resting(order, true_book) if true_book is not None else None
+                if tr is None or not tr.known:
+                    tr = QueueTracker(order, price, 0.0)
+                tr.filled_qty = old.filled_qty
+                queue_trackers.append(tr)
+                trackers_by_id[order_id] = tr
+                self._om.on_amended(order_id, ok=True)
 
             elif kind == "cancel_arrival":
                 # Marks the matching resting order (if it has one by now) as
@@ -427,6 +569,13 @@ class Backtest:
                 tracker = trackers_by_id.get(order_id)
                 if tracker is not None:
                     tracker.cancelled = True
+                if order_id in quote_orders:
+                    q = self._om.quotes.get(order_id)
+                    # A cancel that arrives before its own create (both carry
+                    # the same latency, so only on a same-instant tie) leaves
+                    # the create to be dropped by the cancelled_ids check.
+                    if q is not None and q.exchange_id is not None:
+                        self._om.on_cancel_done(order_id)
 
         if position_breaches:
             worst = max(position_breaches.values())

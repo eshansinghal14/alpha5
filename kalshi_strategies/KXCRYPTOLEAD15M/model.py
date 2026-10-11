@@ -22,7 +22,8 @@ from kalshi_infra.trading.fair import Fair
 from kalshi_strategies.KXCRYPTOLEAD15M.composite import DATA_ROOT, CompositeBar, CompositeBus, bar_files
 from kalshi_strategies.KXCRYPTOLEAD15M.pricer import BaseRateTracker, CoinRacePricer, FairResult
 from kalshi_strategies.KXCRYPTOLEAD15M.robust_har import RobustHarForecaster
-from kalshi_strategies.KXCRYPTOLEAD15M.series import COINS, START_END_AVG_S, coin_from_market_ticker
+from kalshi_strategies.KXCRYPTOLEAD15M.series import (APPLY_BASIS_SD, BASIS_SD_BP, COINS, START_END_AVG_S,
+                                                       coin_from_market_ticker)
 from kalshi_strategies.KXCRYPTOLEAD15M.settlement_tracker import EventWindow, SettlementTracker
 from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed import FeedHealthMonitor
 from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed.coinbase import CoinbaseAdapter
@@ -82,7 +83,9 @@ class CoinRaceModel:
                                             recovery_s=p.recovery_s)
         self.forecaster = forecaster or RobustHarForecaster()
         self.pricer = CoinRacePricer(self.forecaster, p,
-                                     base_rate=BaseRateTracker(p.base_rate_window).rate())
+                                     base_rate=BaseRateTracker(p.base_rate_window).rate(),
+                                     basis_sd=(np.array([BASIS_SD_BP[c] for c in COINS]) * 1e-4
+                                               if APPLY_BASIS_SD else None))
         self.bus = bus
         self.coinbase = coinbase
         self.result: FairResult | None = None
@@ -93,6 +96,7 @@ class CoinRaceModel:
         self._wake = None
         # A mid has moved since the last _price, so the fair lags its inputs.
         self._dirty = True
+        self.basis_tie: frozenset[str] = frozenset()
 
     def set_wakeup(self, fn):
         self._wake = fn
@@ -154,8 +158,26 @@ class CoinRaceModel:
 
     # --- pricing ----------------------------------------------------------
 
+    def _basis_tie_coins(self, now_s: float) -> frozenset[str]:
+        """Coins still in contention for the win once the CF replica is
+        considered alongside the mid: each source's leader plus anything within
+        basis_tie_gap of it. Empty outside the last minute or when one coin
+        clearly leads on both."""
+        gap = self.cfg.pricing.basis_tie_gap
+        if gap <= 0 or now_s < self.window.end_avg_begin:
+            return frozenset()
+        out: set[str] = set()
+        for source in ("mid", "cf"):
+            r = self.tracker.projected_returns(now_s, source)
+            if any(v is None for v in r.values()):
+                return frozenset()
+            best = max(r.values())
+            out |= {c for c, v in r.items() if best - v < gap}
+        return frozenset(out) if len(out) > 1 else frozenset()
+
     def _withhold(self, reason: str):
         self.result = None
+        self.basis_tie = frozenset()
         self.withheld_reason = reason
         return {t: None for t in self.tickers}
 
@@ -224,6 +246,7 @@ class CoinRaceModel:
         self._newest_mono = min(newest)
         self._dirty = False
         self.withheld_reason = None
+        self.basis_tie = self._basis_tie_coins(now_s)
         k = p.ci_vol_multiplier
         out = {}
         for i, c in enumerate(COINS):
@@ -232,7 +255,8 @@ class CoinRaceModel:
             # would erase the edge on tail coins (fair 0.002, band 0.015).
             out[self.ticker_of[c]] = Fair(prob=prob, lo=prob - k * tv, hi=prob + k * tv,
                                           extras={"coin": c, "theo_vol": tv, "tau": self.result.tau,
-                                                  "phase": self.result.phase})
+                                                  "phase": self.result.phase,
+                                                  "basis_tie": c in self.basis_tie})
         return out
 
     # --- FairModel ----------------------------------------------------------
@@ -273,6 +297,17 @@ class CoinRaceModel:
         return self.signal_age_s()
 
     def side_block(self, ticker, side, fair, now_s):
+        # Both sides: our fair on a contender is confidently wrong either way
+        # (KXCRYPTOLEAD15M-26OCT092330: bought HYPE at a 0.97 fair; BTC won on CF).
+        if fair is not None and fair.extras.get("basis_tie"):
+            return "basis_tie"
+        return None
+
+    def quote_block(self, ticker, now_s):
+        # The whole event, not just the bursting coin: the race is a joint
+        # comparison, so one coin's move reprices all five markets.
+        if self.spot is not None and time.monotonic() < self.spot.burst_until:
+            return "spot_burst"
         return None
 
     def summary_extras(self) -> dict:
@@ -283,9 +318,18 @@ class CoinRaceModel:
                              else f"fair withheld: {self.withheld_reason}"),
             "phase": None if r is None else r.phase, "tau_s": snap.tau, "tau_eff": None if r is None else r.tau_eff,
             "start_quality": dict(snap.start_quality), "withheld_reason": self.withheld_reason,
+            "basis_tie": sorted(self.basis_tie),
+            "spot_burst": (None if self.spot is None else
+                            {"active": time.monotonic() < self.spot.burst_until,
+                             "coin": self.spot.burst_coin, "n": self.spot.n_bursts,
+                             "thresholds": self.spot.burst_thresholds()}),
             "fairs": None if r is None else {c: float(r.probs[i]) for i, c in enumerate(COINS)},
             "theo_vol": None if r is None else {c: float(r.theo_vol[i]) for i, c in enumerate(COINS)},
             "feed_health": self.health.snapshot(),
+            "venue_process": (None if self.spot is None or self.spot.venues is None
+                              else self.spot.venues.summary()),
+            "venues_in_mid": {c: sorted(b.venue for b in f._live_books(time.monotonic()))
+                              for c, f in self.bus.feeds.items()},
             "vol_model": self.forecaster.diagnostics() if hasattr(self.forecaster, "diagnostics") else None,
         }
 

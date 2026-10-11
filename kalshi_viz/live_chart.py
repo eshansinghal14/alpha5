@@ -14,12 +14,17 @@ from __future__ import annotations
 import json
 
 from bokeh.embed import file_html
-from bokeh.layouts import column
-from bokeh.models import ColumnDataSource, CustomJS, DatetimeTickFormatter, Range1d, Span
+from bokeh.layouts import row
+from bokeh.models import ColumnDataSource, CustomJS, DatetimeTickFormatter, LinearAxis, Range1d, Span
 from bokeh.plotting import figure
 from bokeh.resources import INLINE
 
 POLL_MS = 1500   # ~ the runtime's flush cadence; faster just refetches the same file
+CHART_HEIGHT = 360
+# Pos/PnL sits to the right of a theo chart that fills the visible iframe, so
+# it is reached by scrolling the iframe horizontally.
+POSPNL_WIDTH = 620
+IFRAME_HEIGHT = CHART_HEIGHT + 18   # + horizontal scrollbar
 
 BLUE, GREEN, PINK, PURPLE = "#00e5ff", "#39ff14", "#ff2079", "#bf40ff"
 YELLOW, ORANGE, CONST, GRID, TEXT = "#e5ff00", "#ff9500", "#d8d8d8", "#888888", "#9a9a9a"
@@ -79,7 +84,8 @@ def build_live_html(series: str, market: str, json_url: str, x_start_ms: float, 
     xr.js_on_change("end", clamp)
     yr = Range1d(start=-0.03, end=1.0, bounds=(-0.03, 1.0))
 
-    p1 = _fig(xr, 430, f"{market}: Kalshi touch, fair, edge demanded, fills", y_range=yr)
+    p1 = _fig(xr, CHART_HEIGHT, "Kalshi touch, fair, edge demanded, fills", y_range=yr)
+    p1.name = "theo"
     # Bands outermost-first so each narrower one covers the previous interior.
     p1.varea(x="t", y1="lo", y2="hi", source=src["fee"], fill_color=ORANGE, fill_alpha=0.18,
              legend_label="edge: taker fee (= take reservation)")
@@ -113,28 +119,43 @@ def build_live_html(series: str, market: str, json_url: str, x_start_ms: float, 
         p1.scatter(x="t", y="p", source=src[name], size=10, marker="x", line_color=color, line_width=2)
     _legend(p1)
 
-    p2 = _fig(xr, 200, f"{market}: net position")
-    p2.step(x="t", y="v", source=src["pos"], mode="after", color=PURPLE, line_width=1.8)
+    # Position on the left axis, PnL on the right: different units, one time axis.
+    p2 = _fig(xr, CHART_HEIGHT, "net position (left) / PnL at fair, $ (right)", y_range=Range1d(-1, 1))
+    p2.sizing_mode, p2.width = "fixed", POSPNL_WIDTH
+    p2.name = "pospnl"
+    p2.extra_y_ranges = {"pnl": Range1d(-1, 1)}
+    p2.yaxis.axis_label = "contracts"
+    pnl_axis = LinearAxis(y_range_name="pnl", axis_label="$")
+    pnl_axis.axis_line_color = pnl_axis.major_tick_line_color = GRID
+    pnl_axis.minor_tick_line_color = None
+    pnl_axis.major_label_text_color = pnl_axis.axis_label_text_color = ORANGE
+    p2.add_layout(pnl_axis, "right")
+    p2.yaxis[0].major_label_text_color = p2.yaxis[0].axis_label_text_color = PURPLE
+    p2.varea(x="t", y1=0, y2="v", source=src["pnl"], fill_color=ORANGE, fill_alpha=0.10, y_range_name="pnl")
+    p2.line(x="t", y="v", source=src["pnl"], color=ORANGE, line_width=2, y_range_name="pnl", legend_label="PnL")
+    p2.add_layout(Span(location=0, dimension="width", line_color=ORANGE, line_width=1, line_alpha=0.4,
+                       y_range_name="pnl"))
+    p2.step(x="t", y="v", source=src["pos"], mode="after", color=PURPLE, line_width=1.8, legend_label="position")
     if max_position:
         for lvl in (max_position, -max_position):
-            p2.add_layout(Span(location=lvl, dimension="width", line_color=TEXT, line_dash="dashed",
+            p2.add_layout(Span(location=lvl, dimension="width", line_color=PURPLE, line_dash="dashed",
                                line_width=1, line_alpha=0.5))
-    p3 = _fig(xr, 200, f"{market}: PnL (this market, marked at fair)")
-    p3.varea(x="t", y1=0, y2="v", source=src["pnl"], fill_color=ORANGE, fill_alpha=0.12)
-    p3.line(x="t", y="v", source=src["pnl"], color=ORANGE, line_width=2)
-    p3.add_layout(Span(location=0, dimension="width", line_color=TEXT, line_width=1, line_alpha=0.5))
+    _legend(p2)
 
-    html = file_html(column(p1, p2, p3, sizing_mode="stretch_width"), INLINE, f"{series} -- {market}")
+    html = file_html(row(p1, p2, sizing_mode="stretch_width"), INLINE, f"{series} -- {market}")
+    # The body is one viewport plus the pos/pnl chart wide, so the
+    # stretch_width theo chart takes exactly the visible width.
     poller = """
+<style>html, body { margin: 0; } body { width: calc(100vw + %dpx); overflow-y: hidden; }</style>
 <script>
 (function () {
   const URL = %s, POLL = %d, START = %f;
-  function fit(fig, vals, minSpan) {
-    vals = vals.filter(v => v !== null);
+  function fit(range, vals, minSpan) {
+    vals = vals.filter(v => v !== null && !Number.isNaN(v));
     if (!vals.length) return;
     let lo = Math.min(...vals), hi = Math.max(...vals), span = hi - lo;
     if (span < minSpan) { const m = (lo + hi) / 2; lo = m - minSpan / 2; hi = m + minSpan / 2; span = minSpan; }
-    fig.y_range.start = lo - span * 0.08; fig.y_range.end = hi + span * 0.08;
+    range.start = lo - span * 0.08; range.end = hi + span * 0.08;
   }
   // Position is a level at every instant: flat 0 before the first fill,
   // holding its last value up to now.
@@ -148,7 +169,7 @@ def build_live_html(series: str, market: str, json_url: str, x_start_ms: float, 
   // Follow the live edge until the user pans/zooms, then leave the view alone.
   let lastSet = null;
   function follow(doc) {
-    const xr = doc.roots()[0].children[0].x_range;
+    const xr = doc.get_model_by_name('theo').x_range;
     if (lastSet && (xr.start !== lastSet[0] || xr.end !== lastSet[1])) return;
     xr.start = START; xr.end = Date.now(); lastSet = [xr.start, xr.end];
   }
@@ -159,7 +180,15 @@ def build_live_html(series: str, market: str, json_url: str, x_start_ms: float, 
     const doc = Bokeh.documents[0]; if (!doc) return;
     follow(doc);
     const m = j.market; if (!m) return;
-    const put = (n, d) => { const s = doc.get_model_by_name(n); if (s) { s.data = d; s.change.emit(); } };
+    // JSON has no NaN, so a gap (no quote, withheld fair) arrives as null, and
+    // BokehJS draws null as 0 -- every pulled LIP quote dove to the axis.
+    // NaN is what Bokeh breaks a line on.
+    const gaps = a => (a || []).map(v => v === null ? NaN : v);
+    const put = (n, d) => {
+      const s = doc.get_model_by_name(n); if (!s) return;
+      const out = {}; for (const k in d) out[k] = k === 't' ? (d[k] || []) : gaps(d[k]);
+      s.data = out; s.change.emit();
+    };
     put('quote', { t: m.q_t, bid: m.bid, ask: m.ask, prob: m.prob, qb: m.qb, qa: m.qa, lb: m.lb || [], la: m.la || [] });
     put('fee',   { t: m.q_t, lo: m.br, hi: m.ar });
     put('ci',    { t: m.q_t, lo: m.ci_bid, hi: m.ci_ask });
@@ -170,11 +199,11 @@ def build_live_html(series: str, market: str, json_url: str, x_start_ms: float, 
     put('fn_m', { t: m.fn_mt, p: m.fn_mp }); put('fn_t', { t: m.fn_tt, p: m.fn_tp });
     const pos = extend(m.pos_t, m.pos_v, Date.now());
     put('pos', pos); put('pnl', { t: m.pnl_t, v: m.pnl_v });
-    const figs = doc.roots()[0].children;
-    fit(figs[1], pos.v, 2); fit(figs[2], m.pnl_v || [], 1);
+    const pp = doc.get_model_by_name('pospnl');
+    if (pp) { fit(pp.y_range, pos.v, 2); fit(pp.extra_y_ranges['pnl'], m.pnl_v || [], 1); }
   }
   poll(); setInterval(poll, POLL);
 })();
 </script>
-""" % (json.dumps(json_url), POLL_MS, x_start_ms)
+""" % (POSPNL_WIDTH, json.dumps(json_url), POLL_MS, x_start_ms)
     return html.replace("</body>", poller + "</body>")

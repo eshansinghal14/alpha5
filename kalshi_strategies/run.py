@@ -8,9 +8,10 @@ Run one or more Kalshi series live (shadow by default).
 
 All tuning lives in each strategy folder's config.json (edited from the
 dashboard). Several series run as one child process each -- isolation from
-each other's CPU stalls and crashes. Kalshi's write-rate limit is per account
-(read from /account/limits at each event start), so each child gets an equal
-share of it.
+each other's CPU stalls and crashes. Kalshi's write budget is per exchange
+SHARD (read from /account/limits at each event start; every order write is
+pinned to its event's shard), so series split it only with others on the same
+shard.
 """
 from __future__ import annotations
 
@@ -25,10 +26,17 @@ import sys
 import threading
 import time
 
+import urllib3
+
 import kalshi_strategies
 from kalshi_infra import REPO_ROOT
 from kalshi_infra.config import load
 from kalshi_infra.kalshi.orders import WRITE_SHARE_ENV
+
+# Silences InsecureRequestWarning spam seen on the user's terminal (source not
+# found in this repo; verification itself is unchanged).
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 # Wait this long after Ctrl-C for children to pull quotes before force-killing
 # (a kill skips the quote pull, so this errs long).
 SHUTDOWN_GRACE_S = 60.0
@@ -80,11 +88,34 @@ def _pump(series, proc):
             print(line.rstrip(), flush=True)
 
 
+def write_shares(series_list: list[str], shard_of) -> dict[str, float]:
+    """Each series' share of the write budget. Writes pinned to a shard bill
+    only that shard's bucket (each with the full tier budget), so series only
+    split the budget with others ON THE SAME SHARD. A series whose shard
+    can't be looked up is assumed to share with everyone (the old, safe split)."""
+    shards = {}
+    for s in series_list:
+        try:
+            shards[s] = shard_of(s)
+        except Exception as e:
+            print(f"[run] WARN: shard lookup for {s} failed ({e!r}); sharing the whole budget", flush=True)
+            shards[s] = None
+    if any(v is None for v in shards.values()):
+        return {s: 1.0 / len(series_list) for s in series_list}
+    n = {}
+    for v in shards.values():
+        n[v] = n.get(v, 0) + 1
+    return {s: 1.0 / n[shards[s]] for s in series_list}
+
+
 def launch_many(series_list: list[str], args) -> int:
-    env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8",
-           WRITE_SHARE_ENV: f"{1.0 / len(series_list):.6f}"}
+    from kalshi_infra.kalshi.markets import series_shard
+    shares = write_shares(series_list, series_shard)
     procs = []
     for s in series_list:
+        env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8",
+               WRITE_SHARE_ENV: f"{shares[s]:.6f}"}
+        print(f"[run] {s}: {shares[s]:.0%} of its shard's write budget", flush=True)
         cmd = [sys.executable, "-u", "-m", "kalshi_strategies.run", "--series", s]
         if args.live_trading:
             cmd.append("--live-trading")
@@ -150,7 +181,11 @@ def main(argv=None):
             ap.error("--event-ticker names one event, so it needs exactly one --series")
         sys.exit(launch_many(series_list, args))
 
+    from kalshi_infra.runtime.priority import set_priority
     from kalshi_infra.runtime.session import session_loop
+    # Trading outranks everything else on the box. Children inherit this and
+    # the writer drops itself back down; may be refused without privileges.
+    set_priority("above_normal")
     s = series_list[0]
     try:
         asyncio.run(session_loop(reg[s], live_trading=args.live_trading, carry_arm=not args.no_carry_arm,

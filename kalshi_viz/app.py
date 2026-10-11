@@ -25,14 +25,17 @@ from kalshi_infra.runtime.control import request_trading_mode  # noqa: E402
 from kalshi_strategies.run import registry  # noqa: E402
 from kalshi_viz import config_form  # noqa: E402
 from kalshi_viz.data import load_day, read_summary, stream_url, summary_age_s  # noqa: E402
-from kalshi_viz.live_chart import POLL_MS, build_live_html  # noqa: E402
+from kalshi_viz.live_chart import IFRAME_HEIGHT, build_live_html  # noqa: E402
 
 st.set_page_config(page_title="Kalshi strategies", layout="wide")
+# Tighter than Streamlit's default 1rem element gap and 2.25rem metric
+# values, so each market's stats + chart take less height.
+st.markdown("<style>[data-testid='stVerticalBlock'] { gap: 0.4rem; } "
+            "[data-testid='stMetricValue'] { font-size: 1.5rem; } "
+            "h4 { padding: 0 0 0.25rem 0; }</style>", unsafe_allow_html=True)
 
 # A summary older than this means the process stopped writing.
 STALE_SUMMARY_S = 15.0
-# Market dropdown: hide markets evaluated less than this share of the busiest one's decisions.
-ACTIVE_MIN_FRACTION = 0.05
 
 BLOCK_TEXT = {
     "stale_signal": "The pricing inputs are older than risk.max_signal_age_s -- a dead feed or a "
@@ -60,6 +63,7 @@ def _ms(v):
 
 def _render_toggle(series: str, s: dict):
     active = bool(s.get("live_trading"))
+    requested = bool(s.get("arm_requested", active))
     if active:
         r = s.get("real") or {}
         st.error(f"🟢 **REAL TRADING IS LIVE** -- {r.get('n_fills', 0)} real fill(s) from "
@@ -68,14 +72,16 @@ def _render_toggle(series: str, s: dict):
         st.info("🔵 SHADOW -- live data, simulated fills, no real orders.")
     key = f"arm_{series}"
     if key not in st.session_state:
-        st.session_state[key] = active
+        st.session_state[key] = requested
     st.checkbox("Send REAL orders to Kalshi (real money)", key=key,
                 on_change=lambda: request_trading_mode(series, st.session_state[key]),
                 help="Arms the running process (no restart). Arming starts a fresh session seeded from "
                      "Kalshi's positions; disarming pulls every resting quote. Positions are never flattened.")
-    if st.session_state[key] != active:
-        st.warning("Waiting for the process to confirm -- it refuses to arm if it can't read Kalshi "
-                   "positions, or inside close.real_trading_cutoff_s.")
+    if st.session_state[key] != requested:
+        st.warning("Waiting for the process to pick up the request.")
+    elif requested and not active:
+        st.warning("Armed, but not sending real orders yet -- inside close.real_trading_cutoff_s "
+                   "(re-arms at the next event), halted, or the arm failed (retried; see the process log).")
     if (s.get("real") or {}).get("n_errors"):
         st.warning(f"{s['real']['n_errors']} real order error(s) -- see the process log.")
 
@@ -99,15 +105,14 @@ def _render_guards(s: dict):
     if problem:
         st.error(f"📡 Signal feed: {problem}")
 
-    c = st.columns(4)
+    c = st.columns(3)
     age, lim = s.get("signal_age_s"), s.get("signal_age_limit_s")
     c[0].metric("Signal age", _ms(age), delta="STALE" if age is not None and lim and age > lim else None,
                 delta_color="inverse", help=f"Limit {_ms(lim)}.")
-    c[1].metric("Feed age", _ms(s.get("feed_age_s")))
     pnl = s.get("pnl") or {}
-    c[2].metric("PnL (fair / touch)", f"${pnl.get('fair', 0):+.2f}", f"touch ${pnl.get('touch', 0):+.2f}",
+    c[1].metric("PnL (fair / touch)", f"${pnl.get('fair', 0):+.2f}", f"touch ${pnl.get('touch', 0):+.2f}",
                 delta_color="off")
-    c[3].metric("LIP accrued", f"${pnl.get('lip_accrued', 0):.2f}",
+    c[2].metric("LIP accrued", f"${pnl.get('lip_accrued', 0):.2f}",
                 help="Expected LIP reward from the scoring replica (program terms from Kalshi).")
 
     qb, eb = s.get("quote_block_counts") or {}, s.get("blocked_counts") or {}
@@ -118,22 +123,21 @@ def _render_guards(s: dict):
 
 
 def _markets(day) -> list[str]:
-    q = day.quote_df
-    traded = set(day.fills_df["ticker"].unique()) if not day.fills_df.empty else set()
-    if q.empty:
-        return sorted(traded)
-    sess = day.summary.get("session_started")
-    if sess and "time" in q.columns:
-        q = q[pd.to_datetime(q["time"], utc=True) >= pd.Timestamp(sess)]
-    if q.empty:
-        return sorted(traded)
-    counts = q.groupby("ticker").size()
-    active = set(counts[counts >= ACTIVE_MIN_FRACTION * counts.max()].index) if len(counts) else set()
-    if "atm_tradeable" in q.columns:
-        active &= set(q.loc[q["atm_tradeable"].fillna(True).astype(bool), "ticker"])
-    keep = active | traded
-    probs = q.dropna(subset=["prob"]).groupby("ticker")["prob"].mean()
-    return sorted(keep, key=lambda t: (abs(probs.get(t, 0.5) - 0.5), t))
+    """Every market of the running event, closest-to-0.5 first. Not gated on
+    decisions: the touch and our fair chart from the session start. Markets
+    the quoter has excluded (max_markets) go last unless traded."""
+    q, f = day.quote_df, day.fills_df
+    traded = set(f["ticker"].unique()) if not f.empty else set()
+    listed = set(day.summary.get("tickers") or []) | traded
+    if not q.empty:
+        listed |= set(q["ticker"].unique())
+    fair = day.fair_df.dropna(subset=["prob"]) if not day.fair_df.empty else day.fair_df
+    probs = fair.groupby("ticker")["prob"].last() if not fair.empty else pd.Series(dtype=float)
+    excluded = set()
+    if not q.empty and "atm_tradeable" in q.columns:
+        last = q.groupby("ticker")["atm_tradeable"].last()
+        excluded = {t for t, ok in last.items() if ok is False or ok == 0} - traded
+    return sorted(listed, key=lambda t: (t in excluded, abs(probs.get(t, 0.5) - 0.5), t))
 
 
 def _render_series(series: str, spec):
@@ -159,32 +163,72 @@ def _render_series(series: str, spec):
         st.session_state[k] = ident
 
     status()
+    _render_markets(series)
 
+
+def _market_stats(day, ticker: str) -> dict:
+    """Per-market numbers from the summary; derived from the fills for a
+    process that predates summary["markets"]."""
+    m = (day.summary.get("markets") or {}).get(ticker)
+    if m is not None:
+        return m
+    f = day.fills_df[day.fills_df["ticker"] == ticker] if not day.fills_df.empty else day.fills_df
+    lip = day.summary.get("lip") or {}
+    return {"pnl": None, "contracts": float(f["size"].sum()) if len(f) else 0.0,
+            "position": (day.summary.get("positions") or {}).get(ticker, 0.0),
+            "lip": (lip.get("accrued_usd") or {}).get(ticker),
+            "lip_qualifying": (lip.get("qualifying_fraction") or {}).get(ticker)}
+
+
+def _market_label(ticker: str, event_ticker: str | None) -> str:
+    """The market's own part of the ticker: BTC for KXCRYPTOLEAD15M-26OCT092115-BTC."""
+    if event_ticker and ticker.startswith(event_ticker + "-"):
+        return ticker[len(event_ticker) + 1:]
+    return ticker.rsplit("-", 1)[-1]
+
+
+def _stable_order(series: str, day, markets: list[str]) -> list[str]:
+    """Keep the first ordering for the whole session: re-sorting as fairs move
+    would reorder the chart iframes, and a moved iframe remounts (losing
+    pan/zoom). New markets go at the end."""
+    k = f"_order_{series}"
+    ident = (day.summary.get("event_ticker"), day.summary.get("session_started"))
+    prev = st.session_state.get(k)
+    order = list(prev[1]) if prev and prev[0] == ident else []
+    order += [t for t in markets if t not in order]
+    st.session_state[k] = (ident, order)
+    return order
+
+
+@st.fragment(run_every="2s")
+def _render_markets(series: str):
     day = load_day(series)
     if day is None:
         return
-    markets = _markets(day)
+    markets = _stable_order(series, day, _markets(day))
     if not markets:
-        st.caption("No decisions recorded yet this session.")
+        st.caption("Waiting for the session's first snapshot.")
         return
-    size = day.fills_df.groupby("ticker")["size"].sum().to_dict() if not day.fills_df.empty else {}
-    market = st.selectbox("Market", markets, key=f"mkt_{series}",
-                          format_func=lambda t: f"{t}  ({size.get(t, 0.0):.4g} contracts)")
     s = day.summary
     q = (s.get("config") or {}).get("quoting") or {}
     sess = s.get("session_started") or ""
-    key = f"_html_{series}_{market}_{sess}_{bool(q.get('enable_quoting'))}"
-    for k in [k for k in st.session_state if k.startswith(f"_html_{series}_") and k != key]:
-        del st.session_state[k]
-    if key not in st.session_state:
-        t0 = pd.Timestamp(sess) if sess else pd.Timestamp.now(tz="UTC") - pd.Timedelta(minutes=15)
-        st.session_state[key] = _chart_html(series, market, t0.value // 10**6, q.get("max_position"),
-                                            bool(q.get("enable_quoting")))
-    st.caption(f"Chart updates itself every {POLL_MS / 1000:.1f}s -- pan/zoom freely.")
-    components.html(st.session_state[key], height=900, scrolling=True)
-    with st.expander("Fills (this market)"):
-        st.dataframe(day.fills_df[day.fills_df["ticker"] == market] if not day.fills_df.empty
-                     else day.fills_df, use_container_width=True)
+    quoting = bool(q.get("enable_quoting"))
+    t0 = pd.Timestamp(sess) if sess else pd.Timestamp.now(tz="UTC") - pd.Timedelta(minutes=15)
+    for tk in markets:
+        m = _market_stats(day, tk)
+        c = st.columns([3, 2, 2, 2, 2], vertical_alignment="bottom")
+        c[0].markdown(f"#### {_market_label(tk, s.get('event_ticker'))}")
+        c[1].metric("PnL", "n/a" if m.get("pnl") is None else f"${m['pnl']:+.2f}")
+        c[2].metric("Contracts traded", f"{m.get('contracts') or 0:.4g}")
+        c[3].metric("Position", f"{m.get('position') or 0:+.4g}")
+        lip, qf = m.get("lip"), m.get("lip_qualifying")
+        c[4].metric("LIP", "no program" if lip is None else f"${lip:.2f}",
+                    None if qf is None else f"{qf:.0%} snapshots qualify", delta_color="off")
+        # Same args -> same html string -> Streamlit keeps the iframe mounted.
+        html = _chart_html(series, tk, t0.value // 10**6, q.get("max_position"), quoting)
+        components.html(html, height=IFRAME_HEIGHT, scrolling=True)
+    with st.expander("Fills"):
+        st.dataframe(day.fills_df, use_container_width=True)
 
 
 def main():

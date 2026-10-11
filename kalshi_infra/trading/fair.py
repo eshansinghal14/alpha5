@@ -49,5 +49,8 @@ class FairModel(Protocol):
         """Series-specific veto on one side of one market; return a reason
         string to block quotes and takes there, or None."""
 
+    # Optional: quote_block(ticker, now_s) -> str | None. Pulls resting quotes
+    # (edge and LIP) without touching takes; the quoter calls it only if present.
+
     def summary_extras(self) -> dict:
         """Series-specific scalars for summary.json."""

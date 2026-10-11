@@ -1,0 +1,793 @@
+"""
+Order manager: turns the quoter's DESIRED quotes into exchange writes, in
+priority order, inside the account write bucket.
+
+The quoter never sends a quote directly. Each decision it publishes, per
+(ticker, side):
+    an EDGE ladder   prices it wants resting (`set_desired`), plus the edge
+                     limit -- the worst own-side price still outside the quote
+                     reservation;
+    a LIP quote      one price and size, or none (`set_lip`).
+This module diffs that against what is actually live and sends, highest
+priority first:
+
+    1  cancels        queued; sent nearest-the-touch first using the WHOLE
+                      bucket. While any is waiting, nothing below is sent.
+    2  takes          sent by the engine directly, never budgeted here.
+    3  best edge level      each side's top ladder price (move or create).
+    4  LIP create, then LIP move
+    5  edge levels behind the best, nearest the touch first.
+    6  trims          cancel edge quotes deeper than the ladder (extra levels
+                      left behind as the touch moved up), deepest first, only
+                      when nothing above is waiting -- they're resting outside
+                      the edge, so they're the cheapest risk to leave a moment.
+
+There is no separate quoting rate: 3-6 may spend whatever is in the bucket
+above `cancels_token` (quoting.cancels_token). That reserve is what's kept for
+the sparse cancels normal quoting needs (a fair move pushing a level inside
+the edge). A full pull (stale signal, halt) needs no special path either:
+everything is queued as cancels, quoting stops, and the whole bucket drains
+them touch-first.
+
+A queued create carries no price of its own: it's re-derived from the
+CURRENT desired set each pump, so a queue that lagged behind a fair move can
+never send a stale quote.
+
+An edge quote is cancelled when (a) it is more than `keep_inside` inside the
+edge, (b) a pull, (c) its size is needed under the position cap, (d) it has
+sat above others' touch + max_improve_ticks for `ahead_grace_s` with no
+ladder level to move down to, or (e) the low-priority trim. `keep_inside`
+only applies to quotes already resting: nothing is ever placed or moved
+inside the edge.
+
+The LIP quote is cancelled at once when its side has no LIP target (no fair,
+stale signal, too little queue ahead, LIP off), and moved -- one amend -- when
+the target price or size changes and it has rested at least `lip_hold_s`.
+
+Slot state per order, the one source of truth for "what is live":
+
+    creating   POST sent, no ack yet          counts as resting for risk
+    resting    acked, on the book
+    amending   price/size amend sent          a cancel waits for its answer
+    cancelling DELETE sent                    still counts until confirmed
+    (gone)     removed once cancel/fill/reject is confirmed
+
+Real and shadow use the same manager and the same bucket rules; only the
+executor differs (see LiveEngine), so a shadow session predicts the real
+one's write spend and queue lag.
+"""
+from __future__ import annotations
+
+import collections
+import dataclasses
+import heapq
+import time
+
+from kalshi_infra.kalshi.venue import TICK
+
+# Write-token costs (GET /account/endpoint_costs, 2026-10-10): create and
+# amend 10, v2 cancel 2.
+COST_CREATE = 10.0
+COST_AMEND = 10.0
+COST_CANCEL = 2.0
+
+CREATING, RESTING, AMENDING, CANCELLING = "creating", "resting", "amending", "cancelling"
+EDGE, LIP = "edge", "lip"
+
+# Creates at the same (ticker, side, role) price that Kalshi rejected: back
+# off this long before trying that price again, so a persistent reject can't
+# burn the bucket once per decision.
+REJECT_BACKOFF_S = 2.0
+
+# Window for the live cancel-rate stats in summary().
+CANCEL_STATS_WINDOW_S = 900
+
+# Reasons that are part of a full pull rather than normal quoting.
+_PULL_REASONS = ("pull", "halt", "disarm", "stop", "shutdown", "not_quotable")
+
+
+@dataclasses.dataclass
+class Quote:
+    """One of our resting (or in-flight) quote orders."""
+    order_id: int
+    ticker: str
+    side: str              # "yes" | "no" -- own-side terms throughout
+    price: float
+    size: float
+    state: str = CREATING
+    exchange_id: str | None = None
+    filled: float = 0.0
+    sent_at: float = 0.0   # clock() at the create, or at the last landed move
+    role: str = EDGE
+    prev_price: float | None = None   # set while an amend is in flight
+    prev_size: float | None = None
+    ahead_since: float | None = None  # clock() since it's been above Desired.max_ahead_price
+
+    @property
+    def remaining(self) -> float:
+        return max(self.size - self.filled, 0.0)
+
+
+@dataclasses.dataclass
+class Desired:
+    """What the quoter wants on one (ticker, side): prices nearest the touch
+    first, own-side terms, each `lots` contracts. `edge_limit` is the best
+    (highest) own-side price that is still outside the quote reservation; any
+    live quote above it is inside the edge."""
+    prices: list[float]
+    lots: float
+    edge_limit: float | None   # None = nothing is acceptable (no reservation / blocked)
+    room: float                # contracts this side may have resting in total
+    # Highest own-side price we're willing to keep resting relative to OTHERS'
+    # touch (their best + max_improve_ticks). None = no cap (nobody else
+    # bidding). A quote above it for ahead_grace_s is moved down to the
+    # ladder, or cancelled.
+    max_ahead_price: float | None = None
+
+
+@dataclasses.dataclass
+class LipTarget:
+    """The LIP quote wanted on one side: one order, own-side price."""
+    price: float
+    size: float
+
+
+class TokenBucket:
+    """Refills at `rate` tokens/s, holds at most one second."""
+
+    def __init__(self, rate: float, clock=time.monotonic):
+        self._clock = clock
+        self.rate = rate
+        self._tokens = rate
+        self._t = clock()
+
+    def available(self) -> float:
+        now = self._clock()
+        self._tokens = min(self.rate, self._tokens + (now - self._t) * self.rate)
+        self._t = now
+        return self._tokens
+
+    def spend(self, n: float):
+        self.available()
+        self._tokens -= n
+
+
+class CancelStats:
+    """Cancels sent per wall second, split into sparse (normal quoting) and
+    pull, over the last CANCEL_STATS_WINDOW_S."""
+
+    def __init__(self, clock):
+        self._clock = clock
+        self.sparse: collections.Counter = collections.Counter()
+        self.pull: collections.Counter = collections.Counter()
+        self._t0 = clock()
+
+    def note(self, reason: str):
+        sec = int(self._clock())
+        (self.pull if reason.startswith(_PULL_REASONS) else self.sparse)[sec] += 1
+
+    def _prune(self, now: int):
+        cut = now - CANCEL_STATS_WINDOW_S
+        for c in (self.sparse, self.pull):
+            for s in [s for s in c if s < cut]:
+                del c[s]
+
+    def summary(self) -> dict:
+        now = int(self._clock())
+        self._prune(now)
+        start = max(int(self._t0), now - CANCEL_STATS_WINDOW_S)
+        n = max(now - start, 1)
+        per_s = sorted(self.sparse.get(s, 0) for s in range(start, now))
+        q = lambda p: per_s[min(len(per_s) - 1, int(p * len(per_s)))] if per_s else 0
+        return {"window_s": n,
+                "sparse_cancels": sum(self.sparse.values()),
+                "sparse_cancels_per_s": {"mean": round(sum(per_s) / n, 2), "p50": q(.5), "p90": q(.9),
+                                         "p99": q(.99), "p999": q(.999), "max": per_s[-1] if per_s else 0},
+                "pull_cancels": sum(self.pull.values()),
+                "pull_bursts": len(self.pull),
+                "largest_pull_second": max(self.pull.values(), default=0)}
+
+
+class OrderManager:
+    """Owns every quote order for one event. Not thread-safe: called only
+    from the event loop (executor callbacks are marshalled back onto it by
+    the engine)."""
+
+    def __init__(self, executor, *, cancels_token: float = 20.0, keep_inside: float = 0.0,
+                 clock=time.monotonic, sim_bucket_tokens_per_s: float | None = None):
+        """`executor` sends writes: .next_order_id() -> int, .create(Quote) ->
+        bool, .amend(Quote, price, size) -> bool, .cancel(Quote, reason),
+        .bucket_tokens() -> float | None (None = no real bucket). Each returns
+        False when it didn't send. Callbacks (on_created, on_amended,
+        on_cancel_done, ...) may fire before the call returns.
+
+        `cancels_token`: tokens creates/moves must leave in the bucket, for
+        cancels; `cancels_token_fn` overrides it for live edits.
+        `keep_inside`: $ a resting edge quote may sit inside the edge before
+        it's cancelled; `keep_inside_fn` overrides it.
+        `sim_bucket_tokens_per_s`: model the account write bucket at this rate
+        when the executor has none (shadow, backtest)."""
+        self.ex = executor
+        self.clock = clock
+        self.sim_bucket = (TokenBucket(sim_bucket_tokens_per_s, clock)
+                           if sim_bucket_tokens_per_s is not None else None)
+        self.cancels_token = cancels_token
+        self.cancels_token_fn = None
+        self.keep_inside = keep_inside
+        self.keep_inside_fn = None
+        # An edge quote above Desired.max_ahead_price is fixed only after this
+        # long; a LIP quote is moved at most once per lip_hold_s.
+        self.ahead_grace_s = 1.0
+        self.ahead_grace_fn = None
+        self.lip_hold_s = 1.0
+        self.lip_hold_fn = None
+        self.quotes: dict[int, Quote] = {}
+        self.desired: dict[tuple[str, str], Desired] = {}
+        self.lip: dict[tuple[str, str], LipTarget | None] = {}
+        self._reject_until: dict[tuple[str, str, str, float], float] = {}
+        # Cancels waiting to be sent: order_id -> reason. Drained nearest the
+        # touch first; nothing else is sent while it's non-empty.
+        self._cancel_q: dict[int, str] = {}
+        self.counts: dict[str, int] = {}
+        self.cancel_stats = CancelStats(clock)
+
+    def _fn(self, fn, default) -> float:
+        v = fn() if fn is not None else default
+        return max(float(v or 0.0), 0.0)
+
+    def _keep(self) -> float:
+        return self._fn(self.keep_inside_fn, self.keep_inside)
+
+    def reserve(self) -> float:
+        """Tokens creates/moves must leave in the bucket for cancels."""
+        return self._fn(self.cancels_token_fn, self.cancels_token)
+
+    def _bump(self, k: str):
+        self.counts[k] = self.counts.get(k, 0) + 1
+
+    # ------------------------------------------------------------------
+    # Queries
+    # ------------------------------------------------------------------
+
+    def live(self, ticker: str | None = None, side: str | None = None, role: str | None = None) -> list[Quote]:
+        """Every quote not yet confirmed gone. All of it can still fill, so
+        all of it counts for risk."""
+        return [q for q in self.quotes.values()
+                if (ticker is None or q.ticker == ticker) and (side is None or q.side == side)
+                and (role is None or q.role == role)]
+
+    def resting_size(self, ticker: str, side: str, role: str | None = EDGE) -> float:
+        return sum(q.remaining for q in self.live(ticker, side, role))
+
+    def ladder(self, ticker: str, side: str, role: str | None = EDGE) -> list[tuple[float, float]]:
+        """[(price, remaining)] of our live quotes on one side (edge only by
+        default) -- everything that can fill, for risk. An amend in flight is
+        at its new price."""
+        return [(q.price, q.remaining) for q in self.live(ticker, side, role)]
+
+    def on_book(self, ticker: str, side: str) -> list[tuple[float, float]]:
+        """[(price, remaining)] of ALL our quotes (edge and LIP) Kalshi's book
+        actually shows: acked and not yet confirmed gone, an amend in flight at
+        its OLD price and size. Netting anything else out of the displayed book
+        would hide another participant's size."""
+        out = []
+        for q in self.live(ticker, side, None):
+            if q.exchange_id is None:
+                continue
+            amending = q.state == AMENDING
+            p = q.prev_price if amending and q.prev_price is not None else q.price
+            z = (q.prev_size - q.filled) if amending and q.prev_size is not None else q.remaining
+            out.append((p, max(z, 0.0)))
+        return out
+
+    def lip_quote(self, ticker: str, side: str) -> Quote | None:
+        live = [q for q in self.live(ticker, side, LIP) if q.state != CANCELLING]
+        return live[0] if live else None
+
+    # ------------------------------------------------------------------
+    # Bucket
+    # ------------------------------------------------------------------
+
+    def _bucket(self) -> float | None:
+        b = self.ex.bucket_tokens()
+        if b is None and self.sim_bucket is not None:
+            return self.sim_bucket.available()
+        return b
+
+    def _spend_sim(self, n: float):
+        if self.sim_bucket is not None and self.ex.bucket_tokens() is None:
+            self.sim_bucket.spend(n)
+
+    def _can_spend(self, cost: float) -> bool:
+        bucket = self._bucket()
+        return bucket is None or bucket - cost >= self.reserve() - 1e-9
+
+    # ------------------------------------------------------------------
+    # Desired state in
+    # ------------------------------------------------------------------
+
+    def set_desired(self, ticker: str, side: str, d: Desired | None):
+        """Publish one side's edge ladder, queue the cancels it implies and
+        send what the bucket allows. Moves/creates are left for `pump`."""
+        if d is None:
+            d = Desired([], 0.0, None, 0.0)
+        self.desired[(ticker, side)] = d
+        for q in self._unsafe(ticker, side, d):
+            self._cancel(q, "inside_edge" if d.edge_limit is not None else "not_quotable")
+        for q in self._over_room(ticker, side, d):
+            self._cancel(q, "room")
+        self._mark_ahead(ticker, side, d)
+        self.drain_cancels()
+
+    def set_lip(self, ticker: str, side: str, t: LipTarget | None):
+        """Publish one side's LIP target (None = no LIP quote there). A live
+        LIP quote with no target is cancelled at once; a changed target is
+        applied by `pump` once the quote has rested lip_hold_s."""
+        self.lip[(ticker, side)] = t
+        if t is None:
+            for q in self.live(ticker, side, LIP):
+                if q.state != CANCELLING:
+                    self._cancel(q, "lip_off")
+            self.drain_cancels()
+
+    def _unsafe(self, ticker, side, d: Desired) -> list[Quote]:
+        """Live edge quotes more than keep_inside inside the edge, or every
+        edge quote if the side may not be quoted at all."""
+        live = [q for q in self.live(ticker, side, EDGE) if q.state != CANCELLING]
+        if d.edge_limit is None:
+            return live
+        limit = d.edge_limit + self._keep()
+        return [q for q in live if q.price > limit + 1e-9]
+
+    def _over_room(self, ticker, side, d: Desired) -> list[Quote]:
+        """Edge quotes to drop so resting size fits under `room`, deepest
+        first. Every level counts toward the position cap."""
+        if d.edge_limit is None:
+            return []
+        keep = [q for q in self.live(ticker, side, EDGE) if q.state != CANCELLING and q.order_id not in self._cancel_q]
+        total = sum(q.remaining for q in keep)
+        out = []
+        for q in sorted(keep, key=lambda q: q.price):          # deepest (lowest own-side price) first
+            if total <= d.room + 1e-9:
+                break
+            out.append(q)
+            total -= q.remaining
+        return out
+
+    def _mark_ahead(self, ticker, side, d: Desired):
+        """Start (or clear) each edge quote's too-far-ahead clock against the
+        side's max_ahead_price. Only the clock: the fix waits for
+        ahead_grace_s in pump, so a touch that dips for a moment and comes
+        back costs nothing."""
+        now = self.clock()
+        cap = d.max_ahead_price
+        for q in self.live(ticker, side, EDGE):
+            if q.state == CANCELLING:
+                continue
+            if cap is not None and q.price > cap + 1e-9:
+                if q.ahead_since is None:
+                    q.ahead_since = now
+            else:
+                q.ahead_since = None
+
+    # ------------------------------------------------------------------
+    # Cancels
+    # ------------------------------------------------------------------
+
+    def pull_all(self, reason: str = "pull"):
+        """Cancel every quote, edge and LIP (stale signal, halt, disarm,
+        stop, shutdown). Desired sets are cleared, so nothing is re-created
+        until the quoter publishes again; the whole bucket goes to the
+        cancels, touch first."""
+        self.desired.clear()
+        self.lip.clear()
+        for q in list(self.quotes.values()):
+            if q.state != CANCELLING:
+                self._cancel(q, reason)
+        self.drain_cancels()
+
+    def _cancel(self, q: Quote, reason: str):
+        """Queue a cancel (or mark an unacked create to be cancelled on ack)."""
+        if q.state == CANCELLING or q.order_id in self._cancel_q:
+            return
+        if q.state == CREATING and q.exchange_id is None:
+            q.state = CANCELLING
+            self._bump(f"cancel_pending_ack:{reason}")
+            return
+        self._cancel_q[q.order_id] = reason
+
+    def _distance(self, q: Quote) -> int:
+        """Ticks from that side's best live quote: 0 = our touch level."""
+        top = max((x.price for x in self.live(q.ticker, q.side, None)), default=q.price)
+        return int(round((top - q.price) / TICK))
+
+    def drain_cancels(self) -> int:
+        """Send queued cancels while the write bucket covers them. Order: by
+        distance from the side's touch (touch levels of every side first),
+        except "room" and "trim" cancels, which shed the deepest first. A cancel
+        behind an amend in flight waits for its answer (one round trip).
+        Returns how many were sent."""
+        if not self._cancel_q:
+            return 0
+
+        def key(oid):
+            q = self.quotes.get(oid)
+            if q is None:
+                return (0, oid)
+            d = self._distance(q)
+            return (-d, oid) if self._cancel_q[oid] in ("room", "trim") else (d, oid)
+
+        sent = 0
+        for oid in sorted(self._cancel_q, key=key):
+            q = self.quotes.get(oid)
+            if q is None or q.state == CANCELLING:
+                self._cancel_q.pop(oid, None)
+                continue
+            if q.state == AMENDING:
+                continue                                    # sent once the amend answers
+            bucket = self._bucket()
+            if bucket is not None and bucket < COST_CANCEL - 1e-9:
+                self._bump("cancel_deferred:bucket")
+                break
+            reason = self._cancel_q.pop(oid)
+            q.state = CANCELLING
+            self._bump(f"cancel:{reason}")
+            self.cancel_stats.note(reason)
+            self._spend_sim(COST_CANCEL)
+            self.ex.cancel(q, reason)
+            sent += 1
+        return sent
+
+    # ------------------------------------------------------------------
+    # Edge moves and creates
+    # ------------------------------------------------------------------
+
+    def missing(self) -> list[tuple[int, str, str, float, float]]:
+        """Every wanted edge level that has nothing at it, as heap entries
+        (distance-from-touch, ticker, side, price, lots). Distance is ticks
+        below the side's first wanted price, so the touch level of every
+        market goes before any market's second level."""
+        out = []
+        now = self.clock()
+        for (ticker, side), d in self.desired.items():
+            if not d.prices or d.edge_limit is None:
+                continue
+            # A cancelling order still occupies its price until confirmed gone:
+            # re-creating there would stack a second order on one that may be
+            # live (and a cancel that fails puts it straight back).
+            have = {round(q.price, 2) for q in self.live(ticker, side, EDGE)}
+            wanted = {round(p, 2) for p in d.prices}
+            # A level is actionable if it can be CREATED within room, or a
+            # spare quote below it can be MOVED there (a move adds no size).
+            # Levels that are neither aren't queued: at the position cap they
+            # would sit in the queue forever (22k pointless pump passes per
+            # 90s with BTC at -10, 2026-10-11).
+            room = d.room - self.resting_size(ticker, side)
+            spares = sorted(q.price for q in self.live(ticker, side, EDGE)
+                            if q.state == RESTING and q.exchange_id is not None
+                            and q.order_id not in self._cancel_q and round(q.price, 2) not in wanted)
+            top = d.prices[0]
+            for p in d.prices:
+                p = round(p, 2)
+                if p in have or p > d.edge_limit + 1e-9:
+                    continue
+                if self._reject_until.get((ticker, side, EDGE, p), 0.0) > now:
+                    continue
+                if room >= d.lots - 1e-9:
+                    room -= d.lots
+                elif spares and spares[0] < p - 1e-9:
+                    spares.pop(0)
+                else:
+                    continue
+                out.append((int(round((top - p) / TICK)), ticker, side, p, d.lots))
+        return out
+
+    def _spare(self, ticker: str, side: str, d: Desired, price: float) -> Quote | None:
+        """Deepest resting edge quote on this side, at a price no longer
+        wanted and BELOW `price` -- the one to move up to that missing level.
+        Never downward: a quote left above the ladder stays put (see
+        _fix_ahead for the bound on how far above)."""
+        wanted = {round(p, 2) for p in d.prices}
+        spare = [q for q in self.live(ticker, side, EDGE)
+                 if q.state == RESTING and q.exchange_id is not None and q.order_id not in self._cancel_q
+                 and round(q.price, 2) not in wanted and q.price < price - 1e-9]
+        return min(spare, key=lambda q: q.price) if spare else None
+
+    def _fix_ahead(self) -> int:
+        """Edge quotes above others' touch + max_improve_ticks for longer than
+        the grace: move each down to the highest missing ladder level below it
+        (one amend), or cancel it if the ladder is already full. Highest
+        first. Returns writes sent."""
+        now = self.clock()
+        grace = self._fn(self.ahead_grace_fn, self.ahead_grace_s)
+        sent = 0
+        for (ticker, side), d in list(self.desired.items()):
+            if d.max_ahead_price is None or d.edge_limit is None:
+                continue
+            late = sorted((q for q in self.live(ticker, side, EDGE)
+                           if q.state == RESTING and q.exchange_id is not None and q.order_id not in self._cancel_q
+                           and q.ahead_since is not None and now - q.ahead_since >= grace - 1e-9),
+                          key=lambda q: -q.price)
+            if not late:
+                continue
+            have = {round(q.price, 2) for q in self.live(ticker, side, EDGE)}
+            holes = sorted((round(p, 2) for p in d.prices
+                            if round(p, 2) not in have and p <= d.edge_limit + 1e-9), reverse=True)
+            for q in late:
+                target = next((p for p in holes if p < q.price - 1e-9), None)
+                if target is not None:
+                    if not self._can_spend(COST_AMEND):
+                        continue
+                    holes.remove(target)
+                    if self._move(q, target):
+                        self._bump("move_down:too_far_ahead")
+                        sent += 1
+                    continue
+                self._cancel(q, "too_far_ahead")
+                sent += 1
+        if sent:
+            self.drain_cancels()
+        return sent
+
+    # ------------------------------------------------------------------
+    # LIP
+    # ------------------------------------------------------------------
+
+    def _lip_work(self) -> tuple[int, bool]:
+        """Bring every side's LIP quote to its target: create if none, move
+        (one amend) if the price or size changed and it has rested lip_hold_s.
+        Missing LIP quotes go before LIP moves. Returns (writes sent, whether
+        the step finished -- False when the bucket ran short)."""
+        now = self.clock()
+        hold = self._fn(self.lip_hold_fn, self.lip_hold_s)
+        creates, moves = [], []
+        for (ticker, side), t in list(self.lip.items()):
+            if t is None:
+                continue
+            q = self.lip_quote(ticker, side)
+            if q is None:
+                if self._reject_until.get((ticker, side, LIP, round(t.price, 2)), 0.0) <= now:
+                    creates.append((ticker, side, t))
+                continue
+            if q.state != RESTING or q.exchange_id is None or q.order_id in self._cancel_q:
+                continue
+            same = abs(q.price - t.price) < 1e-9 and abs(q.remaining - t.size) < 1e-9
+            if not same and now - q.sent_at >= hold - 1e-9:
+                moves.append((q, t))
+        sent = 0
+        for ticker, side, t in creates:
+            if not self._can_spend(COST_CREATE):
+                self._bump("lip_deferred:reserve")
+                return sent, False
+            if self._create(ticker, side, t.price, t.size, LIP):
+                sent += 1
+        for q, t in moves:
+            if not self._can_spend(COST_AMEND):
+                self._bump("lip_deferred:reserve")
+                return sent, False
+            if self._move(q, t.price, q.filled + t.size):
+                self._bump("lip_move")
+                sent += 1
+        return sent, True
+
+    # ------------------------------------------------------------------
+    # Trim
+    # ------------------------------------------------------------------
+
+    def _trim(self) -> int:
+        """Lowest priority: cancel edge quotes that are no longer in the
+        ladder and sit BELOW its deepest level -- extra levels left behind as
+        the touch moved up, which only add size a big move would sweep. Run
+        only when nothing else is waiting, deepest first, and only while the
+        bucket stays above the cancel reserve."""
+        sent = 0
+        for (ticker, side), d in list(self.desired.items()):
+            if not d.prices or d.edge_limit is None:
+                continue
+            floor = min(d.prices)
+            wanted = {round(p, 2) for p in d.prices}
+            extra = sorted((q for q in self.live(ticker, side, EDGE)
+                            if q.state == RESTING and q.order_id not in self._cancel_q
+                            and round(q.price, 2) not in wanted and q.price < floor - 1e-9),
+                           key=lambda q: q.price)
+            for q in extra:
+                if not self._can_spend(COST_CANCEL):
+                    return sent
+                self._cancel(q, "trim")
+                sent += 1
+        if sent:
+            self.drain_cancels()
+        return sent
+
+    # ------------------------------------------------------------------
+    # Pump
+    # ------------------------------------------------------------------
+
+    def pump(self) -> int:
+        """One pass down the priority list: cancels, edge fixes, each side's
+        BEST edge level, LIP, the edge levels behind the best, trims. Each step
+        runs only if everything above it is done. Returns how many writes were
+        sent (cancels excluded)."""
+        self.drain_cancels()
+        if self._cancel_q:
+            self._bump("create_deferred:cancels_pending")
+            return 0
+        sent = self._fix_ahead()
+        if self._cancel_q:
+            return sent
+        n, done = self._fill_edge(lambda dist: dist == 0)
+        sent += n
+        if not done:
+            return sent
+        n, done = self._lip_work()
+        sent += n
+        if not done:
+            return sent
+        n, done = self._fill_edge(lambda dist: dist > 0)
+        sent += n
+        if done and not self.missing():
+            self._trim()
+        return sent
+
+    def _fill_edge(self, which) -> tuple[int, bool]:
+        """Move/create the missing edge levels whose distance-from-best
+        passes `which`, nearest the touch first. Returns (writes sent, whether
+        the step finished -- False when the bucket ran short)."""
+        heap = [e for e in self.missing() if which(e[0])]
+        heapq.heapify(heap)
+        sent = 0
+        while heap:
+            if not self._can_spend(COST_CREATE):
+                self._bump("create_deferred:reserve")
+                return sent, False
+            _, ticker, side, price, lots = heapq.heappop(heap)
+            d = self.desired[(ticker, side)]
+            spare = self._spare(ticker, side, d, price)
+            if spare is not None:
+                if self._move(spare, price):
+                    sent += 1
+                continue
+            if d.room - self.resting_size(ticker, side) < lots - 1e-9:
+                self._bump("create_skipped:room")
+                continue
+            if self._create(ticker, side, price, lots):
+                sent += 1
+        return sent, True
+
+    def _move(self, q: Quote, price: float, size: float | None = None) -> bool:
+        """Amend `q` to `price` (and total size `size`, if given)."""
+        q.prev_price, q.prev_size, q.state = q.price, q.size, AMENDING
+        q.price = price
+        if size is not None:
+            q.size = size
+        if not self.ex.amend(q, price, q.remaining):
+            # Executor couldn't (shadow model, guard): leave it where it was.
+            if q.order_id in self.quotes and q.state == AMENDING:
+                q.price, q.size = q.prev_price, q.prev_size
+                q.prev_price = q.prev_size = None
+                q.state = RESTING
+            return False
+        self._spend_sim(COST_AMEND)
+        self._bump("move")
+        return True
+
+    def _create(self, ticker, side, price, lots, role: str = EDGE) -> bool:
+        # Registered BEFORE it's sent: the executor may ack synchronously
+        # (shadow, tests) and the ack must find it.
+        q = Quote(order_id=self.ex.next_order_id(), ticker=ticker, side=side, price=price,
+                  size=lots, sent_at=self.clock(), role=role)
+        self.quotes[q.order_id] = q
+        if not self.ex.create(q):
+            self.quotes.pop(q.order_id, None)
+            return False
+        self._spend_sim(COST_CREATE)
+        self._bump("create" if role == EDGE else "lip_create")
+        return True
+
+    # ------------------------------------------------------------------
+    # Executor callbacks (event loop)
+    # ------------------------------------------------------------------
+
+    def _check_landed(self, q: Quote, why: str):
+        """A quote just became resting at `q.price`: cancel it if its target
+        went away while it was in flight -- the edge moved through it, a pull
+        cleared its side, or (LIP) the side lost its LIP target."""
+        if q.role == LIP:
+            if self.lip.get((q.ticker, q.side)) is None:
+                self._cancel(q, "lip_off")
+            return
+        d = self.desired.get((q.ticker, q.side))
+        if d is None or d.edge_limit is None or q.price > d.edge_limit + self._keep() + 1e-9:
+            self._cancel(q, why)
+
+    def on_created(self, order_id: int, exchange_id: str | None, filled: float = 0.0):
+        q = self.quotes.get(order_id)
+        if q is None:
+            return
+        q.exchange_id = exchange_id
+        q.filled += filled
+        q.sent_at = self.clock()
+        if q.remaining <= 1e-9:
+            self.quotes.pop(order_id, None)   # crossed in full on arrival
+            return
+        cancelled = q.state == CANCELLING
+        q.state = RESTING
+        if cancelled:
+            self._cancel(q, "after_ack")      # now there's an id to cancel by
+        else:
+            self._check_landed(q, "inside_edge_on_ack")
+        self.drain_cancels()
+
+    def on_amended(self, order_id: int, *, ok: bool, gone: bool = False):
+        """`ok`: Kalshi moved it. `gone`: 404, already off the book (filled or
+        cancelled). Otherwise the amend failed and the order is still resting
+        at its old price and size."""
+        q = self.quotes.get(order_id)
+        if q is None:
+            return
+        if gone:
+            self.quotes.pop(order_id, None)
+            self._cancel_q.pop(order_id, None)
+            return
+        if ok:
+            q.sent_at = self.clock()
+        else:
+            if q.prev_price is not None:
+                q.price = q.prev_price
+            if q.prev_size is not None:
+                q.size = q.prev_size
+            self._bump("move_failed")
+        q.prev_price = q.prev_size = None
+        q.state = RESTING
+        if order_id not in self._cancel_q:
+            self._check_landed(q, "inside_edge_on_move")
+        self.drain_cancels()
+
+    def on_create_failed(self, order_id: int, *, rejected: bool):
+        """The POST errored or was refused (429). `rejected` = Kalshi said no
+        to this order specifically; back off that price."""
+        q = self.quotes.pop(order_id, None)
+        self._cancel_q.pop(order_id, None)
+        if q is not None and rejected:
+            self._reject_until[(q.ticker, q.side, q.role, round(q.price, 2))] = self.clock() + REJECT_BACKOFF_S
+
+    def on_cancel_done(self, order_id: int):
+        """Cancel confirmed, or 404 (already gone -- filled or expired)."""
+        self.quotes.pop(order_id, None)
+        self._cancel_q.pop(order_id, None)
+
+    def on_cancel_failed(self, order_id: int, reason: str = "retry"):
+        """Still on the book: re-queue it; the next pump retries."""
+        q = self.quotes.get(order_id)
+        if q is not None:
+            q.state = RESTING if q.exchange_id is not None else CREATING
+            if q.exchange_id is not None:
+                self._cancel_q[order_id] = reason
+
+    def on_fill(self, order_id: int, size: float):
+        q = self.quotes.get(order_id)
+        if q is None:
+            return
+        q.filled += size
+        if q.remaining <= 1e-9:
+            self.quotes.pop(order_id, None)
+            self._cancel_q.pop(order_id, None)
+
+    def forget_all(self):
+        """Session reset: the engine has already swept the exchange."""
+        self.quotes.clear()
+        self.desired.clear()
+        self.lip.clear()
+        self._cancel_q.clear()
+
+    def summary(self) -> dict:
+        states: dict[str, int] = {}
+        for q in self.quotes.values():
+            k = q.state if q.role == EDGE else f"lip_{q.state}"
+            states[k] = states.get(k, 0) + 1
+        return {"live": states, "queued_creates": len(self.missing()),
+                "queued_cancels": len(self._cancel_q),
+                "cancels_token": self.reserve(),
+                "bucket_tokens": None if self._bucket() is None else round(self._bucket(), 1),
+                "cancels": self.cancel_stats.summary(),
+                "counts": dict(self.counts)}

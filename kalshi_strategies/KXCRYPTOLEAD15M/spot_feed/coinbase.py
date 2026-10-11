@@ -76,6 +76,9 @@ MAX_BOOK_LEVELS = 1000
 PER_MSG_LEVELS = 25
 # Window for the clock-offset minimum in CoinbaseAdapter._data_age.
 OFFSET_WINDOW_S = 120.0
+# Longest a through-the-touch print stands in for the mid if the book never
+# reaches it. Not calibrated: a guess at "longer than level2 lags a sweep".
+TRADE_HOLD_S = 1.0
 
 
 class _ProductBook:
@@ -85,7 +88,7 @@ class _ProductBook:
     books; this adapter just reports what the venue said."""
 
     __slots__ = ("bids", "asks", "last_receive_ts", "last_exchange_ts",
-                 "last_seq", "is_resyncing", "last_wire_ts")
+                 "last_seq", "is_resyncing", "last_wire_ts", "trade_px", "trade_dir", "trade_ts")
 
     def __init__(self):
         # Price-sorted dicts: best bid = bids.peekitem(-1), best ask =
@@ -102,11 +105,44 @@ class _ProductBook:
         # change was RECEIVED (before parsing/queueing). Staleness is
         # measured from this, not from when we got round to applying it.
         self.last_wire_ts: float = 0.0
+        # Last trade that printed through the touch (+1 above the ask, -1
+        # below the bid) and when; cleared once the book catches up to it.
+        self.trade_px: float | None = None
+        self.trade_dir: int = 0
+        self.trade_ts: float = 0.0
 
     def clear(self):
         self.bids.clear()
         self.asks.clear()
         self.is_resyncing = True
+        self.trade_px = None
+
+    def _touch(self) -> tuple[float | None, float | None]:
+        return (self.bids.peekitem(-1)[0] if self.bids else None,
+                self.asks.peekitem(0)[0] if self.asks else None)
+
+    def apply_trade(self, price: float, now: float):
+        """A print outside the bid/ask means the book is behind the matching
+        engine; hold the print as the mid until the book reaches it. A print
+        inside the spread says the book is current."""
+        bb, ba = self._touch()
+        if ba is not None and price > ba:
+            self.trade_px, self.trade_dir, self.trade_ts = price, 1, now
+        elif bb is not None and price < bb:
+            self.trade_px, self.trade_dir, self.trade_ts = price, -1, now
+        else:
+            self.trade_px = None
+
+    def settle_trade(self, now: float):
+        """Drop the held print once the book has moved to it, or after
+        TRADE_HOLD_S in case the book never does (a one-off print)."""
+        if self.trade_px is None:
+            return
+        bb, ba = self._touch()
+        caught_up = ((self.trade_dir > 0 and ba is not None and ba >= self.trade_px)
+                     or (self.trade_dir < 0 and bb is not None and bb <= self.trade_px))
+        if caught_up or now - self.trade_ts > TRADE_HOLD_S:
+            self.trade_px = None
 
     def apply_snapshot(self, bids: list[tuple[float, float]],
                        asks: list[tuple[float, float]]):
@@ -172,6 +208,7 @@ class _ProductBook:
             exchange_ts=self.last_exchange_ts,
             is_resyncing=self.is_resyncing,
             seq=self.last_seq,
+            trade_px=self.trade_px,
         )
 
 
@@ -196,6 +233,9 @@ class CoinbaseAdapter(VenueAdapter):
         # Last view handed out per coin; its receive_ts is advanced in place
         # by _mark_fresh, since the composite holds on to these objects.
         self._views: dict[str, VenueBook] = {}
+        # Optional: callable(coin, trade_dict, as_of, exch_ts) for every live
+        # print (not the subscribe snapshot). Sync; must be cheap.
+        self.on_print = None
 
     def latest(self, coin: str) -> VenueBook | None:
         pb = self._books.get(coin)
@@ -238,7 +278,11 @@ class CoinbaseAdapter(VenueAdapter):
                     # 1/s on the same connection: proves liveness when no
                     # book changes (see _mark_fresh).
                     await ws.send(json.dumps({"type": "subscribe", "channel": "heartbeats"}))
-                    print(f"[spot/coinbase] subscribed level2 + heartbeats to {product_ids}")
+                    # Trades: in a sweep, prints arrive before level2 has
+                    # removed the swept levels (see _ProductBook.apply_trade).
+                    await ws.send(json.dumps({"type": "subscribe", "channel": "market_trades",
+                                              "product_ids": product_ids}))
+                    print(f"[spot/coinbase] subscribed level2 + market_trades + heartbeats to {product_ids}")
                     # Sequence tracking. The level2 channel's own docs
                     # ("guarantees delivery of all updates") PLUS the
                     # overview's warning that TCP can still drop frames
@@ -288,7 +332,7 @@ class CoinbaseAdapter(VenueAdapter):
                         if seq is not None:
                             last_seq = seq
                         channel = d.get("channel")
-                        if channel not in ("l2_data", "heartbeats"):
+                        if channel not in ("l2_data", "heartbeats", "market_trades"):
                             continue
                         exch_ts = _parse_iso_ts(d["timestamp"]) if d.get("timestamp") else None
                         mono = time.monotonic()
@@ -296,6 +340,9 @@ class CoinbaseAdapter(VenueAdapter):
                         if channel == "l2_data":
                             for event in d.get("events", []) or []:
                                 await self._handle_event(event, as_of, exch_ts, seq, on_update)
+                        elif channel == "market_trades":
+                            for event in d.get("events", []) or []:
+                                await self._handle_trades(event, as_of, on_update, exch_ts)
                         self._mark_fresh(as_of)
             except (OSError, websockets.ConnectionClosed) as e:
                 print(f"[spot/coinbase] connection error ({e!r}); retrying in {RECONNECT_DELAY_S}s")
@@ -350,6 +397,7 @@ class CoinbaseAdapter(VenueAdapter):
                                 float(change["new_quantity"]))
         else:
             return
+        pb.settle_trade(as_of)
         pb.last_exchange_ts = exch_ts
         # receive_ts is the monotonic time the data was FRESH at our edge:
         # processing time minus however long it sat queued. Feed health,
@@ -364,6 +412,34 @@ class CoinbaseAdapter(VenueAdapter):
         result = on_update(vb)
         if asyncio.iscoroutine(result):
             await result
+
+    async def _handle_trades(self, event: dict, as_of: float,
+                             on_update: Callable[[VenueBook], Awaitable[None] | None],
+                             exch_ts: float | None = None):
+        # The snapshot is the last 50 trades, already reflected in the book.
+        if event.get("type") != "update":
+            return
+        newest: dict[str, dict] = {}
+        for t in event.get("trades", []) or []:
+            pid = t.get("product_id")
+            if self.on_print is not None and pid in self._coin_by_product:
+                self.on_print(self._coin_by_product[pid], t, as_of, exch_ts)
+            if pid in self._coin_by_product and (pid not in newest or t.get("time", "") >= newest[pid].get("time", "")):
+                newest[pid] = t
+        for pid, t in newest.items():
+            coin = self._coin_by_product[pid]
+            pb = self._books[coin]
+            if pb.is_resyncing or pb.last_receive_ts == 0.0:
+                continue
+            before = pb.trade_px
+            pb.apply_trade(float(t["price"]), as_of)
+            if pb.trade_px == before:
+                continue
+            vb = pb.to_venue_book(self.venue, pid, coin, max_levels=PER_MSG_LEVELS)
+            self._views[coin] = vb
+            result = on_update(vb)
+            if asyncio.iscoroutine(result):
+                await result
 
 
 def _parse_iso_ts(s: str) -> float | None:

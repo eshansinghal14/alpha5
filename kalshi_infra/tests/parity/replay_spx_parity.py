@@ -1,7 +1,13 @@
 """Reference-only: compares against the pre-reorg code in the alpha5_legacy git
 worktree (commit 0a82f3c; recreate with `git worktree add ../alpha5_legacy 0a82f3c`).
 Replay a recorded SPX decision journal through the legacy strategy and the
-new generic Quoter with an identical toy fill model; compare orders + logs."""
+new generic Quoter with an identical toy fill model; compare the PRICING.
+
+Since the order-manager rewrite (2026-10-10) the new quoter publishes a quote
+ladder instead of placing one quote per side, so only takes and the
+reservation/lean columns are expected to match. Quote orders and the
+`quote_bid`/`quote_ask` columns are no longer comparable (the new ones are
+the ladder's top level, capped against others' touch)."""
 import dataclasses
 import glob
 import os
@@ -93,13 +99,13 @@ def new_cfg(oc):
         lean_exponent=oc.lean_exponent, fair_clip_eps=0.0, inflight_timeout_s=oc.inflight_timeout_s,
         take_confirm_s=0.0, max_markets=oc.max_markets, atm_hysteresis=oc.atm_hysteresis,
         enable_quoting=oc.enable_quoting, quoting_edge=oc.quoting_edge,
-        max_improve_ticks=oc.max_improve_ticks, requote_improve_ticks=oc.requote_improve_ticks,
-        min_quote_life_s=oc.min_quote_life_s, requote_delay_s=oc.requote_delay_s)
+        max_improve_ticks=oc.max_improve_ticks, quote_levels_behind=0, cancels_token=0.0,
+        requote_delay_s=oc.requote_delay_s)
     assert oc.fee_multiplier == 0.07 and oc.maker_fee_multiplier == 0.0 and oc.taker_fee_edge_multiplier == 1.0
     return types.SimpleNamespace(
         quoting=q, close=P.CloseParams(real_trading_cutoff_s=0),
         risk=P.RiskParams(max_loss_usd=1e9, max_signal_age_s=1e9, fresh_recovery_s=0.0),
-        lip=P.LipSettings(lip_lots=0.0, prop_max_lip=1.0, lip_min_depth_ahead=0.0))
+        lip=P.LipSettings(enable_lip_quoting=False, lip_lots=0.0, prop_max_lip=1.0, lip_min_depth_ahead=0.0, lip_hold_s=1.0))
 
 
 # What Kalshi reports for KXINX/KXINXU: "quadratic" x 1 -> taker 0.07, maker 0.
@@ -140,11 +146,14 @@ def run(series, n_rows):
         new_s(new_ctx)
 
     o, n = pd.DataFrame(old_s.debug_log), pd.DataFrame(new_s.debug_log)
+    # eff_yes/eff_no and the lean differ once quotes rest (different quote
+    # placement), so they only match while neither side has filled a quote.
     cols = ["bid_reservation", "ask_reservation", "bid_final", "ask_final",
-            "quote_bid_reservation", "quote_ask_reservation", "quote_bid", "quote_ask",
-            "lean_bid", "lean_ask", "eff_yes", "eff_no"]
+            "quote_bid_reservation", "quote_ask_reservation", "lean_bid", "lean_ask"]
+    takes = lambda orders: [x for x in orders if x[0] == "buy" and x[4] == "take"]
     print(f"\n{series}: {len(df)} journal rows replayed -> old {len(o)} decisions, new {len(n)}")
-    print(f"  orders: old {len(old_ctx.orders)}  new {len(new_ctx.orders)}  identical={old_ctx.orders == new_ctx.orders}")
+    print(f"  takes: old {len(takes(old_ctx.orders))}  new {len(takes(new_ctx.orders))}  "
+          f"identical={takes(old_ctx.orders) == takes(new_ctx.orders)}")
     print(f"  fills : old {len(old_ctx.portfolio.fills)}  new {len(new_ctx.portfolio.fills)}")
     if len(o) == len(n):
         for c in cols:
@@ -153,9 +162,10 @@ def run(series, n_rows):
             print(f"  {c:24s} mismatches: {int(mism.sum())}")
     else:
         print("  decision count differs")
-    first = next((i for i, (x, y) in enumerate(zip(old_ctx.orders, new_ctx.orders)) if x != y), None)
+    ot, nt = takes(old_ctx.orders), takes(new_ctx.orders)
+    first = next((i for i, (x, y) in enumerate(zip(ot, nt)) if x != y), None)
     if first is not None:
-        print("  first order divergence at", first, old_ctx.orders[first], new_ctx.orders[first])
+        print("  first take divergence at", first, ot[first], nt[first])
 
 
 if __name__ == "__main__":

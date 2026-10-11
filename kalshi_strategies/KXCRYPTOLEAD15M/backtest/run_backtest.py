@@ -133,7 +133,8 @@ def run_one(event_ticker: str, cfg=None, verbose: bool = True):
     ext = [(pd.Timestamp(t, unit="s", tz="UTC"), {"kind": "tick", "ts": float(t)}) for t in ticks]
     bt = engine.Backtest(fee_multiplier=fee_sched.taker_rate,
                          maker_fee_multiplier=fee_sched.maker_rate,
-                         max_position=cfg.quoting.max_position)
+                         max_position=cfg.quoting.max_position,
+                         cancels_token=cfg.quoting.cancels_token)
     result = bt.run(_Drive(), event_ticker, event_data=data.load_event_data(event_ticker), external_events=ext)
     if verbose:
         print(f"=== {event_ticker}: {n} bars, {len(ext)} ticks, {len(quoter.debug_log)} decisions ===")

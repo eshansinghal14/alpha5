@@ -56,6 +56,8 @@ import pandas as pd
 from kalshi_backtest.book import BookView
 from kalshi_backtest.core import Order, Portfolio, Trade
 from kalshi_backtest.data import STALE_THRESHOLD_S as MAX_BOOK_AGE_S
+from kalshi_infra.kalshi.orders import WRITE_HEADROOM, http_status
+from kalshi_infra.trading import order_manager as om
 from kalshi_backtest.execution import (MEASURED_SEND_S, QueueTracker, resolve_marketable,
                                        resolve_resting)
 
@@ -69,17 +71,20 @@ SHADOW_SEND_S = MEASURED_SEND_S
 # Consecutive REAL order errors before halting. Five in a row is auth,
 # balance or market state, not a moved touch.
 MAX_CONSECUTIVE_ORDER_ERRORS = 5
+# After Kalshi's queue position shows a LIP quote with too little ahead, the
+# LIP target on that side must be strictly deeper than the pulled price for
+# this long: the displayed book (which the target is chosen from) is what
+# overstated the queue in the first place.
+LIP_QUEUE_AVOID_S = 5.0
+# Shadow's modelled write bucket when there is no order client to read the
+# account's limit from: Basic tier, 100 tokens/s (GET /account/limits, 2026-10-10).
+SHADOW_WRITE_TOKENS_PER_S = 100.0 * 0.8
 
 # Slack allowed when checking a fill against its own limit price. One tick
 # covers ordinary venue rounding; anything beyond it is a units or
 # side-convention error in how the response was read, not a better fill.
 PRICE_SANITY_TOL = 0.01
 
-# How long a cancelled/filled resting order stays matchable by its exchange
-# order id (see _drop_resting). Must comfortably exceed the quote-fill poll
-# interval plus one page of latency, since the case it exists for is a fill
-# that lands between the poll's last read and the cancel's 404.
-RETIRED_MATCH_S = 60.0
 # cancel_resting: pause between list-and-cancel passes, and the overall cap.
 # The cap exceeds the configured order timeout (5s) so any POST in flight at
 # shutdown has landed or timed out before the sweep can give up.
@@ -117,15 +122,48 @@ class LiveContext:
         self._engine.submit_order(order, self.time)
         return order
 
-    def cancel(self, order_id: int, force: bool = False):
+    def cancel(self, order_id: int, force: bool = False, reason: str = "strategy"):
         """Every real cancel bypasses the write limiter (cancel_resting and
         _cancel_blocking claim with force), so `force` is the contract, not a
-        switch here."""
-        self._engine.cancel_order(order_id)
+        switch here. `reason` only labels the write-budget accounting."""
+        self._engine.cancel_order(order_id, reason=reason)
 
-    def amend(self, order_id: int, new_size: float) -> bool:
-        """Resize a resting quote in place (False if it isn't resting)."""
-        return self._engine.amend_order(order_id, new_size)
+    def set_quote_ladder(self, ticker: str, side: str, desired):
+        """Publish the edge quotes wanted on one side (order_manager.Desired,
+        or None for none). Cancels it implies go out at once; creates are sent
+        by the manager's pump, nearest the touch first."""
+        self._engine.om.set_desired(ticker, side, desired)
+
+    def set_lip_quote(self, ticker: str, side: str, target):
+        """Publish the LIP quote wanted on one side (order_manager.LipTarget,
+        or None). Lowest priority after the edge ladder. Dropped while a
+        queue-position pull is holding that side to deeper prices."""
+        avoid = self._engine.lip_avoid.get((ticker, side))
+        if target is not None and avoid is not None:
+            px, until = avoid
+            if time.monotonic() < until and target.price >= px - 1e-9:
+                target = None
+            elif time.monotonic() >= until:
+                self._engine.lip_avoid.pop((ticker, side), None)
+        self._engine.om.set_lip(ticker, side, target)
+
+    def lip_quote(self, ticker: str, side: str):
+        """Our live LIP quote on one side as (price, remaining), or None."""
+        q = self._engine.om.lip_quote(ticker, side)
+        return None if q is None else (q.price, q.remaining)
+
+    def quote_ladder(self, ticker: str, side: str) -> list[tuple[float, float]]:
+        """[(price, remaining)] of our live quotes on one side."""
+        return self._engine.om.ladder(ticker, side)
+
+    def quotes_on_book(self, ticker: str, side: str) -> list[tuple[float, float]]:
+        """The subset of our quotes Kalshi's book shows, at the price it shows."""
+        return self._engine.om.on_book(ticker, side)
+
+    @property
+    def own_orders_in_book(self) -> bool:
+        """Kalshi's book includes our resting orders only when they're real."""
+        return self._engine.live_trading
 
 
 class LiveEngine:
@@ -176,6 +214,12 @@ class LiveEngine:
         # loop (blocked_reason), positions are never flattened.
         self.halted = False
         self.halt_reason: str | None = None
+        # "loss" when the PnL failsafe tripped while sending real orders --
+        # the runtime stops every series on that one (see runtime.session).
+        self.halt_kind: str | None = None
+        # Real PnL already booked by earlier events of this process; set by
+        # the session so max_loss_usd bounds the whole run, not one event.
+        self.loss_offset = 0.0
 
         # --- trading guards (see blocked_reason) ---
         self.close_time = close_time
@@ -222,23 +266,39 @@ class LiveEngine:
         self.balance_at_arm: float | None = None
         self.reconcile_mismatches: list[str] = []
 
-        # --- real RESTING orders (quotes) ---
-        # our order_id -> {"exchange_id", "order", "remaining", "cancelling"}.
-        # The only orders this engine owns after their request has returned.
-        self.real_resting: dict[int, dict] = {}
-        self.exchange_to_order: dict[str, int] = {}
-        # Quote POSTs sent but not yet answered. our order_id -> Order.
-        self.inflight_quotes: dict[int, Order] = {}
-        # Orders no longer live but still matchable by exchange id -- see
-        # _drop_resting. our order_id -> (retired_at_monotonic, entry).
-        self._retired: dict[int, tuple] = {}
+        # --- quotes: owned by the OrderManager (see order_manager.py) ---
+        # The manager is the single record of what's live; these two maps are
+        # only for booking fills, and are NOT cleared when a quote is cancelled
+        # (a fill that raced the cancel must still find its order).
+        self._quote_orders: dict[int, Order] = {}
+        self._exchange_to_quote: dict[str, int] = {}
+        # (ticker, side) -> (pulled price, until monotonic): see check_lip_queue.
+        self.lip_avoid: dict[tuple[str, str], tuple[float, float]] = {}
+        # Shadow models the account write bucket at the real refill rate
+        # (with our headroom), so it sees the same throttling a real session
+        # would; real mode uses the order client's own bucket instead.
+        rate = getattr(order_client, "tokens_per_s", None)
+        sim_rate = rate * WRITE_HEADROOM if rate else SHADOW_WRITE_TOKENS_PER_S
+        self.om = om.OrderManager(_Executor(self), cancels_token=quoting.cancels_token,
+                                  sim_bucket_tokens_per_s=sim_rate)
+        self.om.cancels_token_fn = lambda: self.quoting.cancels_token
+        self.om.keep_inside_fn = lambda: getattr(self.quoting, "quote_keep_inside", 0.0) or 0.0
+        self.om.ahead_grace_fn = lambda: getattr(self.quoting, "quote_ahead_grace_s", 1.0)
+        lip_cfg = getattr(getattr(strategy, "cfg", None), "lip", None)
+        self.om.lip_hold_fn = lambda: getattr(lip_cfg, "lip_hold_s", 1.0)
         self.n_real_quotes = 0
         self.n_real_cancelled = 0
+        self.n_real_amends = 0
+        self.failed_amends = 0
         self.failed_cancels = 0
         # (exchange_order_id, trade_id) already booked, so a poll window that
         # deliberately overlaps the previous one can't double-count.
         self._seen_real_fills: set = set()
         self._fill_poll_since: int | None = None
+        # exchange id -> size booked off a create response (no trade id) that
+        # the fill feed has not yet reported. Not cleared on reset, like
+        # _exchange_to_quote: the feed's copy can arrive after one.
+        self._ack_booked: dict[str, float] = {}
 
     def next_order_id(self) -> int:
         return next(self._order_id_seq)
@@ -271,7 +331,10 @@ class LiveEngine:
         return None if self._applied_age_fn is None else self._applied_age_fn()
 
     def position_limit(self) -> float:
-        return self.quoting.max_position
+        """The larger of the two caps: a LIP fill may legitimately take a
+        position past max_position, up to lip.lip_lots."""
+        lip_lots = getattr(getattr(self.strategy, "cfg", None), "lip", None)
+        return max(self.quoting.max_position, getattr(lip_lots, "lip_lots", 0.0) or 0.0)
 
     def signal_age_limit(self) -> float:
         return self.risk.max_signal_age_s
@@ -312,6 +375,7 @@ class LiveEngine:
             prev = self._last_abs_position.get(ticker, 0.0)
             if abs(qty) > prev + 1e-9 and prev > limit + 1e-9:
                 self.halted = True
+                self.halt_kind = "position"
                 self.halt_reason = (f"{ticker} grew to {qty:+.4g} while already past the cap "
                                     f"{limit:g} -- the position cap is not holding")
                 print(f"[live] HALT: {self.halt_reason}. No further orders will be sent.")
@@ -345,9 +409,8 @@ class LiveEngine:
         kalshi = {t: v["position"] for t, v in real.items()}
         ours = {t: p.yes_qty - p.no_qty for t, p in self.portfolio.positions.items()}
         resting_by_ticker: dict[str, float] = {}
-        for entry in self.real_resting.values():
-            tk = entry["order"].ticker
-            resting_by_ticker[tk] = resting_by_ticker.get(tk, 0.0) + entry["remaining"]
+        for q in self.om.live():
+            resting_by_ticker[q.ticker] = resting_by_ticker.get(q.ticker, 0.0) + q.remaining
         tol_base = float(self.n_real_in_flight) + 1.0
         diffs = {}
         for ticker in set(kalshi) | set(ours):
@@ -360,6 +423,7 @@ class LiveEngine:
         self.check_position_limit(kalshi)
         if diffs and not self.halted:
             self.halted = True
+            self.halt_kind = "audit"
             self.halt_reason = ("ledger disagrees with Kalshi on "
                                 + ", ".join(f"{t.split('-')[-1]} {d:+.4g}" for t, d in list(diffs.items())[:4]))
             print(f"[live] HALT: {self.halt_reason} (tolerance {tol_base:g} + that market's "
@@ -380,16 +444,21 @@ class LiveEngine:
         model -- that is why touch is kept in the test rather than replaced
         by the markout number.
 
-        Safe to call repeatedly; halting is one-way for the session.
+        While live, loss_offset (earlier events' real PnL) is added, so the
+        limit is on the whole process's real PnL. Shadow PnL never counts
+        toward it. Safe to call repeatedly; halting is one-way for the session.
         """
         if self.halted:
             return True
         touch, prob = self.current_pnl(mark="touch"), self.current_pnl(mark="prob")
-        worst = min(touch, prob)
+        offset = self.loss_offset if self.live_trading else 0.0
+        worst = min(touch, prob) + offset
         if worst <= -self.risk.max_loss_usd:
             self.halted = True
+            self.halt_kind = "loss" if self.live_trading else "shadow_loss"
             self.halt_reason = (f"PnL {worst:.2f} <= -{self.risk.max_loss_usd:.2f} "
-                                f"(touch {touch:.2f}, markout {prob:.2f})")
+                                f"(this event: touch {touch:.2f}, markout {prob:.2f}; "
+                                f"earlier events {offset:+.2f})")
             print(f"[live] FAILSAFE: {self.halt_reason} -- halting new orders. Existing resting "
                   f"orders are left to resolve normally; restart the process to resume trading.")
         return self.halted
@@ -436,14 +505,15 @@ class LiveEngine:
         """
         if not enabled:
             was_live = self.live_trading
-            # Off FIRST, so nothing new can be sent while the cancels below
-            # are in flight. cancel_order's real path doesn't consult this
-            # flag -- it acts on what is actually resting.
-            self.live_trading = False
             if was_live:
                 print("[live] REAL TRADING DISABLED -- pulling every resting quote off Kalshi. "
                       "Any real POSITION already on the book stays there; nothing is flattened.")
+                # Pull BEFORE flipping the flag: the manager's cancels go to
+                # Kalshi only while live_trading is on. pull_all clears the
+                # desired sets, so the pump has nothing to create meanwhile.
                 self.pull_quotes()
+            self.live_trading = False
+            if was_live:
                 # Blocking, and a full sweep rather than just our own map: an
                 # order left over from a crashed process is invisible to the
                 # map and is exactly what "stop trading" is supposed to mean.
@@ -495,7 +565,8 @@ class LiveEngine:
         self.balance_at_arm = balance
         self.live_trading = True
         print(f"[live] *** REAL TRADING ENABLED -- orders are now being sent to Kalshi. "
-              f"Balance ${balance:.2f}, halt at -${self.risk.max_loss_usd:.0f}. ***")
+              f"Balance ${balance:.2f}, halt at -${self.risk.max_loss_usd:.0f} real PnL this run "
+              f"({self.loss_offset:+.2f} so far). ***")
         return True
 
     def add_session_reset_hook(self, fn):
@@ -543,8 +614,10 @@ class LiveEngine:
         self.failed_cancels = 0
         self._seen_real_fills = set()
         self._fill_poll_since = None
-        self._retired = {}
-        self.exchange_to_order = {}
+        # Shadow quotes were only modelled -- nothing to wait for. Real ones
+        # were cancelled above and their acks are cancelled on arrival via the
+        # discarded-session branch, so the manager can start empty.
+        self.om.forget_all()
         self._shadow_taken = {}
         # Orders already decided but not yet resolved belong to the session
         # being discarded. Their in-flight counters are zeroed here and their
@@ -596,7 +669,8 @@ class LiveEngine:
                           order_type="limit", price=f["price"], size=f["size"],
                           decision_time=pd.Timestamp(f["time"]))
             self.portfolio.record_fill(order, f["price"], f["size"], pd.Timestamp(f["time"]),
-                                       f["liquidity"], fee=f["fee"])
+                                       f["liquidity"], fee=f["fee"], exchange_order_id=f.get("order_id"),
+                                       trade_id=f.get("trade_id"), seeded=True)
         # Seeded orders must not be resolvable -- they already executed.
         self._min_valid_order_id = self._peek_next_order_id()
         if fills:
@@ -677,7 +751,11 @@ class LiveEngine:
         exactly why it doesn't gate the failsafe. Falls back to touch marking
         for any ticker with no current signal.
         """
-        total = 0.0
+        return float(sum(self.pnl_by_ticker(mark).values()))
+
+    def pnl_by_ticker(self, mark: str = "touch") -> dict[str, float]:
+        """current_pnl split per market, same marking rules."""
+        out = {}
         fair_probs = self._fair_probs() if mark == "prob" else {}
         for ticker, pos in self.portfolio.positions.items():
             book = self.books.get(ticker)
@@ -685,10 +763,10 @@ class LiveEngine:
             yes_ask = book.ask if book is not None else None
             p = fair_probs.get(ticker)
             if p is not None:
-                total += pos.unrealized_pnl(p, p)   # both legs marked at the model's fair value
+                out[ticker] = pos.unrealized_pnl(p, p)   # both legs marked at the model's fair value
             else:
-                total += pos.unrealized_pnl(yes_bid, yes_ask)
-        return total
+                out[ticker] = pos.unrealized_pnl(yes_bid, yes_ask)
+        return out
 
     def submit_order(self, order: Order, now: pd.Timestamp):
         """Live analog of engine.py's order_arrival handler.
@@ -733,14 +811,10 @@ class LiveEngine:
             # Every guard above still applies -- halt, cancel, stale book are
             # exactly the conditions under which a real order is worst. Past
             # them, Kalshi's matching engine replaces execution.py: an IOC
-            # either crosses on arrival or is cancelled (the outcome set
-            # resolve_marketable models), and a resting order joins the book
-            # (what resolve_resting models, minus the queue estimate -- the
-            # exchange knows our real queue position and we don't have to).
-            if order.intent == "quote":
-                self._send_real_quote(order)
-            else:
-                self._send_real_order(order)
+            # either crosses on arrival or is cancelled, the outcome set
+            # resolve_marketable models. (Quotes never come through here --
+            # see _om_create.)
+            self._send_real_order(order)
             return
         book = self._net_of_shadow_takes(order, book)
         if book is None:
@@ -752,16 +826,8 @@ class LiveEngine:
             self.portfolio.record_fill(order, fill.price, fill.size, now, fill.liquidity)
             self.check_position_limit()
             return
-        if order.order_type == "market":
-            self._unresolved(order, "market_order_no_depth")
-            return
-        tracker = resolve_resting(order, book)
-        if not tracker.known:
-            # No depth known at this price, so there's no queue to model.
-            self._unresolved(order, "not_marketable_unknown_depth")
-        else:
-            self.queue_trackers.append(tracker)
-            self.trackers_by_id[order.order_id] = tracker
+        # A take is an IOC: nothing rests in shadow either.
+        self._unresolved(order, "ioc_no_fill")
 
     # A simulated take doesn't remove anything from Kalshi's real book, so
     # without this the same touch level is "available" to every later order
@@ -806,7 +872,7 @@ class LiveEngine:
         executor; the response is recorded back on the loop thread (asyncio
         future callbacks run there), which is what keeps Portfolio mutation
         single-threaded against the strategy's own reads."""
-        if not self.order_client.allow_now():
+        if not self.order_client.allow_now("order", reason="take"):
             self._unresolved(order, "rate_limited")
             return
         self.n_real_orders += 1
@@ -839,6 +905,10 @@ class LiveEngine:
             return
         self.n_real_in_flight -= 1
         fill, exc = result
+        if exc is not None and http_status(exc) == 429:
+            self.order_client.note_rate_limited("take")
+            self._unresolved(order, "rate_limited_429")
+            return
         if exc is not None:
             self.real_order_errors += 1
             self.consecutive_order_errors += 1
@@ -872,61 +942,186 @@ class LiveEngine:
                   f"against Kalshi's current response shape.")
         self.n_real_fills += 1
         self.portfolio.record_fill(order, fill.price, fill.size, pd.Timestamp.now(tz="UTC"),
-                                   "taker", fee=fill.fee)
+                                   "taker", fee=fill.fee, exchange_order_id=fill.exchange_order_id)
         print(f"[live] REAL FILL {order.ticker} {order.side} {fill.size:g} @ {fill.price:.4f} "
               f"(fee ${fill.fee:.4f})")
         self.check_position_limit()
 
     # -----------------------------------------------------------------
-    # Real resting orders (quotes)
+    # Quotes: executor for the OrderManager
     # -----------------------------------------------------------------
+    #
+    # The quoter publishes a desired ladder per (ticker, side) through
+    # LiveContext.set_quote_ladder; the OrderManager diffs it against what is
+    # live and calls back here to create / cancel. Real mode sends to Kalshi;
+    # shadow mode registers a QueueTracker after the modelled send latency.
+    # Both go through the same manager, budget and priorities.
 
-    def _send_real_quote(self, order: Order):
-        """Rest `order` at Kalshi, off the event loop (same reasoning as
-        _send_real_order). Unlike a take, what comes back has to be KEPT:
-        the exchange order id is the only handle we have on an order that
-        will otherwise sit on the book indefinitely."""
-        if self._quote_slot_busy(order):
-            # Pull-before-requote: at most one real order per (ticker, side).
-            # The strategy is told the quote didn't land and retries on a
-            # later tick, by which time the old order's cancel has confirmed.
-            self._unresolved(order, "prior_quote_not_cleared")
+    def _om_bucket_tokens(self) -> float | None:
+        """Tokens left in the account-wide write bucket, or None in shadow
+        (where the manager meters only against the quote budget)."""
+        if not self.live_trading or self.order_client is None:
+            return None
+        return self.order_client.tokens_now()
+
+    def _om_create(self, q) -> bool:
+        """Called by OrderManager.pump for one create (already registered in
+        the manager). Returns False if it may not be sent now."""
+        if self.blocked_reason() is not None:
+            return False
+        book = self.books.get(q.ticker)
+        if book is None or (pd.Timestamp.now(tz="UTC") - book.time).total_seconds() > MAX_BOOK_AGE_S:
+            return False
+        if self.live_trading and not self.order_client.allow_now("order", reason=f"new_quote/{q.role}"):
+            return False
+        order = Order(order_id=q.order_id, ticker=q.ticker, side=q.side, order_type="limit",
+                      price=q.price, size=q.size, decision_time=pd.Timestamp.now(tz="UTC"), intent="quote")
+        order.role = q.role
+        self.orders.append(order)
+        self._quote_orders[order.order_id] = order
+        if self.live_trading:
+            self.n_real_orders += 1
+            self.n_real_quotes += 1
+            self.n_real_in_flight += 1
+            self._run_blocking(lambda: self._rest_blocking(order),
+                               lambda res: self._on_real_quote_result(order, res))
+            return True
+        # Shadow: lands after the modelled send latency, against the book then.
+        self._schedule_shadow(order)
+        return True
+
+    def _om_cancel(self, q, reason: str):
+        """Called by the OrderManager for one cancel (it has already checked
+        the bucket). Tokens are debited HERE, on the loop thread, so the
+        manager's very next bucket read sees them."""
+        order = self._quote_orders.get(q.order_id)
+        if not self.live_trading or q.exchange_id is None:
+            # Shadow (or a real order whose create never acked into a real
+            # session): stop its queue model and confirm at once.
+            tracker = self.trackers_by_id.get(q.order_id)
+            if tracker is not None:
+                tracker.cancelled = True
+            self.cancelled_ids.add(q.order_id)
+            self.om.on_cancel_done(q.order_id)
             return
-        if not self.order_client.allow_now():
-            self._unresolved(order, "rate_limited")
-            return
-        self.n_real_orders += 1
-        self.n_real_quotes += 1
-        self.n_real_in_flight += 1
-        self.inflight_quotes[order.order_id] = order
+        tag = f"{reason}/{q.role}"
+        self.order_client.allow_now("cancel", force=True, reason=tag)
+        exchange_id, ticker = q.exchange_id, (order.ticker if order is not None else q.ticker)
+        self._run_blocking(lambda: self._cancel_send(exchange_id, ticker),
+                           lambda res: self._on_cancel_result(q.order_id, res, reason))
+
+    def _om_amend(self, q, price: float, remaining: float) -> bool:
+        """Move a resting quote to `price` (own-side) and `remaining` resting
+        contracts with one amend. Shadow: the queue model has no amend, so a
+        price change retires the old tracker and starts a new one at the back
+        of the new price's queue -- what Kalshi does; a pure size cut keeps
+        its place. Returns False if it may not be sent now."""
+        if self.blocked_reason() is not None:
+            return False
+        order = self._quote_orders.get(q.order_id)
+        if order is None:
+            return False
+        moved = abs(price - order.price) > 1e-9
+        if not self.live_trading:
+            old = self.trackers_by_id.get(q.order_id)
+            filled = old.filled_qty if old is not None else q.filled
+            order.price = price
+            order.size = filled + remaining
+            if old is not None and not moved:
+                old.order.size = order.size          # size change in place
+            else:
+                if old is not None:
+                    old.cancelled = True
+                book = self.books.get(q.ticker)
+                if book is not None:
+                    tr = resolve_resting(order, book)
+                    if not tr.known:
+                        tr = QueueTracker(order, price, 0.0)
+                    tr.filled_qty = filled
+                    self.queue_trackers.append(tr)
+                    self.trackers_by_id[q.order_id] = tr
+            self.om.on_amended(q.order_id, ok=True)
+            return True
+        if not self.order_client.allow_now("amend", reason=f"move/{q.role}"):
+            return False
+        filled = q.filled
+        self.n_real_amends += 1
+
+        def work():
+            try:
+                return self.order_client.amend(q.exchange_id, order, remaining, filled, price=price), None
+            except Exception as exc:
+                return None, exc
+
+        def done(res):
+            resp, exc = res
+            if exc is None:
+                order.price = price
+                order.size = filled + remaining
+                self.om.on_amended(q.order_id, ok=True)
+                return
+            st = http_status(exc)
+            if st == 404:
+                self.om.on_amended(q.order_id, ok=False, gone=True)   # filled/cancelled first
+                return
+            if st == 429:
+                self.order_client.note_rate_limited("move")
+            else:
+                self.failed_amends += 1
+                print(f"[live] WARN: move of quote {q.order_id} to {price} failed ({exc!r}); left at old price")
+            self.om.on_amended(q.order_id, ok=False)
+
+        self._run_blocking(work, done)
+        return True
+
+    def _run_blocking(self, work, done):
+        """Run `work` on the default executor and `done(result)` back on the
+        loop; inline when there is no running loop (tests)."""
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
         if loop is None:
-            self._on_real_quote_result(order, self._rest_blocking(order))
+            done(work())
             return
-        fut = loop.run_in_executor(None, self._rest_blocking, order)
-        fut.add_done_callback(lambda f: self._on_real_quote_result(order, f.result()))
+        loop.run_in_executor(None, work).add_done_callback(
+            lambda f: loop.call_soon_threadsafe(done, f.result()) if not loop.is_closed() else None)
 
-    def _quote_slot_busy(self, order: Order) -> bool:
-        """True if another real order on `order`'s (ticker, side) is still in
-        flight or not yet confirmed cancelled. Any such resting order is
-        unwanted -- the strategy has moved on to `order` -- so this also
-        (re)issues its cancel, which covers a cancel that errored earlier."""
-        busy = False
-        for oid, o in self.inflight_quotes.items():
-            if oid != order.order_id and _slot(o) == _slot(order):
-                # Cancelled on arrival by _on_real_quote_result.
-                self.cancelled_ids.add(oid)
-                busy = True
-        for oid, entry in list(self.real_resting.items()):
-            o = entry["order"]
-            if oid != order.order_id and _slot(o) == _slot(order):
-                self.cancelled_ids.add(oid)
-                self._cancel_real(oid)
-                busy = True
-        return busy
+    def _schedule_shadow(self, order: Order):
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            self._shadow_quote_lands(order)
+            return
+        loop.call_later(SHADOW_SEND_S, self._shadow_quote_lands, order)
+
+    def _shadow_quote_lands(self, order: Order):
+        """Shadow analog of a create ack: cross what's marketable at arrival
+        (a quote priced into a book that moved), rest the remainder behind
+        the displayed queue."""
+        if order.order_id < self._min_valid_order_id or self.om.quotes.get(order.order_id) is None:
+            return
+        q = self.om.quotes[order.order_id]
+        book = self.books.get(order.ticker)
+        if book is None:
+            self.om.on_create_failed(order.order_id, rejected=False)
+            return
+        fill = resolve_marketable(order, book)
+        filled = 0.0
+        if fill is not None:
+            filled = fill.size
+            self.portfolio.record_fill(order, fill.price, fill.size, pd.Timestamp.now(tz="UTC"), "taker")
+            self.check_position_limit()
+        if order.size - filled > 1e-9 and q.state != om.CANCELLING:
+            tracker = resolve_resting(order, book)
+            if not tracker.known:
+                tracker = QueueTracker(order, order.price, 0.0)
+            tracker.filled_qty = filled
+            self.queue_trackers.append(tracker)
+            self.trackers_by_id[order.order_id] = tracker
+        self.om.on_created(order.order_id, f"shadow-{order.order_id}", filled=filled)
 
     def _rest_blocking(self, order: Order) -> tuple:
         """Worker thread -- touches no engine state. Returns (ack, exception)."""
@@ -939,19 +1134,38 @@ class LiveEngine:
         """Back on the event loop: register what is now resting, and book
         whatever crossed on the way in."""
         ack, exc = result
-        self.inflight_quotes.pop(order.order_id, None)
-        if order.order_id < self._min_valid_order_id:
-            # Session discarded while this was in flight. Unlike a take, doing
-            # nothing here would leave a live order on the book that nothing
-            # in this process remembers -- so cancel it on the way past.
-            self.n_real_in_flight -= 1
-            if ack is not None and ack.exchange_order_id is not None:
-                self._cancel_exchange_order(ack.exchange_order_id, order.ticker)
-            return
         self.n_real_in_flight -= 1
+        if order.order_id < self._min_valid_order_id:
+            # Session discarded while in flight: nothing here remembers it,
+            # so cancel it on the way past.
+            if ack is not None and ack.exchange_order_id is not None:
+                self._cancel_exchange_order(ack.exchange_order_id, order.ticker, "orphan")
+            return
+        if exc is not None and http_status(exc) == 429:
+            # Throttled, not broken: nothing rests; the manager re-queues it.
+            self.order_client.note_rate_limited("new_quote")
+            self.om.on_create_failed(order.order_id, rejected=False)
+            self._unresolved(order, "rate_limited_429")
+            return
+        if exc is not None and http_status(exc) is None:
+            # No HTTP answer (timeout, connection reset): the order may be
+            # resting at Kalshi. Keep the slot occupied and go find it by
+            # client id -- freeing it would let the ladder stack a second
+            # order on an unknown first one.
+            self.real_order_errors += 1
+            self.consecutive_order_errors += 1
+            print(f"[live] WARN: no response resting quote {order.order_id} "
+                  f"({order.ticker} {order.side} {order.size}@{order.price}): {exc!r}; looking it up")
+            q = self.om.quotes.get(order.order_id)
+            if q is not None:
+                q.state = om.CANCELLING
+            self._run_blocking(lambda: self._find_lost(order),
+                               lambda res: self._on_lost_found(order, res))
+            return
         if exc is not None:
             self.real_order_errors += 1
             self.consecutive_order_errors += 1
+            self.om.on_create_failed(order.order_id, rejected=True)
             self._unresolved(order, "real_quote_error")
             print(f"[live] ERROR resting REAL quote {order.order_id} "
                   f"({order.ticker} {order.side} {order.size}@{order.price}): {exc!r}")
@@ -962,10 +1176,9 @@ class LiveEngine:
         self.consecutive_order_errors = 0
         filled = 0.0
         if ack.fill is not None:
-            # A quote is priced a tick inside the opposite touch when it's
-            # sent, so this only happens when the book moved during the round
-            # trip. Same limit-price sanity check a take gets: a fill we
-            # cannot account for makes every PnL number downstream a guess.
+            # Priced a tick inside the far touch when sent, so this only
+            # happens when the book moved during the round trip. Same limit
+            # sanity check as a take.
             if ack.fill.price > order.price + PRICE_SANITY_TOL or ack.fill.price < 0.0:
                 self.halted = True
                 self.halt_reason = (f"quote fill price {ack.fill.price:.4f} outside limit "
@@ -973,238 +1186,217 @@ class LiveEngine:
                 print(f"[live] HALT: {self.halt_reason}. Booking it anyway so the ledger reflects "
                       f"the trade, but NO further orders will be sent.")
             filled = ack.fill.size
-            self.n_real_fills += 1
-            self.portfolio.record_fill(order, ack.fill.price, ack.fill.size,
-                                       pd.Timestamp.now(tz="UTC"), "taker", fee=ack.fill.fee)
-            print(f"[live] REAL QUOTE CROSSED {order.ticker} {order.side} {ack.fill.size:g} @ "
-                  f"{ack.fill.price:.4f} (fee ${ack.fill.fee:.4f})")
-        remaining = order.size - filled
+            self._book_real_fill(order, ack.exchange_order_id, None, ack.fill.price, ack.fill.size,
+                                 ack.fill.fee, "taker", pd.Timestamp.now(tz="UTC"))
         if ack.parse_error is not None:
-            # The response carried a fill we could not read. We do not know
-            # our own position any more, and the resting remainder (if any) is
-            # sized off a number we don't have.
+            # A fill we could not read: our position is unknown.
             self.halted = True
-            self.halt_reason = (f"unreadable fill on quote {order.ticker} {order.side}: "
-                                f"{ack.parse_error!r}")
+            self.halt_reason = f"unreadable fill on quote {order.ticker} {order.side}: {ack.parse_error!r}"
             print(f"[live] HALT: {self.halt_reason}. Pulling this quote; check "
                   f"kalshi.orders._parse_fill against Kalshi's current response shape.")
             if ack.exchange_order_id is not None:
-                self._cancel_exchange_order(ack.exchange_order_id, order.ticker)
-            self._quote_not_resting(order)
+                self._cancel_exchange_order(ack.exchange_order_id, order.ticker, "orphan")
+            self.om.on_create_failed(order.order_id, rejected=False)
             return
-        if remaining <= 1e-9:
-            # Crossed in full: nothing rests, and the strategy retires the
-            # quote off its own fill (see _sync_quote_fills) rather than here,
-            # so the requote delay applies -- being crossed on arrival is the
-            # same information as being hit while resting.
-            return
-        if ack.exchange_order_id is None:
-            # An order we can never cancel. Halting is the only honest
-            # response: it is on the book, it can fill, and no code path in
-            # this process can take it back.
+        if ack.exchange_order_id is None and order.size - filled > 1e-9:
+            # On the book with no handle to cancel it by.
             self.halted = True
             self.halt_reason = (f"quote on {order.ticker} {order.side} rested with no order_id in the "
                                 f"response -- it cannot be cancelled from here")
             print(f"[live] HALT: {self.halt_reason}. CANCEL IT BY HAND on Kalshi.")
-            self._quote_not_resting(order)
+            self.om.on_create_failed(order.order_id, rejected=False)
             return
-        self.real_resting[order.order_id] = {"exchange_id": ack.exchange_order_id, "order": order,
-                                             "remaining": remaining, "cancelling": False}
-        self.exchange_to_order[ack.exchange_order_id] = order.order_id
-        if self._fill_poll_since is None:
-            self._fill_poll_since = int(time.time()) - 1
-        if order.order_id in self.cancelled_ids or not self.live_trading:
-            # The strategy (or a disarm) cancelled this while the POST was in
-            # flight, when there was no exchange id to cancel by. Without this
-            # it rests untracked and every requote stacks another on top.
-            self._cancel_real(order.order_id)
+        if ack.exchange_order_id is not None:
+            self._exchange_to_quote[ack.exchange_order_id] = order.order_id
+        # The manager cancels it at once if it was cancelled in flight, or if
+        # the edge moved through it while it was in flight.
+        self.om.on_created(order.order_id, ack.exchange_order_id, filled=filled)
+        if not self.live_trading:
+            q = self.om.quotes.get(order.order_id)
+            if q is not None:
+                self.om._cancel(q, "disarmed_in_flight")
 
-    def fill_poll_min_ts(self) -> int | None:
-        """`min_ts` for the next quote-fill poll (see apply_real_fills).
-        Deliberately a few seconds behind what we've already read: the window
-        overlaps, and (order_id, trade_id) dedupes, so a fill landing exactly
-        on a boundary is seen twice rather than never."""
-        return self._fill_poll_since
-
-    def apply_real_fills(self, fills: list[dict]):
-        """Book fills on our RESTING quotes, from a poll of the fills
-        endpoint.
-
-        Matched strictly on exchange order ids we are currently holding as
-        resting. Every other fill in that response has already been booked
-        off its own create-order response -- a looser match would double
-        every take we've made today.
-        """
-        self._prune_retired()
-        booked = 0
-        for f in fills:
-            our_id = self.exchange_to_order.get(f.get("order_id"))
-            if our_id is None:
-                continue
-            key = (f.get("order_id"), f.get("trade_id"))
-            if key in self._seen_real_fills:
-                continue
-            self._seen_real_fills.add(key)
-            entry = self.real_resting.get(our_id)
-            if entry is None:
-                retired = self._retired.get(our_id)
-                entry = retired[1] if retired is not None else None
-            if entry is None:
-                continue
-            order = entry["order"]
-            if f["side"] != order.side:
-                # Our order's side is what the position is booked against, so
-                # a disagreement means we have mis-mapped the order entirely.
-                print(f"[live] WARN: fill on {f['ticker']} reports side {f['side']} for our "
-                      f"{order.side} quote {our_id} -- booking as {order.side}")
-            self.n_real_fills += 1
-            self.portfolio.record_fill(order, f["price"], f["size"], pd.Timestamp(f["time"]),
-                                       f["liquidity"], fee=f["fee"])
-            entry["remaining"] -= f["size"]
-            booked += 1
-            print(f"[live] REAL QUOTE FILL {order.ticker} {order.side} {f['size']:g} @ "
-                  f"{f['price']:.4f} ({f['liquidity']}, fee ${f['fee']:.4f})")
-            if entry["remaining"] <= 1e-9:
-                self._drop_resting(our_id)
-        # Advance the window only to a couple of seconds back, so the next
-        # poll re-reads the boundary rather than stepping over it.
-        self._fill_poll_since = int(time.time()) - 2
-        if booked:
-            self.check_position_limit()
-
-    def _drop_resting(self, order_id: int):
-        """Move an order out of the live resting set but keep it matchable by
-        exchange id for RETIRED_MATCH_S.
-
-        A cancel confirms as a 404 exactly when the order filled instead of
-        cancelling, and the fill poll is up to one interval behind -- so
-        dropping the mapping the moment the cancel returns would lose that
-        fill entirely, and the position audit would then halt on a
-        discrepancy we had created ourselves.
-        """
-        entry = self.real_resting.pop(order_id, None)
-        if entry is not None:
-            self._retired[order_id] = (time.monotonic(), entry)
-
-    def _prune_retired(self):
-        cutoff = time.monotonic() - RETIRED_MATCH_S
-        for order_id in [k for k, (t, _) in self._retired.items() if t < cutoff]:
-            _, entry = self._retired.pop(order_id)
-            self.exchange_to_order.pop(entry["exchange_id"], None)
-
-    def _cancel_real(self, order_id: int):
-        """Pull our resting order `order_id` off Kalshi.
-
-        The entry is NOT removed here -- only when the exchange confirms.
-        A cancel that errors leaves the order live, and forgetting it at that
-        point is how an order ends up on the book with nothing tracking it;
-        keeping it means pull_quotes and the shutdown sweep both retry.
-        """
-        entry = self.real_resting.get(order_id)
-        if entry is None or entry["cancelling"]:
-            return
-        entry["cancelling"] = True
-        exchange_id = entry["exchange_id"]
-        ticker = getattr(entry.get("order"), "ticker", None)
+    def _find_lost(self, order: Order) -> tuple:
+        """Worker thread: did a create with no response land? Returns
+        ((exchange_id, ticker) | None, exception)."""
+        cid = getattr(order, "client_order_id", None)
+        if cid is None or self.event_ticker is None:
+            # The POST never got as far as building its body: nothing was sent.
+            return None, None
         try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-        if loop is None:
-            self._on_cancel_result(order_id, self._cancel_blocking(exchange_id, ticker))
-            return
-        fut = loop.run_in_executor(None, self._cancel_blocking, exchange_id, ticker)
-        fut.add_done_callback(lambda f: self._on_cancel_result(order_id, f.result()))
+            return self.order_client.find_by_client_id(self.event_ticker, cid), None
+        except Exception as exc:
+            return None, exc
 
-    def _cancel_blocking(self, exchange_id: str, ticker: str | None = None) -> tuple:
-        """Worker thread -- touches no engine state. Returns (ok, exception)."""
+    def _on_lost_found(self, order: Order, result: tuple):
+        """Cancel a create that landed despite no response; free the slot only
+        once we know it isn't resting. If the lookup itself fails the slot
+        stays held -- the shutdown/disarm sweep cancels by listing."""
+        hit, exc = result
+        if exc is not None:
+            print(f"[live] WARN: lookup of lost quote {order.order_id} failed ({exc!r}); "
+                  f"slot held until the next sweep")
+            return
+        if hit is None:
+            self.om.on_create_failed(order.order_id, rejected=False)
+            return
+        exchange_id, ticker = hit
+        self._exchange_to_quote[exchange_id] = order.order_id
+        q = self.om.quotes.get(order.order_id)
+        if q is not None:
+            q.exchange_id = exchange_id
+            self._om_cancel(q, "lost_create")
+
+    def _cancel_send(self, exchange_id: str, ticker: str | None) -> tuple:
+        """Worker thread -- touches no engine state; tokens already debited.
+        Returns (ok, exception)."""
         try:
-            self.order_client.allow_now("cancel", force=True)
             return self.order_client.cancel(exchange_id, ticker), None
         except Exception as exc:
             return None, exc
 
-    def _on_cancel_result(self, order_id: int, result: tuple):
+    def _cancel_blocking(self, exchange_id: str, ticker: str | None = None, reason: str = "untagged") -> tuple:
+        """Debit + send, for cancels outside the manager (orphans, the sweep)."""
+        self.order_client.allow_now("cancel", force=True, reason=reason)
+        return self._cancel_send(exchange_id, ticker)
+
+    def _on_cancel_result(self, order_id: int, result: tuple, reason: str = "retry"):
         ok, exc = result
         if exc is not None:
-            entry = self.real_resting.get(order_id)
-            if entry is not None:
-                entry["cancelling"] = False   # so the next pull retries it
+            if http_status(exc) == 429:
+                # Throttled, not refused: re-queue; it goes again as the
+                # bucket refills, ahead of any create.
+                self.order_client.note_rate_limited("cancel")
+                self.om.on_cancel_failed(order_id, reason)
+                return
             self.failed_cancels += 1
+            self.om.on_cancel_failed(order_id, reason)
             print(f"[live] ERROR cancelling resting order {order_id}: {exc!r} -- it is still on "
-                  f"the book and will be retried on the next pull.")
+                  f"the book and will be retried.")
             return
-        # ok is False for a 404: the order was already gone, which usually
-        # means it filled rather than expired. _drop_resting keeps it
-        # matchable for a while precisely for that case.
+        # ok is False for a 404: already gone, usually because it filled. The
+        # fill feed still matches it by exchange id (_exchange_to_quote keeps it).
         self.n_real_cancelled += 1
-        self._drop_resting(order_id)
+        self.om.on_cancel_done(order_id)
 
-    def _cancel_exchange_order(self, exchange_id: str, ticker: str | None = None):
+    def _cancel_exchange_order(self, exchange_id: str, ticker: str | None = None, reason: str = "orphan"):
         """Cancel by exchange id, for orders we never got to track (a session
         reset or an unreadable response mid-flight). Pass the ticker: without
         it the cancel can't be routed to a non-zero shard."""
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-        if loop is None:
-            self._cancel_blocking(exchange_id, ticker)
+        self._run_blocking(lambda: self._cancel_blocking(exchange_id, ticker, reason), lambda res: None)
+
+    # -----------------------------------------------------------------
+    # Real fills (websocket `fill` channel, plus a REST backstop)
+    # -----------------------------------------------------------------
+
+    def _book_real_fill(self, order: Order, exchange_id, trade_id, price, size, fee, liquidity, when):
+        key = (exchange_id, trade_id)
+        if trade_id is not None:
+            if key in self._seen_real_fills:
+                return False
+            self._seen_real_fills.add(key)
+        if trade_id is None:
+            # Booked off the create response, which has no trade id: the fill
+            # feed reports the same execution again later, with one.
+            if exchange_id is not None:
+                self._ack_booked[exchange_id] = self._ack_booked.get(exchange_id, 0.0) + size
+        elif liquidity == "taker" and self._ack_booked.get(exchange_id, 0.0) > 1e-9:
+            # Consumed by size, not matched by trade: a cross that swept several
+            # levels is one summed fill in the ack but one feed message per level.
+            # Double-booking these halted the audit (2026-10-10 26OCT101115 BTC/ETH).
+            credit = self._ack_booked[exchange_id]
+            used = min(credit, size)
+            self._ack_booked[exchange_id] = credit - used
+            if size - used <= 1e-9:
+                return False
+            fee = fee * (size - used) / size
+            size -= used
+        self.n_real_fills += 1
+        self.portfolio.record_fill(order, price, size, when, liquidity, fee=fee,
+                                   exchange_order_id=exchange_id, trade_id=trade_id)
+        self.om.on_fill(order.order_id, size)
+        print(f"[live] REAL QUOTE FILL {order.ticker} {order.side} {size:g} @ {price:.4f} "
+              f"({liquidity}, fee ${fee:.4f})")
+        return True
+
+    def on_real_fill(self, f: dict):
+        """One fill of OUR order, from the websocket fill channel or the REST
+        backstop poll (same dict shape as KalshiOrderClient.fills). Takes are
+        already booked off their create response, so only resting quotes are
+        matched here -- by exchange order id, deduped on (order_id, trade_id)."""
+        our_id = self._exchange_to_quote.get(f.get("order_id"))
+        if our_id is None:
             return
-        loop.run_in_executor(None, self._cancel_blocking, exchange_id, ticker)
+        order = self._quote_orders.get(our_id)
+        if order is None:
+            return
+        if f["side"] != order.side:
+            print(f"[live] WARN: fill on {f['ticker']} reports side {f['side']} for our "
+                  f"{order.side} quote {our_id} -- booking as {order.side}")
+        when = pd.Timestamp(f["time"]) if f.get("time") is not None else pd.Timestamp.now(tz="UTC")
+        if self._book_real_fill(order, f.get("order_id"), f.get("trade_id"), f["price"], f["size"],
+                                f["fee"], f["liquidity"], when):
+            self.check_position_limit()
+
+    def apply_real_fills(self, fills: list[dict]):
+        for f in fills:
+            self.on_real_fill(f)
+        self._fill_poll_since = int(time.time()) - 2
+
+    def fill_poll_min_ts(self) -> int | None:
+        """`min_ts` for the REST backstop poll: a couple of seconds behind
+        what we've already read, so a boundary fill is read twice (deduped)
+        rather than never."""
+        return self._fill_poll_since
 
     def has_quotes(self) -> bool:
-        """Whether anything of ours is resting -- real orders, or the
-        strategy's own idea of its quotes (shadow mode has no real orders but
-        does have resting QueueTrackers)."""
-        if self.real_resting:
-            return True
-        getter = getattr(self.strategy, "live_quote_order_ids", None)
-        return bool(getter and getter())
+        return bool(self.om.quotes)
+
+    def check_lip_queue(self, positions: dict[str, float], min_ahead: float):
+        """Cancel any LIP quote with less than `min_ahead` truly ahead of it:
+        Kalshi's queue position at its own price plus every order at a better
+        price on that side (from the book). Ours count -- they count toward the
+        LIP reference price too. Unknown orders (just placed, not yet in the
+        listing) are left to the next poll."""
+        for q in self.om.live(role="lip"):
+            if q.state != om.RESTING or q.exchange_id not in positions:
+                continue
+            book = self.books.get(q.ticker)
+            ladder = getattr(book, "ladder", None) if book is not None else None
+            bids = {} if ladder is None else (ladder.yes_bids if q.side == "yes" else ladder.no_bids)
+            better = sum(z for p, z in bids.items() if p > q.price + 1e-9)
+            ahead = positions[q.exchange_id] + better
+            if ahead + 1e-9 < min_ahead:
+                # Cancel now; don't come back to that price or better until
+                # the book alone shows enough there again (it overstates what's
+                # ahead, which is why we're here), for LIP_QUEUE_AVOID_S.
+                self.om._cancel(q, "lip_queue")
+                self.lip_avoid[(q.ticker, q.side)] = (q.price, time.monotonic() + LIP_QUEUE_AVOID_S)
+        self.om.drain_cancels()
+
+    def has_uncancelled_quotes(self) -> bool:
+        return any(q.state != om.CANCELLING for q in self.om.quotes.values())
+
+    def has_quote_history(self) -> bool:
+        """Any real quote reached Kalshi this session, so its fills may still
+        need booking (one that was cancelled can have filled first)."""
+        return bool(self._exchange_to_quote)
 
     def pull_quotes(self):
-        """Withdraw every quote the strategy has resting, in whichever mode
-        we are in: real orders get a DELETE, shadow ones stop filling.
-
-        Called on disarm, on a session reset, and whenever a guard is
-        blocking -- a quote priced off a stale signal or left up through a
-        halt keeps taking risk long after every other guard has stopped
-        taking it, because unlike a take it is already at the exchange.
-        Cancelling a resting offer is not flattening: nothing here closes a
-        position, it only stops us acquiring more.
-
-        The strategy is told to forget them so its next decision quotes from
-        scratch rather than believing in orders that are gone.
-        """
-        getter = getattr(self.strategy, "live_quote_order_ids", None)
-        for order_id in (list(getter()) if getter else []):
-            self.cancel_order(order_id)
-        # Anything real the strategy has already forgotten (a fill it retired
-        # locally whose remainder is still out, an order from a reset session).
-        for order_id in list(self.real_resting):
-            self.cancel_order(order_id)
-        clear = getattr(self.strategy, "clear_quotes", None)
-        if clear is not None:
-            clear()
+        """Withdraw every quote, real or shadow (stale signal, halt, disarm,
+        session reset). Nothing is re-created until the quoter publishes
+        again. Cancelling a resting offer is not flattening."""
+        self.om.pull_all("pull")
 
     def cancel_resting(self):
         """BLOCKING sweep: cancel every order this account still has resting
-        in our event, whether or not we know about it.
-
-        pull_quotes covers what this process placed and remembers. This
-        covers what it placed and lost -- a crashed predecessor, a cancel
-        that errored, an order whose response never came back. Used at the
-        two moments where "nothing of ours is left on the book" has to be
-        true rather than probable: disarming, and shutting the event down.
-        Blocking on purpose -- both callers are about to move on, and an
-        executor task would be racing them.
-        """
+        in our event, whether or not we know about it -- a crashed
+        predecessor, a cancel that errored, an order whose response never came
+        back. Used when disarming and when shutting the event down."""
         if self.order_client is None or self.event_ticker is None:
             return
-        # Several passes, not one: a quote POST still in flight when the sweep
-        # starts lands on the book after a single listing, and Kalshi's order
-        # list lags a fresh create slightly. Done once two passes in a row
-        # come back empty; capped so a stuck listing can't hang shutdown.
+        # Several passes: a POST in flight when the sweep starts lands after a
+        # single listing, and Kalshi's order list lags a fresh create slightly.
         deadline = time.monotonic() + SWEEP_MAX_S
         empty_passes = 0
         while empty_passes < 2 and time.monotonic() < deadline:
@@ -1223,7 +1415,7 @@ class LiveEngine:
                 print(f"[live] cancelling {len(resting)} resting order(s) on {self.event_ticker}")
                 for exchange_id, ticker in resting:
                     try:
-                        self.order_client.allow_now("cancel", force=True)
+                        self.order_client.allow_now("cancel", force=True, reason="sweep")
                         self.order_client.cancel(exchange_id, ticker)
                     except Exception as exc:
                         self.failed_cancels += 1
@@ -1232,10 +1424,9 @@ class LiveEngine:
         if empty_passes < 2:
             print(f"[live] WARN: resting orders may remain on {self.event_ticker} after "
                   f"{SWEEP_MAX_S:.0f}s of sweeping -- CHECK KALSHI BY HAND.")
-        # Retired, not discarded: one of these may have filled instead of
-        # cancelling, and the fill poll needs the id to still resolve.
-        for order_id in list(self.real_resting):
-            self._drop_resting(order_id)
+        # Everything is off the book; ids stay in _exchange_to_quote so a fill
+        # that raced the cancel still books.
+        self.om.forget_all()
 
     def _unresolved(self, order: Order, reason: str):
         """Record a non-fill WITH its cause. A bare count can't distinguish
@@ -1244,78 +1435,18 @@ class LiveEngine:
         backtest's replayed L2), and those call for opposite responses."""
         self.unresolved_orders.append(order)
         self.unresolved_reasons[reason] = self.unresolved_reasons.get(reason, 0) + 1
-        self._quote_not_resting(order)
 
-    def _quote_not_resting(self, order: Order):
-        """Tell the strategy that a quote it believes is on the book never
-        got there -- rate limited, blocked by a guard, rejected by Kalshi.
-
-        Every dropped-order path funnels through here (via _unresolved, plus
-        the two halt paths in _on_real_quote_result that return before it).
-        It matters for a quote in a way it never did for a take: the strategy
-        only requotes when the LEVEL changes, so a quote it wrongly believes
-        is resting leaves that market unquoted until the price happens to
-        move. A dropped take is simply a take that didn't happen.
-        """
-        if order.intent != "quote":
+    def cancel_order(self, order_id: int, reason: str = "strategy"):
+        """Cancel one order by our id: a quote goes through the manager (P0,
+        never budgeted); anything else only stops its shadow queue model."""
+        q = self.om.quotes.get(order_id)
+        if q is not None:
+            self.om._cancel(q, reason)
             return
-        drop = getattr(self.strategy, "drop_quote", None)
-        if drop is not None:
-            drop(order.order_id)
-
-    def amend_order(self, order_id: int, new_size: float) -> bool:
-        """Change a resting quote's remaining size. Real: Kalshi amend (a size
-        increase goes to the back of the queue, a decrease keeps its place).
-        Shadow: the tracker's remaining size changes; queue position is left
-        as is (conservative for an increase is not modelled -- shadow LIP
-        fills are rare by construction)."""
-        if order_id in self.cancelled_ids:
-            return False
-        tracker = self.trackers_by_id.get(order_id)
-        if tracker is not None and not tracker.done:
-            tracker.order.size = tracker.filled_qty + new_size
-        entry = self.real_resting.get(order_id)
-        if entry is None:
-            return tracker is not None and not tracker.done
-        if not self.order_client.allow_now("amend"):
-            return False
-        filled = entry["order"].size - entry["remaining"]
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-
-        def work():
-            try:
-                return self.order_client.amend(entry["exchange_id"], entry["order"], new_size, filled), None
-            except Exception as exc:
-                return None, exc
-
-        def done(result):
-            resp, exc = result
-            if exc is not None:
-                print(f"[live] WARN: amend of resting order {order_id} failed: {exc!r}")
-                return
-            entry["remaining"] = new_size
-            entry["order"].size = filled + new_size
-
-        if loop is None:
-            done(work())
-        else:
-            loop.run_in_executor(None, work).add_done_callback(lambda f: done(f.result()))
-        return True
-
-    def cancel_order(self, order_id: int):
-        """Live analog of engine.py's cancel_arrival handler -- immediate,
-        no latency scheduling (see module docstring). A real resting order
-        additionally gets a DELETE sent to Kalshi; a shadow one just stops
-        filling."""
         self.cancelled_ids.add(order_id)
         tracker = self.trackers_by_id.get(order_id)
         if tracker is not None:
             tracker.cancelled = True
-        if order_id in self.real_resting:
-            self._cancel_real(order_id)
 
     def on_trade(self, ticker: str, trade: Trade, now: pd.Timestamp):
         """Live analog of engine.py's trade_true handler -- advances every
@@ -1327,7 +1458,9 @@ class LiveEngine:
             fill = tracker.on_trade(trade)
             if fill is not None:
                 self.portfolio.record_fill(tracker.order, fill.price, fill.size, now, fill.liquidity)
+                self.om.on_fill(tracker.order.order_id, fill.size)
                 self.check_position_limit()
+        self.queue_trackers = [t for t in self.queue_trackers if not t.done]
 
     def dispatch(self, last_event: object, now: pd.Timestamp):
         """Builds a fresh LiveContext and calls the strategy -- the live
@@ -1344,7 +1477,16 @@ class LiveEngine:
             self.strategy(ctx)
         finally:
             processing_s = time.perf_counter() - t0
+            # Takes first (P1), then whatever creates the quote budget allows.
             self._flush_pending(processing_s)
+            self.pump_quotes()
+
+    def pump_quotes(self):
+        """Send queued quote creates. Also called on a timer by the session,
+        so a backlog drains as the budget refills even when no market moves."""
+        if self.blocked_reason() is not None:
+            return
+        self.om.pump()
 
     def _flush_pending(self, processing_s: float):
         """Schedule every order this dispatch placed to resolve after
@@ -1401,7 +1543,23 @@ class LiveEngine:
             self.n_scheduled -= 1
 
 
-def _slot(order: Order) -> tuple:
-    """One real resting order per (ticker, side, role): the edge quote and the
-    LIP quote on the same side are independent."""
-    return order.ticker, order.side, getattr(order, "role", "edge")
+class _Executor:
+    """The OrderManager's write interface, backed by a LiveEngine."""
+
+    def __init__(self, engine: "LiveEngine"):
+        self._e = engine
+
+    def next_order_id(self):
+        return self._e.next_order_id()
+
+    def create(self, q):
+        return self._e._om_create(q)
+
+    def amend(self, q, price, remaining):
+        return self._e._om_amend(q, price, remaining)
+
+    def cancel(self, q, reason):
+        self._e._om_cancel(q, reason)
+
+    def bucket_tokens(self):
+        return self._e._om_bucket_tokens()

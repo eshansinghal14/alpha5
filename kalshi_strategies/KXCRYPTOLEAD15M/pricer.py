@@ -78,15 +78,22 @@ class FairResult:
 class CoinRacePricer:
 
     def __init__(self, forecaster: CovarianceForecaster, config,
-                 base_rate: np.ndarray | None = None):
+                 base_rate: np.ndarray | None = None, basis_sd: np.ndarray | None = None):
         """`config`: the series' CryptoPricingParams section (mc_n, mc_seed,
-        t_nu, vol_mult, shrinkage_lambda, reaction_latency_s)."""
+        t_nu, vol_mult, shrinkage_lambda, reaction_latency_s). `basis_sd`:
+        per-coin sd (log units) of our final 15-min return vs the one Kalshi
+        settles on, added as independent noise to every draw; None = treat
+        our spot as exact."""
         self.forecaster = forecaster
         self.config = config
         # Common random numbers: pre-generate ONCE at construction and
         # reuse on every tick so theo doesn't jitter on sampling noise.
         rng = np.random.default_rng(self.config.mc_seed)
         self._Z = rng.standard_normal((self.config.mc_n, N_COINS))
+        # Own stream, so adding it leaves the diffusion draws unchanged.
+        self._B = (None if basis_sd is None else
+                   np.random.default_rng(self.config.mc_seed + 1).standard_normal((self.config.mc_n, N_COINS))
+                   * np.asarray(basis_sd, dtype=float))
         if self.config.t_nu is not None:
             # Unit-variance multivariate t: scale by sqrt(nu/chi2 * (nu-2)/nu)
             # so the t mixture changes the TAILS, not the variance. The old
@@ -202,14 +209,16 @@ class CoinRacePricer:
         V = R * np.outer(sd, sd)
 
         if te <= 0 or not np.any(sd > 0):
-            probs = self._argmax_probs(mu[None, :])
             E = None
+            probs = self._argmax_probs(mu[None, :] if self._B is None else mu + self._B)
         else:
             # Re-draw only when the covariance itself changes: forecaster
             # state (new 1s data) or horizon bucket (whole seconds of h).
             key = (getattr(self.forecaster, "version", None), round(h))
             E = self._draws(rate, R, key if key[0] is not None else None)
             Y = mu + math.sqrt(te) * E
+            if self._B is not None:
+                Y = Y + self._B
             probs = self._argmax_probs(Y)
 
         lam = self.config.shrinkage_lambda
@@ -218,7 +227,8 @@ class CoinRacePricer:
             probs = probs / probs.sum()
 
         if compute_delta and E is not None:
-            delta = self._bump_deltas(mu, math.sqrt(te) * E, sd, probs)
+            scaled = math.sqrt(te) * E if self._B is None else math.sqrt(te) * E + self._B
+            delta = self._bump_deltas(mu, scaled, sd, probs)
             lat = self.config.reaction_latency_s
             A = R * np.outer(np.sqrt(rate), np.sqrt(rate)) * lat
             theo_vol = np.sqrt(np.maximum(np.einsum("ij,jk,ik->i", delta, A, delta), 0.0))

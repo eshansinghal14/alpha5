@@ -83,8 +83,7 @@ def test_reference_price_and_scoring_mechanics():
 def test_expected_reward_this_snapshot():
     """reward_per_snapshot = $100 / 900 ~= 0.1111 for a 15-min event.
     Our share of 0.16 on yes side only (no side belongs to someone
-    else) yields 0.16 * 0.1111 = $0.0178 expected per snapshot --
-    assuming both sides qualify.
+    else) is 0.16 of a 2.0 total snapshot score: 0.08 * 0.1111 per snapshot.
     """
     params = LipParams(target_size=200.0, discount_factor=0.5,
                        period_reward_usd=100.0, snapshots_per_period=900)
@@ -98,7 +97,16 @@ def test_expected_reward_this_snapshot():
     assert s.qualifies
     assert math.isclose(s.reward_per_snapshot_usd, 100.0 / 900.0, abs_tol=1e-9)
     assert math.isclose(s.expected_reward_this_snapshot_usd,
-                        s.yes.our_share * s.reward_per_snapshot_usd, abs_tol=1e-9)
+                        s.yes.our_share / 2 * s.reward_per_snapshot_usd, abs_tol=1e-9)
+
+
+def test_owning_the_whole_book_earns_the_period_reward_once():
+    """Both sides entirely ours for every snapshot pays exactly period_reward."""
+    params = LipParams(target_size=100.0, discount_factor=0.5, period_reward_usd=90.0,
+                       snapshots_per_period=900)
+    yes = levels_from_ladder({0.40: 100.0}, [(0.40, 100.0)])
+    no = levels_from_ladder({0.55: 100.0}, [(0.55, 100.0)])
+    assert math.isclose(reward_rate(yes, no, params) * 900, 90.0)
 
 
 def test_marginal_reward_rate_adds_credit():
@@ -154,16 +162,31 @@ def test_reward_capped_per_account():
     assert math.isclose(reward_rate(yes, no, params), 9.0 / 900)
 
 
-def test_tracker_accrues_once_per_second_on_qualifying_book():
-    params = LipParams(target_size=100.0, discount_factor=0.5, period_reward_usd=9.0,
+def test_size_behind_a_level_that_already_meets_target_scores_nothing():
+    """We join at the back: behind a wall that alone reaches Target, our size
+    doesn't help reach it and earns nothing (BTC 2026-10-09, 3,981 at 0.12)."""
+    params = LipParams(target_size=1000.0, discount_factor=0.5, period_reward_usd=9.0,
                        snapshots_per_period=900)
-    ladder = types.SimpleNamespace(yes_bids={0.40: 200.0}, no_bids={0.55: 200.0})
+    no = levels_from_ladder({0.80: 2000.0}, [])
+    wall = levels_from_ladder({0.13: 3.0, 0.12: 4000.0}, [(0.12, 30.0)])
+    above = levels_from_ladder({0.13: 3.0, 0.12: 4000.0}, [(0.13, 30.0)])
+    assert reward_rate(wall, no, params) == 0.0
+    assert reward_rate(above, no, params) > 0.0
+
+
+def test_tracker_accrues_once_per_second_on_qualifying_book():
+    # Target above the others' 150 at 0.40, so our 50 (at the back) still helps reach it.
+    params = LipParams(target_size=250.0, discount_factor=0.5, period_reward_usd=9.0,
+                       snapshots_per_period=900)
+    ladder = types.SimpleNamespace(yes_bids={0.40: 200.0, 0.39: 100.0}, no_bids={0.55: 300.0})
     books = {"T": types.SimpleNamespace(ladder=ladder)}
     quotes = {("T", "yes"): [(0.40, 50.0)]}
     tr = LipTracker({"T": params})
     assert tr.due(0.0)
     tr.snapshot(0.0, books, quotes)
     assert not tr.due(0.5) and tr.due(1.0)
-    # Kalshi's ladder already includes our resting size: 50 of 200 = 0.25 yes share.
-    assert math.isclose(tr.accrued_usd["T"], 0.25 * 9.0 / 900)
+    # Kalshi's ladder already includes our 50 at 0.40. Ref price 0.40; scored
+    # size 200 at 0.40 plus 100 x 0.5 at 0.39 = 250, of which 50 is ours = 0.2
+    # of the yes side, 0.1 of the snapshot's 2.0 total.
+    assert math.isclose(tr.accrued_usd["T"], 0.1 * 9.0 / 900)
     assert tr.qualifying_fraction("T") == 1.0

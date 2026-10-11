@@ -83,6 +83,18 @@ def _info(event_ticker: str, markets: list[dict]) -> EventInfo:
                      markets=markets)
 
 
+def event_shard(event_ticker: str) -> int:
+    """Exchange shard (exchange_index) the event's markets trade on.
+    KXCRYPTOLEAD15M is on 2, KXINX/KXINXU on 0 (GET /events, 2026-10-10)."""
+    return int(kalshi_get(f"/trade-api/v2/events/{event_ticker}", auth=True)["event"]["exchange_index"])
+
+
+def series_shard(series: str) -> int | None:
+    """Shard of the series' next listed event, or None if nothing is listed."""
+    evs = upcoming_events(series)
+    return event_shard(evs[0].event_ticker) if evs else None
+
+
 def incentive_programs(tickers: set[str]) -> dict[str, dict]:
     """Active LIP programs keyed by market ticker, for `tickers` only."""
     out: dict[str, dict] = {}

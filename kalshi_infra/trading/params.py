@@ -17,15 +17,16 @@ class QuotingParams:
         "Cap on |yes - no| PER MARKET, on effective position (fills + in-flight + resting). "
         "Lowering it does not unwind, only caps growth.", min=0, step=1.0)
     constant_edge: float = param(
-        "Flat $ edge floor on every TAKE. The one term that still bites when the band is tight "
-        "and the touch is cheap.", min=0, max=0.5, step=0.005)
+        "Flat $ edge floor on every take AND every resting quote. The one term that still bites "
+        "when the band is tight and the touch is cheap.", min=0, max=0.5, step=0.005)
     edge_fraction: float = param(
         "Fraction of the distance from fair to the band edge (lo when buying, hi when selling) "
         "demanded as edge. 1.0 = only outside the band.", min=0, max=5, step=0.05)
     lean_multiplier: float = param(
         "Inventory lean as a multiple of that same band distance, scaled by "
-        "(effective position / max_position) ** lean_exponent. Only charged to the side that grows "
-        "the position.", min=0, max=5, step=0.1)
+        "(effective position / max_position) ** lean_exponent. Signed: added to the side that grows "
+        "the position, subtracted from the side that reduces it (that side's edge floors at 0, so it "
+        "never quotes through fair).", min=0, max=5, step=0.1)
     lean_dollars: float = param(
         "Flat $ lean at full inventory, same scaling but independent of band width -- the brake "
         "that still works when the model is confident.", min=0, max=0.5, step=0.005)
@@ -50,21 +51,40 @@ class QuotingParams:
     enable_quoting: bool = param("Rest quotes as well as taking. Off withdraws existing quotes on "
                                  "each market's next decision.")
     quoting_edge: float = param(
-        "Flat $ floor for a RESTING quote, in place of constant_edge (CI and lean are shared).",
+        "Extra $ edge for a RESTING quote, on top of constant_edge + band + lean (a quote pays the "
+        "maker fee instead of the taker fee).",
         min=0, max=0.5, step=0.005)
     max_improve_ticks: int = param(
-        "Max ticks a quote may sit inside the near touch. Caps edge handed over in a wide market "
-        "(KXINX 2026-08-17 uncapped: 6% of quotes overshot best_bid+1 tick, p90 by 24c).",
-        min=0, step=1)
-    requote_improve_ticks: float = param(
-        "Ticks of improvement needed before cancel/replacing a still-acceptable quote; replacing "
-        "forfeits queue priority.", min=0, step=1)
-    min_quote_life_s: float = param(
-        "A quote younger than this is only replaced if fair crosses it. Throttles order rate when "
-        "fair ticks often (SPX: 41/s -> 8/s at 2s). 0 disables.", min=0, max=30, step=0.5)
+        "Max ticks the best quote may sit inside the near touch (others' orders, ours excluded). "
+        "Caps edge handed over in a wide market (KXINX 2026-08-17 uncapped: 6% of quotes "
+        "overshot best_bid+1 tick, p90 by 24c).", min=0, step=1)
+    quote_levels_behind: int = param(
+        "Extra order_lots levels per side, one tick apart, behind the best quote. 0 = one level. "
+        "Every level counts toward max_position and the lean. Quotes left deeper than the ladder "
+        "(the touch moved up) are cancelled at the lowest priority.", min=0, max=20, step=1)
+    skip_quote_depth_ahead: float | None = param(
+        "Don't add a ladder level when more than this many contracts (others', ours excluded) "
+        "already rest at its price or better -- deep behind the touch it almost never fills, so it "
+        "only spends write budget, and the queue in front moving would add and drop it over and over. "
+        "A level already resting is never cancelled for going deep. null disables.",
+        min=0, step=10.0)
+    quote_ahead_grace_s: float = param(
+        "How long a resting quote may sit more than max_improve_ticks above others' best (e.g. "
+        "after the bid it improved on was pulled) before it's moved down to the ladder with one "
+        "amend, or cancelled if the ladder is full. Filters touch flickers: a bid pulled and "
+        "re-posted within this costs no write.", min=0, max=30, step=0.5)
+    quote_keep_inside: float = param(
+        "$ a RESTING quote may sit inside the edge before it's cancelled. 0 = cancel the moment the "
+        "edge moves through it. New levels are never placed inside the edge. Each 0.01 saves a "
+        "cancel + re-create when fair wobbles back.", min=0, max=0.1, step=0.005)
+    cancels_token: float = param(
+        "Write tokens quote creates and moves (10 each) must leave in the bucket, kept for cancels "
+        "(2 each). Everything above it is quoting's. Cancels and takes may always use the whole "
+        "bucket. 20 = 10 cancels; sparse cancels were mean 0.7/s, p99 8, max 14 live on 2026-10-11.",
+        min=0, step=2.0)
     requote_delay_s: float = param(
-        "After our quote on a (market, side) is hit, that side stays unquoted this long.",
-        min=0, max=120, step=0.5)
+        "After our quote on a (market, side) is hit, that side adds no new levels this long "
+        "(levels already up stay).", min=0, max=120, step=0.5)
 
 
 @section
@@ -90,8 +110,8 @@ class RiskParams:
 @section
 class RuntimeParams:
     quote_fill_poll_s: float = param(
-        "Fills-endpoint poll for resting quotes; must stay within the audit's one-interval "
-        "tolerance for resting size.", min=0.2, step=0.1)
+        "REST backstop poll of the fills endpoint. Quote fills arrive on Kalshi's fill websocket; "
+        "this only catches what a websocket gap dropped.", min=0.2, step=0.1)
     control_poll_s: float = param("config.json / trading_mode.json poll.", min=0.2, step=0.1)
 
 
@@ -99,18 +119,25 @@ class RuntimeParams:
 class LipSettings:
     """Program parameters (target, discount, reward, period) come from Kalshi's
     /incentive_programs per market; these only shape our own LIP quote."""
+    enable_lip_quoting: bool = param(
+        "Rest one LIP-farming quote per side, after the edge ladder in priority. Off cancels any "
+        "LIP quote. LIP accrual is measured either way.")
     lip_lots: float = param(
-        "Max contracts in the separate LIP-farming quote per side. 0 disables it. Fewer are rested "
-        "when fewer earn the same reward, and never more than max_position leaves room for (a LIP "
-        "quote can fill like any other).", min=0, step=1.0)
+        "Max |position| a LIP fill may take a side to: the LIP quote rests at most lip_lots minus "
+        "the position on that side (and minus resting edge size there). Fewer are rested when "
+        "fewer earn the same reward. 0 disables.", min=0, step=1.0)
     prop_max_lip: float = param(
         "Rest the LIP quote at the DEEPEST level outside the edge that still earns at least this "
         "fraction of the best LIP/s available outside the edge. 1 = the best level; lower = deeper "
         "and safer for less reward.", min=0, max=1, step=0.05)
     lip_min_depth_ahead: float = param(
-        "Min contracts resting ahead of the LIP quote (better prices plus same-price queue). A "
-        "level with less is never used, and a resting LIP quote that drops below it is cancelled "
-        "first, ahead of every other order.", min=0, step=10.0)
+        "Min contracts resting AHEAD of the LIP quote -- every order at a better price plus the "
+        "queue ahead at its own price, ours included (they count toward the reference price too). "
+        "A level with less is never used; a resting LIP quote whose queue ahead (Kalshi's own "
+        "queue position, polled) drops below it is cancelled at once.", min=0, step=10.0)
+    lip_hold_s: float = param(
+        "A resting LIP quote is moved to a new price or size at most this often (one amend). "
+        "Safety cancels (depth ahead, edge, stale, LIP off) are never held.", min=0, max=60, step=0.5)
 
 
 SHARED_SECTIONS = ("quoting", "close", "risk", "runtime", "lip")
@@ -121,3 +148,4 @@ def check_strategy_config(cfg) -> None:
     missing = [s for s in SHARED_SECTIONS if not hasattr(cfg, s)]
     if missing:
         raise TypeError(f"{type(cfg).__name__} is missing shared config sections: {missing}")
+

@@ -32,7 +32,7 @@ from kalshi_infra.kalshi import markets as km
 from kalshi_infra.kalshi.orders import KalshiOrderClient
 from kalshi_infra.kalshi.ws_feed import LiveKalshiFeed
 from kalshi_infra.runtime import persist
-from kalshi_infra.runtime.control import TradingModeWatcher
+from kalshi_infra.runtime.control import StopWatcher, TradingModeWatcher, request_stop_all
 from kalshi_infra.runtime.series import Series
 from kalshi_infra.runtime.writer import DecisionLog, SnapshotWriter
 from kalshi_infra.trading import lip as lipmod
@@ -43,6 +43,8 @@ from kalshi_infra.trading.quoter import Quoter
 
 
 FLUSH_INTERVAL_S = 1.0      # rows shipped to the writer process; serialising happens there
+LIP_QUEUE_POLL_S = 1.0     # LIP queue-position check; read bucket, 200/s on Basic
+PUMP_INTERVAL_S = 0.05      # quote-create queue drain; one create's budget refills in 0.25s at 40/s
 AUDIT_INTERVAL_S = 5.0
 REPRICE_IDLE_S = 1.0        # reprice even without new inputs, so time decay and withhold states advance
 CLOSE_GRACE_S = 1.0
@@ -68,6 +70,10 @@ def _decision_key(row: dict) -> tuple:
     return tuple(row.get(k) for k in _DECISION_FIELDS)
 
 
+class StopAll(Exception):
+    """The run is over: the loss limit tripped here or another series' did."""
+
+
 async def session_loop(series: Series, *, live_trading: bool, carry_arm: bool,
                        event_ticker: str | None = None):
     """`event_ticker` names a one-off event (no rollover)."""
@@ -86,11 +92,22 @@ async def _session_loop(series: Series, writer: SnapshotWriter, *, live_trading:
     _log(series.ticker, f"config loaded from {series.config_path}"
          + (f" [{series.config_key}]" if series.config_key else ""))
     trading = TradingModeWatcher(series.ticker)
+    stopper = StopWatcher()
+    # Real PnL of finished events, carried so max_loss_usd bounds the run.
+    run_state = {"real_pnl": 0.0}
     armed = live_trading
     done: set[str] = set()
     rolled = False
     nxt: dict = {}     # filled by run_event's prefetch with the next event's lookups
     while True:
+        if (reason := stopper.poll()) is not None:
+            _log(series.ticker, f"STOPPING: {reason}")
+            return
+        lim = store.config.risk.max_loss_usd
+        if run_state["real_pnl"] <= -lim:
+            request_stop_all(f"{series.ticker} real PnL this run {run_state['real_pnl']:+.2f} <= -{lim:g}")
+            _log(series.ticker, f"STOPPING: real PnL this run {run_state['real_pnl']:+.2f} <= -{lim:g}")
+            return
         for c in store.poll():
             _log(series.ticker, f"config: {c}")
         for c in store.apply_pending():
@@ -133,9 +150,14 @@ async def _session_loop(series: Series, writer: SnapshotWriter, *, live_trading:
         try:
             armed = await run_event(series, ev, store, trading, writer, live_trading=armed,
                                     prep=prep.get("prep"),
-                                    next_slot=None if event_ticker else nxt, done=done)
+                                    next_slot=None if event_ticker else nxt, done=done,
+                                    stopper=stopper, run_state=run_state)
         except asyncio.CancelledError:
             raise
+        except StopAll as e:
+            _log(series.ticker, f"STOPPED: {e}. Real PnL this run {run_state['real_pnl']:+.2f}. "
+                                f"Restart the process to trade again.")
+            return
         except Exception:
             _log(series.ticker, f"{ev.event_ticker} failed; retrying after {RETRY_S:.0f}s:")
             traceback.print_exc()
@@ -157,8 +179,14 @@ async def _prepare(S: str, ev: km.EventInfo) -> dict:
     fees, progs, client = await asyncio.gather(
         loop.run_in_executor(None, _guarded, kfees.for_event, S, ev.event_ticker),
         loop.run_in_executor(None, _guarded, km.incentive_programs, tickers),
-        loop.run_in_executor(None, _guarded, KalshiOrderClient.from_account))
+        loop.run_in_executor(None, _guarded, _client_for, ev.event_ticker))
     return {"event_ticker": ev.event_ticker, "fees": fees, "lip": progs, "order_client": client}
+
+
+def _client_for(event_ticker: str) -> KalshiOrderClient:
+    """An order client pinned to the event's exchange shard, so every write is
+    billed to that shard's own write bucket (see KalshiOrderClient.shard)."""
+    return KalshiOrderClient.from_account(shard=km.event_shard(event_ticker))
 
 
 def _guarded(fn, *a):
@@ -171,9 +199,11 @@ def _guarded(fn, *a):
 async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
                     trading: TradingModeWatcher, writer: SnapshotWriter, *, live_trading: bool,
                     prep: dict | None = None, next_slot: dict | None = None,
-                    done: set | None = None) -> bool:
-    """Trade one event until it closes. Returns whether real trading was
-    armed at the end (carried into the next event). `prep` is this event's
+                    done: set | None = None, stopper: StopWatcher | None = None,
+                    run_state: dict | None = None) -> bool:
+    """Trade one event until it closes. Returns whether real trading is
+    requested (carried into the next event), even if the close cutoff
+    disarmed the engine. `prep` is this event's
     _prepare() result if it was fetched ahead of time; `next_slot` receives
     the next event and its _prepare() shortly before this one closes."""
     S = series.ticker
@@ -185,7 +215,7 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
     else:
         model = await series.build_model(ev, cfg)
     tickers = list(model.tickers)
-    writer.start_event(pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d"))
+    writer.start_event(pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d"), tickers)
     lip_pending = "lip" not in prep
 
     fee_sched, err = prep["fees"]
@@ -207,7 +237,7 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
     quoter = Quoter(cfg, model, fee_sched, close_time=ev.close_time, lip=lip, record_debug=True)
     order_client, err = prep["order_client"]
     if err is None:
-        _log(S, f"write budget {order_client.tokens_per_s:g} tokens/s "
+        _log(S, f"write budget {order_client.tokens_per_s:g} tokens/s on shard {order_client.shard} "
                 f"(~{order_client.max_orders_per_s:g} orders/s) from Kalshi account limits")
     else:
         _log(S, f"WARN: no order client ({err!r}); real trading cannot be armed")
@@ -215,6 +245,18 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
                         order_client=order_client, event_ticker=ev.event_ticker, close_time=ev.close_time)
     engine.set_clocks(signal_age_fn=model.signal_age_s, feed_age_fn=model.feed_age_s,
                       applied_age_fn=model.applied_age_s)
+    run_state = {"real_pnl": 0.0} if run_state is None else run_state
+    engine.loss_offset = run_state["real_pnl"]
+    # This event's real PnL, worse of touch/fair, as of the last moment it
+    # was armed -- after a cutoff disarm the ledger keeps taking paper fills.
+    event_real = {"pnl": None}
+    stop = {"reason": None}
+    stop_evt = asyncio.Event()
+
+    def _stop(reason: str):
+        if stop["reason"] is None:
+            stop["reason"] = reason
+            stop_evt.set()
 
     quoter.debug_log = DecisionLog(writer, _decision_key)
     engine.add_session_reset_hook(writer.reset_session)
@@ -226,8 +268,24 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
         cut, rem = cfg.close.real_trading_cutoff_s, remaining_s()
         return cut > 0 and rem is not None and rem <= cut
 
-    if live_trading and not inside_real_cutoff():
-        engine.set_live_trading(True)
+    # What the dashboard asked for, kept apart from what the engine is doing:
+    # the cutoff disarm is temporary, and returning the engine's state made
+    # the next event start in shadow until the switch was toggled off and on.
+    arm = {"want": live_trading, "retry_at": 0.0}
+
+    def reconcile_arm():
+        if engine.live_trading and (not arm["want"] or inside_real_cutoff()):
+            if arm["want"]:
+                _log(S, f"real trading OFF: within {cfg.close.real_trading_cutoff_s:g}s of close; "
+                        f"paper continues, re-arms next event")
+            engine.set_live_trading(False)
+        elif (arm["want"] and not engine.live_trading and not inside_real_cutoff()
+              and not engine.halted and time.monotonic() >= arm["retry_at"]):
+            if not engine.set_live_trading(True):
+                arm["retry_at"] = time.monotonic() + RETRY_S
+                _log(S, f"arm failed; retrying in {RETRY_S:.0f}s (disarm from the dashboard to stop)")
+
+    reconcile_arm()
 
     timings = {k: collections.deque(maxlen=400) for k in ("reprice", "dispatch", "loop_lag")}
 
@@ -249,7 +307,13 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
         engine.on_trade(ticker, trade, now)
         engine.dispatch(trade, now)
 
-    kalshi = LiveKalshiFeed(tickers, on_quote, on_trade, label=S)
+    def on_fill(f):
+        # Our own fills off the websocket: books resting-quote fills within
+        # one message of Kalshi matching them (the REST poll was up to 1s).
+        if engine.live_trading:
+            engine.on_real_fill(f)
+
+    kalshi = LiveKalshiFeed(tickers, on_quote, on_trade, label=S, on_fill=on_fill)
 
     # --- loops ---
     wake = asyncio.Event()
@@ -272,8 +336,9 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
                     continue
                 now = pd.Timestamp.now(tz="UTC")
                 for t, f in fairs.items():
-                    if f is not None:
-                        writer.fair({"time": now, "ticker": t, "prob": f.prob, "prob_lo": f.lo, "prob_hi": f.hi})
+                    # A withheld fair is recorded as NaN so the chart shows a gap.
+                    writer.fair({"time": now, "ticker": t, "prob": f.prob if f else float("nan"),
+                                 "prob_lo": f.lo if f else float("nan"), "prob_hi": f.hi if f else float("nan")})
                 t1 = time.perf_counter()
                 engine.dispatch(FairUpdate(fairs), now)
                 timings["dispatch"].append(time.perf_counter() - t1)
@@ -290,16 +355,13 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
                 for c in store.poll():
                     _log(S, f"config: {c}")
                 want = trading.poll()
-                if want is not None and want and inside_real_cutoff():
-                    _log(S, "arm request ignored: inside real_trading_cutoff_s")
-                    want = None
-                if want is not None and want != engine.live_trading:
-                    got = engine.set_live_trading(want)
-                    _log(S, f"trading mode requested live={want}, in effect live={got}")
-                if engine.live_trading and inside_real_cutoff():
-                    _log(S, f"real trading OFF: within {cfg.close.real_trading_cutoff_s:g}s of close; "
-                            f"paper continues")
-                    engine.set_live_trading(False)
+                if want is not None:
+                    arm["want"], arm["retry_at"] = want, 0.0
+                    if want and inside_real_cutoff():
+                        _log(S, "arm request held: inside real_trading_cutoff_s, arms next event")
+                reconcile_arm()
+                if want is not None:
+                    _log(S, f"trading mode requested live={want}, in effect live={engine.live_trading}")
             except Exception:
                 _log(S, "WARN: control poll failed:")
                 traceback.print_exc()
@@ -319,11 +381,12 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
                 traceback.print_exc()
 
     async def quote_fill_loop():
-        """Resting-quote fills have no response to piggyback on; this poll is
-        their only path into the ledger."""
+        """REST backstop for resting-quote fills. The fill websocket is the
+        primary path; this catches anything a reconnect dropped. Deduped on
+        (order_id, trade_id), so overlap is harmless."""
         while True:
             await asyncio.sleep(cfg.runtime.quote_fill_poll_s)
-            if not engine.live_trading or not engine.exchange_to_order:
+            if not engine.live_trading or not engine.has_quote_history():
                 continue
             try:
                 fills = await asyncio.get_running_loop().run_in_executor(
@@ -332,6 +395,35 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
                 engine.apply_real_fills(fills)
             except Exception:
                 _log(S, "WARN: quote fill poll failed:")
+                traceback.print_exc()
+
+    async def lip_queue_loop():
+        """Kalshi's own queue position for our LIP quotes (read bucket, no
+        write tokens). The book can't tell us what's really ahead -- displayed
+        size includes orders that joined behind us -- so a LIP quote whose
+        true queue ahead plus everything at better prices falls under
+        lip_min_depth_ahead is cancelled here."""
+        while True:
+            await asyncio.sleep(LIP_QUEUE_POLL_S)
+            if not engine.live_trading or not cfg.lip.enable_lip_quoting or not engine.om.live(role="lip"):
+                continue
+            try:
+                pos = await asyncio.get_running_loop().run_in_executor(
+                    None, engine.order_client.queue_positions, ev.event_ticker)
+                engine.check_lip_queue(pos, cfg.lip.lip_min_depth_ahead)
+            except Exception:
+                _log(S, "WARN: LIP queue-position poll failed:")
+                traceback.print_exc()
+
+    async def pump_loop():
+        """Drain queued quote creates as the quote budget refills, even when
+        no market event is waking the strategy."""
+        while True:
+            await asyncio.sleep(PUMP_INTERVAL_S)
+            try:
+                engine.pump_quotes()
+            except Exception:
+                _log(S, "WARN: quote pump failed:")
                 traceback.print_exc()
 
     async def lag_probe():
@@ -343,13 +435,12 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
 
     def _flush(now):
         writer.pnl(now, engine.current_pnl(mark="prob") + (lip.total_usd() if lip is not None else 0.0))
-        for t, pos in engine.portfolio.positions.items():
-            f = quoter.fairs.get(t)
-            if f is not None:
-                writer.pnl_ticker(t, now, pos.unrealized_pnl(f.prob, f.prob))
+        for t, v in engine.pnl_by_ticker(mark="prob").items():
+            writer.pnl_ticker(t, now, v)
         summary = persist.build_summary(series=S, event_ticker=ev.event_ticker, engine=engine,
                                         quoter=quoter, store=store, model=model, now=now,
-                                        timings={k: _stat(v) for k, v in timings.items()})
+                                        timings={k: _stat(v) for k, v in timings.items()},
+                                        arm_requested=arm["want"])
         writer.flush(summary, engine.portfolio.fills, engine.live_trading)
 
     async def flush_loop():
@@ -357,9 +448,16 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
             await asyncio.sleep(FLUSH_INTERVAL_S)
             try:
                 engine.check_failsafe()
+                if engine.live_trading:
+                    event_real["pnl"] = min(engine.current_pnl(mark="touch"), engine.current_pnl(mark="prob"))
+                if engine.halt_kind == "loss":
+                    request_stop_all(f"{S} loss limit: {engine.halt_reason}")
+                    _stop(f"loss limit -- {engine.halt_reason}")
+                elif stopper is not None and (reason := stopper.poll()) is not None:
+                    _stop(reason)
                 blocked = engine.blocked_reason()
                 # Resting quotes keep taking risk through a halt until withdrawn.
-                if blocked is not None and engine.has_quotes():
+                if blocked is not None and engine.has_uncancelled_quotes():
                     _log(S, f"pulling quotes -- {blocked}")
                     engine.pull_quotes()
                 _flush(pd.Timestamp.now(tz="UTC"))
@@ -411,11 +509,16 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
     _log(S, f"starting feeds for {ev.event_ticker} ({len(tickers)} markets, "
             f"{'REAL ORDERS' if engine.live_trading else 'shadow'})")
     coros = [kalshi.run(), *model.feed_tasks(), reprice_loop(), control_loop(), audit_loop(),
-             quote_fill_loop(), lag_probe(), flush_loop(), prefetch_next(), lip_lookup()]
+             quote_fill_loop(), pump_loop(), lip_queue_loop(), lag_probe(), flush_loop(), prefetch_next(), lip_lookup()]
     tasks = [asyncio.create_task(c) for c in coros]
     try:
-        await until_close()
-        _log(S, f"{ev.event_ticker} closed")
+        closer, stopped = asyncio.create_task(until_close()), asyncio.create_task(stop_evt.wait())
+        await asyncio.wait({closer, stopped}, return_when=asyncio.FIRST_COMPLETED)
+        closer.cancel(); stopped.cancel()
+        if stop["reason"] is None:
+            _log(S, f"{ev.event_ticker} closed")
+        else:
+            _log(S, f"STOP: {stop['reason']} -- disarming, pulling every quote, exiting")
     finally:
         for t in tasks:
             t.cancel()
@@ -425,9 +528,11 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
             try:
                 engine.pull_quotes()
                 engine.cancel_resting()
-                if engine.exchange_to_order:
+                if engine.has_quote_history():
                     engine.apply_real_fills(engine.order_client.fills(
                         ev.event_ticker, min_ts=engine.fill_poll_min_ts()))
+                event_real["pnl"] = min(engine.current_pnl(mark="touch"), engine.current_pnl(mark="prob"))
+                engine.live_trading = False
             except Exception:
                 _log(S, f"WARN: shutdown cleanup failed -- CHECK KALSHI BY HAND for resting "
                         f"orders on {ev.event_ticker}:")
@@ -443,4 +548,12 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
         except Exception:
             _log(S, "WARN: final snapshot failed:")
             traceback.print_exc()
-    return engine.live_trading
+        # Marked at the last armed moment (worse of touch/fair), not at
+        # settlement, so it can differ from the account by the move after.
+        if event_real["pnl"] is not None:
+            run_state["real_pnl"] += event_real["pnl"]
+            _log(S, f"{ev.event_ticker} real PnL {event_real['pnl']:+.2f}; "
+                    f"this run {run_state['real_pnl']:+.2f} (halt at -{cfg.risk.max_loss_usd:g})")
+    if stop["reason"] is not None:
+        raise StopAll(stop["reason"])
+    return arm["want"]

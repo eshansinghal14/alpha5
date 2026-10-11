@@ -19,14 +19,16 @@ Mechanics:
   4. Score of a qualifying order = `size * DF^N`, where N = ticks below
      the Reference Price (0 if at or above it).
   5. Normalize across all users on that side.
-  6. User's snapshot score = normalized YES share + normalized NO share
-     (max 2.0 across all users on that market).
-  7. SNAPSHOT EXCLUSION: if EITHER side fails to reach Target, the
-     snapshot is excluded. Payout for the period scales by
-     (non_excluded / total).
-  8. Payout = (user_total_score / all_users_total_score) *
-             period_reward * (non_excluded / total), rounded down to the
-             cent, min $1.00.
+    6. User's snapshot score = normalized YES share + normalized NO share
+       (max 2.0 across all users on that market).
+    7. SNAPSHOT EXCLUSION: if EITHER side fails to reach Target, the
+       snapshot is excluded. Payout for the period scales by
+       (non_excluded / total).
+    8. Payout = (user_total_score / all_users_total_score) *
+               period_reward * (non_excluded / total), rounded down to the
+               cent, min $1.00. all_users_total_score is 2.0 per qualifying
+               snapshot, so one snapshot is worth
+               (yes_share + no_share) / 2 * period_reward / total.
 
 Scoring functions are pure: the caller provides the book (qualifying
 levels per side) and its own resting size. Hand-example from the Kalshi
@@ -118,15 +120,29 @@ def _score_side(levels: list[LipLevel], params: LipParams) -> LipSideScore:
 
     # Score each level within [best .. stop_idx] inclusive. N = ticks
     # below the Reference Price (0 if at or ABOVE it).
+    #
+    # Only size that "helps reach the Target Size" scores, in price-time
+    # priority. Within a level our size is assumed to be at the BACK (we
+    # always join there), so ours counts only if the size ahead of it is
+    # still short of Target. Counting a whole level made the chooser park
+    # LIP size behind a 3,981-lot wall that met a 1,000 target on its own,
+    # earning nothing (BTC 2026-10-09). Others at a level are counted in
+    # full (their orders are ahead of ours and do help reach Target), which
+    # keeps our share a lower bound.
     DF = params.discount_factor
+    T = params.target_size
     scored: list[LipLevel] = []
     our_score = 0.0
     all_score = 0.0
+    before = 0.0
     for lv in levels[:stop_idx + 1]:
         ticks_below = max(0, int(round((reference_price - lv.price) / TICK)))
         weight = DF ** ticks_below
-        all_score += lv.size * weight
-        our_score += lv.mine * weight
+        others = max(lv.size - lv.mine, 0.0)
+        ours_q = lv.mine if before + others < T - 1e-9 else 0.0
+        all_score += (others + ours_q) * weight
+        our_score += ours_q * weight
+        before += lv.size
         scored.append(lv)
     share = (our_score / all_score) if all_score > 0 else 0.0
     return LipSideScore(
@@ -159,11 +175,10 @@ def score_book(
     no = _score_side(no_levels, params)
     qualifies = yes.qualifies and no.qualifies
     reward_per_snapshot = params.period_reward_usd / max(params.snapshots_per_period, 1)
-    # Expected reward THIS snapshot (dollars) given both sides qualify:
-    #   (yes_share + no_share) * reward_per_snapshot.
-    # Spec: max contribution across all users is 2.0, so a single user's
-    # expected value is bounded by 2 * reward_per_snapshot.
-    expected = (yes.our_share + no.our_share) * reward_per_snapshot if qualifies else 0.0
+    # Halved: all users' scores sum to 2.0 per qualifying snapshot, and the
+    # payout is our share of that sum. Without it, owning both sides
+    # outright would earn twice the period reward.
+    expected = (yes.our_share + no.our_share) / 2.0 * reward_per_snapshot if qualifies else 0.0
     return LipBookScore(
         yes=yes, no=no, qualifies=qualifies,
         reward_per_snapshot_usd=reward_per_snapshot,
@@ -350,7 +365,7 @@ def choose_lip_level(*, side: str, others_yes: dict, others_no: dict,
             lv = merged.setdefault(p, [0.0, 0.0])
             lv[1] += s
             lv[0] = max(lv[0], lv[1])
-    rps = params.period_reward_usd / max(params.snapshots_per_period, 1)
+    rps = params.period_reward_usd / max(params.snapshots_per_period, 1) / 2.0   # see score_book
     cap = None if params.max_reward_usd is None else params.max_reward_usd / params.snapshots_per_period
 
     def _rate_with(price, size):
@@ -405,6 +420,9 @@ def choose_lip_level(*, side: str, others_yes: dict, others_no: dict,
     return LipChoice(None, 0.0, 0.0, best, 0.0)
 
 
+MAX_CATCHUP_S = 5   # past this a gap is a stall (dead feed), not a quiet book
+
+
 class LipTracker:
     """Per-market expected LIP accrual for one event. Markets with no active
     program accrue nothing. Measurement only -- nothing here feeds pricing."""
@@ -414,16 +432,20 @@ class LipTracker:
         self.accrued_usd: dict[str, float] = {t: 0.0 for t in params}
         self.snapshots_qualified: dict[str, int] = {t: 0 for t in params}
         self.snapshots_total: dict[str, int] = {t: 0 for t in params}
-        self._last_snapshot_s: float | None = None
+        self._last_sec: int | None = None
 
     def due(self, now_s: float) -> bool:
-        """Kalshi snapshots once per second."""
-        return self._last_snapshot_s is None or now_s - self._last_snapshot_s >= 1.0
+        """Kalshi snapshots once per wall-clock second."""
+        return self._last_sec is None or math.floor(now_s) > self._last_sec
 
     def snapshot(self, now_s: float, books: dict, ours: dict[tuple[str, str], list]):
         """`books`: ticker -> BookView (with .ladder). `ours`: (ticker, side)
         -> [(price, size)] of our resting orders, own-side terms."""
-        self._last_snapshot_s = now_s
+        sec = math.floor(now_s)
+        # Called on dispatch, which can be >1s apart; the book is unchanged
+        # between dispatches, so each skipped second scores the same.
+        n = 1 if self._last_sec is None else max(1, min(sec - self._last_sec, MAX_CATCHUP_S))
+        self._last_sec = sec
         for ticker, params in self.params.items():
             if params.period_reward_usd <= 0:
                 continue
@@ -434,10 +456,14 @@ class LipTracker:
             yes = levels_from_ladder(ladder.yes_bids, ours.get((ticker, "yes"), []))
             no = levels_from_ladder(ladder.no_bids, ours.get((ticker, "no"), []))
             score = score_book(yes, no, params)
-            self.snapshots_total[ticker] += 1
+            self.snapshots_total[ticker] += n
             if score.qualifies:
-                self.snapshots_qualified[ticker] += 1
-                self.accrued_usd[ticker] += reward_rate(yes, no, params)
+                self.snapshots_qualified[ticker] += n
+                got = self.accrued_usd[ticker] + n * score.expected_reward_this_snapshot_usd
+                # The account cap is on the period total, not per snapshot.
+                if params.max_reward_usd is not None:
+                    got = min(got, params.max_reward_usd)
+                self.accrued_usd[ticker] = got
 
     def total_usd(self) -> float:
         return float(sum(self.accrued_usd.values()))

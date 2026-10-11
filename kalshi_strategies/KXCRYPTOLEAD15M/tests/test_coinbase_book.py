@@ -121,6 +121,43 @@ def test_any_message_freshens_every_synced_book():
     assert ad._books["BTC"].last_receive_ts == 1.0   # resyncing: not vouched for
 
 
+def test_print_through_the_touch_moves_mid_but_not_book_mid():
+    """The held print is a pricing signal only: bars (and so the settlement
+    averages) are built from book_mid."""
+    pb = _ProductBook()
+    pb.apply_snapshot(bids=[(100.0, 5)], asks=[(100.1, 4)])
+    pb.last_receive_ts = 1.0
+    pb.apply_trade(100.5, now=1.0)
+    vb = _emit(pb)
+    assert vb.mid() == 100.5
+    assert abs(vb.book_mid() - 100.05) < 1e-12
+
+
+def test_held_print_clears_when_book_catches_up():
+    pb = _ProductBook()
+    pb.apply_snapshot(bids=[(100.0, 5)], asks=[(100.1, 4)])
+    pb.apply_trade(100.5, now=1.0)
+    pb.apply_change("ask", 100.1, 0.0)
+    pb.apply_change("ask", 100.6, 4.0)
+    pb.settle_trade(now=1.1)
+    assert pb.trade_px is None
+
+
+def test_every_live_print_reaches_on_print():
+    import asyncio
+    ad = CoinbaseAdapter(coins=["BTC"])
+    ad._books["BTC"].apply_snapshot(bids=[(100.0, 1)], asks=[(100.1, 1)])
+    ad._books["BTC"].last_receive_ts = 1.0
+    seen = []
+    ad.on_print = lambda coin, t, as_of, ts: seen.append((coin, t["trade_id"]))
+    ev = {"type": "update", "trades": [{"product_id": "BTC-USD", "trade_id": i, "price": "100.05",
+                                        "size": "1", "time": f"2026-10-10T00:00:0{i}Z"} for i in range(3)]}
+    asyncio.run(ad._handle_trades(ev, 2.0, lambda vb: None))
+    assert seen == [("BTC", 0), ("BTC", 1), ("BTC", 2)]
+    asyncio.run(ad._handle_trades({**ev, "type": "snapshot"}, 2.0, lambda vb: None))
+    assert len(seen) == 3
+
+
 def test_custom_max_levels_param():
     pb = _ProductBook()
     pb.apply_snapshot(bids=[(100.0 - 0.01 * i, 1.0) for i in range(20)],

@@ -15,8 +15,11 @@
       "enable_quoting": true,
       "quoting_edge": 0.005,
       "max_improve_ticks": 1,
-      "requote_improve_ticks": 2.0,
-      "min_quote_life_s": 2.0,
+      "quote_levels_behind": 2,
+      "skip_quote_depth_ahead": null,
+      "quote_keep_inside": 0.0,
+      "quote_ahead_grace_s": 1.0,
+      "cancels_token": 20.0,
       "requote_delay_s": 1.0,
       "order_lots": 1.0
     },
@@ -33,9 +36,11 @@
       "control_poll_s": 1.0
     },
     "lip": {
+      "enable_lip_quoting": false,
       "lip_lots": 0.0,
       "prop_max_lip": 0.8,
-      "lip_min_depth_ahead": 50.0
+      "lip_min_depth_ahead": 50.0,
+      "lip_hold_s": 1.0
     },
     "pricing": {
       "event_suffix": "H1600",
@@ -74,8 +79,11 @@
       "enable_quoting": true,
       "quoting_edge": 0.005,
       "max_improve_ticks": 1,
-      "requote_improve_ticks": 2.0,
-      "min_quote_life_s": 2.0,
+      "quote_levels_behind": 2,
+      "skip_quote_depth_ahead": null,
+      "quote_keep_inside": 0.0,
+      "quote_ahead_grace_s": 1.0,
+      "cancels_token": 20.0,
       "requote_delay_s": 1.0,
       "order_lots": 1.0
     },
@@ -92,9 +100,11 @@
       "control_poll_s": 1.0
     },
     "lip": {
+      "enable_lip_quoting": false,
       "lip_lots": 0.0,
       "prop_max_lip": 0.8,
-      "lip_min_depth_ahead": 50.0
+      "lip_min_depth_ahead": 50.0,
+      "lip_hold_s": 1.0
     },
     "pricing": {
       "event_suffix": "H1600",

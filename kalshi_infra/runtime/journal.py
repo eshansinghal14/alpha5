@@ -62,6 +62,9 @@ class DayJournal:
         self._buf: dict[str, list] = {s: [] for s in STREAMS}
         self._last_bbo: dict[str, tuple] = {}
         self._seen_fills: set = set()
+        self._seen_orders: set = set()
+        self._seen_trades: set = set()
+        self._load_seen_exchange_ids()
         self._seq = self._next_seq()
         self.n_written: dict[str, int] = {s: 0 for s in STREAMS}
 
@@ -98,23 +101,52 @@ class DayJournal:
     def record_decision(self, row: dict) -> None:
         self._buf["decisions"].append(row)
 
+    def _load_seen_exchange_ids(self) -> None:
+        """Ids already journaled today, so a restarted process's replayed
+        fills are recognised: every trade id, plus the order ids of fills
+        that had no trade id. Parts written before these columns existed
+        contribute nothing."""
+        for path in glob.glob(os.path.join(self.dir, "fills", "part-*.parquet")):
+            try:
+                df = pd.read_parquet(path)
+            except Exception:
+                continue
+            if "trade_id" in df.columns:
+                self._seen_trades.update(df["trade_id"].dropna())
+                if "exchange_order_id" in df.columns:
+                    self._seen_orders.update(df.loc[df["trade_id"].isna(), "exchange_order_id"].dropna())
+
     def record_fills(self, fills, live_trading: bool) -> None:
         """Journal any fill not already journaled.
 
-        Keyed rather than indexed because the fill list is not append-only
-        from this module's point of view: reset_session swaps in a fresh
-        Portfolio, and seed_fills_from_kalshi then replays the event's
-        earlier real fills into it. Both would re-present fills already
-        recorded, and an index would also silently skip the new ones."""
+        Real fills are keyed on Kalshi's ids. Our own order_id is not usable:
+        seed_fills_from_kalshi replays an event's fills on every arm under
+        fresh local ids and Kalshi's timestamps, so a local key journaled
+        each replay as a new fill (2026-10-09/10: 577 journal rows vs 495
+        real fills, $103 vs $32 PnL)."""
         for f in fills:
-            key = (f.order_id, str(f.time), f.ticker, f.side, f.price, f.size)
-            if key in self._seen_fills:
+            xo, tid = getattr(f, "exchange_order_id", None), getattr(f, "trade_id", None)
+            if tid is not None and tid in self._seen_trades:
                 continue
-            self._seen_fills.add(key)
+            if xo is not None and xo in self._seen_orders and (tid is None or getattr(f, "seeded", False)):
+                # An order booked off its create response carries no trade id,
+                # and a sweep comes back as one summed fill but replays as one
+                # row per level -- so its replay can only match on the order.
+                continue
+            if xo is None and tid is None:
+                key = (f.order_id, str(f.time), f.ticker, f.side, f.price, f.size)
+                if key in self._seen_fills:
+                    continue
+                self._seen_fills.add(key)
+            if tid is not None:
+                self._seen_trades.add(tid)
+            elif xo is not None:
+                self._seen_orders.add(xo)
             self._buf["fills"].append({
                 "time": f.time, "ticker": f.ticker, "side": f.side, "price": f.price,
                 "size": f.size, "fee": f.fee, "liquidity": f.liquidity,
-                "order_id": f.order_id,
+                "order_id": f.order_id, "exchange_order_id": xo, "trade_id": tid,
+                "seeded": bool(getattr(f, "seeded", False)),
                 # Which ledger this fill belongs to. A day can contain both,
                 # and averaging shadow fills into a real session's PnL is
                 # exactly the splice reset_session exists to prevent.

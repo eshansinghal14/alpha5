@@ -1,4 +1,4 @@
-"""CoinRaceModel gates and Fair shape, offline (no network)."""
+﻿"""CoinRaceModel gates and Fair shape, offline (no network)."""
 import time
 
 import pandas as pd
@@ -116,7 +116,7 @@ def test_spot_feed_carries_state_across_events():
     from kalshi_strategies.KXCRYPTOLEAD15M.live_feed import SpotFeed
     now = time.time()
     cfg = config(recovery_s=0.0)
-    spot = SpotFeed(cfg, persist=False)
+    spot = SpotFeed(cfg, persist=False, venues=False)
     spot.forecaster = ConstantCovForecaster()
     spot.forecaster_warmed = True
     a = CoinRaceModel(_event(now - 300, now + 600), cfg, spot=spot)
@@ -137,6 +137,79 @@ def test_spot_feed_carries_state_across_events():
     assert any(bar.ts_s == int(now - 30) for bar in b.tracker._bars["BTC"])
 
 
+def _last_minute_model(now, mid_ret, cf_ret, **pricing):
+    """Model 30s from close whose end-average bars give each coin `mid_ret`
+    on the mid and `cf_ret` on the CF replica."""
+    cfg = config(recovery_s=0.0, **pricing)
+    m = CoinRaceModel(_event(now - 870, now + 30), cfg, bus=CompositeBus(coins=COINS, persist=False),
+                      coinbase=None, forecaster=ConstantCovForecaster())
+    S, T = m.window.S, m.window.T
+    bars = {}
+    for c in COINS:
+        p = PX[c]
+        start = [CompositeBar(c, S - 60 + i, p, 1.0, 1, 0, False, p, 1) for i in range(60)]
+        end = [CompositeBar(c, T - 60 + i, p * (1 + cf_ret[c]), 1.0, 1, 0, False, p * (1 + mid_ret[c]), 1)
+               for i in range(30)]
+        bars[c] = start + end
+    m.tracker.backfill(bars)
+    return m
+
+
+def test_basis_tie_blocks_both_sides_of_contenders_only():
+    now = time.time()
+    flat = {c: 0.0 for c in COINS}
+    # Mid says HYPE by 1bp, CF says BTC by 1bp: KXCRYPTOLEAD15M-26OCT092330's shape.
+    mid = {**flat, "HYPE": 0.0011, "BTC": 0.0010}
+    cf = {**flat, "HYPE": 0.0010, "BTC": 0.0011}
+    m = _last_minute_model(now, mid, cf)
+    _feed(m, time.monotonic(), {"HYPE": 1.0011, "BTC": 1.0010})
+    fairs = m.reprice(now)
+    assert m.basis_tie == {"HYPE", "BTC"}
+    for c in COINS:
+        t = m.ticker_of[c]
+        want = "basis_tie" if c in ("HYPE", "BTC") else None
+        assert m.side_block(t, "yes", fairs[t], now) == want
+        assert m.side_block(t, "no", fairs[t], now) == want
+
+
+def test_clear_leader_on_both_sources_is_not_a_basis_tie():
+    now = time.time()
+    lead = {**{c: 0.0 for c in COINS}, "SOL": 0.003}
+    m = _last_minute_model(now, lead, lead)
+    _feed(m, time.monotonic(), {"SOL": 1.003})
+    fairs = m.reprice(now)
+    assert m.basis_tie == frozenset()
+    assert all(m.side_block(t, "yes", f, now) is None for t, f in fairs.items())
+
+
+def test_basis_tie_off_outside_last_minute():
+    now = time.time()
+    m = _model(now, recovery_s=0.0)
+    _feed(m, time.monotonic())
+    m.reprice(now)
+    assert m.basis_tie == frozenset()
+
+
+def test_spot_burst_pulls_quotes_for_every_market_then_expires():
+    from kalshi_strategies.KXCRYPTOLEAD15M.live_feed import SpotFeed
+    now = time.time()
+    cfg = config(recovery_s=0.0, burst_usd_1s={c: 1000.0 for c in COINS}, burst_hold_s=1.5)
+    spot = SpotFeed(cfg, persist=False, venues=False)
+    spot.forecaster = ConstantCovForecaster()
+    m = CoinRaceModel(_event(now - 300, now + 600), cfg, spot=spot)
+    spot.attach(m)
+    woke = []
+    m.set_wakeup(lambda: woke.append(1))
+    mono = time.monotonic()
+    spot._on_print("BTC", {"price": "80000", "size": "0.005", "trade_id": 1}, mono, None)   # $400
+    assert m.quote_block(m.ticker_of["ETH"], now) is None and not woke
+    spot._on_print("BTC", {"price": "80000", "size": "0.01", "trade_id": 2}, mono + 0.2, None)  # $1200 in 1s
+    assert woke
+    assert all(m.quote_block(t, now) == "spot_burst" for t in m.tickers)
+    spot.burst_until = time.monotonic() - 0.01
+    assert m.quote_block(m.ticker_of["ETH"], now) is None
+
+
 def test_signal_age_is_oldest_coins_newest_book():
     now = time.time()
     m = _model(now, recovery_s=0.0)
@@ -144,4 +217,40 @@ def test_signal_age_is_oldest_coins_newest_book():
     for c in COINS:
         m.bus.observe(_book(c, mono - (0.3 if c == "HYPE" else 0.0)))
     m.reprice(now)
-    assert m.signal_age_s() >= 0.3
+    # (mono - 0.3) then (later - that) rounds to 0.2999999998 sometimes.
+    assert m.signal_age_s() >= 0.3 - 1e-6
+
+
+def test_burst_calibrator_tracks_its_own_quantile_and_falls_back_until_ready():
+    import numpy as np
+    from kalshi_strategies.KXCRYPTOLEAD15M import prints as P
+    cal = P.BurstCalibrator(["BTC"], {"BTC": 123.0})
+    assert cal.threshold("BTC") == 123.0                      # nothing sampled: static fallback
+    n = int(P.MIN_CALIB_S / P.SAMPLE_S)
+    rng = np.random.default_rng(0)
+    cal.seed(rng.uniform(0, 1000, size=(n, 1)))
+    assert cal.ready
+    cal.adopt(cal.quantiles(cal.snapshot()))
+    assert 990 < cal.threshold("BTC") < 1000                  # p99.5 of U(0, 1000)
+    cal.seed(rng.uniform(0, 10_000, size=(len(cal._buf[0]), 1)))   # volume regime 10x higher
+    cal.adopt(cal.quantiles(cal.snapshot()))
+    assert cal.threshold("BTC") > 9_000
+
+
+def test_burst_calibrator_keeps_last_value_when_a_coin_goes_quiet():
+    import numpy as np
+    from kalshi_strategies.KXCRYPTOLEAD15M import prints as P
+    cal = P.BurstCalibrator(["XRP"], None)
+    cal.seed(np.full((int(P.MIN_CALIB_S / P.SAMPLE_S), 1), 500.0))
+    cal.adopt(cal.quantiles(cal.snapshot()))
+    cal.seed(np.zeros((len(cal._buf[0]), 1)))
+    cal.adopt(cal.quantiles(cal.snapshot()))
+    assert cal.threshold("XRP") == 500.0                      # a zero quantile would trip on any print
+
+
+def test_detector_level_decays_without_new_prints():
+    from kalshi_strategies.KXCRYPTOLEAD15M.prints import BurstDetector
+    d = BurstDetector(["BTC"])
+    assert d.add("BTC", 1000.0, 10.0) == 1000.0
+    assert d.level("BTC", 10.5) == 1000.0
+    assert d.level("BTC", 11.01) == 0.0

@@ -14,8 +14,8 @@ loss at every time-remaining bucket. Feed it the venue TOP-OF-BOOK MID
   * HAR: research/har_coefs_robust.json, fitted for h = 30..900 s on
     those features. `rate_per_s(h)` interpolates log-rate in log h, so the
     pricer can ask for the horizon that is actually left.
-  * Correlation: causal EWMA of 60 s returns sampled every 10 s, 4 h half-
-    life. 1 s returns understate it badly (asynchronous updates).
+  * Correlation: causal EWMA of 300 s returns sampled every 30 s, 4 h half-
+    life. Shorter returns understate it (asynchronous updates, lead-lag).
   * Scale monitor: c = EWMA(r_300^2 / f_300) on our own feed. A MONITOR,
     not a fix: applied clamped to [0.6, 1.6]; outside [0.4, 2.5] the feed
     is broken (2026-10-08's CF-replica HYPE read 0.06) and `alarms()`
@@ -47,10 +47,13 @@ VFLOOR = 1e-10
 # mean r^2 of this many returns (clipping off until then).
 BASE_WARMUP_N = 600
 
-CORR_STEP_S = 10
-CORR_RET_S = 60
+# 300 s returns, not the reference's 60 s: BTC-alt corr keeps rising out to
+# ~300 s (BTC-SOL 0.75 @10s, 0.84 @60s, 0.87 @300-900s, 10-08/09 Coinbase
+# mids; ~1 s lead-lag), and the race settles on 15 min returns.
+CORR_STEP_S = 30
+CORR_RET_S = 300
 CORR_HL_S = 4 * 3600.0
-CORR_INIT_N = 360            # first hour of 10 s samples seeds the EWMA, as in the reference
+CORR_INIT_N = 120            # first hour of 30 s samples seeds the EWMA
 # Used until CORR_INIT_N samples exist. Same structure as the reference golden
 # cases; the live mid on 2026-10-08 measured 0.76-0.83 majors, 0.58-0.65 HYPE.
 PRIOR_CORR = np.full((5, 5), 0.85)
@@ -59,7 +62,10 @@ np.fill_diagonal(PRIOR_CORR, 1.0)
 
 SCALE_H_S = 300
 SCALE_EVERY_S = 60
-SCALE_HL_N = 2 * 86400 / SCALE_EVERY_S     # 2-day half-life, in samples
+# 2-day half-life, in samples. Tried 6 h on 10-08/09: single 300 s outcomes
+# run up to ~26x the forecast in jumpy hours, so a fast c chases them to the
+# 1.6 clamp and log loss got worse (10-09 1.0035 -> 1.0127), even capped.
+SCALE_HL_N = 2 * 86400 / SCALE_EVERY_S
 SCALE_MIN_N = 60                           # an hour of 300 s outcomes before it acts
 SCALE_CLAMP = (0.6, 1.6)
 SCALE_ALARM = (0.4, 2.5)

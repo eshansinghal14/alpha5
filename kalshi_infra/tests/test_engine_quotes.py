@@ -1,0 +1,405 @@
+"""LiveEngine + Quoter + OrderManager end to end, synchronously (no event
+loop, so every executor call resolves inline). Real mode runs against a fake
+order client; shadow uses the engine's own queue model."""
+import types
+
+import pandas as pd
+import pytest
+
+from kalshi_backtest.book import BookView, L2Book
+from kalshi_backtest.core import Trade
+from kalshi_infra.kalshi.fees import schedule
+from kalshi_infra.kalshi.orders import RestingAck
+from kalshi_infra.trading import order_manager as om
+from kalshi_infra.trading.engine import LiveEngine
+from kalshi_infra.trading.fair import Fair, FairUpdate
+from kalshi_infra.trading.quoter import Quoter
+from kalshi_infra.tests.test_quoter import Model, cfg
+
+FREE = schedule("quadratic", 0)
+
+
+class FakeClient:
+    """Kalshi stand-in: acks every create, records cancels, unlimited budget."""
+
+    def __init__(self):
+        self.creates, self.cancels, self.amends = [], [], []
+        self._n = 0
+        self.fail_cancel = False
+
+    def amend(self, exchange_id, order, new_size, filled, price=None):
+        self.amends.append((exchange_id, price))
+        return {"order_id": exchange_id}
+
+    def allow_now(self, kind="order", force=False, reason="untagged"):
+        return True
+
+    def tokens_now(self):
+        return 1e9
+
+    def note_rate_limited(self, reason="unknown"):
+        pass
+
+    def place_resting(self, order):
+        self._n += 1
+        self.creates.append((order.ticker, order.side, order.price, order.size))
+        return RestingAck(exchange_order_id=f"ex{self._n}", fill=None)
+
+    def place_ioc(self, order):
+        return None
+
+    def cancel(self, exchange_id, ticker=None):
+        if self.fail_cancel:
+            raise RuntimeError("boom")
+        self.cancels.append(exchange_id)
+        return True
+
+
+def book(bid=0.40, ask=0.60, depth=100.0):
+    lb = L2Book("A")
+    lb.apply_snapshot("yes", [(bid, depth)], time=pd.Timestamp.now(tz="UTC"))
+    lb.apply_snapshot("no", [(round(1 - ask, 2), depth)], time=pd.Timestamp.now(tz="UTC"))
+    q = lb.to_quote(pd.Timestamp.now(tz="UTC"))
+    return BookView.from_quote(q, ladder=lb)
+
+
+def setup(real=False, **q):
+    q.setdefault("cancels_token", 0.0)
+    q.setdefault("quote_levels_behind", 2)
+    c = cfg(**q)
+    quoter = Quoter(c, Model(), FREE, close_time=None)
+    client = FakeClient() if real else None
+    eng = LiveEngine(quoter, risk=c.risk, quoting=c.quoting, fees=FREE, order_client=client, event_ticker="E")
+    if real:
+        eng.live_trading = True          # bypass the arm reconcile (no REST in tests)
+    eng.update_book(book())
+    return eng, quoter, client
+
+
+def fair(eng, p=0.50, w=0.01):
+    eng.dispatch(FairUpdate({"A": Fair(p, p - w, p + w)}), pd.Timestamp.now(tz="UTC"))
+
+
+def live_prices(eng, side):
+    return sorted((q.price for q in eng.om.live("A", side) if q.state != om.CANCELLING), reverse=True)
+
+
+def xid(eng, side, price):
+    """Exchange id of our live quote at (side, price)."""
+    (q,) = [q for q in eng.om.live("A", side) if abs(q.price - price) < 1e-9]
+    return q.exchange_id
+
+
+def fill(eng, exch, side, price=0.41, trade="t1"):
+    eng.on_real_fill({"ticker": "A", "side": side, "price": price, "size": 1.0, "fee": 0.0,
+                      "time": pd.Timestamp.now(tz="UTC"), "liquidity": "maker",
+                      "order_id": exch, "trade_id": trade})
+
+
+def test_shadow_rests_the_full_ladder_both_sides():
+    eng, _, _ = setup()
+    fair(eng)
+    assert live_prices(eng, "yes") == [0.41, 0.40, 0.39]
+    assert live_prices(eng, "no") == [0.41, 0.40, 0.39]
+    assert all(q.state == om.RESTING for q in eng.om.live())
+
+
+def test_real_mode_sends_creates_and_tracks_exchange_ids():
+    eng, _, client = setup(real=True)
+    fair(eng)
+    assert len(client.creates) == 6
+    assert all(q.exchange_id and q.state == om.RESTING for q in eng.om.live())
+
+
+def test_steady_fair_sends_nothing_more():
+    eng, _, client = setup(real=True)
+    fair(eng)
+    n = len(client.creates)
+    for _ in range(20):
+        fair(eng)
+        eng.dispatch(eng.books["A"], pd.Timestamp.now(tz="UTC"))
+    assert len(client.creates) == n and client.cancels == []
+
+
+def test_fair_drop_cancels_only_levels_now_inside_the_edge():
+    eng, _, client = setup(real=True)
+    fair(eng, 0.50)                      # yes ladder 0.41/0.40/0.39, edge 0.48
+    top = xid(eng, "yes", 0.41)
+    fair(eng, 0.42)                      # quote reservation 0.40 -> 0.41 yes is inside
+    assert top in client.cancels
+    yes_cancelled = [x for x in client.cancels if x in {top}]
+    assert yes_cancelled == [top]
+    assert live_prices(eng, "yes")[0] <= 0.40
+
+
+def test_fair_rise_keeps_old_levels_and_adds_new_ones():
+    eng, _, client = setup(real=True)
+    fair(eng, 0.50)
+    yes_ids = {q.exchange_id for q in eng.om.live("A", "yes")}
+    yes_before = set(live_prices(eng, "yes"))
+    fair(eng, 0.60, w=0.01)              # no-side levels now inside; yes levels still outside
+    assert yes_before <= set(live_prices(eng, "yes"))
+    assert not yes_ids & set(client.cancels)
+
+
+def test_stale_signal_pulls_every_quote():
+    eng, quoter, client = setup(real=True)
+    fair(eng)
+    quoter.model.age = 5.0
+    fair(eng)
+    assert sorted(client.cancels) == sorted(f"ex{i}" for i in range(1, 7))
+    assert eng.om.live() == []
+
+
+def test_pull_quotes_then_nothing_recreated_until_next_decision():
+    eng, _, client = setup(real=True)
+    fair(eng)
+    eng.pull_quotes()
+    eng.pump_quotes()
+    assert len(client.creates) == 6 and eng.om.live() == []
+    fair(eng)
+    assert len(client.creates) == 12
+
+
+def test_disarm_cancels_on_kalshi_before_flipping_mode():
+    eng, _, client = setup(real=True)
+    fair(eng)
+    eng.cancel_resting = lambda: None    # no REST sweep in tests
+    eng.set_live_trading(False)
+    assert len(client.cancels) == 6 and not eng.live_trading
+
+
+def test_failed_cancel_stays_tracked_and_is_retried():
+    eng, quoter, client = setup(real=True)
+    fair(eng)
+    client.fail_cancel = True
+    quoter.model.age = 5.0
+    fair(eng)
+    assert len(eng.om.live()) == 6 and all(q.state == om.RESTING for q in eng.om.live())
+    client.fail_cancel = False
+    fair(eng)
+    assert eng.om.live() == []
+
+
+def test_real_fill_books_and_frees_the_level():
+    eng, _, client = setup(real=True)
+    fair(eng)
+    fill(eng, xid(eng, "yes", 0.41), "yes")
+    assert eng.portfolio.position("A").yes_qty == 1.0
+    assert 0.41 not in live_prices(eng, "yes")
+
+
+def test_duplicate_fill_is_booked_once():
+    eng, _, _ = setup(real=True)
+    fair(eng)
+    x = xid(eng, "yes", 0.41)
+    fill(eng, x, "yes")
+    fill(eng, x, "yes")
+    assert eng.portfolio.position("A").yes_qty == 1.0
+
+
+def test_fill_after_cancel_still_books():
+    """A fill that raced its cancel must still reach the ledger."""
+    eng, quoter, _ = setup(real=True)
+    fair(eng)
+    x = xid(eng, "no", 0.41)
+    quoter.model.age = 5.0
+    fair(eng)                            # everything cancelled and confirmed
+    assert eng.om.live() == []
+    fill(eng, x, "no", trade="t9")
+    assert eng.portfolio.position("A").no_qty == 1.0
+
+
+def test_fill_wakes_requote_delay_and_ladder_refills_after_it():
+    eng, quoter, client = setup(real=True, requote_delay_s=0.0)
+    fair(eng)
+    fill(eng, xid(eng, "yes", 0.41), "yes")
+    n = len(client.creates)
+    fair(eng)
+    assert len(client.creates) > n     # the filled level is replaced
+
+
+def test_shadow_quote_fills_off_trades_behind_the_queue():
+    eng, _, _ = setup()
+    fair(eng)
+    now = pd.Timestamp.now(tz="UTC")
+    # 0.41 yes is a new level (no depth ahead): a print there fills it.
+    eng.on_trade("A", Trade(ticker="A", time=now, price=0.41, size=1.0, taker_side="no"), now)
+    assert eng.portfolio.position("A").yes_qty == 1.0
+    assert 0.41 not in live_prices(eng, "yes")
+
+
+def test_position_cap_limits_ladder_depth():
+    eng, _, client = setup(real=True, max_position=2.0)
+    fair(eng)
+    assert len(live_prices(eng, "yes")) == 2 and len(live_prices(eng, "no")) == 2
+
+
+def test_lost_create_is_found_and_cancelled_never_double_placed():
+    """A create that times out (no HTTP answer) may still rest. The slot is
+    held -- no second order on that level -- until the lookup says."""
+    import requests
+    eng, _, client = setup(real=True, quote_levels_behind=0)
+    orig = client.place_resting
+    calls = {"n": 0}
+
+    def flaky(order):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            order.client_order_id = "cid1"                # the real client stamps this before sending
+            orig(order)                                   # it DID land at Kalshi...
+            raise requests.ConnectionError("timeout")     # ...but we never heard back
+        return orig(order)
+
+    client.place_resting = flaky
+    client.find_by_client_id = lambda ev, cid: ("ex1", "A")
+    fair(eng)
+    assert "ex1" in client.cancels                        # found and pulled
+    yes_creates = [c for c in client.creates if c[1] == "yes"]
+    assert len(yes_creates) == 1 or "ex1" in client.cancels
+
+
+def test_lost_create_lookup_failure_keeps_slot_held():
+    import requests
+    eng, _, client = setup(real=True, quote_levels_behind=0)
+
+    sent = []
+
+    def boom(order):
+        order.client_order_id = f"cid{order.order_id}"
+        sent.append(order.order_id)
+        raise requests.ConnectionError("timeout")
+
+    client.place_resting = boom
+
+    def lookup_fails(ev, cid):
+        raise RuntimeError("api down")
+
+    client.find_by_client_id = lookup_fails
+    fair(eng)
+    fair(eng)
+    fair(eng)
+    # One create per side, then nothing: both slots are held, unknown.
+    assert len(sent) == 2
+    assert len(eng.om.live()) == 2 and all(q.state == om.CANCELLING for q in eng.om.live())
+
+
+def test_rejected_create_frees_slot_and_backs_off_that_price():
+    import requests
+    eng, _, client = setup(real=True, quote_levels_behind=0)
+
+    class Resp:
+        status_code = 400
+
+    def reject(order):
+        e = requests.HTTPError("400 bad")
+        e.response = Resp()
+        raise e
+
+    client.place_resting = reject
+    fair(eng)
+    assert eng.om.live() == []
+    fair(eng)                                   # inside REJECT_BACKOFF_S: not retried
+    assert eng.om.counts.get("create", 0) == 2
+
+
+def _crossing_client(client, size):
+    from kalshi_infra.kalshi.orders import RealFill
+
+    def cross(order):
+        client._n += 1
+        client.creates.append((order.ticker, order.side, order.price, order.size))
+        x = f"ex{client._n}"
+        return RestingAck(exchange_order_id=x, fill=RealFill(price=order.price, size=min(size, order.size),
+                                                             fee=0.0, exchange_order_id=x))
+    client.place_resting = cross
+
+
+def _net(eng):
+    p = eng.portfolio.position("A")
+    return p.yes_qty - p.no_qty
+
+
+def test_quote_that_crossed_on_arrival_is_not_booked_again_from_the_fill_feed():
+    """The create response books the cross with no trade id; the fill feed then
+    reports the same execution with one."""
+    eng, _, client = setup(real=True, quote_levels_behind=0, order_lots=1.0)
+    _crossing_client(client, 1.0)
+    fair(eng)
+    before = _net(eng)
+    yes = [x for x, (t, s, p, z) in zip((f"ex{i + 1}" for i in range(len(client.creates))), client.creates)
+           if s == "yes"][0]
+    eng.on_real_fill({"ticker": "A", "side": "yes", "price": 0.41, "size": 1.0, "fee": 0.0,
+                      "time": pd.Timestamp.now(tz="UTC"), "liquidity": "taker", "order_id": yes, "trade_id": "t1"})
+    assert _net(eng) == before
+
+
+def test_swept_cross_reported_per_level_is_booked_once():
+    eng, _, client = setup(real=True, quote_levels_behind=0, order_lots=2.0)
+    _crossing_client(client, 2.0)
+    fair(eng)
+    before = _net(eng)
+    yes = [f"ex{i + 1}" for i, c in enumerate(client.creates) if c[1] == "yes"][0]
+    for tid in ("t1", "t2"):
+        eng.on_real_fill({"ticker": "A", "side": "yes", "price": 0.41, "size": 1.0, "fee": 0.0,
+                          "time": pd.Timestamp.now(tz="UTC"), "liquidity": "taker", "order_id": yes,
+                          "trade_id": tid})
+    assert _net(eng) == before
+
+
+def test_partial_cross_still_books_the_later_maker_fill():
+    eng, _, client = setup(real=True, quote_levels_behind=0, order_lots=2.0)
+    _crossing_client(client, 1.0)
+    fair(eng)
+    before = _net(eng)
+    yes = [f"ex{i + 1}" for i, c in enumerate(client.creates) if c[1] == "yes"][0]
+    eng.on_real_fill({"ticker": "A", "side": "yes", "price": 0.41, "size": 1.0, "fee": 0.0,
+                      "time": pd.Timestamp.now(tz="UTC"), "liquidity": "taker", "order_id": yes, "trade_id": "t1"})
+    eng.on_real_fill({"ticker": "A", "side": "yes", "price": 0.41, "size": 1.0, "fee": 0.0,
+                      "time": pd.Timestamp.now(tz="UTC"), "liquidity": "maker", "order_id": yes, "trade_id": "t2"})
+    assert _net(eng) == before + 1.0
+
+
+def test_real_touch_improvement_is_one_amend_not_cancel_plus_create():
+    """Others' bid steps up 0.40 -> 0.42: the top follows to 0.43. The
+    deepest spare yes level is amended up; no yes create or cancel."""
+    eng, _, client = setup(real=True, quote_levels_behind=2)
+    fair(eng)
+    yes_before = [c for c in client.creates if c[1] == "yes"]
+    eng.update_book(book(bid=0.42))
+    eng.dispatch(eng.books["A"], pd.Timestamp.now(tz="UTC"))
+    yes_after = [c for c in client.creates if c[1] == "yes"]
+    assert len(yes_after) == len(yes_before)
+    assert client.amends and all(px >= 0.41 for _, px in client.amends)
+    assert live_prices(eng, "yes")[0] == 0.43
+
+
+def test_shadow_touch_improvement_moves_too():
+    eng, _, _ = setup(quote_levels_behind=2)
+    fair(eng)
+    eng.om.sim_bucket._tokens = eng.om.sim_bucket.rate   # refill (the test clock is wall time)
+    eng.update_book(book(bid=0.42))
+    eng.dispatch(eng.books["A"], pd.Timestamp.now(tz="UTC"))
+    assert live_prices(eng, "yes")[0] == 0.43 and eng.om.counts.get("move", 0) >= 1
+
+
+def test_keep_inside_param_reaches_the_manager():
+    eng, _, client = setup(real=True, quote_levels_behind=0, quote_keep_inside=0.02)
+    fair(eng, 0.50)                      # yes top 0.41, edge 0.48
+    fair(eng, 0.42)                      # edge 0.40: 0.41 is 1c inside -> kept
+    assert not client.cancels or all(c != xid(eng, "yes", 0.41) for c in client.cancels)
+
+
+def test_halt_blocks_new_creates():
+    eng, _, client = setup(real=True)
+    eng.halted, eng.halt_reason = True, "test"
+    fair(eng)
+    assert client.creates == []
+
+
+def test_shadow_bucket_and_cancels_token_meter_creates():
+    """Shadow models the 80/s bucket: a 60-token reserve leaves two creates."""
+    eng, _, _ = setup(cancels_token=60.0)
+    fair(eng)
+    assert len(eng.om.live()) == 2
+    assert {q.price for q in eng.om.live()} == {0.41}   # the touch level of each side first

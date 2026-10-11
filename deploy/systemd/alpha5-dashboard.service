@@ -1,0 +1,15 @@
+[Unit]
+Description=alpha5 dashboard (localhost only; reach it with an SSH tunnel)
+After=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/opt/alpha5
+ExecStart=/opt/alpha5/.venv/bin/streamlit run kalshi_viz/app.py --server.port 8502 --server.address 127.0.0.1 --server.headless true
+# Lowest priority: it only reads files the writer produces.
+Nice=19
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -75,6 +75,14 @@ class Fill:
     time: pd.Timestamp
     fee: float
     liquidity: str    # "taker" | "maker"
+    # Kalshi's own ids, live real fills only. A fill booked off an order
+    # response has the order id but no trade id; one read off the fills
+    # endpoint has both.
+    exchange_order_id: str | None = None
+    trade_id: str | None = None
+    # Replayed from Kalshi into a fresh session (LiveEngine.seed_fills_from_kalshi),
+    # not a new execution -- usually already journaled by the session that made it.
+    seeded: bool = False
 
 
 def kalshi_fee(price: float, contracts: float, fee_multiplier: float = 0.07) -> float:
@@ -177,7 +185,8 @@ class Portfolio:
         return self.positions[ticker]
 
     def record_fill(self, order: Order, price: float, size: float, time: pd.Timestamp, liquidity: str,
-                    fee: float | None = None) -> Fill:
+                    fee: float | None = None, *, exchange_order_id: str | None = None,
+                    trade_id: str | None = None, seeded: bool = False) -> Fill:
         """`fee` overrides the modelled kalshi_fee -- pass it when the venue
         reported the real one (live trading does; see kalshi.orders.RealFill),
         since kalshi_fee's multiplier is an unverified default."""
@@ -185,7 +194,8 @@ class Portfolio:
             mult = self.fee_multiplier if liquidity == "taker" else self.maker_fee_multiplier
             fee = kalshi_fee(price, size, mult)
         fill = Fill(order_id=order.order_id, ticker=order.ticker, side=order.side,
-                    price=price, size=size, time=time, fee=fee, liquidity=liquidity)
+                    price=price, size=size, time=time, fee=fee, liquidity=liquidity,
+                    exchange_order_id=exchange_order_id, trade_id=trade_id, seeded=seeded)
         self.position(order.ticker).apply_fill(fill)
         self.fills.append(fill)
         return fill
