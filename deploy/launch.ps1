@@ -1,4 +1,4 @@
-# Create the c7g.large in us-east-1: key pair, a security group that only
+﻿# Create the c7g.large in us-east-1: key pair, a security group that only
 # admits SSH from this machine's current IP, Ubuntu 24.04 arm64, 30 GB gp3.
 # Requires `aws login` first. Prints the public IP and the next commands.
 param(
@@ -14,8 +14,11 @@ $keyPath = Join-Path $env:USERPROFILE ".ssh\$keyName.pem"
 aws sts get-caller-identity --region $Region | Out-Null
 
 if (-not (Test-Path $keyPath)) {
-    aws ec2 create-key-pair --region $Region --key-name $keyName --key-type ed25519 `
-        --query KeyMaterial --output text | Set-Content -NoNewline -Encoding ascii $keyPath
+    # Join the CLI's output lines with LF: piping it straight to Set-Content
+    # -NoNewline dropped every line break and OpenSSH rejected the key.
+    $pem = (aws ec2 create-key-pair --region $Region --key-name $keyName --key-type ed25519 `
+        --query KeyMaterial --output text) -join "`n"
+    [IO.File]::WriteAllText($keyPath, $pem.TrimEnd() + "`n")
     # OpenSSH refuses a key other users can read.
     icacls $keyPath /inheritance:r /grant:r "$($env:USERNAME):(R)" | Out-Null
 }
@@ -41,6 +44,7 @@ $id = aws ec2 run-instances --region $Region --image-id $ami --instance-type $Ty
     --metadata-options "HttpTokens=required" `
     --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$Name}]" `
     --query "Instances[0].InstanceId" --output text
+if ($LASTEXITCODE -ne 0 -or -not $id) { throw "run-instances failed; nothing launched" }
 aws ec2 wait instance-running --region $Region --instance-ids $id
 $ip = aws ec2 describe-instances --region $Region --instance-ids $id `
     --query "Reservations[0].Instances[0].PublicIpAddress" --output text
@@ -49,6 +53,6 @@ $ip = aws ec2 describe-instances --region $Region --instance-ids $id `
 "key: $keyPath"
 "next:"
 "  ssh -i `"$keyPath`" ubuntu@$ip 'curl -fsSL https://raw.githubusercontent.com/eshansinghal14/alpha5/ec2-live/deploy/bootstrap.sh | bash -s ec2-live'"
-"  powershell -File deploy\push_secrets.ps1 -Host ubuntu@$ip -Key `"$keyPath`""
+"  powershell -File deploy\push_secrets.ps1 -Target ubuntu@$ip -Key `"$keyPath`""
 "  ssh -i `"$keyPath`" ubuntu@$ip 'sudo systemctl enable --now alpha5-crypto alpha5-dashboard'"
 "  dashboard: ssh -i `"$keyPath`" -N -L 8502:127.0.0.1:8502 ubuntu@$ip  then open http://localhost:8502"
