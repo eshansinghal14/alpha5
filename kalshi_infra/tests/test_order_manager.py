@@ -512,3 +512,49 @@ def test_on_book_includes_lip():
     m.set_lip("A", "yes", LipTarget(0.30, 20.0))
     m.pump(); ack_all(m, ex)
     assert m.on_book("A", "yes") == [(0.30, 20.0)]
+
+
+# ---------------------------------------------------------------------------
+# Level cap: levels left behind a stepped-back ladder go before new ones
+# ---------------------------------------------------------------------------
+
+def _resting(m, prices, t="A", side="yes"):
+    for i, p in enumerate(prices, start=100):
+        m.quotes[i] = om.Quote(i, t, side, p, 1.0, state=om.RESTING, exchange_id=f"x{i}")
+
+
+def test_excess_levels_cancelled_most_aggressive_first_before_any_create():
+    # 2026-10-12 17:25:51 BTC: ladder stepped back 0.56/0.55 -> 0.52/0.51 while
+    # 0.56/0.55/0.54 still rested, and all five were swept.
+    m, ex, _ = mk()
+    _resting(m, [0.56, 0.55, 0.54])
+    m.set_desired("A", "yes", Desired([0.52, 0.51], 1.0, 0.56, 10.0, None, max_levels=2))
+    assert [r for _, r in ex.cancels] == ["excess_level"]
+    assert m.quotes[ex.cancels[0][0]].price == 0.56          # the one a sweep hits first
+    m.pump()
+    # The two still above the ladder are moved down onto it (no new orders).
+    assert ex.creates == []
+    assert sorted(p for _, p, _ in ex.amends) == [0.51, 0.52]
+
+
+def test_no_create_while_side_is_at_its_level_cap():
+    m, ex, _ = mk()
+    _resting(m, [0.60, 0.59])                                   # at the cap, ahead of the ladder
+    m.set_desired("A", "yes", Desired([0.55, 0.54], 1.0, 0.60, 10.0, None, max_levels=2))
+    m.pump()
+    assert ex.creates == []
+    assert len(m.live("A", "yes")) <= 2
+
+
+def test_level_cap_never_drops_a_wanted_level():
+    m, ex, _ = mk()
+    _resting(m, [0.52, 0.51, 0.49])
+    m.set_desired("A", "yes", Desired([0.52, 0.51], 1.0, 0.56, 10.0, None, max_levels=2))
+    assert [m.quotes[o].price for o, _ in ex.cancels] == [0.49]
+
+
+def test_no_level_cap_keeps_old_behaviour():
+    m, ex, _ = mk()
+    _resting(m, [0.56, 0.55, 0.54])
+    m.set_desired("A", "yes", Desired([0.52, 0.51], 1.0, 0.56, 10.0, None))
+    assert ex.cancels == []

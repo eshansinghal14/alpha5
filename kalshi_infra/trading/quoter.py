@@ -500,13 +500,13 @@ class Quoter:
             room = q.max_position + (net - self._inflight(ticker, "no", now))
         room = max(room, 0.0)
         ahead = self._max_ahead_price(ticker, side, market_bid, market_ask, ladder)
+        n = max(int(q.quote_levels_behind), 0) + 1
         if until is not None and now < until:
             # Recently hit: keep what's up (still outside the edge), add nothing.
-            return Desired([], q.order_lots, edge_limit, room, ahead)
+            return Desired([], q.order_lots, edge_limit, room, ahead, max_levels=n)
         top = self._top_price(ticker, side, res, market_bid, market_ask, ladder)
         if top is None:
-            return Desired([], q.order_lots, edge_limit, room, ahead)
-        n = max(int(q.quote_levels_behind), 0) + 1
+            return Desired([], q.order_lots, edge_limit, room, ahead, max_levels=n)
         cap = q.skip_quote_depth_ahead
         others = self._others_bids(ticker, side, ladder) if cap is not None else None
         prices = []
@@ -518,7 +518,7 @@ class Quoter:
                 self._skipped_deep += 1
                 break                               # every deeper level has at least as much ahead
             prices.append(p)
-        return Desired(prices, q.order_lots, edge_limit, room, ahead)
+        return Desired(prices, q.order_lots, edge_limit, room, ahead, max_levels=n)
 
     def _max_ahead_price(self, ticker, side, market_bid, market_ask, ladder) -> float | None:
         """Highest own-side price a resting quote may keep relative to OTHERS'
