@@ -254,3 +254,79 @@ def test_detector_level_decays_without_new_prints():
     assert d.add("BTC", 1000.0, 10.0) == 1000.0
     assert d.level("BTC", 10.5) == 1000.0
     assert d.level("BTC", 11.01) == 0.0
+
+
+# --- market-implied shift ---------------------------------------------------
+
+class _Bk:
+    def __init__(self, ticker, bid, ask):
+        self.ticker, self.bid, self.ask = ticker, bid, ask
+
+
+def _quote_market(m, probs):
+    for c, p in probs.items():
+        m.on_book(_Bk(m.ticker_of[c], p - 0.01, p + 0.01))
+
+
+def _converge(m, now, steps=60, dt=10.0):
+    fairs = None
+    for k in range(steps):
+        fairs = m._price(now + k * dt, None)
+    return fairs
+
+
+def test_market_shift_off_is_a_no_op():
+    now = time.time()
+    a = _model(now, recovery_s=0.0, market_shift_alpha=0.0)
+    b = _model(now, recovery_s=0.0, market_shift_alpha=0.0)
+    for m in (a, b):
+        _feed(m, time.monotonic(), {"SOL": 1.0005})
+    _quote_market(a, {"BTC": 0.6, "ETH": 0.1, "SOL": 0.1, "XRP": 0.1, "HYPE": 0.1})
+    fa, fb = a.reprice(now), b.reprice(now)
+    assert all(abs(fa[t].prob - fb[t].prob) < 1e-12 for t in fa)
+    assert not a._shift.any()
+
+
+def test_market_shift_moves_fair_toward_market_by_alpha():
+    now = time.time()
+    m = _model(now, recovery_s=0.0, market_shift_alpha=0.25, market_shift_half_life_s=1.0,
+               market_shift_fit_s=0.5)
+    _feed(m, time.monotonic())
+    base = {c: m.reprice(now)[m.ticker_of[c]].prob for c in COINS}
+    target = {"BTC": base["BTC"] + 0.15, "ETH": base["ETH"] - 0.05, "SOL": base["SOL"] - 0.05,
+              "XRP": base["XRP"] - 0.03, "HYPE": base["HYPE"] - 0.02}
+    _quote_market(m, target)
+    # Stay inside the window (end average begins at T-60 = now+540).
+    fairs = _converge(m, now, steps=50, dt=10.0)
+    assert fairs is not None
+    btc = fairs[m.ticker_of["BTC"]].prob
+    # Moves toward the market, but only part of the way (alpha = 0.25).
+    assert base["BTC"] < btc < target["BTC"]
+    assert abs(m._shift.sum()) < 1e-12               # relative shifts only
+
+
+def test_market_shift_frozen_in_last_minute():
+    now = time.time()
+    m = _model(now, recovery_s=0.0, market_shift_alpha=0.25, market_shift_half_life_s=1.0,
+               market_shift_fit_s=0.5)
+    _feed(m, time.monotonic())
+    _quote_market(m, {"BTC": 0.6, "ETH": 0.1, "SOL": 0.1, "XRP": 0.1, "HYPE": 0.1})
+    _converge(m, now, steps=50, dt=10.0)
+    before = m._shift.copy()
+    # Market flips hard inside the end average: the shift must not follow.
+    _quote_market(m, {"BTC": 0.05, "ETH": 0.05, "SOL": 0.8, "XRP": 0.05, "HYPE": 0.05})
+    T = m.window.T
+    for k in range(10):
+        m._price(T - 50 + k * 4, None)
+    assert (m._shift == before).all()
+
+
+def test_on_book_empty_market_is_dropped():
+    now = time.time()
+    m = _model(now, recovery_s=0.0)
+    m.on_book(_Bk(m.ticker_of["BTC"], 0.3, 0.4))
+    assert abs(m._kmid["BTC"] - 0.35) < 1e-12
+    m.on_book(_Bk(m.ticker_of["BTC"], None, 0.05))   # no bid: still a price
+    assert abs(m._kmid["BTC"] - 0.025) < 1e-12
+    m.on_book(_Bk(m.ticker_of["BTC"], None, None))   # no market at all
+    assert "BTC" not in m._kmid

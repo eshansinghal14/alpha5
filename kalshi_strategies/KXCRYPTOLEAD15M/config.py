@@ -63,6 +63,20 @@ class CryptoPricingParams:
                             "(1h RV window + 1h correlation seed + slack).", min=0, step=600,
                             apply=APPLY_NEXT_EVENT)
     composite_flush_s: float = param("Persist 1s composite bars this often.", min=1, step=5)
+    market_shift_alpha: float = param(
+        "Share of the market-implied per-coin return shift (the one that would move our five fairs "
+        "onto the Kalshi mids) applied to pricing, after EMA smoothing. 0 disables. 0.25 on 1,485 "
+        "events 2026-09-21..10-07 (Coinbase trades + Kalshi 1m candles): log loss -0.0040, t -2.9; "
+        "244 events 10-09..12 on recorded books: -0.0101, t -1.9. 0.5 was noisier, 1.0 worse than none.",
+        min=0, max=1, step=0.05)
+    market_shift_half_life_s: float = param(
+        "EMA half-life of the market-implied shift. 30/60/120 scored within noise of each other.",
+        min=1, step=10)
+    market_shift_fit_s: float = param(
+        "How often a new market-implied shift is estimated (one ridge solve on the bump deltas).",
+        min=0.5, step=0.5)
+    market_shift_max_bp: float = param(
+        "Cap on any one coin's estimated shift, per estimate, in bp of return.", min=0, step=0.5)
     kalshi_start_offset_events: int = param(
         "Once Kalshi publishes the start value (single-coin 15M expiration_value), price off it, "
         "shifted onto our mid's level by the mean offset over this many previous boundaries. "

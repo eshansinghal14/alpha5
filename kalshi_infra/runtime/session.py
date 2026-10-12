@@ -310,9 +310,13 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
                 "max_ms": round(v[-1] * 1000, 2), "n": len(v)}
 
     # --- Kalshi ---
+    model_on_book = getattr(model, "on_book", None)   # optional: models that read the Kalshi book
+
     def on_quote(book):
         writer.bbo(book)
         engine.update_book(book)
+        if model_on_book is not None:
+            model_on_book(book)
         engine.dispatch(book, pd.Timestamp.now(tz="UTC"))
 
     def on_trade(ticker, trade):
