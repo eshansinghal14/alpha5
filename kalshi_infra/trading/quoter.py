@@ -10,7 +10,7 @@ Per market and side, every decision is:
 
     d       = distance from fair to the band edge (prob - lo buying, hi - prob selling)
     ci      = edge_fraction * d
-    lean    = (lean_multiplier * d + lean_dollars) * sign(ratio) * |ratio| ** lean_exponent
+    lean    = lean_dollars * ratio
               ratio = effective position / max_position, signed toward the side that GROWS it;
               negative on the reducing side, where the edge then floors at 0
     take    : prob - (constant_edge + ci + lean + taker_fee) >= ask
@@ -18,7 +18,7 @@ Per market and side, every decision is:
 
 Fees are Kalshi's own for this event (kalshi.fees.FeeSchedule). The edge before
 fees is floored at 0, so a reservation never lands on the wrong side of fair.
-Effective position = fills + takes sent within inflight_timeout_s + every
+Effective position = fills + takes sent within CONFIRM_S + every
 live quote on that side (2026-08-28: 60% of same-ticker fills landed inside
 one round trip of the previous one, so ignoring in-flight size let a market
 run flat -> cap with zero lean charged).
@@ -46,6 +46,16 @@ from kalshi_infra.kalshi.venue import MAX_PRICE, MIN_PRICE, TICK
 from kalshi_infra.trading.fair import Fair, FairUpdate
 from kalshi_infra.trading.lip import LipTracker, choose_lip_level, others_ladder
 from kalshi_infra.trading.order_manager import Desired, LipTarget
+
+# Fair is clipped to [eps, 1-eps] before quoting (logged unclipped). Well
+# inside Kalshi's 1c minimum price, so it only guards against a 0/1 fair.
+FAIR_CLIP_EPS = 0.001
+
+# How long until Kalshi confirms what we sent. A sent take counts toward the
+# position this long, and a take's signal must hold this long first (one take
+# per side per window). Real crypto takes from EC2, 2026-10-12 02:19-03:30 UTC:
+# send -> booked fill p50 29ms, p99 53ms, max 55ms (n=106); ~2x the max.
+CONFIRM_S = 0.1
 
 
 class Quoter:
@@ -143,13 +153,13 @@ class Quoter:
         self._fills_seen = len(fills)
 
     def _inflight(self, ticker: str, side: str, now: pd.Timestamp) -> float:
-        """Take size sent on (ticker, side) within inflight_timeout_s. A take
-        fills on arrival or not at all, so a size total is enough."""
+        """Take size sent on (ticker, side) within CONFIRM_S. A take fills on
+        arrival or not at all, so a size total is enough."""
         key = (ticker, side)
         recent = self._sent.get(key)
         if not recent:
             return 0.0
-        cutoff = now - pd.Timedelta(seconds=self.cfg.quoting.inflight_timeout_s)
+        cutoff = now - pd.Timedelta(seconds=CONFIRM_S)
         recent = [(t, s) for t, s in recent if t > cutoff]
         self._sent[key] = recent
         return sum(s for _, s in recent)
@@ -210,11 +220,9 @@ class Quoter:
         return ticker in self._atm_set
 
     def _take_ok(self, key, now_s: float) -> bool:
-        """Signal has held for take_confirm_s, and at most one take per side
-        per window after that. 0 = immediate."""
-        w = self.cfg.quoting.take_confirm_s
-        if w <= 0:
-            return True
+        """Signal has held for CONFIRM_S, and at most one take per side per
+        window after that."""
+        w = CONFIRM_S
         since = self._take_since.setdefault(key, now_s)
         if now_s - since < w:
             return False
@@ -252,8 +260,7 @@ class Quoter:
                 self._log_row(ctx, now, ticker, fair, market_bid, market_ask, block=gate)
             return
 
-        eps = q.fair_clip_eps
-        prob = min(max(fair.prob, eps), 1.0 - eps)
+        prob = min(max(fair.prob, FAIR_CLIP_EPS), 1.0 - FAIR_CLIP_EPS)
         d_lo = max(fair.prob - fair.lo, 0.0)
         d_hi = max(fair.hi - fair.prob, 0.0)
         ci_bid, ci_ask = q.edge_fraction * d_lo, q.edge_fraction * d_hi
@@ -270,15 +277,12 @@ class Quoter:
         def _ratio(x):
             return 0.0 if max_pos <= 0 else max(-1.0, min(1.0, x / max_pos))
 
-        def _signed(r):
-            return math.copysign(abs(r) ** q.lean_exponent, r)
-
         # Signed lean: positive grows the edge on the side that adds to the
         # position, negative cuts it on the side that reduces it. Unsigned, the
         # reducing side asked the full edge at the cap and sat a median 9c
         # behind the touch, unquoted 53% of the time (KXCRYPTOLEAD15M 2026-10-11).
-        lean_bid = (q.lean_multiplier * d_lo + q.lean_dollars) * _signed(_ratio(eff_yes))
-        lean_ask = (q.lean_multiplier * d_hi + q.lean_dollars) * _signed(-_ratio(eff_no))
+        lean_bid = q.lean_dollars * _ratio(eff_yes)
+        lean_ask = q.lean_dollars * -_ratio(eff_no)
 
         fee_bid = self.fees.taker(market_ask) if market_ask is not None else 0.0
         fee_ask = self.fees.taker(market_bid) if market_bid is not None else 0.0

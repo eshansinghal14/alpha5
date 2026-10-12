@@ -22,25 +22,10 @@ class QuotingParams:
     edge_fraction: float = param(
         "Fraction of the distance from fair to the band edge (lo when buying, hi when selling) "
         "demanded as edge. 1.0 = only outside the band.", min=0, max=5, step=0.05)
-    lean_multiplier: float = param(
-        "Inventory lean as a multiple of that same band distance, scaled by "
-        "(effective position / max_position) ** lean_exponent. Signed: added to the side that grows "
-        "the position, subtracted from the side that reduces it (that side's edge floors at 0, so it "
-        "never quotes through fair).", min=0, max=5, step=0.1)
     lean_dollars: float = param(
-        "Flat $ lean at full inventory, same scaling but independent of band width -- the brake "
-        "that still works when the model is confident.", min=0, max=0.5, step=0.005)
-    lean_exponent: float = param("Lean convexity. 1 = linear, 2 = barely any lean until near the cap.",
-                                 min=0.1, max=5, step=0.5)
-    fair_clip_eps: float = param(
-        "Fair is clipped to [eps, 1-eps] before quoting (logged unclipped).", min=0, max=0.1, step=0.001)
-    inflight_timeout_s: float = param(
-        "How long a sent take counts against the cap/lean before we assume its fill has been seen. "
-        "Must exceed send latency (~34ms measured) plus processing.", min=0.05, max=10, step=0.05)
-    take_confirm_s: float = param(
-        "A take must stay justified this long before it fires, and fires at most once per window "
-        "per side. Guards against one-tick fair jumps; 0 disables (latency strategies).",
-        min=0, max=10, step=0.05)
+        "$ lean at full inventory, linear in effective position / max_position. Added to the side "
+        "that grows the position, subtracted from the side that reduces it (that side's edge floors "
+        "at 0, so it never quotes through fair).", min=0, max=0.5, step=0.005)
     max_markets: int | None = param(
         "Trade only the N markets with fair closest to 0.5 (null = all). Data/order-rate limit, "
         "not an edge filter.", min=1, step=1)

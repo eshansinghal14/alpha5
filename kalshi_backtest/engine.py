@@ -500,7 +500,7 @@ class Backtest:
                     # This was not a modelling nicety. A missed take rested
                     # untracked forever: the strategy records takes only in
                     # `_sent` for in-flight accounting, which expires after
-                    # inflight_timeout_s, and `_resting()` reads `_quotes`,
+                    # quoter.CONFIRM_S, and `_resting()` reads `_quotes`,
                     # which takes never enter. So they were invisible to the
                     # position cap. On KXINXU-26AUG28H1600 that accumulated
                     # 92 uncancelled orders at one price on T7734.9999; a

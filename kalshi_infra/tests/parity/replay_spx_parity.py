@@ -7,7 +7,10 @@ Since the order-manager rewrite (2026-10-10) the new quoter publishes a quote
 ladder instead of placing one quote per side, so only takes and the
 reservation/lean columns are expected to match. Quote orders and the
 `quote_bid`/`quote_ask` columns are no longer comparable (the new ones are
-the ladder's top level, capped against others' touch)."""
+the ladder's top level, capped against others' touch).
+
+Since 2026-10-12 the lean is flat linear (no band term, no exponent) and
+takes wait quoter.CONFIRM_S, so leans and take timing no longer match legacy."""
 import dataclasses
 import glob
 import os
@@ -95,9 +98,8 @@ class Ctx:
 def new_cfg(oc):
     q = P.QuotingParams(
         order_lots=oc.quote_size, max_position=oc.max_position, constant_edge=oc.constant_edge,
-        edge_fraction=oc.edge_fraction, lean_multiplier=oc.lean_multiplier, lean_dollars=oc.lean_dollars,
-        lean_exponent=oc.lean_exponent, fair_clip_eps=0.0, inflight_timeout_s=oc.inflight_timeout_s,
-        take_confirm_s=0.0, max_markets=oc.max_markets, atm_hysteresis=oc.atm_hysteresis,
+        edge_fraction=oc.edge_fraction, lean_dollars=oc.lean_dollars,
+        max_markets=oc.max_markets, atm_hysteresis=oc.atm_hysteresis,
         enable_quoting=oc.enable_quoting, quoting_edge=oc.quoting_edge,
         max_improve_ticks=oc.max_improve_ticks, quote_levels_behind=0, cancels_token=0.0,
         requote_delay_s=oc.requote_delay_s)

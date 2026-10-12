@@ -10,17 +10,23 @@ from kalshi_backtest.core import Order, Portfolio
 from kalshi_infra.kalshi.fees import schedule
 from kalshi_infra.trading import params as P
 from kalshi_infra.trading.fair import Fair, FairUpdate
-from kalshi_infra.trading.quoter import Quoter
+from kalshi_infra.trading import quoter as quoter_mod
+from kalshi_infra.trading.quoter import FAIR_CLIP_EPS, Quoter
 
 T0 = pd.Timestamp("2026-10-08 20:00:00", tz="UTC")
 FREE = schedule("quadratic", 0)          # zero fees: edge arithmetic only
 KALSHI = schedule("quadratic", 1)        # 0.07 taker, 0 maker
 
 
+@pytest.fixture(autouse=True)
+def immediate_takes(monkeypatch):
+    """Edge arithmetic tests take on the first step; the confirm tests set it back."""
+    monkeypatch.setattr(quoter_mod, "CONFIRM_S", 0.0)
+
+
 def cfg(**q):
     base = dict(order_lots=1.0, max_position=10.0, constant_edge=0.01, edge_fraction=1.0,
-                lean_multiplier=1.0, lean_dollars=0.02, lean_exponent=2.0, fair_clip_eps=0.0,
-                inflight_timeout_s=0.5, take_confirm_s=0.0, max_markets=None, atm_hysteresis=0,
+                lean_dollars=0.02, max_markets=None, atm_hysteresis=0,
                 enable_quoting=True, quoting_edge=0.0, max_improve_ticks=1, quote_levels_behind=0,
                 skip_quote_depth_ahead=None, quote_keep_inside=0.0, quote_ahead_grace_s=1.0,
                 cancels_token=20.0, requote_delay_s=1.0)
@@ -130,23 +136,25 @@ def test_kalshi_taker_fee_is_charged_into_the_edge():
     assert takes(ctx) == []          # 0.60 - 0.02 - 0.0171 < 0.58
 
 
-def test_take_confirm_requires_signal_to_hold():
-    q, ctx = Quoter(cfg(take_confirm_s=0.75), Model(), FREE, close_time=None), Ctx()
+def test_take_confirm_requires_signal_to_hold(monkeypatch):
+    monkeypatch.setattr(quoter_mod, "CONFIRM_S", 0.1)
+    q, ctx = Quoter(cfg(), Model(), FREE, close_time=None), Ctx()
     f = {"A": Fair(0.60, 0.59, 0.61)}
     step(q, ctx, f, Book("A", 0.40, 0.55))
-    step(q, ctx, f, dt=0.5)
+    step(q, ctx, f, dt=0.06)
     assert takes(ctx) == []
-    step(q, ctx, f, dt=0.3)
+    step(q, ctx, f, dt=0.05)
     assert len(takes(ctx)) == 1
-    step(q, ctx, f, dt=0.1)          # at most one take per window
+    step(q, ctx, f, dt=0.05)         # at most one take per window
     assert len(takes(ctx)) == 1
 
 
-def test_take_confirm_resets_when_signal_lapses():
-    q, ctx = Quoter(cfg(take_confirm_s=0.75), Model(), FREE, close_time=None), Ctx()
+def test_take_confirm_resets_when_signal_lapses(monkeypatch):
+    monkeypatch.setattr(quoter_mod, "CONFIRM_S", 0.1)
+    q, ctx = Quoter(cfg(), Model(), FREE, close_time=None), Ctx()
     step(q, ctx, {"A": Fair(0.60, 0.59, 0.61)}, Book("A", 0.40, 0.55))
-    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, dt=0.5)
-    step(q, ctx, {"A": Fair(0.60, 0.59, 0.61)}, dt=0.5)
+    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, dt=0.06)
+    step(q, ctx, {"A": Fair(0.60, 0.59, 0.61)}, dt=0.06)
     assert takes(ctx) == []
 
 
@@ -290,10 +298,10 @@ def test_max_markets_blocks_far_markets():
 
 
 def test_fair_clip_applies_to_quoting_not_log():
-    q, ctx = Quoter(cfg(fair_clip_eps=0.01), Model(), FREE, close_time=None), Ctx()
-    step(q, ctx, {"A": Fair(0.001, 0.0, 0.002)}, Book("A", 0.01, 0.03))
+    q, ctx = Quoter(cfg(), Model(), FREE, close_time=None), Ctx()
+    step(q, ctx, {"A": Fair(0.0, 0.0, 0.002)}, Book("A", 0.01, 0.03))
     r = q.debug_log[-1]
-    assert r["prob"] == 0.01 and r["prob_raw"] == 0.001
+    assert r["prob"] == FAIR_CLIP_EPS and r["prob_raw"] == 0.0
 
 
 def test_lean_adds_to_growing_side_and_subtracts_from_reducing_side():
@@ -301,8 +309,8 @@ def test_lean_adds_to_growing_side_and_subtracts_from_reducing_side():
     ctx.portfolio.position("A").yes_qty = 10.0
     step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, Book("A", 0.40, 0.60))
     r = q.debug_log[-1]
-    assert r["lean_bid"] == pytest.approx((1.0 * 0.01 + 0.02) * 1.0)
-    assert r["lean_ask"] == pytest.approx(-(1.0 * 0.01 + 0.02) * 1.0)
+    assert r["lean_bid"] == pytest.approx(0.02)
+    assert r["lean_ask"] == pytest.approx(-0.02)
 
 
 def test_every_live_level_counts_toward_lean():
@@ -311,7 +319,7 @@ def test_every_live_level_counts_toward_lean():
     ctx.ours[("A", "yes")] = [(0.41, 1.0), (0.40, 1.0), (0.39, 1.0)]
     step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, Book("A", 0.40, 0.60))
     r = q.debug_log[-1]
-    assert r["eff_yes"] == 3.0 and r["lean_bid"] == pytest.approx(0.01 + 0.02)
+    assert r["eff_yes"] == 3.0 and r["lean_bid"] == pytest.approx(0.02)
 
 
 def test_room_counts_fills_not_resting_quotes():
@@ -456,23 +464,23 @@ def _short(ctx, n):
 
 def test_reducing_side_edge_cut_by_lean_at_the_cap():
     # Short 10 at a cap of 10, buying yes reduces it. Band 0.01 each side,
-    # lean at full ratio = 1.0*0.01 + 0.02 = 0.03.
+    # lean at full ratio = lean_dollars 0.02.
     q, ctx = Quoter(cfg(constant_edge=0.03), Model(), FREE, close_time=None), Ctx()
     _short(ctx, 10)
     step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, Book("A", 0.30, 0.70))
     r = q.debug_log[-1]
-    assert r["lean_bid"] == pytest.approx(-0.03)
-    assert r["bid_edge"] == pytest.approx(0.03 + 0.01 - 0.03)
-    assert r["ask_edge"] == pytest.approx(0.03 + 0.01 + 0.03)
+    assert r["lean_bid"] == pytest.approx(-0.02)
+    assert r["bid_edge"] == pytest.approx(0.03 + 0.01 - 0.02)
+    assert r["ask_edge"] == pytest.approx(0.03 + 0.01 + 0.02)
 
 
 def test_reducing_lean_scales_with_position_like_the_growing_lean():
     q, ctx = Quoter(cfg(constant_edge=0.03), Model(), FREE, close_time=None), Ctx()
     step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, Book("A", 0.30, 0.70))
     assert q.debug_log[-1]["lean_bid"] == 0.0
-    _short(ctx, 5)                                              # half the cap: 0.5 ** 2
+    _short(ctx, 5)                                              # half the cap, linear
     step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)})
-    assert q.debug_log[-1]["lean_bid"] == pytest.approx(-0.03 * 0.25)
+    assert q.debug_log[-1]["lean_bid"] == pytest.approx(-0.02 * 0.5)
 
 
 def test_reducing_edge_never_goes_through_fair():
@@ -488,5 +496,5 @@ def test_reducing_quote_moves_up_to_the_touch_at_the_cap():
     q, ctx = Quoter(cfg(constant_edge=0.03), Model(), FREE, close_time=None), Ctx()
     _short(ctx, 10)
     step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, Book("A", 0.47, 0.60))
-    # Edge 0.03 + 0.01 - 0.03 = 0.01 below fair: 0.49, capped one tick inside the 0.47 bid.
+    # Edge 0.03 + 0.01 - 0.02 = 0.02 below fair: 0.48, also the one-tick-inside cap on the 0.47 bid.
     assert ladder(ctx, "yes") == [0.48]
