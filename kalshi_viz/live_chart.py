@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 
 from bokeh.embed import file_html
+from bokeh.events import Reset
 from bokeh.layouts import row
 from bokeh.models import ColumnDataSource, CustomJS, DatetimeTickFormatter, LinearAxis, Range1d, Span
 from bokeh.plotting import figure
@@ -142,6 +143,12 @@ def build_live_html(series: str, market: str, json_url: str, x_start_ms: float, 
                                line_width=1, line_alpha=0.5))
     _legend(p2)
 
+    # Bokeh's reset restores the x-range from page load, which is a stale
+    # "now". Go back to the whole session and resume following the live edge.
+    on_reset = CustomJS(code="if (window.a5Reset) window.a5Reset();")
+    p1.js_on_event(Reset, on_reset)
+    p2.js_on_event(Reset, on_reset)
+
     html = file_html(row(p1, p2, sizing_mode="stretch_width"), INLINE, f"{series} -- {market}")
     # The body is one viewport plus the pos/pnl chart wide, so the
     # stretch_width theo chart takes exactly the visible width.
@@ -202,6 +209,10 @@ def build_live_html(series: str, market: str, json_url: str, x_start_ms: float, 
     const pp = doc.get_model_by_name('pospnl');
     if (pp) { fit(pp.y_range, pos.v, 2); fit(pp.extra_y_ranges['pnl'], m.pnl_v || [], 1); }
   }
+  window.a5Reset = function () {
+    const doc = Bokeh.documents[0]; if (!doc) return;
+    lastSet = null; follow(doc); poll();
+  };
   poll(); setInterval(poll, POLL);
 })();
 </script>
