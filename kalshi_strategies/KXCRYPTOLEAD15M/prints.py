@@ -12,6 +12,7 @@ In-sample, so recheck once these files hold a few days of prints.
 from __future__ import annotations
 
 import collections
+import json
 import os
 import time
 from pathlib import Path
@@ -55,6 +56,55 @@ REFRESH_S = 60.0
 AUTO_SOURCES = ("coinbase", "hyperliquid", *PERP_SOURCES)
 
 
+# Calibrated thresholds, saved on every refresh so a restart can reuse them
+# until its own calibrator is ready. Without this a restart ran on the static
+# fallbacks for 30+ min: HL XRP's $5k fallback vs ~$150k calibrated pulled
+# quotes 54% of the time after the 2026-10-12 16:46 UTC restart.
+SAVED_PATH = Path(_DATA_ROOT) / "kalshi_crypto" / "burst_thresholds.json"
+# Saved thresholds older than this are ignored: thresholds drift with the
+# session (HL ETH p99.5 $50k at 05:30 vs $625k at 15:00 UTC, 2026-10-11), so
+# only a quick restart should reuse them.
+SAVED_MAX_AGE_S = 1800.0
+
+
+def save_thresholds(by_source: dict[str, dict[str, float]], path: Path = SAVED_PATH, now: float | None = None):
+    """Atomic write of {source: {coin: usd_1s}} with the time they were computed.
+    Merges into the file, so a source that isn't ready yet keeps its last values."""
+    now = time.time() if now is None else now
+    doc = {"sources": {}}
+    try:
+        doc = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        pass
+    srcs = doc.get("sources") or {}
+    for s, th in by_source.items():
+        srcs[s] = {"written_at": now, "usd_1s": {c: float(v) for c, v in th.items()}}
+    doc = {"sources": srcs}
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f".tmp-{os.getpid()}")
+    tmp.write_text(json.dumps(doc, indent=1))
+    os.replace(tmp, path)
+
+
+def load_thresholds(path: Path = SAVED_PATH, now: float | None = None,
+                    max_age_s: float = SAVED_MAX_AGE_S) -> dict[str, dict[str, float]]:
+    """{source: {coin: usd_1s}} for each source saved within max_age_s; {} if none."""
+    now = time.time() if now is None else now
+    try:
+        doc = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    for s, rec in (doc.get("sources") or {}).items():
+        try:
+            if 0 <= now - float(rec["written_at"]) <= max_age_s:
+                out[s] = {c: float(v) for c, v in rec["usd_1s"].items() if float(v) > 0}
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
 class BurstDetector:
     """Per-coin trailing notional. Clocks are the adapter's monotonic
     `as_of`, the same clock feed health and signal age use."""
@@ -96,6 +146,8 @@ class BurstCalibrator:
         self._n = 0
         self.fallback = dict(fallback or {})
         self.live: dict[str, float] = {}
+        # Recently saved calibration from a previous run, used until ready.
+        self.saved: dict[str, float] = {}
 
     def sample(self, levels: dict[str, float]):
         for k, c in enumerate(self.coins):
@@ -129,7 +181,14 @@ class BurstCalibrator:
     def threshold(self, coin: str) -> float | None:
         if self.ready and coin in self.live:
             return self.live[coin]
+        if coin in self.saved:
+            return self.saved[coin]
         return self.fallback.get(coin)
+
+    @property
+    def source(self) -> str:
+        """Where threshold() is reading from: live, saved or fallback."""
+        return "live" if self.ready else ("saved" if self.saved else "fallback")
 
 
 def seed_rows(source: str, coins, now_wall: float, root: Path = PRINTS_ROOT) -> np.ndarray:

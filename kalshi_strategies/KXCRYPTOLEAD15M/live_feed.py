@@ -17,7 +17,7 @@ import time
 
 from kalshi_strategies.KXCRYPTOLEAD15M.composite import CompositeBus
 from kalshi_strategies.KXCRYPTOLEAD15M.prints import (AUTO_SOURCES, HL_BURST_USD_1S, PERP_BURST_USD_1S, PERP_SOURCES,
-                                                       REFRESH_S,
+                                                       REFRESH_S, load_thresholds, save_thresholds,
                                                        SAMPLE_S, BurstCalibrator, BurstDetector, PrintLog,
                                                        seed_rows)
 from kalshi_strategies.KXCRYPTOLEAD15M.robust_har import RobustHarForecaster
@@ -95,6 +95,15 @@ class SpotFeed:
                       **{v: BurstCalibrator(COINS, None) for v in PERP_SOURCES}}
         self._calib_seeded = not persist        # tests: nothing on disk to seed from
         self._calib_tasks: list[asyncio.Task] = []
+        self._persist = persist
+        if persist:
+            saved = load_thresholds()
+            for src, th in saved.items():
+                if src in self.calib:
+                    self.calib[src].saved = th
+            if saved:
+                print(f"[KXCRYPTOLEAD15M] burst thresholds: reusing saved {sorted(saved)} until recalibrated",
+                      flush=True)
 
     def _threshold(self, source: str, coin: str) -> float | None:
         if source in AUTO_SOURCES:
@@ -102,8 +111,15 @@ class SpotFeed:
         return None
 
     def burst_thresholds(self) -> dict:
-        return {s: {"calibrated": c.ready, "usd_1s": {k: round(c.threshold(k) or 0) for k in COINS}}
+        return {s: {"calibrated": c.ready, "source": c.source,
+                    "usd_1s": {k: round(c.threshold(k) or 0) for k in COINS}}
                 for s, c in self.calib.items()}
+
+    def _save_calibrated(self):
+        """Persist every source that is calibrated now. Off the loop."""
+        ready = {s: dict(c.live) for s, c in self.calib.items() if c.ready and c.live}
+        if ready:
+            save_thresholds(ready)
 
     async def _calib_seed(self):
         """Rebuild the last CALIB_WINDOW_S of samples from disk once, so a
@@ -137,6 +153,11 @@ class SpotFeed:
                     cal.adopt(await loop.run_in_executor(None, cal.quantiles, cal.snapshot()))
                 except Exception as e:
                     print(f"[KXCRYPTOLEAD15M] burst threshold refresh failed: {e!r}", flush=True)
+            if self._persist:
+                try:
+                    await loop.run_in_executor(None, self._save_calibrated)
+                except Exception as e:
+                    print(f"[KXCRYPTOLEAD15M] burst threshold save failed: {e!r}", flush=True)
 
     def _on_print(self, coin: str, t: dict, as_of: float, exch_ts: float | None, venue: str = "coinbase"):
         try:
