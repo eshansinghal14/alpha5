@@ -33,6 +33,8 @@ class QuotingParams:
         "A market in the traded set stays until it ranks below max_markets + this, so the edge "
         "markets don't flip on noise.", min=0, step=1)
 
+    enable_taking: bool = param("Send takes (IOC orders that cross the touch). Off leaves quoting "
+                                "untouched, so the strategy runs maker-only.")
     enable_quoting: bool = param("Rest quotes as well as taking. Off withdraws existing quotes on "
                                  "each market's next decision.")
     quoting_edge: float = param(

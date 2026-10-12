@@ -1,11 +1,12 @@
 {
   "quoting": {
-    "max_position": 5.0,
+    "max_position": 3.0,
     "constant_edge": 0.045,
     "edge_fraction": 1.0,
     "lean_dollars": 0.03,
     "max_markets": null,
     "atm_hysteresis": 0,
+    "enable_taking": true,
     "enable_quoting": true,
     "quoting_edge": 0.0,
     "max_improve_ticks": 1,

@@ -27,7 +27,7 @@ def immediate_takes(monkeypatch):
 def cfg(**q):
     base = dict(order_lots=1.0, max_position=10.0, constant_edge=0.01, edge_fraction=1.0,
                 lean_dollars=0.02, max_markets=None, atm_hysteresis=0,
-                enable_quoting=True, quoting_edge=0.0, max_improve_ticks=1, quote_levels_behind=0,
+                enable_taking=True, enable_quoting=True, quoting_edge=0.0, max_improve_ticks=1, quote_levels_behind=0,
                 skip_quote_depth_ahead=None, quote_keep_inside=0.0, quote_ahead_grace_s=1.0,
                 cancels_token=20.0, requote_delay_s=1.0)
     base.update(q)
@@ -343,6 +343,13 @@ def test_requote_delay_after_a_maker_fill_adds_nothing_but_keeps_the_edge_limit(
     assert d.prices == [] and d.edge_limit == pytest.approx(0.47)
     step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, dt=1.0)
     assert ladder(ctx, "yes") == [0.41]
+
+
+def test_taking_disabled_sends_no_takes_but_still_quotes():
+    q, ctx = Quoter(cfg(enable_taking=False), Model(), FREE, close_time=None), Ctx()
+    step(q, ctx, {"A": Fair(0.60, 0.59, 0.61)}, Book("A", 0.40, 0.55))
+    assert takes(ctx) == []
+    assert ctx.desired[("A", "yes")].edge_limit is not None
 
 
 def test_quoting_disabled_publishes_unquotable():

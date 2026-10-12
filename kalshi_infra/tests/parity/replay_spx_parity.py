@@ -100,7 +100,7 @@ def new_cfg(oc):
         order_lots=oc.quote_size, max_position=oc.max_position, constant_edge=oc.constant_edge,
         edge_fraction=oc.edge_fraction, lean_dollars=oc.lean_dollars,
         max_markets=oc.max_markets, atm_hysteresis=oc.atm_hysteresis,
-        enable_quoting=oc.enable_quoting, quoting_edge=oc.quoting_edge,
+        enable_taking=True, enable_quoting=oc.enable_quoting, quoting_edge=oc.quoting_edge,
         max_improve_ticks=oc.max_improve_ticks, quote_levels_behind=0, cancels_token=0.0,
         requote_delay_s=oc.requote_delay_s)
     assert oc.fee_multiplier == 0.07 and oc.maker_fee_multiplier == 0.0 and oc.taker_fee_edge_multiplier == 1.0
