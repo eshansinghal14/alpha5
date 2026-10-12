@@ -19,7 +19,7 @@
   },
   "trading_time": {
     "real_trading_delay_s": 10.0,
-    "real_trading_cutoff_s": 20.0
+    "real_trading_cutoff_s": 30.0
   },
   "risk": {
     "max_loss_usd": 80.0,

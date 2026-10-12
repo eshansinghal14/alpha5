@@ -21,7 +21,7 @@ KALSHI = schedule("quadratic", 1)        # 0.07 taker, 0 maker
 @pytest.fixture(autouse=True)
 def immediate_takes(monkeypatch):
     """Edge arithmetic tests take on the first step; the confirm tests set it back."""
-    monkeypatch.setattr(quoter_mod, "CONFIRM_S", 0.0)
+    monkeypatch.setattr(quoter_mod, "TAKE_HOLD_S", 0.0)
 
 
 def cfg(**q):
@@ -136,25 +136,25 @@ def test_kalshi_taker_fee_is_charged_into_the_edge():
     assert takes(ctx) == []          # 0.60 - 0.02 - 0.0171 < 0.58
 
 
-def test_take_confirm_requires_signal_to_hold(monkeypatch):
-    monkeypatch.setattr(quoter_mod, "CONFIRM_S", 0.1)
+def test_take_hold_requires_signal_to_hold(monkeypatch):
+    monkeypatch.setattr(quoter_mod, "TAKE_HOLD_S", 0.5)
     q, ctx = Quoter(cfg(), Model(), FREE, close_time=None), Ctx()
     f = {"A": Fair(0.60, 0.59, 0.61)}
     step(q, ctx, f, Book("A", 0.40, 0.55))
-    step(q, ctx, f, dt=0.06)
+    step(q, ctx, f, dt=0.3)
     assert takes(ctx) == []
-    step(q, ctx, f, dt=0.05)
+    step(q, ctx, f, dt=0.25)
     assert len(takes(ctx)) == 1
-    step(q, ctx, f, dt=0.05)         # at most one take per window
+    step(q, ctx, f, dt=0.25)         # at most one take per window
     assert len(takes(ctx)) == 1
 
 
-def test_take_confirm_resets_when_signal_lapses(monkeypatch):
-    monkeypatch.setattr(quoter_mod, "CONFIRM_S", 0.1)
+def test_take_hold_resets_when_signal_lapses(monkeypatch):
+    monkeypatch.setattr(quoter_mod, "TAKE_HOLD_S", 0.5)
     q, ctx = Quoter(cfg(), Model(), FREE, close_time=None), Ctx()
     step(q, ctx, {"A": Fair(0.60, 0.59, 0.61)}, Book("A", 0.40, 0.55))
-    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, dt=0.06)
-    step(q, ctx, {"A": Fair(0.60, 0.59, 0.61)}, dt=0.06)
+    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, dt=0.3)
+    step(q, ctx, {"A": Fair(0.60, 0.59, 0.61)}, dt=0.3)
     assert takes(ctx) == []
 
 

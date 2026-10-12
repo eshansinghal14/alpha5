@@ -51,11 +51,15 @@ from kalshi_infra.trading.order_manager import Desired, LipTarget
 # inside Kalshi's 1c minimum price, so it only guards against a 0/1 fair.
 FAIR_CLIP_EPS = 0.001
 
-# How long until Kalshi confirms what we sent. A sent take counts toward the
-# position this long, and a take's signal must hold this long first (one take
-# per side per window). Real crypto takes from EC2, 2026-10-12 02:19-03:30 UTC:
+# How long until Kalshi confirms what we sent; a sent take counts toward the
+# position this long. Real crypto takes from EC2, 2026-10-12 02:19-03:30 UTC:
 # send -> booked fill p50 29ms, p99 53ms, max 55ms (n=106); ~2x the max.
 CONFIRM_S = 0.1
+
+# A take's signal must hold this long first, and fires at most once per side
+# per window. Not a latency: at 0.1s the bot fired 72 and 105 takes into the
+# final-minute leader flips of 26OCT120300/0315 and lost $16 (2026-10-12).
+TAKE_HOLD_S = 0.5
 
 
 class Quoter:
@@ -220,9 +224,11 @@ class Quoter:
         return ticker in self._atm_set
 
     def _take_ok(self, key, now_s: float) -> bool:
-        """Signal has held for CONFIRM_S, and at most one take per side per
+        """Signal has held for TAKE_HOLD_S, and at most one take per side per
         window after that."""
-        w = CONFIRM_S
+        w = TAKE_HOLD_S
+        if w <= 0:
+            return True
         since = self._take_since.setdefault(key, now_s)
         if now_s - since < w:
             return False
