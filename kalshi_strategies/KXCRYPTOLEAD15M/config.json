@@ -1,29 +1,29 @@
 {
   "quoting": {
     "max_position": 5.0,
-    "constant_edge": 0.04,
+    "constant_edge": 0.045,
     "edge_fraction": 1.0,
-    "lean_dollars": 0.02,
+    "lean_dollars": 0.03,
     "max_markets": null,
     "atm_hysteresis": 0,
     "enable_quoting": true,
     "quoting_edge": 0.0,
-    "max_improve_ticks": 2,
+    "max_improve_ticks": 1,
     "quote_levels_behind": 1,
     "skip_quote_depth_ahead": null,
     "quote_keep_inside": 0.01,
     "quote_ahead_grace_s": 1.0,
     "cancels_token": 20.0,
     "requote_delay_s": 0.5,
-    "order_lots": 0.5
+    "order_lots": 0.8
   },
   "trading_time": {
     "real_trading_delay_s": 10.0,
-    "real_trading_cutoff_s": 30.0
+    "real_trading_cutoff_s": 20.0
   },
   "risk": {
     "max_loss_usd": 80.0,
-    "max_signal_age_s": 0.25,
+    "max_signal_age_s": 0.2,
     "fresh_recovery_s": 0.5
   },
   "runtime": {
