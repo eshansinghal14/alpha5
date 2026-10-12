@@ -1,5 +1,6 @@
 """
-Account balance floor: stop ALL live trading if Kalshi cash drops below a floor.
+Account floor: stop ALL live trading if Kalshi portfolio (cash + position
+value) drops below a floor.
 
     python -m kalshi_infra.runtime.balance_watchdog --floor 1000 --interval 30
 
@@ -76,8 +77,8 @@ def cancel_all(client: KalshiOrderClient) -> int:
     return n
 
 
-def trip(client: KalshiOrderClient, cash: float, floor: float):
-    reason = f"balance watchdog: cash ${cash:.2f} < floor ${floor:.2f}"
+def trip(client: KalshiOrderClient, total: float, floor: float):
+    reason = f"balance watchdog: portfolio ${total:.2f} < floor ${floor:.2f}"
     log(f"TRIP: {reason}")
     request_stop_all(reason)
     for series in os.listdir(LIVE_ROOT):
@@ -124,25 +125,28 @@ def main():
             time.sleep(min(args.interval, 10))
             continue
 
+        # Cash + position value: cash alone dips whenever money is tied up
+        # in open positions, which isn't a loss.
+        total = cash + pv
         atomic_write_json(HEARTBEAT_PATH, {
             "time": pd.Timestamp.now(tz="UTC").isoformat(), "cash": cash,
-            "portfolio_value": pv, "floor": args.floor, "pid": os.getpid()})
-        if cash < args.floor:
+            "portfolio_value": pv, "total": total, "floor": args.floor, "pid": os.getpid()})
+        if total < args.floor:
             # Confirm with a second read so one odd response can't kill the session.
             time.sleep(2)
             try:
-                cash2, _ = read_balance(client)
+                total2 = sum(read_balance(client))
             except Exception as e:
                 log(f"confirm read failed: {e!r}; tripping on first read")
-                cash2 = cash
-            if cash2 < args.floor:
+                total2 = total
+            if total2 < args.floor:
                 try:
-                    trip(client, cash2, args.floor)
+                    trip(client, total2, args.floor)
                 except Exception as e:
                     # STOP.json is written first, so the sessions still stop.
                     log(f"trip cleanup error: {e!r}")
                 return
-            log(f"sub-floor read ${cash:.2f} not confirmed (${cash2:.2f})")
+            log(f"sub-floor read ${total:.2f} not confirmed (${total2:.2f})")
         time.sleep(args.interval)
 
 

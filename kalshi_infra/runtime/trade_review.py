@@ -36,18 +36,21 @@ def settlement(ticker: str) -> str | None:
     return r
 
 
-def review(series: str, dates: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+def review(series: str, dates: list[str], event: str | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """`event` limits every stream to that event's tickers, which keeps it
+    light enough to run on the live box."""
     fills, dec, bbo = [], [], []
     for d in dates:
-        f = read_journal(series, d, "fills")
+        f = read_journal(series, d, "fills", ticker_prefix=event)
         if f.empty:
             continue
         if "mode" not in f.columns:
             continue
         seeded = f["seeded"].fillna(False).astype(bool) if "seeded" in f.columns else False
         fills.append(f[(f["mode"] == "real") & ~seeded])
-        dec.append(read_journal(series, d, "decisions")[["time", "ticker", "prob", "market_bid", "market_ask", "x_phase", "x_tau"]])
-        bbo.append(read_journal(series, d, "bbo")[["time", "ticker", "bid", "ask"]])
+        dec.append(read_journal(series, d, "decisions", ticker_prefix=event,
+                                columns=["time", "ticker", "prob", "market_bid", "market_ask", "x_phase", "x_tau"]))
+        bbo.append(read_journal(series, d, "bbo", ticker_prefix=event, columns=["time", "ticker", "bid", "ask"]))
     if not fills:
         return pd.DataFrame(), pd.DataFrame()
     f = pd.concat(fills).drop_duplicates(["order_id", "trade_id", "time", "price", "size"]).sort_values("time")
@@ -135,7 +138,7 @@ def main():
     if args.event:
         d = pd.Timestamp.now(tz="UTC")
         dates = [(d - pd.Timedelta(days=1)).strftime("%Y-%m-%d"), d.strftime("%Y-%m-%d")]
-        f, _ = review(args.series, dates)
+        f, _ = review(args.series, dates, event=args.event)
         f = f[f["ticker"].str.startswith(args.event)] if not f.empty else f
         cols = ["time", "ticker", "side", "price", "size", "fee", "liquidity", "prob", "market_bid", "market_ask",
                 "mid_after", "markout", "edge_at_fill", "x_tau", "x_phase", "result", "settled_pnl", "bad_reason"]

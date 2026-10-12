@@ -182,8 +182,13 @@ def write(captured: dict | None) -> None:
         df.to_parquet(path)
 
 
-def read_journal(series: str, date: str, stream: str, out_root: str = None) -> pd.DataFrame:
+def read_journal(series: str, date: str, stream: str, out_root: str = None,
+                 columns: list[str] | None = None, ticker_prefix: str | None = None) -> pd.DataFrame:
     """The whole day's `stream`, across every process that wrote it today.
+
+    Pass `columns` and `ticker_prefix` when reading on the live box: a full
+    day of decisions is ~2.5 GB in memory, and on EC2 (3.8 GB, trading uses
+    ~1.4 GB) that got the reader OOM-killed (2026-10-12).
 
     Returns an empty frame when nothing has been journaled. A part that
     fails to read is skipped rather than raised on -- the newest one can be
@@ -191,12 +196,20 @@ def read_journal(series: str, date: str, stream: str, out_root: str = None) -> p
     parts = sorted(glob.glob(os.path.join(journal_dir(series, date, out_root), stream, "part-*.parquet")))
     if not parts:
         return pd.DataFrame()
+
+    def _filter(df):
+        if ticker_prefix is not None and "ticker" in df.columns:
+            df = df[df["ticker"].str.startswith(ticker_prefix)]
+        return df
+
     # One dataset read is ~10x faster than a read_parquet per part (106
     # fills parts: 1.1s -> ~0.1s); fall back to per-part only when one part
     # is unreadable or the parts' schemas disagree.
     try:
+        import pyarrow.compute as pc
         import pyarrow.dataset as ds
-        df = ds.dataset(parts, format="parquet").to_table().to_pandas()
+        flt = None if ticker_prefix is None else pc.starts_with(pc.field("ticker"), ticker_prefix)
+        df = ds.dataset(parts, format="parquet").to_table(columns=columns, filter=flt).to_pandas()
         if "time" in df.columns:
             df = df.sort_values("time").reset_index(drop=True)
         return df
@@ -205,7 +218,7 @@ def read_journal(series: str, date: str, stream: str, out_root: str = None) -> p
     frames = []
     for path in parts:
         try:
-            frames.append(pd.read_parquet(path))
+            frames.append(_filter(pd.read_parquet(path, columns=columns)))
         except Exception:
             continue
     if not frames:

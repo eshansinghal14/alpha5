@@ -1,0 +1,19 @@
+[Unit]
+Description=alpha5 balance floor: stop all live trading if the portfolio drops below $1000
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/opt/alpha5
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/alpha5/.venv/bin/python -u -m kalshi_infra.runtime.balance_watchdog --floor 1000 --interval 30
+# Exits 0 after tripping and must stay down, so a session re-armed by hand
+# isn't stopped again. Restarts only if it crashes.
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/opt/alpha5/data/live/balance_watchdog.out.log
+StandardError=append:/opt/alpha5/data/live/balance_watchdog.out.log
+
+[Install]
+WantedBy=multi-user.target
