@@ -34,7 +34,9 @@ EC2_KEY = os.path.join(os.path.expanduser("~"), ".ssh", "alpha5-live-key.pem")
 EC2_REGION, EC2_SG = "us-east-1", "sg-0ad95e21cd6ad28e0"
 SSH = ["ssh", "-i", EC2_KEY, "-o", "ConnectTimeout=30", "-o", "ConnectionAttempts=3",
        "-o", "BatchMode=yes", EC2_HOST]
-EC2_PY = "cd /opt/alpha5 && .venv/bin/python"
+# Every python the review runs on the live box goes through this 1 GiB memory
+# cap (deploy/review_py.sh), so a heavy query can't take trading down with it.
+EC2_PY = "/opt/alpha5/deploy/review_py.sh"
 
 PROMPT = """You are reviewing ONE just-finished Kalshi {series} event: {event}. READ-ONLY job.
 Do NOT edit code, do NOT touch STOP.json, trading_mode.json, or any process (here or on EC2). Do not place or cancel orders.
@@ -47,6 +49,9 @@ Live trading runs on an EC2 box, not this machine; this machine's data/live has 
      {ssh} "grep -v '^\\[record\\]' /opt/alpha5/data/live/run.out.log | tail -n 200"
    The decision/bbo journal is under /opt/alpha5/data/live/{series}/<date>/journal/ on EC2
    (kalshi_infra.runtime.journal.read_journal). Write any helper script to a temp dir, scp it over, and run it with {ec2_py}.
+   MEMORY: live trading shares EC2's 3.8 GB. ALWAYS run python there through {ec2_py} (it is capped at 1 GB and
+   killed past that; never call .venv/bin/python directly). A full day of decisions is ~2.5 GB, so ALWAYS pass
+   read_journal(..., ticker_prefix="{event}", columns=[only what you need]).
 3. Judge each fill / burst of fills manually. Only call a trade BAD when it is definitively a bad decision
    (e.g. traded on stale fair after a spot jump, quote left resting through an obvious move, repeated takes into a
    running market, size far above normal, trading against own model, fees > edge). A loser that was +EV at the time is NOT bad.
