@@ -23,7 +23,7 @@ import streamlit.components.v1 as components  # noqa: E402
 
 from kalshi_infra.runtime.control import request_trading_mode  # noqa: E402
 from kalshi_strategies.run import registry  # noqa: E402
-from kalshi_viz import config_form  # noqa: E402
+from kalshi_viz import config_form, perf_panel  # noqa: E402
 from kalshi_viz.data import load_day, read_summary, stream_url, summary_age_s  # noqa: E402
 from kalshi_viz.live_chart import IFRAME_HEIGHT, build_live_html  # noqa: E402
 
@@ -137,10 +137,19 @@ def _markets(day) -> list[str]:
     if not q.empty and "atm_tradeable" in q.columns:
         last = q.groupby("ticker")["atm_tradeable"].last()
         excluded = {t for t, ok in last.items() if ok is False or ok == 0} - traded
-    return sorted(listed, key=lambda t: (t in excluded, abs(probs.get(t, 0.5) - 0.5), t))
+        # With max_markets set, chart only the markets the quoter trades (plus
+        # any we hold fills in); the rest are dozens of empty SPX buckets.
+        if ((day.summary.get("config") or {}).get("quoting") or {}).get("max_markets"):
+            listed -= excluded
+    # Unpriced markets last: SPX prices only the IB-scoped buckets near the
+    # money, and defaulting those to 0.5 sorted dozens of empty charts first.
+    return sorted(listed, key=lambda t: (t not in probs.index, t in excluded, abs(probs.get(t, 0.5) - 0.5), t))
 
 
 def _render_series(series: str, spec):
+    st.title(series)
+    perf_panel.render(series)
+
     @st.fragment(run_every="2s")
     def status():
         s = read_summary(series)
@@ -205,7 +214,8 @@ def _render_markets(series: str):
     day = load_day(series)
     if day is None:
         return
-    markets = _stable_order(series, day, _markets(day))
+    current = _markets(day)
+    markets = [t for t in _stable_order(series, day, current) if t in current]
     if not markets:
         st.caption("Waiting for the session's first snapshot.")
         return
