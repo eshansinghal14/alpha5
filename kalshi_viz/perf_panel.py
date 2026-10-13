@@ -59,11 +59,11 @@ def _side(s: dict):
              help="Mid just before the fill minus our price: the half-spread we got at the fill.")
     a, b = st.columns(2)
     t = s.get("t_event")
-    a.metric("Events", f"{s['events']}", f"{s['won']:.0%} won · t={t:+.2f}" if not math.isnan(t) else
-             f"{s['won']:.0%} won", delta_color="off",
-             help="t = mean event PnL / its standard error. Under ~2 is within noise.")
+    a.metric("Lots filled", f"{s['contracts']:,.0f}", f"{s['fills']} fills · {s['taker']} taker", delta_color="off",
+             help="Contracts traded in the window, maker and taker.")
     b.metric("Max drawdown", _usd(s["max_dd"]), f"fees ${s['fees']:.2f}", delta_color="off")
-    st.caption(f"{s['fills']} fills ({s['taker']} taker) · {s['contracts']:.0f} contracts")
+    st.caption(f"{s['events']} events · {s['won']:.0%} won"
+               + (f" · t={t:+.2f} (under ~2 is within noise)" if not math.isnan(t) else ""))
 
 
 def _table(s: dict):
