@@ -30,8 +30,13 @@ class CryptoPricingParams:
         "Fair band half-width = this x theo_vol (the 1-sigma fair move over reaction_latency_s).",
         min=0, max=10, step=0.1)
     reaction_latency_s: float = param(
-        "Horizon for theo_vol. 0.05s = SPX loop's dispatch-to-arrival; not yet measured for Coinbase.",
+        "Horizon for theo_vol: the fair move we charge for is the one over this many seconds.",
         min=0.001, step=0.01)
+    theo_vol_reval_draws: int = param(
+        "theo_vol by full revaluation: reprice under this many joint coin moves over the horizon and "
+        "take E|fair change| (sigma-equivalent). Prices a race flip the slope x 1-sigma estimate misses "
+        "(26OCT131200: 5-13c shown, 90c move). 0 = the old slope x 1-sigma estimate.",
+        min=0, max=512, step=8)
     delta_refresh_s: float = param("Cadence of the bump deltas / theo_vol (edge sizing only).",
                                    min=0.05, step=0.05)
     max_cross_coin_skew_s: float = param(

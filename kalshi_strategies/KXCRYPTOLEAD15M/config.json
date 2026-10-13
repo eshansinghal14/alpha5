@@ -47,6 +47,7 @@
     "base_rate_window": 500,
     "ci_vol_multiplier": 1.5,
     "reaction_latency_s": 0.05,
+    "theo_vol_reval_draws": 32,
     "delta_refresh_s": 0.5,
     "max_cross_coin_skew_s": 1.0,
     "basis_tie_gap": 7.5e-05,

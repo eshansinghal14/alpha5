@@ -3,8 +3,9 @@ Live Coin Race model for one KXCRYPTOLEAD15M event: Coinbase books ->
 per-coin composite mid -> settlement tracker + HAR vol forecaster -> MC
 winner probabilities -> per-market Fair.
 
-Band = prob +/- ci_vol_multiplier * theo_vol, where theo_vol is the 1-sigma
-fair move over reaction_latency_s from the bump deltas. The pricer works in
+Band = prob +/- ci_vol_multiplier * theo_vol, where theo_vol is the
+sigma-equivalent fair move over reaction_latency_s: full revaluation under
+joint coin moves (theo_vol_reval_draws > 0), else the bump deltas x 1-sigma. The pricer works in
 log returns; only the SettlementTracker works in Kalshi's arithmetic returns.
 """
 from __future__ import annotations

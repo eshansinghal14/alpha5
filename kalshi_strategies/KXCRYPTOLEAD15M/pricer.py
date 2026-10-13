@@ -60,6 +60,11 @@ N_COINS = len(COINS)
 # L = averaging length (s). The end average "effective time" is L/3 = 20s,
 # which is what makes mu/V continuous at tau = 60.
 L = START_END_AVG_S
+# Rows of the fixed draws each theo_vol revaluation reprices. 32 reprices of
+# 5k rows cost ~25ms per delta refresh on the dev box, on the event loop; 2k
+# cuts that ~2.5x. p and p' share the rows, so a fair change still resolves
+# to 1/2000 (0.05c) per flipped row.
+REVAL_ROWS = 2000
 
 
 @dataclasses.dataclass
@@ -71,7 +76,7 @@ class FairResult:
     tau_eff: float                    # trace(V) / sum of diag of Sigma_rate -- "equivalent seconds"
     phase: str
     delta: np.ndarray                 # shape (5, 5), dp_i / dx_j
-    theo_vol: np.ndarray              # shape (5,), 1-sigma theo move over reaction_latency_s
+    theo_vol: np.ndarray              # shape (5,), 1-sigma-equivalent theo move over reaction_latency_s
     diagnostics: dict
 
 
@@ -112,6 +117,7 @@ class CoinRacePricer:
         self._E: np.ndarray | None = None
         self._last_corr: np.ndarray | None = None
         self._last_rate: np.ndarray | None = None
+        self._reval_z: np.ndarray | None = None      # unit move draws for _reval_theo_vol, keyed on count
 
     # ------------------------------------------------------------------
     # Variance clock
@@ -230,8 +236,16 @@ class CoinRacePricer:
             scaled = math.sqrt(te) * E if self._B is None else math.sqrt(te) * E + self._B
             delta = self._bump_deltas(mu, scaled, sd, probs)
             lat = self.config.reaction_latency_s
-            A = R * np.outer(np.sqrt(rate), np.sqrt(rate)) * lat
-            theo_vol = np.sqrt(np.maximum(np.einsum("ij,jk,ik->i", delta, A, delta), 0.0))
+            n_reval = int(getattr(self.config, "theo_vol_reval_draws", 0) or 0)
+            if n_reval > 0:
+                # dmu/dx: 1 in the window, tau/60 in the last minute (only the
+                # remaining part of the end average moves), 0 before the start
+                # is locked (mu doesn't depend on x there).
+                g = 1.0 if phase == "in_window" else (tau / L if phase == "last_minute" else 0.0)
+                theo_vol = self._reval_theo_vol(mu + scaled, rate, R, lat, g, n_reval) * (1.0 - lam)
+            else:
+                A = R * np.outer(np.sqrt(rate), np.sqrt(rate)) * lat
+                theo_vol = np.sqrt(np.maximum(np.einsum("ij,jk,ik->i", delta, A, delta), 0.0))
         elif compute_delta:
             delta, theo_vol = np.zeros((N_COINS, N_COINS)), np.zeros(N_COINS)
         elif prev_result is not None:
@@ -306,6 +320,53 @@ class CoinRacePricer:
         if self._tw is not None:
             E = E * self._tw
         return self._argmax_probs(mu + E)
+
+    def _reval_theo_vol(self, Y0: np.ndarray, rate: np.ndarray, R: np.ndarray, h: float, g: float,
+                        n: int) -> np.ndarray:
+        """1-sigma-equivalent fair move over the next `h` seconds by full
+        revaluation: E|p(x + dx) - p(x)| over joint coin moves dx, scaled by
+        sqrt(pi/2) so it equals the delta method's sigma when p is linear.
+
+        The delta method takes slope x 1-sigma. Near a race flip p is close to
+        a step in the gap, so the slope misses the jump: on
+        KXCRYPTOLEAD15M-26OCT131200 it showed 5-13c while ETH went 93% -> 2%
+        in one second (2026-10-13). Here a move that crosses the gap prices the
+        whole jump, weighted by how likely that move is.
+
+        Moves: n draws (antithetic pairs, t-tailed like the pricer's) from the
+        coins' joint per-second covariance x h; each reprices the fixed draws
+        Y0 shifted by g * dx. Uses the first REVAL_ROWS rows of Y0 for both p
+        and p', so sampling noise cancels except on rows whose winner flips."""
+        if g <= 0 or h <= 0:
+            return np.zeros(N_COINS)
+        n = max(2, n - n % 2)
+        if self._reval_z is None or self._reval_z.shape[0] != n:
+            rng = np.random.default_rng(self.config.mc_seed + 2)
+            z = rng.standard_normal((n // 2, N_COINS))
+            nu = self.config.t_nu
+            if nu is not None:
+                z = z * np.sqrt(nu / rng.chisquare(nu, n // 2) * (nu - 2.0) / nu)[:, None]
+            self._reval_z = np.vstack([z, -z])
+        s = np.sqrt(np.maximum(rate, 0.0))
+        C = R * np.outer(s, s) * h + 1e-30 * np.eye(N_COINS)
+        try:
+            Lc = np.linalg.cholesky(C)
+        except np.linalg.LinAlgError:
+            w, Q = np.linalg.eigh((C + C.T) / 2.0)
+            Lc = Q @ np.diag(np.sqrt(np.clip(w, 1e-30, None)))
+        dx = (self._reval_z @ Lc.T) * g
+        Ys = Y0[:REVAL_ROWS]
+        p0 = self._argmax_probs(Ys)
+        acc = np.zeros(N_COINS)
+        for k in range(dx.shape[0]):
+            acc += np.abs(self._argmax_probs(Ys + dx[k]) - p0)
+        # E|z| of a unit-variance move: sqrt(2/pi) for a normal, ~0.74 for t5.
+        # Dividing by the normal's would read 8% low under the t moves.
+        nu = self.config.t_nu
+        e_abs = (math.sqrt(2.0 / math.pi) if nu is None else
+                 2.0 * math.sqrt(nu - 2.0) * math.exp(math.lgamma((nu + 1) / 2) - math.lgamma(nu / 2))
+                 / (math.sqrt(math.pi) * (nu - 1.0)))
+        return acc / dx.shape[0] / e_abs
 
     def _bump_deltas(self, mu: np.ndarray, E_scaled: np.ndarray, sd: np.ndarray,
                      probs_0: np.ndarray) -> np.ndarray:
