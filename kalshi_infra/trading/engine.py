@@ -322,9 +322,12 @@ class LiveEngine:
 
     def position_limit(self) -> float:
         """The larger of the two caps: a LIP fill may legitimately take a
-        position past max_position, up to the largest LIP size."""
+        position past max_position, up to the largest LIP size. Only while LIP
+        quoting is on: otherwise a 400-lot LIP setting would silently loosen
+        the guard on the edge quotes."""
         lip = getattr(getattr(self.strategy, "cfg", None), "lip", None)
-        lip_max = lip.max_lots() if lip is not None and hasattr(lip, "max_lots") else 0.0
+        lip_max = (lip.max_lots() if lip is not None and hasattr(lip, "max_lots")
+                   and getattr(lip, "enable_lip_quoting", False) else 0.0)
         return max(self.quoting.max_position, lip_max)
 
     def signal_age_limit(self) -> float:
