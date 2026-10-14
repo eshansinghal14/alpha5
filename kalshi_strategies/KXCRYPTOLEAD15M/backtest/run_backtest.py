@@ -103,10 +103,9 @@ def run_one(event_ticker: str, cfg=None, verbose: bool = True):
         fc.update(float(ts), by_s[ts])
 
     model = _ReplayModel(ev, cfg, bus=_ReplayBus(live), coinbase=None, forecaster=fc)
-    # Freshness is a wall-clock concept; recovery_s on the replay clock would block forever.
+    # Freshness is a wall-clock concept: the replay clock would read every fair as stale.
     cfg = types.SimpleNamespace(**{**vars(cfg), "risk": types.SimpleNamespace(
-        **{**vars(cfg.risk), "max_signal_age_s": math.inf,
-           "fresh_recovery_s": 0.0})})
+        **{**vars(cfg.risk), "max_signal_age_s": math.inf})})
     model.cfg = cfg
     fee_sched = kfees.for_event(ev.event_ticker.split('-')[0], ev.event_ticker, at=ev.close_time)
     lip = None

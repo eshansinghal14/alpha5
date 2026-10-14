@@ -24,8 +24,7 @@
   },
   "risk": {
     "max_loss_usd": 80.0,
-    "max_signal_age_s": 0.2,
-    "fresh_recovery_s": 0.5
+    "max_signal_age_s": 0.2
   },
   "runtime": {
     "quote_fill_poll_s": 1.0,

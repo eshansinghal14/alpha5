@@ -95,11 +95,8 @@ class RiskParams:
         "Halt new orders once session PnL reaches -this on the worse of touch/fair marking.",
         min=0, step=5)
     max_signal_age_s: float = param(
-        "Pull quotes and stop taking when the fair's newest input is older than this.",
-        min=0.01, max=60, step=0.05)
-    fresh_recovery_s: float = param(
-        "After a stale episode, fair must stay fresh this long before quotes return (no flapping).",
-        min=0, max=60, step=0.5)
+        "Pull quotes and stop taking when the fair's newest input is older than this; they return "
+        "as soon as it's back under.", min=0.01, max=60, step=0.05)
 
 
 @section

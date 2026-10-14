@@ -3,6 +3,32 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-12..14 — Crypto live tuning, audit race, signal age
+
+Findings and numbers: `kalshi_strategies/KXCRYPTOLEAD15M/research/HANDOFF.md` §7 #5-#8.
+
+- `quoting.enable_taking` (dashboard checkbox): off = maker-only. Takes
+  lost money on every window tested; crypto runs with it off.
+- `CONFIRM_S` (0.1s, measured send -> booked fill) and `TAKE_HOLD_S` (0.5s)
+  replace `inflight_timeout_s` / `take_confirm_s`. The lean is flat linear
+  (`lean_dollars` only; `lean_multiplier` / `lean_exponent` removed);
+  `fair_clip_eps` is hardcoded.
+- Crypto `pricing.theo_vol_reval_draws`: theo_vol by full revaluation over
+  joint coin moves (0 = the old slope x 1-sigma). Fixes the last minute's
+  missing tau/60 factor, which read 60/tau too high.
+- Position audit compares Kalshi against our ledger before AND after the
+  read and halts only after 2 consecutive disagreements. The four
+  "ledger disagrees" halts were fills racing the read; the books matched.
+- `risk.fresh_recovery_s` removed: quotes return as soon as the signal age
+  is back under `max_signal_age_s`. `signal_age_s` is logged on every
+  decision row.
+- Dashboard: strategy performance panel (PnL with 1s/10s markout by
+  window, lots filled, drawdown); only `max_markets` markets are charted
+  when it's set.
+- Overnight safety: balance watchdog (portfolio floor) runs on EC2; the
+  review agent's EC2 queries run under a 1 GiB memory cap
+  (`deploy/review_py.sh`).
+
 ## 2026-10-09 — Reorg: kalshi_strategies + generic runtime + kalshi_viz
 
 **Layout.** `kalshi_crypto/`, `kalshi_latency_arbs/`, `kalshi_main/` and

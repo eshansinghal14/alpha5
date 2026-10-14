@@ -84,10 +84,6 @@ class Quoter:
         self._take_since: dict[tuple[str, str], float] = {}
         self._take_last: dict[tuple[str, str], float] = {}
         self._last_signal_age: float | None = None
-        # Fresh "since forever" until a stale episode: the recovery hold is
-        # for flapping, and applying it at event start held every crypto
-        # rollover ~2s stale with good data (2026-10-09).
-        self._fresh_since: float | None = float("-inf")
         self.block_counts: dict[str, int] = {}
         self.debug_log: list[dict] = []
         # Our live quotes as last reported by the ctx, per (ticker, side):
@@ -193,18 +189,12 @@ class Quoter:
     # ------------------------------------------------------------------
 
     def signal_stale(self) -> bool:
-        """Fair inputs older than max_signal_age_s, or not yet fresh for
-        fresh_recovery_s after a stale episode (no flapping)."""
-        r = self.cfg.risk
+        """Fair inputs older than max_signal_age_s. Quotes return the moment
+        the age is back under the limit: the old fresh_recovery_s hold was 83%
+        of stale-blocked decisions with the age already under it (2026-10-14)."""
         age = self.model.signal_age_s()
         self._last_signal_age = age
-        now = pd.Timestamp.now(tz="UTC").timestamp()
-        if age is None or age > r.max_signal_age_s:
-            self._fresh_since = None
-            return True
-        if self._fresh_since is None:
-            self._fresh_since = now
-        return (now - self._fresh_since) < r.fresh_recovery_s
+        return age is None or age > self.cfg.risk.max_signal_age_s
 
     def _atm_tradeable(self, ticker: str) -> bool:
         """Among the max_markets fairs closest to 0.5. Ties break on ticker;

@@ -60,8 +60,7 @@ def run_one(event_ticker: str, cfg=None, *, conflate_ms: int = ibe.IB_OPTIONS_CO
     cfg = cfg or load(SpxConfig, CONFIG_PATH, series)
     # Freshness and close-time guards are wall-clock live concepts.
     cfg = types.SimpleNamespace(**{**vars(cfg), "risk": types.SimpleNamespace(
-        **{**vars(cfg.risk), "max_signal_age_s": float("inf"),
-           "fresh_recovery_s": 0.0})})
+        **{**vars(cfg.risk), "max_signal_age_s": float("inf")})})
     event_data = data.load_event_data(event_ticker, allow_predexon=allow_predexon)
     markets, events, _grid, _lo, probs_mid, _hi = signal_grid.precompute_signal(
         event_ticker, conflate_ms=conflate_ms, return_grid=True)

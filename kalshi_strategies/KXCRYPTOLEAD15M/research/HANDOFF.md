@@ -4,7 +4,7 @@
 
 # kalshi_crypto — Handoff / State of Work
 
-**Last updated:** 2026-10-08
+**Last updated:** 2026-10-14 (live-trading findings: §7 #5-#8)
 **Series:** `KXCRYPTOLEAD15M` (Kalshi "Coin Race 15 minutes")
 **Spec:** `OpenCode Build Prompt  Kalshi Coin Race LIP Market Maker.md` (this folder)
 **Also read:** `README.md` (this folder) for the math + usage quick-start.
@@ -584,6 +584,128 @@ objective, so this needs a decision. Facts to start from:
   that needs E[rest] or P(fill) depends on fixing it first.
 - Hooks already in place: `decompose_edge(lip_credit_bid/ask=...)`,
   `lip_scorer.marginal_reward_rate`, `score_book(...).reference_price`.
+
+### #5 — LIP quote is picked off on big moves; depth-ahead rule doesn't protect (2026-10-12)
+
+Backtest: 57 events 2026-10-12 02:30-16:30 UTC, Predexon ladders (~0.5s),
+Kalshi prints for fills, live decision journal for the edge, live
+`choose_lip_level` (20 lots, prop_max 0.7). Script and per-fill output:
+`%TEMP%/opencode/lip_bt.py`, `lip_live_fills.csv` (not in the repo).
+
+| depth rule | reward | fills | 10s markout | settled |
+|---|---|---|---|---|
+| none | $56 | 189 | -$190 | -$53 |
+| live (>=150 ahead) | $55 | 161 | -$183 | -$55 |
+| >=500 ahead | $17 | 25 | -$2 | +$27 |
+| >=150 excl. largest level | $6 | 31 | -$36 | +$14 |
+
+- Depth ahead was almost always ~240 = two 120-lot levels (`[120, 120, 3]`),
+  a ladder repeated every few ticks, likely one maker. In 131/161 fills >75%
+  of it vanished without trading; in 73 it all left within one ~0.5s
+  snapshot, median 0.00s before our fill. They pull, the sweep hits us.
+- Concentration and level counts don't separate it: one maker spans levels.
+- Fills cluster across coins in the same instant (one coin move reprices the
+  event); worst stretch 1-3 min before close.
+- Sim is optimistic (0.1s cancel on every snapshot vs live's 1s queue poll).
+- Not yet tried: pull LIP on a coin jump, no LIP in the last 3 min, deeper
+  (lower prop_max) or smaller lots.
+- $1 payout floor: on 2026-10-12/13 our edge quotes alone accrued a median
+  $0.02 per market-period (max $0.07; 0 of 485 reached $1). One order held
+  the whole period at the best bid on BOTH sides needs ~50 lots to clear $1
+  in ~90% of periods (20 lots: 3%); one side alone needs ~100. LIP quoting
+  is off (`lip.enable_lip_quoting` false) until adverse fills are solved.
+
+### #6 — Live edge, adverse fills and the last minute (2026-10-11..14)
+
+Everything below is maker-only unless stated: taking lost money on every
+window tested and is off (`quoting.enable_taking` false, dashboard checkbox).
+
+**Taking.** 985 real taker fills (2026-10-12): 10s markout -3.1c/contract
+(t -5), settled -$49. More fair-vs-touch edge was WORSE (>15c edge: -5.7c
+at 10s, -13.5c settled): a big disagreement is usually our fair being wrong.
+Raising the theo_vol horizon only cut take volume; per-take quality didn't
+improve at any horizon, constant-edge-matched or not.
+
+**Where maker fills go wrong.** Spread captured at the fill is ~5.7c; ~80%
+of it is gone within 1s (we're filled by the move that's repricing through
+the quote). Adverse fills are predicted by the race moving AFTER the fill
+(|dz| >= 0.5 within 10s: 75-88% adverse) and by theo_vol at the fill, not by
+the coin's distance from first or by time of day. The last 1-3 min is the
+worst stretch in every cut (sim, live, LIP).
+
+**theo_vol.** `pricing.theo_vol_reval_draws` (32, live): full revaluation,
+E|fair change| over joint coin moves for `reaction_latency_s`, scaled to
+1-sigma-equivalent. Also fixes the missing tau/60 factor in the last minute
+(the old slope x 1-sigma read 60/tau too high there: 2x at 30s). Live it
+reads ~1.3x lower >3 min out, ~2.4x lower 1-3 min out, ~6x lower <60s than
+the old calc; the 1-3 min gap is larger than the smoke test predicted and
+is not explained yet (suspect MC noise inflating the old slope^2). Neither
+calc prices a race flip: 26OCT131200 lost $7.38 when SOL moved ~8bp in 2s
+(~6 model sigma) at 35-47s left and swept 5.5 lots of ETH-yes/SOL-no; no
+model-vol draw puts weight on that move.
+
+**Edge fit** (965 maker fills, old theo_vol, 2s horizon): A = edge - markout
+= a + b*theo_vol per time bucket. >3 min: edge_fraction ~0.63 (90% CI
+0.17-1.02); 1-3 min and <60s: b ~ 0, a ~13c and ~17c (flat risk, not
+theo_vol). R^2 ~0.01 and the halves disagree; partly circular (we're only
+filled where our own rule put the quote).
+
+**Live settings history.** 2s horizon + edge_fraction 0.5 + constant 3.5c
+(10-12 21:23) ; new theo_vol (10-13 18:51) ; edge_fraction 0.7 (20:20) ;
+0.8 + 60s cutoff (23:15) ; max_signal_age 0.1 (10-14 ~05:50). Per period:
+
+| period | events | lots/ev | 10s c/lot | PnL |
+|---|---|---|---|---|
+| old theo_vol, 0.5 | 82 | 12.9 | +1.3 | +$20.80 |
+| new theo_vol, 0.5 | 7 | 20.4 | -0.4 | +$8.56 |
+| new theo_vol, 0.7 | 12 | 19.0 | +0.8 | -$0.81 |
+| new theo_vol, 0.8, 60s cutoff | 22 | 19.3 | +1.5 | +$33.36 (t 2.6) |
+
+Per-event noise in 10s markout is ~5.4c/lot: a 1c/lot difference between two
+settings or sessions needs ~230 events each, a 2c difference ~60.
+
+**Last minute.** Cutoff 60s (`trading_time.real_trading_cutoff_s`): 30-60s
+was 8% of lots at ~break-even and holds the jump risk above. 1-3 min still
+shows weak 1s markout; a flat edge add-on there is the next thing to try.
+
+**Pulls.** spot_burst pulls (~15% of quote time) avoided flow that was worse
+than our fills (-1.0c 10s, -2.9c settled per contract, upper-bound sim); keep
+them. stale_signal pulls are ~0.5% of time and cost nothing measurable.
+spot_burst is not logged as a block (shows as priced rows with 0 levels);
+log it before relying on that inference.
+
+**Signal age.** `signal_age_s` is now on every decision row (10-14). First
+2h: p50 8ms, p99 51ms, 0.14% of decisions over 100ms. `fresh_recovery_s` was
+removed (10-14): 83% of stale-blocked decisions were the 0.5s recovery hold
+with the age already under the limit.
+
+**Time of day.** No session is worse yet (maker 10s markout +0.4c Asia,
++1.0c Europe, +0.5c US, +1.1c late US, all +-0.6-1.0c), but settings changed
+across those hours; needs ~a week on fixed settings. Faster check not yet
+run: share of our fills that are part of a multi-level sweep, by session.
+
+### #7 — Position-audit halts were a race, not bad bookkeeping (fixed 2026-10-14)
+
+Four "ledger disagrees with Kalshi" halts (26OCT111900, 111945, 121245,
+130915). Kalshi's /fills matched our journal execution for execution every
+time; net positions per coin were identical. The audit read Kalshi's
+positions while a burst of fills was landing: one side had them, the other
+didn't, and a quote that filled fully no longer counted as resting, so the
+tolerance didn't cover it. Fix (`engine.audit_positions`): compare against
+our ledger before AND after the read, and halt only after AUDIT_STRIKES (2)
+consecutive disagreements (5s apart). A real gap still halts, ~10s instead
+of 5s.
+
+### #8 — Open
+
+- 1-3 min edge add-on (flat, time-bucketed); refit edge_fraction on the new
+  theo_vol after a day on fixed settings.
+- Why new theo_vol is 2.4x lower 1-3 min out.
+- Log spot_burst as a block; consider a shorter burst hold (2-5s pulls were
+  slightly positive).
+- Time-of-day and max_signal_age (50ms) once there's a week of data.
+- LIP: needs ~50 lots/side for the $1 floor and a fix for sweep pickoffs.
+
 
 ---
 

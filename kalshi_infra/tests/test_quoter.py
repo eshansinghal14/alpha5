@@ -34,7 +34,7 @@ def cfg(**q):
     return types.SimpleNamespace(
         quoting=P.QuotingParams(**base),
         trading_time=P.TradingTimeParams(real_trading_delay_s=0.0, real_trading_cutoff_s=0.0),
-        risk=P.RiskParams(max_loss_usd=80.0, max_signal_age_s=1.0, fresh_recovery_s=0.0),
+        risk=P.RiskParams(max_loss_usd=80.0, max_signal_age_s=1.0),
         lip=P.LipSettings(enable_lip_quoting=False, lip_lots=0.0, prop_max_lip=1.0, lip_min_depth_ahead=0.0, lip_hold_s=1.0))
 
 
@@ -267,16 +267,14 @@ def test_stale_signal_publishes_nothing_quotable_and_logs_reason():
     assert r["prob_raw"] == 0.50     # fair still logged under a block (no theo gap)
 
 
-def test_fresh_recovery_applies_after_a_stale_episode_not_at_start():
-    c = cfg()
-    c.risk = P.RiskParams(max_loss_usd=80.0, max_signal_age_s=1.0, fresh_recovery_s=60.0)
+def test_quotes_return_as_soon_as_signal_is_fresh_again():
     m = Model()
-    q = Quoter(c, m, FREE, close_time=None)
+    q = Quoter(cfg(), m, FREE, close_time=None)
     assert not q.signal_stale()
     m.age = 5.0
     assert q.signal_stale()
     m.age = 0.0
-    assert q.signal_stale()          # inside the recovery hold
+    assert not q.signal_stale()      # no recovery hold
 
 
 def test_series_side_block_vetoes_one_side():
