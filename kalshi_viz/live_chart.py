@@ -18,7 +18,14 @@ from bokeh.events import Reset
 from bokeh.layouts import row
 from bokeh.models import ColumnDataSource, CustomJS, DatetimeTickFormatter, LinearAxis, Range1d, Span
 from bokeh.plotting import figure
-from bokeh.resources import INLINE
+from bokeh.resources import CDN
+
+# BokehJS from cdn.bokeh.org (pinned to the installed version), cached by the
+# browser once. INLINE embedded ~1.4 MB of JS in EVERY chart iframe: a
+# 53-market KXINXU page was ~75 MB through the SSH tunnel (2026-10-14).
+# Not self-hosted: Streamlit's static route serves .js as text/plain + nosniff,
+# which browsers refuse to execute.
+RESOURCES = CDN
 
 POLL_MS = 1500   # ~ the runtime's flush cadence; faster just refetches the same file
 CHART_HEIGHT = 360
@@ -149,7 +156,7 @@ def build_live_html(series: str, market: str, json_url: str, x_start_ms: float, 
     p1.js_on_event(Reset, on_reset)
     p2.js_on_event(Reset, on_reset)
 
-    html = file_html(row(p1, p2, sizing_mode="stretch_width"), INLINE, f"{series} -- {market}")
+    html = file_html(row(p1, p2, sizing_mode="stretch_width"), RESOURCES, f"{series} -- {market}")
     # The body is one viewport plus the pos/pnl chart wide, so the
     # stretch_width theo chart takes exactly the visible width.
     poller = """

@@ -1,6 +1,13 @@
 [theme]
 base = "dark"
 
+[browser]
+# The usage-stats pageProfile message arriving right after a websocket
+# reconnect raises "Tried to use SessionInfo before it was initialized" in
+# Streamlit 1.39 (streamlit/streamlit#9767), which reloads the page. Seen
+# through the EC2 SSH tunnel on 2026-10-14.
+gatherUsageStats = false
+
 [server]
 # Serves kalshi_viz/static/ at /app/static/ -- how the live chart fetches its own
 # data snapshot same-origin, without a second web server or CORS setup.

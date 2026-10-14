@@ -136,12 +136,14 @@ def _render_guards(s: dict):
                    + " | orders: " + (", ".join(f"{k} x{v}" for k, v in eb.items()) or "none"))
 
 
-def _markets(day) -> list[str]:
-    """Every market of the running event, closest-to-0.5 first. Not gated on
-    decisions: the touch and our fair chart from the session start. Markets
-    the quoter has excluded (max_markets) go last unless traded."""
+def _markets(day, show_all: bool = False) -> list[str]:
+    """Markets of the running event to chart, closest-to-0.5 first. With
+    max_markets set (and not show_all), only the ones the quoter currently
+    trades plus any we have traded or hold: the S&P events list 30-60
+    markets and every chart is its own iframe."""
     q, f = day.quote_df, day.fills_df
     traded = set(f["ticker"].unique()) if not f.empty else set()
+    traded |= {t for t, v in (day.summary.get("positions") or {}).items() if abs(v) > 1e-9}
     listed = set(day.summary.get("tickers") or []) | traded
     if not q.empty:
         listed |= set(q["ticker"].unique())
@@ -151,10 +153,11 @@ def _markets(day) -> list[str]:
     if not q.empty and "atm_tradeable" in q.columns:
         last = q.groupby("ticker")["atm_tradeable"].last()
         excluded = {t for t, ok in last.items() if ok is False or ok == 0} - traded
-        # With max_markets set, chart only the markets the quoter trades (plus
-        # any we hold fills in); the rest are dozens of empty SPX buckets.
-        if ((day.summary.get("config") or {}).get("quoting") or {}).get("max_markets"):
-            listed -= excluded
+        if ((day.summary.get("config") or {}).get("quoting") or {}).get("max_markets") and not show_all:
+            # Unquoted markets never appear in quote_df, so "not excluded"
+            # kept all of them: 53 charts on KXINXU (2026-10-14).
+            active = {t for t, ok in last.items() if ok is True or ok == 1}
+            listed = (active | traded) & listed
     # Unpriced markets last: SPX prices only the IB-scoped buckets near the
     # money, and defaulting those to 0.5 sorted dozens of empty charts first.
     return sorted(listed, key=lambda t: (t not in probs.index, t in excluded, abs(probs.get(t, 0.5) - 0.5), t))
@@ -232,7 +235,8 @@ def _render_markets(series: str):
     day = load_day(series)
     if day is None:
         return
-    current = _markets(day)
+    show_all = st.checkbox("Show every market (slow on S&P: one chart each)", key=f"all_mkts_{series}")
+    current = _markets(day, show_all)
     markets = [t for t in _stable_order(series, day, current) if t in current]
     if not markets:
         st.caption("Waiting for the session's first snapshot.")
