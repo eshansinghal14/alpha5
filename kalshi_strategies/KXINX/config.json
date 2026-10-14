@@ -50,6 +50,7 @@
       "lip_cheap_lots": 0.0,
       "lip_rich_min_price": 0.8,
       "lip_rich_lots": 0.0,
+      "lip_fair_margin": null,
       "lip_min_time_left_s": 0.0,
       "lip_hold_s": 1.0
     },
@@ -107,6 +108,7 @@
       "lip_cheap_lots": 0.0,
       "lip_rich_min_price": 0.8,
       "lip_rich_lots": 0.0,
+      "lip_fair_margin": null,
       "lip_min_time_left_s": 0.0,
       "lip_hold_s": 1.0
     },
@@ -164,6 +166,7 @@
       "lip_cheap_lots": 0.0,
       "lip_rich_min_price": 0.8,
       "lip_rich_lots": 0.0,
+      "lip_fair_margin": null,
       "lip_min_time_left_s": 0.0,
       "lip_hold_s": 1.0
     },

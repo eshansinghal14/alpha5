@@ -139,6 +139,11 @@ class LipSettings:
     lip_rich_lots: float = param(
         "LIP order size on an expensive-side price, less any position already held on that side. "
         "0 disables the expensive side.", min=0, step=10.0)
+    lip_fair_margin: float | None = param(
+        "Cap the LIP price at own-side fair minus this, so LIP never rests above what the model says "
+        "the side is worth. null = no fair check. Live 2026-10-14 22:22-22:55 UTC: 613 of 1,109 LIP "
+        "lots filled >2c above fair and carried $24.5 of the $28.2 10s markout loss.",
+        min=0, max=0.5, step=0.005)
     lip_min_time_left_s: float = param(
         "No LIP quote with fewer than this many seconds to close. The last 3 min lost money net "
         "in every cut of the 2026-10-11..14 backtest.", min=0, step=30)

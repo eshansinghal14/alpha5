@@ -371,7 +371,7 @@ class Quoter:
             # quote_block (spot_burst): pulling on spot cost more LIP than it
             # saved in pickoffs (LIP_REPORT.md §5).
             side_ok = q.enable_quoting and (block_bid if side == "yes" else block_ask) is None
-            lips[side] = self._lip_target(ticker, side, book, ladder, net, now) if side_ok else None
+            lips[side] = self._lip_target(ticker, side, book, ladder, net, now, prob) if side_ok else None
             self._publish_lip(ctx, ticker, side, lips[side])
         quote_bid = _top_yes("yes", out["yes"])
         quote_ask = _top_yes("no", out["no"])
@@ -412,16 +412,16 @@ class Quoter:
     # LIP quote
     # ------------------------------------------------------------------
 
-    def _lip_target(self, ticker, side, book, ladder, net, now) -> LipTarget | None:
+    def _lip_target(self, ticker, side, book, ladder, net, now, prob) -> LipTarget | None:
         """Where the one LIP quote on this side should rest, or None.
 
         Price: others' best bid on this side (our own orders, LIP included,
         netted out, so the quote follows the book down rather than holding
-        itself up), capped a tick inside the far touch. Quoted only if that
-        price is in a band (lip.lots_at) and at least lip_min_time_left_s
-        remain. Our fair and edge are deliberately not consulted: holding
-        the quote outside the edge reservation left it almost never at the
-        best bid, where nearly all the LIP is (LIP_REPORT.md §6).
+        itself up), capped a tick inside the far touch and, with
+        lip_fair_margin set, at own-side fair minus that margin. Quoted only if
+        the price is in a band (lip.lots_at) and at least lip_min_time_left_s
+        remain. The full edge reservation is NOT used: it left the quote almost
+        never at the best bid, where nearly all the LIP is (LIP_REPORT.md §6).
 
         Size: lots_at(price) minus the position already held on this side and
         our resting edge size there."""
@@ -441,6 +441,9 @@ class Quoter:
         far = book.ask if side == "yes" else (None if book.bid is None else 1.0 - book.bid)
         if far is not None:
             price = min(price, round(far - TICK, 2))
+        if lc.lip_fair_margin is not None:
+            fair_own = prob if side == "yes" else 1.0 - prob
+            price = min(price, round(math.floor((fair_own - lc.lip_fair_margin) / TICK + 1e-9) * TICK, 2))
         if not (MIN_PRICE <= price <= MAX_PRICE):
             return None
         held = net if side == "yes" else -net

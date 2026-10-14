@@ -39,7 +39,7 @@ def cfg(**q):
 
 
 LIP_OFF = dict(enable_lip_quoting=False, lip_cheap_max_price=0.2, lip_cheap_lots=0.0, lip_rich_min_price=0.8,
-               lip_rich_lots=0.0, lip_min_time_left_s=0.0, lip_hold_s=1.0)
+               lip_rich_lots=0.0, lip_fair_margin=None, lip_min_time_left_s=0.0, lip_hold_s=1.0)
 
 
 class Model:
@@ -503,6 +503,22 @@ def test_lip_capped_inside_far_touch():
     q, ctx = lip_q()
     lip_step(q, ctx, yes={0.10: 500.0}, no={0.91: 200.0})
     assert ctx.lip_targets[("A", "yes")].price == 0.08
+
+
+def test_lip_fair_margin_caps_price_below_fair():
+    """Best yes bid 0.10, fair 0.07: with a 2c margin the LIP bid is 0.05, not 0.10.
+    No side: own-side fair 0.93, best no bid 0.89 already under 0.91 -> unchanged."""
+    q, ctx = lip_q(lip_fair_margin=0.02, lip_rich_lots=100.0)
+    lip_step(q, ctx, fair=0.07)
+    assert ctx.lip_targets[("A", "yes")].price == 0.05
+    assert ctx.lip_targets[("A", "no")].price == 0.89
+
+
+def test_lip_fair_margin_can_pull_the_quote():
+    # Fair 0.02: cap at 0.00 -> below the 1c minimum -> no LIP on yes.
+    q, ctx = lip_q(lip_fair_margin=0.02)
+    lip_step(q, ctx, fair=0.02)
+    assert ctx.lip_targets[("A", "yes")] is None
 
 
 def test_lip_obeys_side_block_and_enable_quoting_but_not_spot_burst():
