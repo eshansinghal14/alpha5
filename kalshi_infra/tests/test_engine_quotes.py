@@ -229,6 +229,32 @@ def test_shadow_quote_fills_off_trades_behind_the_queue():
     assert 0.41 not in live_prices(eng, "yes")
 
 
+def _lip_engine():
+    eng, _, client = setup(real=True)
+    eng.update_book(book(bid=0.10, ask=0.60, depth=500.0))
+    eng.om.set_lip("A", "yes", om.LipTarget(0.10, 100.0))
+    eng.pump_quotes()
+    q = eng.om.lip_quote("A", "yes")
+    assert q is not None and q.exchange_id is not None
+    return eng, client, q
+
+
+def test_requeue_lip_moves_front_of_queue_to_back():
+    eng, client, q = _lip_engine()
+    # 30 ahead at 0.10, 500 displayed: 370 behind us.
+    out = eng.requeue_lip({q.exchange_id: 30.0}, min_ahead=200.0)
+    assert out == [("A", "yes", 0.10, 30.0, 370.0, True)]
+    assert client.amends[-1] == (q.exchange_id, 0.10)
+
+
+def test_requeue_lip_leaves_deep_or_last_quotes():
+    eng, client, q = _lip_engine()
+    n = len(client.amends)
+    assert eng.requeue_lip({q.exchange_id: 300.0}, min_ahead=200.0)[0][-1] is False   # deep enough
+    assert eng.requeue_lip({q.exchange_id: 400.0}, min_ahead=500.0)[0][-1] is False   # nobody behind
+    assert len(client.amends) == n
+
+
 def test_position_cap_limits_ladder_depth():
     eng, _, client = setup(real=True, max_position=2.0)
     fair(eng)

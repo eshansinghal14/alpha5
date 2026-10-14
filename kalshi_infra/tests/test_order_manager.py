@@ -507,6 +507,50 @@ def test_lip_never_trimmed_or_moved_as_edge_spare():
     assert ex.amends == [] and not ex.cancels
 
 
+def _resting_lip(m, ex):
+    m.set_lip("A", "yes", LipTarget(0.30, 20.0))
+    m.pump(); ack_all(m, ex)
+    return m.lip_quote("A", "yes")
+
+
+def test_lip_requeue_is_one_size_bump_amend():
+    m, ex, _ = mk()
+    q = _resting_lip(m, ex)
+    assert m.requeue_lip(q, urgent=True)
+    assert ex.amends == [(q.order_id, 0.30, pytest.approx(20.0 + om.LIP_REQUEUE_BUMP))]
+    assert ex.cancels == [] and m.counts["lip_requeue"] == 1
+
+
+def test_lip_requeue_rate_limited_per_side():
+    m, ex, c = mk()
+    q = _resting_lip(m, ex)
+    assert m.requeue_lip(q, urgent=True)
+    answer_amends(m, ex)
+    c.t += om.LIP_REQUEUE_MIN_S - 0.1
+    assert not m.requeue_lip(q, urgent=True)
+    c.t += 0.2
+    assert m.requeue_lip(q, urgent=True)
+
+
+def test_lip_requeue_non_urgent_needs_spare_tokens():
+    m, ex, _ = mk(bucket=25.0, reserve=10.0)       # 15 spare: one amend, not amend + 2 creates
+    q = _resting_lip(m, ex)
+    ex.bucket = 25.0
+    assert not m.requeue_lip(q, urgent=False)
+    assert m.requeue_lip(q, urgent=True)
+
+
+def test_requeued_lip_bump_is_not_amended_back():
+    m, ex, c = mk()
+    m.lip_hold_s = 0.0
+    q = _resting_lip(m, ex)
+    m.requeue_lip(q, urgent=True); answer_amends(m, ex)
+    n = len(ex.amends)
+    c.t += 1.0
+    m.pump()
+    assert len(ex.amends) == n                    # target 20.0, resting 20.01: left alone
+
+
 def test_on_book_includes_lip():
     m, ex, _ = mk()
     m.set_lip("A", "yes", LipTarget(0.30, 20.0))

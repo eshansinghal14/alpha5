@@ -292,6 +292,19 @@ def levels_from_ladder(bids: dict[float, float], ours: list[tuple[float, float]]
     return sorted((LipLevel(price=p, size=v[0], mine=v[1]) for p, v in acc.items()), key=lambda lv: -lv.price)
 
 
+def levels_with_ours(others: dict[float, float], ours: list[tuple[float, float]]) -> list[LipLevel]:
+    """Levels from OTHERS' ladder (ours already removed) with our orders
+    added on top -- unlike levels_from_ladder, whose input still contains
+    ours."""
+    acc = {p: [s, 0.0] for p, s in others.items()}
+    for p, s in ours:
+        if s > 0:
+            lv = acc.setdefault(round(p, 2), [0.0, 0.0])
+            lv[0] += s
+            lv[1] += s
+    return sorted((LipLevel(price=p, size=v[0], mine=v[1]) for p, v in acc.items()), key=lambda lv: -lv.price)
+
+
 def others_ladder(bids: dict[float, float], ours: list[tuple[float, float]]) -> dict[float, float]:
     """The visible ladder with our own resting size removed."""
     out = dict(bids)
@@ -374,6 +387,6 @@ class LipTracker:
 __all__ = [
     "LipParams", "LipLevel", "LipSideScore", "LipBookScore",
     "score_book", "marginal_reward_rate", "period_payout",
-    "params_from_program", "levels_from_ladder", "others_ladder", "reward_rate",
+    "params_from_program", "levels_from_ladder", "levels_with_ours", "others_ladder", "reward_rate",
     "LipTracker",
 ]

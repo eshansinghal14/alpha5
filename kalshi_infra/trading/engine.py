@@ -142,6 +142,12 @@ class LiveContext:
         q = self._engine.om.lip_quote(ticker, side)
         return None if q is None else (q.price, q.remaining)
 
+    def lip_queue(self, ticker: str, side: str):
+        """(contracts ahead, behind) of our LIP quote at the last queue poll, or None."""
+        if self._engine.om.lip_quote(ticker, side) is None:
+            return None
+        return self._engine.lip_queue.get((ticker, side))
+
     def quote_ladder(self, ticker: str, side: str) -> list[tuple[float, float]]:
         """[(price, remaining)] of our live quotes on one side."""
         return self._engine.om.ladder(ticker, side)
@@ -264,6 +270,9 @@ class LiveEngine:
         # (a fill that raced the cancel must still find its order).
         self._quote_orders: dict[int, Order] = {}
         self._exchange_to_quote: dict[str, int] = {}
+        # (ticker, side) -> (contracts ahead, behind) of our LIP quote at the
+        # last queue-position poll; logged on decision rows.
+        self.lip_queue: dict[tuple[str, str], tuple[float, float]] = {}
         # Shadow models the account write bucket at the real refill rate
         # (with our headroom), so it sees the same throttling a real session
         # would; real mode uses the order client's own bucket instead.
@@ -1367,6 +1376,36 @@ class LiveEngine:
 
     def has_quotes(self) -> bool:
         return bool(self.om.quotes)
+
+    def requeue_lip(self, positions: dict[str, float], min_ahead: float) -> list[tuple]:
+        """Move LIP quotes that have worked toward the front of their queue
+        back to the end. `positions`: Kalshi's queue position (contracts ahead
+        at the order's own price) per exchange id. One with fewer than
+        `min_ahead` ahead and size displayed behind it is re-queued,
+        fewest-ahead first, while the write bucket allows. Returns
+        [(ticker, side, price, ahead, behind, requeued)] for logging."""
+        cands = []
+        for q in self.om.live(role="lip"):
+            if q.state != om.RESTING or q.exchange_id not in positions:
+                continue
+            ahead = positions[q.exchange_id]
+            book = self.books.get(q.ticker)
+            ladder = getattr(book, "ladder", None) if book is not None else None
+            level = 0.0 if ladder is None else \
+                (ladder.yes_bids if q.side == "yes" else ladder.no_bids).get(round(q.price, 2), 0.0)
+            behind = max(level - ahead - q.remaining, 0.0)
+            self.lip_queue[(q.ticker, q.side)] = (ahead, behind)
+            cands.append((ahead, behind, q))
+        out = []
+        for ahead, behind, q in sorted(cands, key=lambda c: c[0]):
+            # Already last: re-queueing would change nothing and spend a write.
+            want = ahead + 1e-9 < min_ahead and behind > 1e-9
+            # Front quarter of the threshold: next in line for a sweep, so it
+            # may use any token above the cancel reserve; otherwise only spare ones.
+            urgent = ahead < min_ahead / 4
+            done = self.om.requeue_lip(q, urgent) if want else False
+            out.append((q.ticker, q.side, q.price, ahead, behind, done))
+        return out
 
     def has_uncancelled_quotes(self) -> bool:
         return any(q.state != om.CANCELLING for q in self.om.quotes.values())

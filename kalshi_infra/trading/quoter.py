@@ -45,7 +45,7 @@ import pandas as pd
 
 from kalshi_infra.kalshi.venue import MAX_PRICE, MIN_PRICE, TICK
 from kalshi_infra.trading.fair import Fair, FairUpdate
-from kalshi_infra.trading.lip import LipTracker, others_ladder
+from kalshi_infra.trading.lip import LipTracker, levels_with_ours, others_ladder, reward_rate
 from kalshi_infra.trading.order_manager import Desired, LipTarget
 
 # Fair is clipped to [eps, 1-eps] before quoting (logged unclipped). Well
@@ -97,6 +97,10 @@ class Quoter:
         self._skipped_deep = 0   # ladder levels left out by skip_quote_depth_ahead
         # Our live LIP quote per (ticker, side): (price, remaining) or None.
         self._lip_live: dict[tuple[str, str], tuple[float, float] | None] = {}
+        # Best-case LIP payout per market with a LIP target, and the markets
+        # currently holding a lip_max_markets slot.
+        self._lip_proj: dict[str, float] = {}
+        self._lip_set: set[str] = set()
 
     # ------------------------------------------------------------------
     # Engine interface
@@ -266,6 +270,8 @@ class Quoter:
             for side in ("yes", "no"):
                 self._publish(ctx, ticker, side, None)
                 self._publish_lip(ctx, ticker, side, None)    # a stale fill is the big adverse one
+            self._lip_proj.pop(ticker, None)
+            self._lip_set.discard(ticker)
             if self.record_debug:
                 # The fair still exists under a stale_signal block; logging it
                 # as None drew a theo gap on every block (~12% of rows,
@@ -367,16 +373,22 @@ class Quoter:
             d = self._ladder(ticker, side, res, market_bid, market_ask, ladder, net, now)
             self._publish(ctx, ticker, side, d)
             out[side] = d
-            # LIP obeys enable_quoting and the model's side blocks, but not
-            # quote_block (spot_burst): pulling on spot cost more LIP than it
-            # saved in pickoffs (LIP_REPORT.md §5).
-            side_ok = q.enable_quoting and (block_bid if side == "yes" else block_ask) is None
+            # LIP obeys enable_quoting, the model's side blocks and quote_block
+            # (spot_burst): a big-trade burst is when a 300-lot LIP order gets
+            # swept, and the fair it's priced off is momentarily least reliable.
+            side_ok = (q.enable_quoting and not quote_gate
+                       and (block_bid if side == "yes" else block_ask) is None)
             lips[side] = self._lip_target(ticker, side, book, ladder, net, now, prob) if side_ok else None
+        lips = self._lip_select(ctx, ticker, lips, ladder, now)
+        for side in ("yes", "no"):
             self._publish_lip(ctx, ticker, side, lips[side])
         quote_bid = _top_yes("yes", out["yes"])
         quote_ask = _top_yes("no", out["no"])
         lip_bid = None if lips["yes"] is None else lips["yes"].price
         lip_ask = None if lips["no"] is None else round(1.0 - lips["no"].price, 2)
+        lq = getattr(ctx, "lip_queue", None)
+        lq_yes = lq(ticker, "yes") if lq is not None else None
+        lq_no = lq(ticker, "no") if lq is not None else None
 
         if self.record_debug:
             self._log_row(ctx, now, ticker, fair, market_bid, market_ask, prob=prob, const=const,
@@ -389,6 +401,11 @@ class Quoter:
                           cap_yes=cap_yes, cap_no=cap_no, mfee_bid=mfee_bid, mfee_ask=mfee_ask,
                           qres_bid=qres_bid, qres_ask=qres_ask, quote_bid=quote_bid, quote_ask=quote_ask,
                           lip_bid=lip_bid, lip_ask=lip_ask, block_bid=block_bid, block_ask=block_ask,
+                          lip_size_bid=None if lips["yes"] is None else lips["yes"].size,
+                          lip_size_ask=None if lips["no"] is None else lips["no"].size,
+                          lip_proj_usd=self._lip_proj.get(ticker),
+                          lip_ahead_bid=None if lq_yes is None else lq_yes[0],
+                          lip_ahead_ask=None if lq_no is None else lq_no[0],
                           n_levels_bid=len(out["yes"].prices) if out["yes"] else 0,
                           n_levels_ask=len(out["no"].prices) if out["no"] else 0)
 
@@ -451,6 +468,72 @@ class Quoter:
         if size < 1:
             return None
         return LipTarget(price, float(size))
+
+    def _lip_rate(self, ticker, lips, ladder) -> float:
+        """$/s this market's LIP targets would earn against the book as it is
+        now (others' size plus our edge quotes), never filled."""
+        params = self.lip.params.get(ticker)
+        if params is None or ladder is None:
+            return 0.0
+        sides = {}
+        for side in ("yes", "no"):
+            bids = ladder.yes_bids if side == "yes" else ladder.no_bids
+            if self._own_in_book:
+                bids = others_ladder(bids, list(self._shown.get((ticker, side), [])))
+            ours = list(self._ours.get((ticker, side), []))
+            t = lips.get(side)
+            if t is not None:
+                ours.append((t.price, t.size))
+            sides[side] = levels_with_ours(bids, ours)
+        return reward_rate(sides["yes"], sides["no"], params)
+
+    def _lip_select(self, ctx, ticker, lips, ladder, now) -> dict:
+        """Apply the per-market LIP gates to this market's side targets:
+        lip_min_payout_usd (best case over the rest of the period) and
+        lip_max_markets (only the event's top markets by that projection)."""
+        lc = self.cfg.lip
+        if self.lip is None or all(t is None for t in lips.values()):
+            self._lip_proj.pop(ticker, None)
+            self._lip_set.discard(ticker)
+            return lips
+        rate = self._lip_rate(ticker, lips, ladder)
+        left = None if self.close_time is None else \
+            max((self.close_time - now).total_seconds() - lc.lip_min_time_left_s, 0.0)
+        proj = self.lip.accrued_usd.get(ticker, 0.0) + rate * (left if left is not None else 0.0)
+        self._lip_proj[ticker] = proj
+        off = {"yes": None, "no": None}
+        if lc.lip_min_payout_usd > 0 and left is not None and proj < lc.lip_min_payout_usd:
+            # Out of the ranking too: a market that can't pay must not hold a slot.
+            self._lip_proj.pop(ticker, None)
+            self._lip_set.discard(ticker)
+            self._block("lip_below_floor")
+            return off
+        n = lc.lip_max_markets
+        if n is not None:
+            # Members hold their place unless beaten by 25%: re-ranking on every
+            # book tick would move 300-lot orders between markets constantly.
+            ranked = sorted(self._lip_proj, key=lambda t: -self._lip_proj[t])
+            keep = [t for t in ranked if t in self._lip_set and t in self._lip_proj]
+            for t in ranked:
+                if len(keep) >= n:
+                    weakest = min(keep, key=lambda k: self._lip_proj[k])
+                    if t not in keep and self._lip_proj[t] > 1.25 * self._lip_proj[weakest]:
+                        keep.remove(weakest)
+                        keep.append(t)
+                elif t not in keep:
+                    keep.append(t)
+            new_set = set(keep[:n])
+            # Markets decide one at a time, so one that lost its slot to this
+            # one already published a target: pull it now, not on its next tick.
+            for t in self._lip_set - new_set:
+                if t != ticker:
+                    for s in ("yes", "no"):
+                        self._publish_lip(ctx, t, s, None)
+            self._lip_set = new_set
+            if ticker not in self._lip_set:
+                self._block("lip_not_top")
+                return off
+        return lips
 
     def _others_bids(self, ticker, side, ladder) -> dict | None:
         """Other participants' bids on one side, own-side prices: the displayed
@@ -595,6 +678,9 @@ class Quoter:
             "quote_bid": v.get("quote_bid"), "quote_ask": v.get("quote_ask"),
             "n_levels_bid": v.get("n_levels_bid"), "n_levels_ask": v.get("n_levels_ask"),
             "lip_bid": v.get("lip_bid"), "lip_ask": v.get("lip_ask"),
+            "lip_size_bid": v.get("lip_size_bid"), "lip_size_ask": v.get("lip_size_ask"),
+            "lip_proj_usd": v.get("lip_proj_usd"),
+            "lip_ahead_bid": v.get("lip_ahead_bid"), "lip_ahead_ask": v.get("lip_ahead_ask"),
             "block_bid": block or v.get("block_bid"), "block_ask": block or v.get("block_ask"),
             "atm_tradeable": ticker in self._atm_set if self.cfg.quoting.max_markets else True,
         }

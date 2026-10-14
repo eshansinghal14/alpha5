@@ -151,10 +151,23 @@ Per market and side (`trading/quoter.py` docstring has the formula):
   that price is ≤ `lip_cheap_max_price` (size `lip_cheap_lots`) or
   ≥ `lip_rich_min_price` (size `lip_rich_lots`), and with at least
   `lip_min_time_left_s` to close. Size is net of the position already held
-  on that side and our resting edge size there. Pulled with the edge quotes
-  on no fair, a stale signal, `enable_quoting` off or a model side block;
-  not on `spot_burst`. Moved at most once per `lip_hold_s`. Why:
-  `kalshi_strategies/KXCRYPTOLEAD15M/research/LIP_REPORT.md`.
+  on that side and our resting edge size there. Capped at own-side fair
+  minus `lip_fair_margin`. Pulled with the edge quotes on no fair, a stale
+  signal, `enable_quoting` off, a model side block or `spot_burst`. Moved at
+  most once per `lip_hold_s`.
+  - **Payout floor** (`lip_min_payout_usd`): a market is LIP-quoted only if
+    LIP accrued so far plus our current $/s (book as it is, our quotes never
+    filled) held to the LIP stop would clear it. Kalshi pays nothing under $1.
+  - **`lip_max_markets`**: only the event's top markets by that projection; a
+    member keeps its slot until another projects 25% more.
+  - **Re-queue** (`lip_requeue_min_ahead`, real mode): every `lip_hold_s` the
+    session reads Kalshi's queue position (read bucket). A LIP order with
+    fewer than that many contracts ahead at its price and size behind it is
+    sent to the back with one amend adding 0.01 lots (a size increase loses
+    priority). At most once per side per 5s; one in the front quarter of the
+    threshold may spend any token above `cancels_token`, the rest only spare
+    ones (two creates' worth on top).
+  Why: `kalshi_strategies/KXCRYPTOLEAD15M/research/LIP_REPORT.md`.
 
 Every reason a side doesn't trade (`no_fair`, `stale_signal`,
 `outside_atm_set`, or a series `side_block` string) is logged per decision

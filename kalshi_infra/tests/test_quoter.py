@@ -39,7 +39,8 @@ def cfg(**q):
 
 
 LIP_OFF = dict(enable_lip_quoting=False, lip_cheap_max_price=0.2, lip_cheap_lots=0.0, lip_rich_min_price=0.8,
-               lip_rich_lots=0.0, lip_fair_margin=None, lip_min_time_left_s=0.0, lip_hold_s=1.0)
+               lip_rich_lots=0.0, lip_fair_margin=None, lip_min_payout_usd=0.0, lip_max_markets=None,
+               lip_requeue_min_ahead=None, lip_min_time_left_s=0.0, lip_hold_s=1.0)
 
 
 class Model:
@@ -521,16 +522,95 @@ def test_lip_fair_margin_can_pull_the_quote():
     assert ctx.lip_targets[("A", "yes")] is None
 
 
-def test_lip_obeys_side_block_and_enable_quoting_but_not_spot_burst():
+def test_lip_obeys_side_block_and_enable_quoting():
     q, ctx = lip_q()
     q.model.block[("A", "yes")] = "basis_tie"
-    q.model.quote_block = lambda ticker, now_s: "spot_burst"
     lip_step(q, ctx)
     assert ctx.lip_targets[("A", "yes")] is None
     assert ctx.lip_targets[("A", "no")] is not None
     q.cfg.quoting = dataclasses.replace(q.cfg.quoting, enable_quoting=False)
     lip_step(q, ctx, dt=0.1)
     assert ctx.lip_targets[("A", "no")] is None
+
+
+def test_lip_pulled_on_spot_burst():
+    q, ctx = lip_q()
+    q.model.quote_block = lambda ticker, now_s: "spot_burst"
+    lip_step(q, ctx)
+    assert ctx.lip_targets[("A", "yes")] is None and ctx.lip_targets[("A", "no")] is None
+
+
+# Program: $9 per 900s period, target 300. Yes side others 100 @0.10 + 300
+# @0.09; our 400 at the best bid. Only the 0.10 level scores (cum 500 >= 300
+# there): our share 400/500 = 0.8. No side: LIP rich side off, share 0.
+# Rate = 0.8 / 2 * 9/900 = 0.004 $/s. LIP stops 180s before close.
+FLOOR_YES = {0.10: 100.0, 0.09: 300.0}
+RATE = 0.8 / 2 * 9 / 900
+
+
+def test_lip_floor_blocks_when_best_case_payout_too_small():
+    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_min_payout_usd=1.0, lip_rich_lots=0.0)   # 120s -> $0.48
+    lip_step(q, ctx, yes=FLOOR_YES)
+    assert ctx.lip_targets[("A", "yes")] is None
+    assert q.block_counts.get("lip_below_floor", 0) >= 1
+
+
+def test_lip_floor_passes_with_enough_time_left():
+    q, ctx = lip_q(lip_min_payout_usd=1.0, lip_rich_lots=0.0)                                      # 420s -> $1.68
+    lip_step(q, ctx, yes=FLOOR_YES)
+    assert ctx.lip_targets[("A", "yes")] is not None
+    assert q._lip_proj["A"] == pytest.approx(420 * RATE, rel=1e-6)
+
+
+def test_lip_floor_counts_what_is_already_accrued():
+    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_min_payout_usd=1.0, lip_rich_lots=0.0)
+    q.lip.accrued_usd["A"] = 0.60                                               # 0.60 + 0.48
+    lip_step(q, ctx, yes=FLOOR_YES)
+    assert ctx.lip_targets[("A", "yes")] is not None
+
+
+def test_lip_floor_ignores_size_behind_a_level_already_at_target():
+    """Others' 500 at the best bid meet the 300 target alone, so our 400 behind
+    them scores nothing (lip._score_side) -- the floor sees $0 and blocks."""
+    q, ctx = lip_q(lip_min_payout_usd=1.0, lip_rich_lots=0.0)
+    lip_step(q, ctx)
+    assert ctx.lip_targets[("A", "yes")] is None
+
+
+def _two_markets(**lip):
+    base = dict(lip_min_payout_usd=0.0, lip_max_markets=1, lip_rich_lots=0.0)
+    base.update(lip)
+    q = Quoter(lip_cfg(**base), Model(), FREE, close_time=CLOSE, lip=LipTracker({"A": LIPP, "B": LIPP}))
+    return q, LipCtx()
+
+
+def _book(t, best_size):
+    yes = {0.10: best_size, 0.09: 300.0}
+    return Book(t, 0.10, 0.11, ladder=types.SimpleNamespace(yes_bids=yes, no_bids=dict(NO)))
+
+
+def _step2(q, ctx, a, b, dt=0.0):
+    ctx.time = ctx.time + pd.Timedelta(seconds=dt)
+    ctx.books["A"], ctx.books["B"] = _book("A", a), _book("B", b)
+    ctx.last_event = FairUpdate({"A": Fair(0.10, 0.09, 0.11), "B": Fair(0.10, 0.09, 0.11)})
+    q(ctx)
+
+
+def test_lip_max_markets_keeps_the_best_projection():
+    q, ctx = _two_markets()
+    _step2(q, ctx, a=250.0, b=100.0)      # shares 400/650 vs 400/500: B
+    assert ctx.lip_targets[("B", "yes")] is not None
+    assert ctx.lip_targets[("A", "yes")] is None
+
+
+def test_lip_max_markets_member_holds_until_beaten_by_25pct():
+    q, ctx = _two_markets()
+    _step2(q, ctx, a=100.0, b=150.0)               # A 0.80 vs B 0.73: A
+    assert ctx.lip_targets[("A", "yes")] is not None
+    _step2(q, ctx, a=150.0, b=120.0, dt=0.1)        # B 0.77 vs A 0.73: +6%, A keeps it
+    assert ctx.lip_targets[("A", "yes")] is not None and ctx.lip_targets[("B", "yes")] is None
+    _step2(q, ctx, a=250.0, b=50.0, dt=0.1)         # B 0.89 vs A 0.62: +44%, swap
+    assert ctx.lip_targets[("B", "yes")] is not None and ctx.lip_targets[("A", "yes")] is None
 
 
 def test_lips_at_band_edges():

@@ -429,6 +429,27 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
                 _log(S, "WARN: quote fill poll failed:")
                 traceback.print_exc()
 
+    async def lip_queue_loop():
+        """Every lip_hold_s: Kalshi's queue position for our LIP quotes (a GET,
+        read bucket) and re-queue to the back any with fewer than
+        lip_requeue_min_ahead ahead. Each check is logged, so fill quality can
+        later be costed against queue position."""
+        while True:
+            await asyncio.sleep(max(cfg.lip.lip_hold_s, 0.25))
+            lc = cfg.lip
+            if (not engine.live_trading or not lc.enable_lip_quoting or lc.lip_requeue_min_ahead is None
+                    or not engine.om.live(role="lip")):
+                continue
+            try:
+                pos = await asyncio.get_running_loop().run_in_executor(
+                    None, engine.order_client.queue_positions, ev.event_ticker)
+                for tk, side, px, ahead, behind, done in engine.requeue_lip(pos, lc.lip_requeue_min_ahead):
+                    if done:
+                        _log(S, f"LIP requeue {tk} {side} @{px:.2f}: {ahead:.0f} ahead, {behind:.0f} behind")
+            except Exception:
+                _log(S, "WARN: LIP queue-position poll failed:")
+                traceback.print_exc()
+
     async def pump_loop():
         """Drain queued quote creates as the quote budget refills, even when
         no market event is waking the strategy."""
@@ -523,7 +544,7 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
     _log(S, f"starting feeds for {ev.event_ticker} ({len(tickers)} markets, "
             f"{'REAL ORDERS' if engine.live_trading else 'shadow'})")
     coros = [kalshi.run(), *model.feed_tasks(), reprice_loop(), control_loop(), audit_loop(),
-             quote_fill_loop(), pump_loop(), lag_probe(), flush_loop(), prefetch_next(), lip_lookup()]
+             quote_fill_loop(), pump_loop(), lip_queue_loop(), lag_probe(), flush_loop(), prefetch_next(), lip_lookup()]
     tasks = [asyncio.create_task(c) for c in coros]
     try:
         closer, stopped = asyncio.create_task(until_close()), asyncio.create_task(stop_evt.wait())
