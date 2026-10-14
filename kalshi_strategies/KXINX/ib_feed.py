@@ -146,12 +146,12 @@ def _eq_nan(a: float, b: float) -> bool:
     return a == b
 
 
-def _check_budget(event_ticker: str, strikes) -> None:
+def _check_budget(label: str, strikes) -> None:
     n_lines = 2 * len(strikes)
     if n_lines > ibf.IB_MARKET_DATA_LINES:
         # Over budget doesn't error at IB; the last subscriptions just starve.
-        raise ValueError(f"{event_ticker}: {n_lines} contracts exceeds IB's "
-                         f"{ibf.IB_MARKET_DATA_LINES}-line budget; pass fewer `tickers`")
+        raise ValueError(f"{label}: {n_lines} contracts exceeds IB's "
+                         f"{ibf.IB_MARKET_DATA_LINES}-line budget; scope fewer buckets")
 
 
 def _rebuild_book(old: "LiveOptionBook | None", contracts, hold: HoldParams) -> "LiveOptionBook":
@@ -174,24 +174,20 @@ def _rebuild_book(old: "LiveOptionBook | None", contracts, hold: HoldParams) -> 
 
 
 class LiveIBFeed:
-    """One IB socket, subscribed to every SPXW call+put bracketing this
-    event's bucket boundaries. `tickers` optionally scopes to the ATM
-    subset (same convention as the backtest's scoped SPXW cache)."""
+    """One IB socket, subscribed to the SPXW call+put at each of `strikes`
+    for `expiry`. Callers choose the strikes (see
+    ibf.resolve_event_strikes); the pricing hub passes the union across
+    every series priced off this expiry."""
 
-    def __init__(self, event_ticker: str, tickers: list[str] | None, *, client_id: int,
-                 hold: HoldParams, reconnect_delay_s: float):
-        self.event_ticker = event_ticker
+    def __init__(self, expiry, strikes, *, client_id: int, hold: HoldParams,
+                 reconnect_delay_s: float, label: str | None = None):
+        self.expiry = expiry
+        self.label = label or f"SPXW {expiry}"
         self.hold = hold
         self.reconnect_delay_s = reconnect_delay_s
-        self._tickers_arg = tickers
         self._client_id = client_id
-
-        resolved = ibf.resolve_event_strikes(event_ticker, tickers=tickers)
-        self.markets = resolved["markets"]
-        self.expiry = resolved["expiry"]
-        self.scope_tickers = list(tickers) if tickers is not None else None
-        self._initial_strikes = np.asarray(resolved["strikes"], dtype=float)
-        _check_budget(event_ticker, self._initial_strikes)
+        self._initial_strikes = np.asarray(sorted(set(float(k) for k in strikes)), dtype=float)
+        _check_budget(self.label, self._initial_strikes)
         # Rebuilt in _connect_and_subscribe once we know which strikes IB
         # actually qualified -- a $5 neighbor past the chain's edge may not
         # exist, and the sides can end up with different strike sets.
@@ -298,27 +294,30 @@ class LiveIBFeed:
         self._subs[c.conId] = (c, t)
         self._conid_to_slot[c.conId] = (float(c.strike), c.right)
 
-    async def rescope(self, tickers: list[str]) -> bool:
-        """Move the subscription to bracket `tickers` without reconnecting.
+    @property
+    def strikes(self) -> list[float]:
+        return [float(k) for k in self._initial_strikes]
+
+    async def set_strikes(self, strikes) -> bool:
+        """Move the subscription to `strikes` without reconnecting.
 
         New lines are subscribed BEFORE old ones are cancelled, and quotes
         (and hold state) for strikes present in both are carried over, so
         pricing never sees a gap. Returns True if anything changed."""
+        want = np.asarray(sorted(set(float(k) for k in strikes)), dtype=float)
         async with self._rescope_lock:
             if not self._connected:
-                self.scope_tickers = list(tickers)
-                self._initial_strikes = np.asarray(
-                    ibf.resolve_event_strikes(self.event_ticker, tickers=tickers)["strikes"], dtype=float)
-                return True
-            want = np.asarray(ibf.resolve_event_strikes(self.event_ticker, tickers=tickers)["strikes"],
-                              dtype=float)
+                changed = not np.array_equal(want, self._initial_strikes)
+                _check_budget(self.label, want)
+                self._initial_strikes = want
+                return changed
             have = {s for s, _ in self._conid_to_slot.values()}
             add = [k for k in want if k not in have]
             drop_strikes = have - set(want)
             if not add and not drop_strikes:
-                self.scope_tickers = list(tickers)
+                self._initial_strikes = want
                 return False
-            _check_budget(self.event_ticker, want)
+            _check_budget(self.label, want)
             new_contracts = await self._qualify(add) if add else []
             kept = [c for c, _ in self._subs.values() if float(c.strike) not in drop_strikes]
             for c in new_contracts:
@@ -331,7 +330,6 @@ class LiveIBFeed:
                     self._ib.cancelMktData(c)
                 except Exception:
                     pass
-            self.scope_tickers = list(tickers)
             self._initial_strikes = want
             print(f"[ib_feed] rescoped: +{len(add)} -{len(drop_strikes)} strikes -> "
                   f"{len(self._subs)} contracts ({self.book.call_strikes.min():.0f}-"

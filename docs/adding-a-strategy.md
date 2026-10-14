@@ -14,8 +14,11 @@ kalshi_strategies/<FOLDER>/
   backtest/ research/ tests/
 ```
 
-One folder may serve several series tickers (KXINX_U serves KXINX and
-KXINXU), with one complete `config.json` section per ticker.
+One folder may serve several series tickers (KXINX serves KXINX, KXINXU
+and KXINXDUD), with one complete `config.json` section per ticker.
+`run --series <FOLDER>` runs all of them. A folder can also declare
+`SERVICES = [Service(...)]`, processes its series share (KXINX's pricing
+hub); the launcher starts and supervises them.
 
 ## 2. Config
 
@@ -23,10 +26,9 @@ KXINXU), with one complete `config.json` section per ticker.
 @section
 class MyConfig:
     quoting: QuotingParams
-    close: CloseParams
+    trading_time: TradingTimeParams
     risk: RiskParams
     runtime: RuntimeParams
-    kalshi_ws: KalshiWsParams
     lip: LipSettings
     pricing: MyPricingParams     # your fields, declared with param(...)
 ```
@@ -74,5 +76,5 @@ picks it up.
 
 Drive the same `Quoter` through `kalshi_backtest.engine.Backtest`, feeding
 your fairs as `FairUpdate` external events (see
-`KXINX_U/backtest/run_backtest.py`). Fees come from
+`KXINX/backtest/run_backtest.py`). Fees come from
 `kalshi.fees.for_event` exactly as live.

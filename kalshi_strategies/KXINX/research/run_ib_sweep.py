@@ -4,15 +4,15 @@ cost of IB's 100ms conflation is a measured number rather than an
 assumption.
 
 Usage:
-    python -m kalshi_strategies.KXINX_U.research.run_ib_sweep                  # both series
-    python -m kalshi_strategies.KXINX_U.research.run_ib_sweep KXINX            # one series
-    python -m kalshi_strategies.KXINX_U.research.run_ib_sweep KXINX EVENT...   # specific events
+    python -m kalshi_strategies.KXINX.research.run_ib_sweep                  # both series
+    python -m kalshi_strategies.KXINX.research.run_ib_sweep KXINX            # one series
+    python -m kalshi_strategies.KXINX.research.run_ib_sweep KXINX EVENT...   # specific events
 """
 import sys
 import traceback
 
 from kalshi_backtest import results
-from kalshi_strategies.KXINX_U.backtest.run_backtest import discover_runnable_events, run_one
+from kalshi_strategies.KXINX.backtest.run_backtest import discover_runnable_events, run_one
 
 # (label, conflate_ms). Conflation was a measured no-op on 2026-08-29: tick,
 # 100ms and 250ms were byte-identical across 7 event-days because the 2s

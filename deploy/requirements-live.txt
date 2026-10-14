@@ -1,6 +1,6 @@
-# Live trading on EC2 (KXCRYPTOLEAD15M). Pinned to the versions the local box
-# ran on 2026-10-11, so the server runs the code that was tested. All have
-# aarch64 (Graviton) wheels.
+# Live trading on EC2 (KXCRYPTOLEAD15M, and the S&P series KXINX/KXINXU/
+# KXINXDUD). Pinned to the versions the local box ran on 2026-10-11, so the
+# server runs the code that was tested. All have aarch64 (Graviton) wheels.
 numpy==2.2.6
 pandas==2.2.3
 pyarrow==23.0.1
@@ -13,6 +13,9 @@ cryptography==44.0.3
 zstandard==0.23.0
 pytz==2024.2
 psutil==7.2.2
+# S&P option feed (pure Python; installs aeventkit + nest_asyncio). Version the
+# local box ran on 2026-10-12.
+ib_async==2.1.0
 # Imported by kalshi_backtest.data on the live path; nothing calls it there.
 databento==0.83.0
 # Dashboard (served on localhost only, viewed through an SSH tunnel).

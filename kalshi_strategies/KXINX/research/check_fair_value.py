@@ -8,7 +8,7 @@ F = K + C - P per strike, which should agree across strikes if the
 option book is coherent.
 
 Usage:
-    python -m kalshi_strategies.KXINX_U.research.check_fair_value --series KXINX [--seconds 60]
+    python -m kalshi_strategies.KXINX.research.check_fair_value --series KXINX [--seconds 60]
 """
 import argparse
 import asyncio
@@ -22,10 +22,11 @@ from kalshi_infra import keys
 from kalshi_infra.api_functions import kalshi_get
 from kalshi_infra.config import load
 from kalshi_infra.kalshi import markets as km
-from kalshi_strategies.KXINX_U import _pick_event
-from kalshi_strategies.KXINX_U.config import CONFIG_PATH, SpxConfig
-from kalshi_strategies.KXINX_U.ib_feed import HoldParams, LiveIBFeed
-from kalshi_strategies.KXINX_U.live_pricing import compute_live_bucket_probs
+from kalshi_infra import ib_functions as ibf
+from kalshi_strategies.KXINX import _pick_event
+from kalshi_strategies.KXINX.config import CONFIG_PATH, HUB_KEY, HubConfig, SpxConfig
+from kalshi_strategies.KXINX.ib_feed import HoldParams, LiveIBFeed
+from kalshi_strategies.KXINX.live_pricing import compute_live_bucket_probs
 
 
 def _kalshi_bbo(event_ticker: str) -> dict[str, tuple[float, float]]:
@@ -57,13 +58,16 @@ async def main(series: str, seconds: float, interval_s: float):
     ev = _pick_event(km.open_events(series), cfg)
     if ev is None:
         raise SystemExit(f"no tradeable {series} event right now")
-    event, p = ev.event_ticker, cfg.pricing
+    event = ev.event_ticker
+    h = load(HubConfig, CONFIG_PATH, HUB_KEY)
     scope = dbf.select_event_buckets(event, cfg.quoting.max_markets or 5)
-    # +10 so this never collides with a running session's clientId.
-    feed = LiveIBFeed(event, tickers=scope, client_id=keys.IB_CLIENT_ID + 10 + p.ib_client_id_offset,
-                      hold=HoldParams(p.hold_baseline_s, p.hold_multiplier, p.hold_settle_s,
-                                      p.hold_min_samples, p.hold_sample_s),
-                      reconnect_delay_s=p.ib_reconnect_delay_s)
+    resolved = ibf.resolve_event_strikes(event, tickers=scope)
+    # +10 so this never collides with the hub's clientId.
+    feed = LiveIBFeed(resolved["expiry"], resolved["strikes"], client_id=keys.IB_CLIENT_ID + 10 + h.ib_client_id_offset,
+                      hold=HoldParams(h.hold_baseline_s, h.hold_multiplier, h.hold_settle_s,
+                                      h.hold_min_samples, h.hold_sample_s),
+                      reconnect_delay_s=h.ib_reconnect_delay_s)
+    feed.markets = resolved["markets"]
     print(f"[fair] {event}: scoped to {len(scope)} ATM buckets")
     task = asyncio.create_task(feed.run())
     loop = asyncio.get_running_loop()
@@ -78,7 +82,8 @@ async def main(series: str, seconds: float, interval_s: float):
             b = feed.book
             arr = b.snapshot_arrays()
             probs = compute_live_bucket_probs(feed.markets, b.call_strikes, arr[0], arr[1], arr[2],
-                                              b.put_strikes, arr[3], arr[4], arr[5])
+                                              b.put_strikes, arr[3], arr[4], arr[5],
+                                              monotone=cfg.pricing.monotone_levels)
             bbo = await loop.run_in_executor(None, _kalshi_bbo, event)
             fwds = _parity_forwards(b)
             if fwds:
@@ -120,7 +125,7 @@ async def main(series: str, seconds: float, interval_s: float):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--series", choices=("KXINX", "KXINXU"), required=True)
+    ap.add_argument("--series", choices=("KXINX", "KXINXU", "KXINXDUD"), required=True)
     ap.add_argument("--seconds", type=float, default=60.0)
     ap.add_argument("--interval-s", type=float, default=5.0)
     args = ap.parse_args()

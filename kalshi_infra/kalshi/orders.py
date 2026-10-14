@@ -91,6 +91,12 @@ def write_budget_tokens_per_s() -> float:
     return float(kalshi_get(LIMITS_PATH, auth=True)["write"]["refill_rate"])
 
 
+def process_write_tokens_per_s() -> float:
+    """This process's share (WRITE_SHARE_ENV) of the account's write budget."""
+    import os
+    return write_budget_tokens_per_s() * float(os.environ.get(WRITE_SHARE_ENV, "1"))
+
+
 POSITIONS_PATH = "/trade-api/v2/portfolio/positions"
 BALANCE_PATH = "/trade-api/v2/portfolio/balance"
 FILLS_PATH = "/trade-api/v2/portfolio/fills"
@@ -187,25 +193,66 @@ def _count(payload: dict, base: str) -> float | None:
     return None
 
 
+class WriteBudget:
+    """The write-token bucket. One per order client by default; several
+    clients in one process (a write group's series) can share one, so they
+    draw on a single budget instead of fixed slices of it. Thread-safe."""
+
+    def __init__(self, tokens_per_s: float):
+        self.tokens_per_s = tokens_per_s
+        # Metered below Kalshi's own limit: our bucket debits at send, Kalshi's
+        # at arrival, and bursts sized to exactly the limit drew 429s at arm
+        # time (2026-10-09, a 100-token Basic bucket).
+        self.rate = tokens_per_s * WRITE_HEADROOM
+        # Basic tier holds one second of budget (higher tiers three; one is
+        # the safe floor for either).
+        self.capacity = self.rate
+        self._tokens = self.capacity
+        self._last = time.monotonic()
+        self._lock = threading.Lock()
+
+    def _refill(self, now: float):
+        self._tokens = min(self.capacity, self._tokens + (now - self._last) * self.rate)
+        self._last = now
+
+    def tokens_now(self) -> float:
+        with self._lock:
+            self._refill(time.monotonic())
+            return self._tokens
+
+    def take(self, cost: float, force: bool = False) -> bool:
+        """Spend `cost`, or refuse. force=True always spends (may go negative)."""
+        with self._lock:
+            self._refill(time.monotonic())
+            if self._tokens < cost and not force:
+                return False
+            self._tokens -= cost
+            return True
+
+    def empty(self):
+        """Kalshi said 429: its bucket is emptier than ours thinks."""
+        with self._lock:
+            self._tokens = min(self._tokens, 0.0)
+            self._last = time.monotonic()
+
+
 class KalshiOrderClient:
     """Places real IOC orders and reads real positions. Every method here
     does blocking network I/O and MUST be called off the asyncio event loop
     (LiveEngine runs them on an executor thread) -- a ~40ms POST on the loop
     stalls both feeds and every scheduled order resolution."""
 
-    def __init__(self, tokens_per_s: float, timeout_s: float = ORDER_TIMEOUT_S):
+    def __init__(self, tokens_per_s: float, timeout_s: float = ORDER_TIMEOUT_S,
+                 budget: WriteBudget | None = None):
         """`tokens_per_s`: this process's share of the account's write budget
-        (see write_budget_tokens_per_s)."""
+        (see write_budget_tokens_per_s). `budget`: a bucket shared with other
+        clients; tokens_per_s is then taken from it."""
         self._session = requests.Session()
         self._key = auth.load_private_key()
         self._lock = threading.Lock()
-        self.tokens_per_s = tokens_per_s
-        # Metered below Kalshi's own limit: our bucket debits at send, Kalshi's
-        # at arrival, and bursts sized to exactly the limit drew 429s at arm
-        # time (2026-10-09, a 100-token Basic bucket).
-        self._rate = tokens_per_s * WRITE_HEADROOM
-        self._tokens = self._capacity()
-        self._last_refill = time.monotonic()
+        self.budget = budget if budget is not None else WriteBudget(tokens_per_s)
+        self.tokens_per_s = self.budget.tokens_per_s
+        self._rate = self.budget.rate
         self.timeout_s = timeout_s
         self.n_rate_limited = 0
         # Write-budget accounting by (kind, reason): spent tokens and call
@@ -216,14 +263,13 @@ class KalshiOrderClient:
         self._t0 = time.monotonic()
 
     @classmethod
-    def from_account(cls, shard: int | None = None) -> "KalshiOrderClient":
+    def from_account(cls, shard: int | None = None, budget: WriteBudget | None = None) -> "KalshiOrderClient":
         """`shard`: the exchange_index every write is pinned to (see
-        _shard_field). This process's share of the budget comes from
-        WRITE_SHARE_ENV, which kalshi_strategies.run sets per SHARD: series on
-        different shards don't share a bucket."""
-        import os
-        share = float(os.environ.get(WRITE_SHARE_ENV, "1"))
-        c = cls(tokens_per_s=write_budget_tokens_per_s() * share)
+        _shard_field). Without a shared `budget`, this process's share of the
+        account budget comes from WRITE_SHARE_ENV, which kalshi_strategies.run
+        sets per SHARD: processes on different shards don't share a bucket."""
+        c = cls(tokens_per_s=process_write_tokens_per_s() if budget is None else budget.tokens_per_s,
+                budget=budget)
         c.shard = shard
         return c
 
@@ -250,17 +296,11 @@ class KalshiOrderClient:
     # holds one second of budget on the Basic tier.
     COST = {"order": 10, "amend": 10, "cancel": 2}
 
-    def _capacity(self) -> float:
-        # Basic tier holds one second of budget (higher tiers three; one is
-        # the safe floor for either).
-        return self._rate
-
     def note_rate_limited(self, reason: str = "unknown"):
         """Kalshi said 429: its bucket is emptier than ours thinks. Empty
         ours so the next writes wait for real refill."""
+        self.budget.empty()
         with self._lock:
-            self._tokens = min(self._tokens, 0.0)
-            self._last_refill = time.monotonic()
             self.n_rate_limited += 1
             self._429[reason] = self._429.get(reason, 0) + 1
 
@@ -288,23 +328,18 @@ class KalshiOrderClient:
             self._t0 = time.monotonic()
 
     def tokens_now(self) -> float:
-        """Tokens currently in this process's bucket (may be negative after a
-        forced cancel). Spends nothing."""
-        now = time.monotonic()
-        with self._lock:
-            return min(self._capacity(), self._tokens + (now - self._last_refill) * self._rate)
+        """Tokens currently in the bucket (may be negative after a forced
+        cancel). Spends nothing."""
+        return self.budget.tokens_now()
 
     def can_afford(self, kind: str = "order", reserve: float = 0.0) -> bool:
         """Would `kind` be allowed now with `reserve` tokens left over?
         Spends nothing. Lets the quoter skip building an order the bucket
         would refuse."""
-        now = time.monotonic()
-        with self._lock:
-            tokens = min(self._capacity(), self._tokens + (now - self._last_refill) * self._rate)
-        return tokens >= self.COST[kind] + reserve
+        return self.budget.tokens_now() >= self.COST[kind] + reserve
 
     def allow_now(self, kind: str = "order", force: bool = False, reason: str = "untagged") -> bool:
-        """Spend `kind`'s tokens from this process's bucket, or refuse.
+        """Spend `kind`'s tokens from the bucket, or refuse.
 
         Refusing rather than sleeping is deliberate: a queued order arriving
         late would cross a book nobody looked at, and the quoter re-decides on
@@ -315,15 +350,11 @@ class KalshiOrderClient:
         refused cancel leaves a real order resting where we no longer want
         it, which is strictly worse than a 429."""
         cost = self.COST[kind]
-        now = time.monotonic()
+        ok = self.budget.take(cost, force=force)
         with self._lock:
-            self._tokens = min(self._capacity(),
-                               self._tokens + (now - self._last_refill) * self._rate)
-            self._last_refill = now
-            if self._tokens < cost and not force:
+            if not ok:
                 self._refused[(kind, reason)] = self._refused.get((kind, reason), 0) + 1
                 return False
-            self._tokens -= cost
             rec = self._spent.setdefault((kind, reason), [0, 0.0])
             rec[0] += 1
             rec[1] += cost

@@ -218,6 +218,9 @@ class OrderManager:
         self.clock = clock
         self.sim_bucket = (TokenBucket(sim_bucket_tokens_per_s, clock)
                            if sim_bucket_tokens_per_s is not None else None)
+        # Set by WriteGroup.attach: the group then owns the reserve, the
+        # cancel order and the pump, across every member's quotes.
+        self.group = None
         self.cancels_token = cancels_token
         self.cancels_token_fn = None
         self.keep_inside = keep_inside
@@ -245,9 +248,12 @@ class OrderManager:
     def _keep(self) -> float:
         return self._fn(self.keep_inside_fn, self.keep_inside)
 
+    def own_reserve(self) -> float:
+        return self._fn(self.cancels_token_fn, self.cancels_token)
+
     def reserve(self) -> float:
         """Tokens creates/moves must leave in the bucket for cancels."""
-        return self._fn(self.cancels_token_fn, self.cancels_token)
+        return self.group.reserve() if self.group is not None else self.own_reserve()
 
     def _bump(self, k: str):
         self.counts[k] = self.counts.get(k, 0) + 1
@@ -428,41 +434,51 @@ class OrderManager:
         top = max((x.price for x in self.live(q.ticker, q.side, None)), default=q.price)
         return int(round((top - q.price) / TICK))
 
+    def cancel_order(self) -> list[tuple[int, int]]:
+        """Queued cancels as (rank, order_id), lowest rank first: distance
+        from the side's touch (touch levels of every side first), except
+        "room" and "trim" cancels, which shed the deepest first."""
+        out = []
+        for oid, reason in list(self._cancel_q.items()):
+            q = self.quotes.get(oid)
+            d = 0 if q is None else self._distance(q)
+            out.append((-d if reason in ("room", "trim") else d, oid))
+        return out
+
+    def send_cancel(self, oid: int) -> str:
+        """Send one queued cancel if the bucket covers it: "sent", "skip"
+        (no longer queued or already cancelling), "wait" (an amend is in
+        flight; sent once it answers) or "bucket" (not enough tokens)."""
+        q = self.quotes.get(oid)
+        if oid not in self._cancel_q or q is None or q.state == CANCELLING:
+            self._cancel_q.pop(oid, None)
+            return "skip"
+        if q.state == AMENDING:
+            return "wait"
+        bucket = self._bucket()
+        if bucket is not None and bucket < COST_CANCEL - 1e-9:
+            self._bump("cancel_deferred:bucket")
+            return "bucket"
+        reason = self._cancel_q.pop(oid)
+        q.state = CANCELLING
+        self._bump(f"cancel:{reason}")
+        self.cancel_stats.note(reason)
+        self._spend_sim(COST_CANCEL)
+        self.ex.cancel(q, reason)
+        return "sent"
+
     def drain_cancels(self) -> int:
-        """Send queued cancels while the write bucket covers them. Order: by
-        distance from the side's touch (touch levels of every side first),
-        except "room" and "trim" cancels, which shed the deepest first. A cancel
-        behind an amend in flight waits for its answer (one round trip).
-        Returns how many were sent."""
-        if not self._cancel_q:
-            return 0
-
-        def key(oid):
-            q = self.quotes.get(oid)
-            if q is None:
-                return (0, oid)
-            d = self._distance(q)
-            return (-d, oid) if self._cancel_q[oid] in ("room", "trim") else (d, oid)
-
+        """Send queued cancels while the write bucket covers them, in
+        cancel_order. In a write group, every member's cancels are drained
+        together in one order. Returns how many were sent."""
+        if self.group is not None:
+            return self.group.drain_cancels()
         sent = 0
-        for oid in sorted(self._cancel_q, key=key):
-            q = self.quotes.get(oid)
-            if q is None or q.state == CANCELLING:
-                self._cancel_q.pop(oid, None)
-                continue
-            if q.state == AMENDING:
-                continue                                    # sent once the amend answers
-            bucket = self._bucket()
-            if bucket is not None and bucket < COST_CANCEL - 1e-9:
-                self._bump("cancel_deferred:bucket")
+        for _, oid in sorted(self.cancel_order()):
+            r = self.send_cancel(oid)
+            if r == "bucket":
                 break
-            reason = self._cancel_q.pop(oid)
-            q.state = CANCELLING
-            self._bump(f"cancel:{reason}")
-            self.cancel_stats.note(reason)
-            self._spend_sim(COST_CANCEL)
-            self.ex.cancel(q, reason)
-            sent += 1
+            sent += r == "sent"
         return sent
 
     # ------------------------------------------------------------------
@@ -654,7 +670,10 @@ class OrderManager:
         """One pass down the priority list: cancels, edge fixes, each side's
         BEST edge level, LIP, the edge levels behind the best, trims. Each step
         runs only if everything above it is done. Returns how many writes were
-        sent (cancels excluded)."""
+        sent (cancels excluded). In a write group the group runs this pass
+        across every member at once."""
+        if self.group is not None:
+            return self.group.pump()
         self.drain_cancels()
         if self._cancel_q:
             self._bump("create_deferred:cancels_pending")
@@ -688,21 +707,24 @@ class OrderManager:
                 self._bump("create_deferred:reserve")
                 return sent, False
             _, ticker, side, price, lots = heapq.heappop(heap)
-            d = self.desired[(ticker, side)]
-            spare = self._spare(ticker, side, d, price)
-            if spare is not None:
-                if self._move(spare, price):
-                    sent += 1
-                continue
-            if d.room - self.resting_size(ticker, side) < lots - 1e-9:
-                self._bump("create_skipped:room")
-                continue
-            if d.max_levels is not None and len(self.live(ticker, side, EDGE)) >= d.max_levels:
-                self._bump("create_skipped:levels")
-                continue
-            if self._create(ticker, side, price, lots):
-                sent += 1
+            sent += self.fill_level(ticker, side, price, lots)
         return sent, True
+
+    def fill_level(self, ticker: str, side: str, price: float, lots: float) -> bool:
+        """Fill one missing edge level (a missing() entry): move a spare
+        quote there, else create one if room and the level cap allow.
+        Returns whether a write was sent. The caller checks the bucket."""
+        d = self.desired[(ticker, side)]
+        spare = self._spare(ticker, side, d, price)
+        if spare is not None:
+            return self._move(spare, price)
+        if d.room - self.resting_size(ticker, side) < lots - 1e-9:
+            self._bump("create_skipped:room")
+            return False
+        if d.max_levels is not None and len(self.live(ticker, side, EDGE)) >= d.max_levels:
+            self._bump("create_skipped:levels")
+            return False
+        return self._create(ticker, side, price, lots)
 
     def _move(self, q: Quote, price: float, size: float | None = None) -> bool:
         """Amend `q` to `price` (and total size `size`, if given)."""
@@ -839,5 +861,106 @@ class OrderManager:
                 "queued_cancels": len(self._cancel_q),
                 "cancels_token": self.reserve(),
                 "bucket_tokens": None if self._bucket() is None else round(self._bucket(), 1),
+                "write_group": None if self.group is None else self.group.summary(),
                 "cancels": self.cancel_stats.summary(),
                 "counts": dict(self.counts)}
+
+
+class WriteGroup:
+    """Several OrderManagers sharing ONE write bucket: one cancel reserve
+    and one priority queue across all of them, instead of each member
+    holding a fixed slice of the budget.
+
+    Each pump pass interleaves the members' work in the same priority order
+    one manager uses: every member's queued cancels (touch first, across all
+    members), then too-far-ahead fixes, then every member's touch levels,
+    then LIP, then the levels behind the touch, then trims. A deferred step
+    in any member stops the pass for everyone, so a quiet series' backlog
+    can't be starved by a busy one and vice versa.
+
+    `bucket` is the shared token count (None = unmetered); the reserve is
+    the largest member's own cancels_token, so tightening one series'
+    setting never loosens another's. Not thread-safe: event loop only."""
+
+    def __init__(self, sim_tokens_per_s: float | None = None, clock=time.monotonic):
+        """`sim_tokens_per_s`: the shadow model of the shared bucket, used by
+        members whose executor has no real bucket (shadow mode)."""
+        self.members: dict[str, OrderManager] = {}
+        self.sim_bucket = TokenBucket(sim_tokens_per_s, clock) if sim_tokens_per_s else None
+
+    def attach(self, name: str, m: OrderManager):
+        m.group = self
+        if self.sim_bucket is not None:
+            m.sim_bucket = self.sim_bucket
+        self.members[name] = m
+
+    def detach(self, name: str):
+        m = self.members.pop(name, None)
+        if m is not None:
+            m.group = None
+
+    def reserve(self) -> float:
+        return max((m.own_reserve() for m in self.members.values()), default=0.0)
+
+    def drain_cancels(self) -> int:
+        queued = [(rank, i, name, oid) for i, (name, m) in enumerate(self.members.items())
+                  for rank, oid in m.cancel_order()]
+        sent = 0
+        for _, _, name, oid in sorted(queued):
+            m = self.members.get(name)
+            if m is None:
+                continue
+            r = m.send_cancel(oid)
+            if r == "bucket":
+                break
+            sent += r == "sent"
+        return sent
+
+    def _cancels_pending(self) -> bool:
+        return any(m._cancel_q for m in self.members.values())
+
+    def _fill_edge(self, which) -> tuple[int, bool]:
+        heap = [(e[0], i, name, *e[1:]) for i, (name, m) in enumerate(self.members.items())
+                for e in m.missing() if which(e[0])]
+        heapq.heapify(heap)
+        sent = 0
+        while heap:
+            _, _, name, ticker, side, price, lots = heapq.heappop(heap)
+            m = self.members.get(name)
+            if m is None:
+                continue
+            if not m._can_spend(COST_CREATE):
+                m._bump("create_deferred:reserve")
+                return sent, False
+            sent += m.fill_level(ticker, side, price, lots)
+        return sent, True
+
+    def pump(self) -> int:
+        self.drain_cancels()
+        if self._cancels_pending():
+            for m in self.members.values():
+                if m._cancel_q:
+                    m._bump("create_deferred:cancels_pending")
+            return 0
+        sent = sum(m._fix_ahead() for m in list(self.members.values()))
+        if self._cancels_pending():
+            return sent
+        n, done = self._fill_edge(lambda dist: dist == 0)
+        sent += n
+        if not done:
+            return sent
+        for m in list(self.members.values()):
+            n, done = m._lip_work()
+            sent += n
+            if not done:
+                return sent
+        n, done = self._fill_edge(lambda dist: dist > 0)
+        sent += n
+        if done and not any(m.missing() for m in self.members.values()):
+            for m in list(self.members.values()):
+                m._trim()
+        return sent
+
+    def summary(self) -> dict:
+        return {"members": list(self.members), "reserve": self.reserve(),
+                "queued_cancels": sum(len(m._cancel_q) for m in self.members.values())}

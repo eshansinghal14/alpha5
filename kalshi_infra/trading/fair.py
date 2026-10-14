@@ -53,6 +53,8 @@ class FairModel(Protocol):
     # (edge and LIP) without touching takes; the quoter calls it only if present.
     # Optional: on_book(book) -> None. Every Kalshi BBO update, before the
     # engine acts on it; the session calls it only if present.
+    # Optional: attach_engine(engine) -> None. Called once per event after the
+    # LiveEngine is built, for models that need this session's positions.
 
     def summary_extras(self) -> dict:
         """Series-specific scalars for summary.json."""

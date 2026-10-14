@@ -44,9 +44,23 @@ BLOCK_TEXT = {
 }
 
 
+SERIES_KEY = "dash_series"
+
+
 @st.cache_resource
 def _registry():
     return registry()
+
+
+def _stale(series: str) -> bool:
+    """True if a timed fragment is drawing a series that is no longer
+    selected. Fragment ids hash the function and page position, not its
+    args, so every series' fragments share ids; a 2s rerun in flight when
+    the sidebar changed drew KXINX's charts into the KXINXDUD page."""
+    if st.session_state.get(SERIES_KEY, series) != series:
+        st.rerun(scope="app")
+        return True
+    return False
 
 
 @st.cache_data(max_entries=64, show_spinner=False)
@@ -152,6 +166,8 @@ def _render_series(series: str, spec):
 
     @st.fragment(run_every="2s")
     def status():
+        if _stale(series):
+            return
         s = read_summary(series)
         if s is None:
             st.info(f"No {series} session today. Start one with "
@@ -211,6 +227,8 @@ def _stable_order(series: str, day, markets: list[str]) -> list[str]:
 
 @st.fragment(run_every="2s")
 def _render_markets(series: str):
+    if _stale(series):
+        return
     day = load_day(series)
     if day is None:
         return
@@ -246,7 +264,7 @@ def main():
     with st.sidebar:
         st.header("Series")
         live = [t for t in sorted(reg) if read_summary(t) is not None]
-        series = st.radio("Series", sorted(reg), label_visibility="collapsed",
+        series = st.radio("Series", sorted(reg), label_visibility="collapsed", key=SERIES_KEY,
                           format_func=lambda t: t + ("  ●" if t in live else ""))
         st.header("Config")
         config_form.render(reg[series])

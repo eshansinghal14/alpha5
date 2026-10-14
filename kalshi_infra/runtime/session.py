@@ -31,7 +31,7 @@ from kalshi_infra.kalshi import fees as kfees
 from kalshi_infra.kalshi import markets as km
 from kalshi_infra.kalshi.orders import KalshiOrderClient
 from kalshi_infra.kalshi.ws_feed import LiveKalshiFeed
-from kalshi_infra.runtime import persist
+from kalshi_infra.runtime import persist, write_groups
 from kalshi_infra.runtime.control import StopWatcher, TradingModeWatcher, request_stop_all
 from kalshi_infra.runtime.series import Series
 from kalshi_infra.runtime.writer import DecisionLog, SnapshotWriter
@@ -170,7 +170,7 @@ async def _session_loop(series: Series, writer: SnapshotWriter, *, live_trading:
         rolled = True
 
 
-async def _prepare(S: str, ev: km.EventInfo) -> dict:
+async def _prepare(S: str, ev: km.EventInfo, write_group: str | None = None) -> dict:
     """The event's Kalshi REST lookups, concurrently and off the loop: run
     in sequence on the loop they were ~2.3s (LIP alone 1.5s, 2026-10-09)
     during which no feed was read."""
@@ -179,14 +179,17 @@ async def _prepare(S: str, ev: km.EventInfo) -> dict:
     fees, progs, client = await asyncio.gather(
         loop.run_in_executor(None, _guarded, kfees.for_event, S, ev.event_ticker),
         loop.run_in_executor(None, _guarded, km.incentive_programs, tickers),
-        loop.run_in_executor(None, _guarded, _client_for, ev.event_ticker))
+        loop.run_in_executor(None, _guarded, _client_for, ev.event_ticker, write_group))
     return {"event_ticker": ev.event_ticker, "fees": fees, "lip": progs, "order_client": client}
 
 
-def _client_for(event_ticker: str) -> KalshiOrderClient:
+def _client_for(event_ticker: str, write_group: str | None = None) -> KalshiOrderClient:
     """An order client pinned to the event's exchange shard, so every write is
-    billed to that shard's own write bucket (see KalshiOrderClient.shard)."""
-    return KalshiOrderClient.from_account(shard=km.event_shard(event_ticker))
+    billed to that shard's own write bucket (see KalshiOrderClient.shard).
+    In a write group it draws on the group's one shared budget."""
+    shard = km.event_shard(event_ticker)
+    budget = None if write_group is None else write_groups.get(write_group, shard).budget
+    return KalshiOrderClient.from_account(shard=shard, budget=budget)
 
 
 def _guarded(fn, *a):
@@ -209,7 +212,7 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
     S = series.ticker
     cfg = store.config
     if prep is None or prep["event_ticker"] != ev.event_ticker:
-        prep_task = asyncio.create_task(_prepare(S, ev))
+        prep_task = asyncio.create_task(_prepare(S, ev, series.write_group))
         model = await series.build_model(ev, cfg)
         prep = await prep_task
     else:
@@ -245,6 +248,16 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
                         order_client=order_client, event_ticker=ev.event_ticker, close_time=ev.close_time)
     engine.set_clocks(signal_age_fn=model.signal_age_s, feed_age_fn=model.feed_age_s,
                       applied_age_fn=model.applied_age_s)
+    attach = getattr(model, "attach_engine", None)   # optional: models that read our positions
+    if attach is not None:
+        attach(engine)
+    group = None
+    if series.write_group is not None:
+        shard = order_client.shard if order_client is not None else None
+        group = write_groups.get(series.write_group, shard).group
+        group.attach(S, engine.om)
+        _log(S, f"write group {series.write_group}: sharing one bucket and quote queue with "
+                f"{', '.join(n for n in group.members if n != S) or 'no other series yet'}")
     run_state = {"real_pnl": 0.0} if run_state is None else run_state
     engine.loss_offset = run_state["real_pnl"]
     # This event's real PnL, worse of touch/fair, as of the last moment it
@@ -501,7 +514,7 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
             if start is not None and (start - ev.close_time).total_seconds() > PREFETCH_BEFORE_CLOSE_S:
                 return   # not back-to-back (KXINX overnight): limits/LIP could change by then
             next_slot["event"] = nxt_ev
-            prep = await _prepare(S, nxt_ev)
+            prep = await _prepare(S, nxt_ev, series.write_group)
             # A series' LIP programs are created when the event opens, so an
             # early lookup finds none (2026-10-09: 0/5 markets); it's redone
             # at the start, concurrently with everything else.
@@ -558,6 +571,10 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
                         f"orders on {ev.event_ticker}:")
                 traceback.print_exc()
         await asyncio.gather(*tasks, return_exceptions=True)
+        if group is not None:
+            # Its cancels were sent above; leaving keeps a closed event's
+            # quotes out of the next pass and its reserve out of the max.
+            group.detach(S)
         try:
             await model.close()
         except Exception:

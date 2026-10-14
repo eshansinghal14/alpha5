@@ -1,0 +1,41 @@
+# IB Gateway, headless, for the S&P strategy's option feed: IB Gateway +
+# IBC (logs in, accepts dialogs, restarts daily) + Xvfb, from
+# github.com/gnzsnz/ib-gateway-docker (native aarch64 since 10.37). Started by
+# deploy/systemd/alpha5-ibgateway.service; credentials in ib.env (not in git).
+#
+# The API port is published on 127.0.0.1 only: the IB API is unauthenticated
+# plain TCP, so anything that can reach it can trade the account.
+name: alpha5-ib
+services:
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    restart: always
+    env_file: ./ib.env
+    environment:
+      TRADING_MODE: live
+      # Market data only: the strategy never routes orders through IB.
+      READ_ONLY_API: "yes"
+      TIME_ZONE: America/New_York
+      TZ: America/New_York
+      # A restart (not a logoff) needs no fresh 2FA for a week, so this keeps
+      # the session alive without a phone tap every day. 23:45 ET is after
+      # the 16:00 close and before the next 09:00 open.
+      AUTO_RESTART_TIME: "11:45 PM"
+      # An unanswered push times out after ~3 min; IBC then logs in again and
+      # sends a new one, until one is approved.
+      TWOFA_TIMEOUT_ACTION: restart
+      RELOGIN_AFTER_TWOFA_TIMEOUT: "yes"
+      # Uses the main login, so a desktop TWS/Gateway login takes the session.
+      # "primary": the gateway takes it back when it reconnects (that may
+      # need a push).
+      EXISTING_SESSION_DETECTED_ACTION: primary
+      TWS_SETTINGS_PATH: /home/ibgateway/tws_settings
+      JAVA_HEAP_SIZE: "768"
+    volumes:
+      - ./tws_settings:/home/ibgateway/tws_settings
+    ports:
+      - "127.0.0.1:4001:4003"
+      # VNC to the gateway's screen, for the weekly 2FA / a stuck dialog.
+      # Reach it with an SSH tunnel (see docs/ec2-spx.md).
+      - "127.0.0.1:5900:5900"
+    mem_limit: 1200m

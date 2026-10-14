@@ -3,7 +3,7 @@ Backtest the generic Quoter on a KXINX / KXINXU event: cached Kalshi quotes
 + Databento SPXW options, through kalshi_backtest.engine with the same
 config.json section the live session uses.
 
-    python -m kalshi_strategies.KXINX_U.backtest.run_backtest KXINX [event_ticker ...]
+    python -m kalshi_strategies.KXINX.backtest.run_backtest KXINX [event_ticker ...]
 
 With no event tickers, runs every event of the series that has both a cached
 Kalshi source and an unscoped (full-chain) SPXW cache.
@@ -23,9 +23,9 @@ from kalshi_infra.config import load
 from kalshi_infra.kalshi import fees as kfees
 from kalshi_infra.trading.fair import Fair, FairUpdate
 from kalshi_infra.trading.quoter import Quoter
-from kalshi_strategies.KXINX_U import ib_emulation as ibe
-from kalshi_strategies.KXINX_U import signal_grid
-from kalshi_strategies.KXINX_U.config import CONFIG_PATH, SpxConfig
+from kalshi_strategies.KXINX import ib_emulation as ibe
+from kalshi_strategies.KXINX import signal_grid
+from kalshi_strategies.KXINX.config import CONFIG_PATH, SpxConfig
 
 _SPXW_QUOTES = os.path.join(DATA_ROOT, "databento", "SPXW", "quotes")
 
@@ -63,7 +63,7 @@ def run_one(event_ticker: str, cfg=None, *, conflate_ms: int = ibe.IB_OPTIONS_CO
         **{**vars(cfg.risk), "max_signal_age_s": float("inf")})})
     event_data = data.load_event_data(event_ticker, allow_predexon=allow_predexon)
     markets, events, _grid, _lo, probs_mid, _hi = signal_grid.precompute_signal(
-        event_ticker, conflate_ms=conflate_ms, return_grid=True)
+        event_ticker, conflate_ms=conflate_ms, return_grid=True, monotone=cfg.pricing.monotone_levels)
     ext = [(t, FairUpdate({p["ticker"]: Fair(p["prob"], p["prob_lo"], p["prob_hi"])})) for t, p in events]
     close = pd.Timestamp(min(m["close_time"] for m in markets))
     # Fees as of the event (the series' schedule can change between days).

@@ -1,0 +1,15 @@
+[Unit]
+Description=alpha5 IB Gateway (docker, IBC auto-login) for the S&P option feed
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/alpha5/deploy/ibgateway
+ExecStart=/usr/bin/docker compose up -d --pull missing
+ExecStop=/usr/bin/docker compose down
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

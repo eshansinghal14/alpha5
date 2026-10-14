@@ -29,11 +29,34 @@ Findings and numbers: `kalshi_strategies/KXCRYPTOLEAD15M/research/HANDOFF.md` §
   review agent's EC2 queries run under a 1 GiB memory cap
   (`deploy/review_py.sh`).
 
+## 2026-10-13 — S&P folder renamed, KXINXDUD, shared pricing hub
+
+- `kalshi_strategies/KXINX_U` -> `kalshi_strategies/KXINX`. It now also
+  serves KXINXDUD (one "above prior close" market per day).
+- `run --series` takes folder names and runs all their series;
+  `--only` names single series. `--series KXINX` = KXINX + KXINXU +
+  KXINXDUD.
+- One pricing hub process (`KXINX/hub.py`) replaces three IB connections:
+  union subscription, one curve fit per tick batch, fairs streamed per
+  series. IB/hold settings moved from each series' `pricing` section to
+  `config.json["hub"]`.
+- Combined risk: `hub.combined_max_loss_usd` caps the worst-case
+  settlement loss across all S&P positions; sides that would worsen it are
+  blocked (`combined_risk`).
+- `pricing.monotone_levels` (default off): monotone P(S>K) before
+  differencing into buckets.
+- `ib_functions` strike candidates snapped to the $5 grid (a 7808.69
+  boundary asked IB for 7803/7808/7813).
+- Write groups: the three S&P series run in one process on one write
+  bucket, one `cancels_token` reserve and one quote priority queue. The
+  per-series split (26.7 tokens each) sat below reserve + one create, so no
+  S&P quote was ever placed with three series running.
+
 ## 2026-10-09 — Reorg: kalshi_strategies + generic runtime + kalshi_viz
 
 **Layout.** `kalshi_crypto/`, `kalshi_latency_arbs/`, `kalshi_main/` and
 `viz/` are removed. Pricing lives in `kalshi_strategies/<FOLDER>/`
-(`KXINX_U` serves KXINX and KXINXU; `KXCRYPTOLEAD15M`); everything else is
+(`KXINX` serves KXINX and KXINXU; `KXCRYPTOLEAD15M`); everything else is
 shared in `kalshi_infra/` (`kalshi/`, `trading/`, `runtime/`). One launcher:
 `python -m kalshi_strategies.run --series ...`. One dashboard:
 `streamlit run kalshi_viz/app.py`. All code is packages imported from the

@@ -1,0 +1,28 @@
+[Unit]
+Description=alpha5 S&P daily (KXINX, KXINXU, KXINXDUD + pricing hub), shadow unless armed
+After=network-online.target chrony.service alpha5-ibgateway.service
+Wants=network-online.target alpha5-ibgateway.service
+
+[Service]
+User=ubuntu
+WorkingDirectory=/opt/alpha5
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+# The hub connects to IB Gateway at keys.IB_HOST:IB_PORT = 127.0.0.1:4001
+# (alpha5-ibgateway's docker port). Without it the hub reports "not
+# connected", every series goes stale and nothing quotes; it reconnects by
+# itself once the gateway is up.
+ExecStart=/opt/alpha5/.venv/bin/python -u -m kalshi_strategies.run --series KXINX
+# Below crypto (nice -5): crypto trades real money and must win the CPU.
+# run.py would otherwise raise itself to above_normal like crypto.
+Environment=ALPHA5_PRIORITY=normal
+Nice=0
+KillSignal=SIGINT
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/opt/alpha5/data/live/spx.out.log
+StandardError=append:/opt/alpha5/data/live/spx.err.log
+
+[Install]
+WantedBy=multi-user.target

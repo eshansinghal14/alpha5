@@ -3,8 +3,9 @@
 **Date:** 2026-10-05
 **Scope:** Live trading only. Backtest unaffected.
 
-*Paths updated after the 2026-10-09 reorg: the feed is now
-`kalshi_strategies/KXINX_U/ib_feed.py`, driven by `KXINX_U/model.py`.*
+*Paths updated after the 2026-10-09 reorg, and again 2026-10-13: the feed
+is `kalshi_strategies/KXINX/ib_feed.py`, owned by the shared pricing hub
+(`KXINX/hub.py`), one IB connection for every S&P series.*
 
 ## What changed
 
@@ -42,11 +43,12 @@ Databento's cmbp-1 OPRA pull remains the only practical bulk source.
 
 ## Interface the live feed satisfies
 
-`KXINX_U/model.py` expects:
+`KXINX/hub.py` expects:
 
 ```python
 class LiveIBFeed:
-    def __init__(self, event_ticker, tickers, *, client_id, hold: HoldParams, reconnect_delay_s)
+    def __init__(self, expiry, strikes, *, client_id, hold: HoldParams, reconnect_delay_s, label=None)
+    async def set_strikes(self, strikes) -> bool   # resubscribe without a gap
     book: LiveOptionBook   # has call_strikes, put_strikes (np.ndarray),
                            # snapshot_arrays() -> 6-tuple (mid/bid/ask x call/put)
     def drain(self) -> int           # applies buffered ticks; returns N
@@ -56,8 +58,8 @@ class LiveIBFeed:
     async def run(self) -> None               # keeps the client alive
 ```
 
-See `kalshi_strategies/KXINX_U/ib_feed.py` for the implementation. Hold
-and reconnect values come from the `pricing` section of `KXINX_U/config.json`.
+See `kalshi_strategies/KXINX/ib_feed.py` for the implementation. Hold
+and reconnect values come from the `hub` section of `KXINX/config.json`.
 
 ## IB contract specification
 

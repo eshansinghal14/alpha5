@@ -297,6 +297,45 @@ def clip_band_preserving_width(lo, mid, hi):
     return lo_c, np.clip(mid, lo_c, hi_c), hi_c
 
 
+# Floor on a level's band width when weighting the monotone projection: one
+# Kalshi tick, so a zero-width level can't get unbounded weight.
+MONOTONE_MIN_WIDTH = 0.01
+
+
+def _pava_non_increasing(y: np.ndarray, w: np.ndarray) -> np.ndarray:
+    """Weighted least-squares non-increasing fit (pool adjacent violators)."""
+    vals, wts, cnts = [], [], []
+    for v, wt in zip(y, w):
+        vals.append(v); wts.append(wt); cnts.append(1)
+        while len(vals) > 1 and vals[-2] < vals[-1]:
+            v2, w2, c2 = vals.pop(), wts.pop(), cnts.pop()
+            tw = wts[-1] + w2
+            vals[-1] = (vals[-1] * wts[-1] + v2 * w2) / tw
+            wts[-1] = tw
+            cnts[-1] += c2
+    return np.repeat(vals, cnts)
+
+
+def monotone_prob_above(probs: np.ndarray, widths: np.ndarray) -> np.ndarray:
+    """Project P(S_T > K), given at ascending K, onto non-increasing values in
+    [0, 1]. NaN levels are skipped and stay NaN.
+
+    Without this, B-L noise makes some P(>K) rise with K; the bucket built on
+    that pair goes negative and its clip to 0 adds mass (KXINX bucket sums
+    hit 1.40 at 15:50 on 2026-08-27 while the raw sum was 0.9999). Weighted
+    by 1/width^2 so a noisy edge-of-scope level (live KXINXU 2026-10-12:
+    stuck at 0.64, band 0.30, next to tight 1.00s) yields to its neighbours
+    instead of dragging them down."""
+    probs = np.asarray(probs, dtype=float)
+    out = np.full(probs.shape, np.nan)
+    ok = ~np.isnan(probs) & ~np.isnan(widths)
+    if ok.sum() == 0:
+        return out
+    w = 1.0 / np.maximum(np.asarray(widths, dtype=float)[ok], MONOTONE_MIN_WIDTH) ** 2
+    out[ok] = np.clip(_pava_non_increasing(probs[ok], w), 0.0, 1.0)
+    return out
+
+
 def nan_safe_min_max(vals: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Column-wise (min, max) ignoring NaNs, with NaN for any column that is
     ENTIRELY NaN.

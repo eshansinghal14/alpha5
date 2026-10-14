@@ -19,28 +19,6 @@ from kalshi_infra import keys
 from kalshi_infra.databento_functions import (_kxinx_event_markets, bracket_listed_strikes,
                                  select_event_buckets, IB_MARKET_DATA_LINES)
 
-# Buckets the strategy may trade at once (run_live sets max_markets to this).
-# Bounded by Kalshi's order rate, not IB lines: each quoted market costs
-# ~1.5 orders/s even with the requote throttle, against a 5/s per-series
-# budget when both series run.
-DEFAULT_ATM_BUCKETS = {"KXINX": 5, "KXINXU": 5}
-
-# Extra buckets subscribed beyond the tradeable set, on each side, so the
-# ATM set can drift (and ride atm_hysteresis) without leaving the priced
-# region. KXINX buckets are 25pts wide, KXINXU thresholds 5pts. Lines this
-# costs, measured 2026-10-08: KXINX 7 buckets -> 48, KXINXU 13 -> 30.
-SCOPE_MARGIN_BUCKETS = {"KXINX": 1, "KXINXU": 4}
-
-# Re-scope once the option-implied ATM bucket is this many buckets from the
-# centre we subscribed around (or has reached the scope's edge). KXINX at 1
-# ping-ponged every ~60s on 2026-10-08 with ATM sitting on a bucket boundary;
-# the scope's margin already covers a 1-bucket move.
-RESCOPE_DRIFT_BUCKETS = {"KXINX": 2, "KXINXU": 3}
-
-# Each concurrent process needs its own clientId (a duplicate disconnects
-# the older one), so the two series can run side by side.
-CLIENT_ID_OFFSET = {"KXINX": 0, "KXINXU": 1}
-
 ET = ZoneInfo("America/New_York")
 
 # 10090 "part of requested market data is not subscribed": fires once per
@@ -117,17 +95,6 @@ def ordered_tickers(markets: list[dict]) -> list[str]:
     return [m["ticker"] for m in sorted(ms, key=_bucket_key)]
 
 
-def scope_around(markets: list[dict], centre_ticker: str, series: str) -> list[str]:
-    """Contiguous window of buckets centred on `centre_ticker`: the tradeable
-    count plus SCOPE_MARGIN_BUCKETS each side. Contiguous so the bracketing
-    strikes overlap (cheapest in IB lines) and drift is measurable in buckets."""
-    order = ordered_tickers(markets)
-    i = order.index(centre_ticker)
-    half = DEFAULT_ATM_BUCKETS[series] // 2 + SCOPE_MARGIN_BUCKETS[series]
-    lo = max(0, min(i - half, len(order) - (2 * half + 1)))
-    return order[lo:lo + 2 * half + 1]
-
-
 def kalshi_centre(event_ticker: str) -> str:
     """Bucket nearest 50/50 on Kalshi's own touch -- the scope's centre
     when there is no option-implied price yet."""
@@ -135,6 +102,26 @@ def kalshi_centre(event_ticker: str) -> str:
     if not t:
         raise ValueError(f"no quoted buckets on {event_ticker}")
     return t[0]
+
+
+def market_boundaries(markets: list[dict]) -> set[float]:
+    return {float(m[k]) for m in markets for k in ("floor_strike", "cap_strike") if m.get(k) is not None}
+
+
+def strikes_for_boundaries(boundaries: set[float]) -> list[float]:
+    """SPXW strikes to subscribe for these Kalshi boundaries: the nearest
+    listed strike to each, plus its neighbours."""
+    if not boundaries:
+        return []
+    # Snapped to the $5 grid: KXINXDUD's strike is the prior close (e.g.
+    # 7808.69), and stepping from lo - pad gave 7803/7808/7813, none listed.
+    # qualifyContractsAsync drops anything the chain doesn't list, so this
+    # only has to be a superset.
+    lo, hi = min(boundaries), max(boundaries)
+    pad = 25.0
+    start = int((lo - pad) // 5) * 5
+    listed = [float(k) for k in range(start, int(hi + pad) + 1, 5)]
+    return sorted(bracket_listed_strikes(boundaries, listed))
 
 
 def resolve_event_strikes(event_ticker: str, tickers: list[str] | None = None) -> dict:
@@ -157,23 +144,10 @@ def resolve_event_strikes(event_ticker: str, tickers: list[str] | None = None) -
 
     close_time = datetime.datetime.fromisoformat(markets[0]["close_time"].replace("Z", "+00:00"))
     expiry = close_time.astimezone(ET).date()
-
-    boundaries: set[float] = set()
-    for m in markets:
-        for k in ("floor_strike", "cap_strike"):
-            v = m.get(k)
-            if v is not None:
-                boundaries.add(float(v))
+    boundaries = market_boundaries(markets)
     if not boundaries:
         raise ValueError(f"no floor/cap strikes on any {event_ticker} market")
-
-    # Candidate strikes: full $5 integer ladder spanning the boundaries plus
-    # a $25 pad. qualifyContractsAsync drops anything the chain doesn't
-    # actually list, so this just has to be a superset.
-    lo, hi = min(boundaries), max(boundaries)
-    pad = 25.0
-    listed = [float(k) for k in range(int(lo - pad), int(hi + pad) + 1, 5)]
-    strikes = sorted(bracket_listed_strikes(boundaries, listed))
+    strikes = strikes_for_boundaries(boundaries)
 
     return {
         "markets": all_markets,     # every bucket -- passed to live_pricing

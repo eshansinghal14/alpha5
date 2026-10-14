@@ -26,7 +26,7 @@ NEW_SNIPPET = r"""
 import sys, json
 sys.path.insert(0, r'{new}')
 from kalshi_backtest import results
-from kalshi_strategies.KXINX_U.backtest.run_backtest import run_one
+from kalshi_strategies.KXINX.backtest.run_backtest import run_one
 r, q, _ = run_one('{et}', verbose=False)
 print('JSON' + json.dumps({{k: (v if isinstance(v, (int, float, str)) or v is None else str(v)) for k, v in results.summary(r).items()}}))
 print('ORDERS' + json.dumps([(o.ticker, o.side, round(o.price, 4), o.intent, str(o.decision_time)) for o in r.orders]))

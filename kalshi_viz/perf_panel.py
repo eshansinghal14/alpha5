@@ -84,6 +84,11 @@ def render(series: str):
 
     @st.fragment(run_every="15s")
     def body():
+        # Same shared-fragment-id race as app._stale: don't draw a series
+        # that is no longer selected.
+        if st.session_state.get("dash_series", series) != series:
+            st.rerun(scope="app")
+            return
         df = p.latest
         if df is None:
             st.caption("Loading performance from the day journals… (first pass takes ~30s)")

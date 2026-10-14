@@ -45,7 +45,7 @@ standalone drawdown PNG (plot_drawdown) remain available for callers who
 want those specifically instead of the combined PDF.
 
 Usage:
-    python -m kalshi_strategies.KXINX_U.backtest.markout_analysis [event_ticker ...] [n]
+    python -m kalshi_strategies.KXINX.backtest.markout_analysis [event_ticker ...] [n]
 Defaults to KXINX-26AUG18H1600, n=5. One or more event tickers may be
 passed (one full run per ticker); a trailing all-digit argument is read as
 n instead of a ticker.
@@ -632,8 +632,8 @@ def generate_day_plots(result, event_data, event_ticker: str, signal_events: lis
 
 
 def main(event_ticker: str, n: int = 5):
-    from kalshi_strategies.KXINX_U import signal_grid
-    from kalshi_strategies.KXINX_U.backtest.run_backtest import run_one
+    from kalshi_strategies.KXINX import signal_grid
+    from kalshi_strategies.KXINX.backtest.run_backtest import run_one
     result, quoter, probs_mid = run_one(event_ticker, verbose=False)
     event_data = data.load_event_data(event_ticker)
     _m, signal_events = signal_grid.precompute_signal(event_ticker)

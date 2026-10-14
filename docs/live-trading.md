@@ -38,14 +38,44 @@ GIL long enough to stall the loop past `max_signal_age_s`.
 ## Running
 
 ```
-python -m kalshi_strategies.run --series KXINX KXINXU KXCRYPTOLEAD15M
-python -m kalshi_strategies.run --series KXINX --event-ticker KXINX-26OCT09H1600   # one event, no rollover
-python -m kalshi_strategies.run --series KXINXU --live-trading                      # REAL orders from start
+python -m kalshi_strategies.run --series KXINX KXCRYPTOLEAD15M                    # folders: all their series
+python -m kalshi_strategies.run --series KXINX --only KXINXU                      # one series (+ its hub)
+python -m kalshi_strategies.run --only KXINX --event-ticker KXINX-26OCT09H1600    # one event, no rollover
+python -m kalshi_strategies.run --series KXINX --live-trading                     # REAL orders from start
 streamlit run kalshi_viz/app.py
 ```
 
-Several series run as separate processes so one series' CPU stalls or
-crash can't stall another.
+`--series` takes strategy folder names; `--only` takes series tickers.
+Series run as separate processes so one series' CPU stalls or crash can't
+stall another -- except a write group (`Series.write_group`), whose series
+run together in one process.
+
+### Write groups
+
+KXINX, KXINXU and KXINXDUD are write group `spx-daily`: one process, one
+write bucket (`orders.WriteBudget`, the process's whole shard share), one
+`cancels_token` reserve (the largest member's setting) and one quote
+priority queue (`order_manager.WriteGroup`). Each pump pass goes through
+every member's cancels (touch first across all of them), then fixes, then
+every member's touch levels, then LIP, then deeper levels, then trims.
+Splitting the budget per series instead left 26.7 tokens each with three
+series on shard 0, below `cancels_token` 20 + one create (10), so nothing
+quoted (2026-10-13). The trade-off: one crash takes down all three.
+
+### S&P pricing hub
+
+`--series KXINX` runs KXINX, KXINXU and KXINXDUD plus one shared pricing
+process (`kalshi_strategies/KXINX/hub.py`, the folder's `SERVICES`). The hub
+holds the only IB connection: it subscribes the union of every series'
+scope, fits the option curve once per tick batch, and streams each series
+its own fairs off that one fit over localhost TCP (port `hub.port`). Series
+report positions back; the hub blocks any side that would push the
+combined worst-case settlement loss past `hub.combined_max_loss_usd` and
+reports it as `combined_risk` (summary extras, `side_block` reason).
+
+The launcher restarts the hub if it dies and reuses one already listening.
+A series that loses the hub goes stale (`signal_age_s` is the hub's last
+fit) and pulls quotes until it reconnects.
 
 If the dashboard shows "📡 Signal feed: IB Gateway reports broken ...", the
 gateway has lost its own link to IB (codes 2110/2103/2157) while our socket

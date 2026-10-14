@@ -1,7 +1,8 @@
 """
 What a series folder in kalshi_strategies provides to the generic runtime.
 
-    SERIES        = Series(...)   # module attribute in kalshi_strategies/<FOLDER>/__init__.py
+    SERIES   = {ticker: Series(...)}   # module attribute in kalshi_strategies/<FOLDER>/__init__.py
+    SERVICES = [Service(...)]          # optional: processes the folder's series share
 
 The runtime owns everything else: rollover, the Kalshi feed, the engine,
 the quoter, guards, control files, persistence.
@@ -58,3 +59,17 @@ class Series:
     # When to start trading the picked event. The session sleeps until then
     # without touching the API.
     trade_from: Callable[[EventInfo, object], pd.Timestamp | None] = lambda ev, cfg: ev.open_time
+    # Series with the same write_group run in ONE process and share one write
+    # bucket, one cancels_token reserve and one quote priority queue
+    # (runtime.write_groups). None = its own process and its own budget slice.
+    write_group: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class Service:
+    """A process shared by a folder's series (e.g. one pricing feed). The
+    launcher starts `python -m <module> --parent-pid <launcher>` before the
+    series, keeps it running, and reuses one already listening on `port()`."""
+    name: str
+    module: str
+    port: Callable[[], int]

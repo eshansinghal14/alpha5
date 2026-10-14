@@ -330,9 +330,11 @@ def summarize(df: pd.DataFrame, since: pd.Timestamp | None = None) -> dict:
 
 def curves(df: pd.DataFrame, since: pd.Timestamp | None = None) -> pd.DataFrame:
     """Long frame (time, line, usd): cumulative PnL and 1s/10s markout $ by fill time."""
-    d = window(df, since).sort_values("time")
+    d = window(df, since)
+    # A series with no real fills has a column-less empty frame.
     if d.empty:
         return pd.DataFrame(columns=["time", "line", "usd"])
+    d = d.sort_values("time")
     start = since if since is not None else d.time.min()
     lines = {"PnL (settled; open at mid)": d.pnl_c, "1s markout": d.mo1, "10s markout": d.mo10}
     out = []

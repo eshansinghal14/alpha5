@@ -63,12 +63,18 @@ def test_unpinned_client_sends_no_index():
 
 def test_shares_split_only_within_a_shard():
     shard = {"KXCRYPTOLEAD15M": 2, "KXINX": 0, "KXINXU": 0}
-    s = write_shares(list(shard), shard.get)
+    s = write_shares([["KXCRYPTOLEAD15M"], ["KXINX"], ["KXINXU"]], shard.get)
     assert s == {"KXCRYPTOLEAD15M": 1.0, "KXINX": 0.5, "KXINXU": 0.5}
+
+
+def test_write_group_is_one_process_with_the_whole_shard():
+    shard = {"KXCRYPTOLEAD15M": 2, "KXINX": 0, "KXINXU": 0, "KXINXDUD": 0}
+    s = write_shares([["KXCRYPTOLEAD15M"], ["KXINX", "KXINXU", "KXINXDUD"]], shard.get)
+    assert s == {"KXCRYPTOLEAD15M": 1.0, "KXINX": 1.0}
 
 
 def test_unknown_shard_falls_back_to_equal_split():
     def boom(s):
         raise RuntimeError("down")
-    s = write_shares(["A", "B"], boom)
+    s = write_shares([["A"], ["B"]], boom)
     assert s == {"A": 0.5, "B": 0.5}

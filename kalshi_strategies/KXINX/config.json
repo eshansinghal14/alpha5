@@ -1,9 +1,21 @@
 {
+  "hub": {
+    "port": 47231,
+    "ib_client_id_offset": 0,
+    "ib_reconnect_delay_s": 3.0,
+    "hold_baseline_s": 180.0,
+    "hold_multiplier": 3.0,
+    "hold_settle_s": 0.3,
+    "hold_min_samples": 5,
+    "hold_sample_s": 2.0,
+    "combined_max_loss_usd": 120.0,
+    "risk_check_s": 1.0
+  },
   "KXINX": {
     "quoting": {
-      "max_position": 10.0,
+      "max_position": 5.0,
       "constant_edge": 0.01,
-      "edge_fraction": 1.0,
+      "edge_fraction": 0.6,
       "lean_dollars": 0.02,
       "max_markets": 5,
       "atm_hysteresis": 2,
@@ -17,7 +29,7 @@
       "quote_ahead_grace_s": 1.0,
       "cancels_token": 20.0,
       "requote_delay_s": 1.0,
-      "order_lots": 1.0
+      "order_lots": 0.5
     },
     "trading_time": {
       "real_trading_delay_s": 0.0,
@@ -43,31 +55,79 @@
       "event_open_et": "09:00",
       "rescope_check_s": 10.0,
       "round_decimals": 3,
-      "hold_baseline_s": 180.0,
-      "hold_multiplier": 3.0,
-      "hold_settle_s": 0.3,
-      "hold_min_samples": 5,
-      "hold_sample_s": 2.0,
-      "ib_reconnect_delay_s": 3.0,
       "noise_jump": 0.02,
       "noise_revert_frac": 0.5,
       "noise_max_rate": 0.05,
       "noise_window": 200,
       "noise_min_samples": 40,
-      "ib_client_id_offset": 0,
       "scope_margin_buckets": 1,
-      "rescope_drift_buckets": 2
+      "rescope_drift_buckets": 2,
+      "monotone_levels": false
     }
   },
   "KXINXU": {
     "quoting": {
-      "max_position": 10.0,
+      "max_position": 5.0,
       "constant_edge": 0.01,
       "edge_fraction": 1.0,
       "lean_dollars": 0.02,
       "max_markets": 5,
       "atm_hysteresis": 2,
-      "enable_taking": true,
+      "enable_taking": false,
+      "enable_quoting": true,
+      "quoting_edge": 0.0,
+      "max_improve_ticks": 1,
+      "quote_levels_behind": 2,
+      "skip_quote_depth_ahead": null,
+      "quote_keep_inside": 0.0,
+      "quote_ahead_grace_s": 1.0,
+      "cancels_token": 20.0,
+      "requote_delay_s": 1.0,
+      "order_lots": 0.5
+    },
+    "trading_time": {
+      "real_trading_delay_s": 0.0,
+      "real_trading_cutoff_s": 0.0
+    },
+    "risk": {
+      "max_loss_usd": 80.0,
+      "max_signal_age_s": 0.25
+    },
+    "runtime": {
+      "quote_fill_poll_s": 1.0,
+      "control_poll_s": 1.0
+    },
+    "lip": {
+      "enable_lip_quoting": false,
+      "lip_lots": 0.0,
+      "prop_max_lip": 0.8,
+      "lip_min_depth_ahead": 50.0,
+      "lip_hold_s": 1.0
+    },
+    "pricing": {
+      "event_suffix": "H1600",
+      "event_open_et": "09:00",
+      "rescope_check_s": 10.0,
+      "round_decimals": 3,
+      "noise_jump": 0.02,
+      "noise_revert_frac": 0.5,
+      "noise_max_rate": 0.05,
+      "noise_window": 200,
+      "noise_min_samples": 40,
+      "scope_margin_buckets": 4,
+      "rescope_drift_buckets": 3,
+      "monotone_levels": false
+    }
+  },
+  "KXINXDUD": {
+    "quoting": {
+      "max_position": 5.0,
+      "constant_edge": 0.01,
+      "edge_fraction": 1.0,
+      "lean_dollars": 0.02,
+      "max_markets": null,
+      "atm_hysteresis": 0,
+      "enable_taking": false,
       "enable_quoting": true,
       "quoting_edge": 0.005,
       "max_improve_ticks": 1,
@@ -77,7 +137,7 @@
       "quote_ahead_grace_s": 1.0,
       "cancels_token": 20.0,
       "requote_delay_s": 1.0,
-      "order_lots": 1.0
+      "order_lots": 0.5
     },
     "trading_time": {
       "real_trading_delay_s": 0.0,
@@ -103,20 +163,14 @@
       "event_open_et": "09:00",
       "rescope_check_s": 10.0,
       "round_decimals": 3,
-      "hold_baseline_s": 180.0,
-      "hold_multiplier": 3.0,
-      "hold_settle_s": 0.3,
-      "hold_min_samples": 5,
-      "hold_sample_s": 2.0,
-      "ib_reconnect_delay_s": 3.0,
       "noise_jump": 0.02,
       "noise_revert_frac": 0.5,
       "noise_max_rate": 0.05,
       "noise_window": 200,
       "noise_min_samples": 40,
-      "ib_client_id_offset": 1,
-      "scope_margin_buckets": 4,
-      "rescope_drift_buckets": 3
+      "scope_margin_buckets": 0,
+      "rescope_drift_buckets": 1,
+      "monotone_levels": false
     }
   }
 }

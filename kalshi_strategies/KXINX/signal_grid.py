@@ -22,8 +22,8 @@ from collections import deque
 import pandas as pd
 
 from kalshi_infra import databento_functions as dbf
-from kalshi_strategies.KXINX_U import grid_pricing as laf
-from kalshi_strategies.KXINX_U import ib_emulation as ibe
+from kalshi_strategies.KXINX import grid_pricing as laf
+from kalshi_strategies.KXINX import ib_emulation as ibe
 
 
 # A Kalshi event may only be priced off options expiring at the same moment.
@@ -173,6 +173,7 @@ def compute_prob_grid(
     hold_multiplier: float = 3.0,
     hold_settle_window: str = "300ms",
     should_abort=None,
+    monotone: bool = False,
 ):
     """
     `should_abort`, if given, is checked periodically during the expensive
@@ -251,7 +252,8 @@ def compute_prob_grid(
     _check_abort()
 
     probs_lo, probs_mid, probs_hi = laf.bucket_probabilities_ci(
-        markets, call_mid, call_spread, put_mid, put_spread, grid, should_abort=should_abort)
+        markets, call_mid, call_spread, put_mid, put_spread, grid, should_abort=should_abort,
+        monotone=monotone)
 
     return markets, grid, probs_lo, probs_mid, probs_hi
 
@@ -269,6 +271,7 @@ def precompute_signal(
     round_decimals: int = 3,
     return_grid: bool = False,
     should_abort=None,
+    monotone: bool = False,
 ) -> tuple[list[dict], list[tuple]]:
     """
     EVERY market's own option-implied probability + CI, as external-event
@@ -296,7 +299,7 @@ def precompute_signal(
         event_ticker, underlying=underlying, conflate_ms=conflate_ms,
         transport_ms=transport_ms, freq=freq, tolerance=tolerance,
         hold_baseline_window=hold_baseline_window, hold_multiplier=hold_multiplier,
-        hold_settle_window=hold_settle_window, should_abort=should_abort,
+        hold_settle_window=hold_settle_window, should_abort=should_abort, monotone=monotone,
     )
     if probs_mid is None or probs_mid.empty:
         empty = markets, []

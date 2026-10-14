@@ -1,7 +1,7 @@
 """
 Databento API functions -- tick-level (cmbp-1 top-of-book) historical S&P 500
 options quotes, via the OPRA.PILLAR dataset. Used to compare against Kalshi
-KXINX range-market BBO in kalshi_strategies/KXINX_U (does Kalshi's quote lag the
+KXINX range-market BBO in kalshi_strategies/KXINX (does Kalshi's quote lag the
 options-implied probability, or vice versa?).
 
 Schema is "cmbp-1", not the plain "mbp-1" used on single-venue datasets like
@@ -571,7 +571,7 @@ def bracket_listed_strikes(boundaries: set[float], listed_strikes: list[float]) 
     fetched here. `listed_strikes` must already be sorted ascending.
     Shared by load_kxinx_event_option_quotes (historical SPXW) and by
     the live feed's own subscription-symbol selection
-    (kalshi_strategies/KXINX_U/ib_feed.py) -- identical
+    (kalshi_strategies/KXINX/ib_feed.py) -- identical
     bracket-selection logic regardless of whether the caller then fetches
     historical ticks or subscribes live."""
     wanted = set()

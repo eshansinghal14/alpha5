@@ -1,0 +1,19 @@
+[Unit]
+Description=alpha5 IB Gateway watchdog: restart the container (new login + push) if the API stays down
+After=alpha5-ibgateway.service
+Wants=alpha5-ibgateway.service
+
+[Service]
+User=ubuntu
+SupplementaryGroups=docker
+WorkingDirectory=/opt/alpha5
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/alpha5/.venv/bin/python -u -m kalshi_strategies.KXINX.ib_watchdog
+Nice=10
+Restart=always
+RestartSec=30
+StandardOutput=append:/opt/alpha5/data/live/ib_watchdog.log
+StandardError=append:/opt/alpha5/data/live/ib_watchdog.log
+
+[Install]
+WantedBy=multi-user.target

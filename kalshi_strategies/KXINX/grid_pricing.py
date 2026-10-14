@@ -19,8 +19,8 @@ import pandas as pd
 
 from kalshi_infra import databento_functions as dbf
 from kalshi_infra import predexon_functions as pf
-from kalshi_strategies.KXINX_U import bl_pricing as pricing
-from kalshi_strategies.KXINX_U import ib_emulation as ibe
+from kalshi_strategies.KXINX import bl_pricing as pricing
+from kalshi_strategies.KXINX import ib_emulation as ibe
 
 
 class ComputationAborted(Exception):
@@ -362,8 +362,12 @@ def bucket_probabilities_ci(
     put_mid: pd.DataFrame, put_spread: pd.DataFrame,
     grid: pd.DatetimeIndex,
     should_abort=None,
+    monotone: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
+    monotone: same as live_pricing.compute_live_bucket_probs(monotone=...),
+    applied per grid row.
+
     `should_abort`, if given, is a zero-arg callable checked between each
     of the 6 spline-fitting passes below (the overwhelming majority of
     this function's runtime) -- raises ComputationAborted the moment it
@@ -491,6 +495,19 @@ def bucket_probabilities_ci(
         if level not in bounds_cache:
             bounds_cache[level] = prob_above_bounds(level)
         return bounds_cache[level]
+
+    mono_cache: dict[float, np.ndarray] = {}
+    if monotone:
+        levels = sorted({float(m[k]) for m in markets for k in ("floor_strike", "cap_strike")
+                         if m.get(k) is not None})
+        raw = np.column_stack([cached_mid(L) for L in levels])
+        widths = np.column_stack([np.subtract(*cached_bounds(L)[::-1]) for L in levels])
+        fixed = np.vstack([pricing.monotone_prob_above(raw[i], widths[i]) for i in range(raw.shape[0])])
+        mono_cache = {L: fixed[:, j] for j, L in enumerate(levels)}
+        _mid = cached_mid
+
+        def cached_mid(level):  # noqa: F811
+            return mono_cache[level] if level in mono_cache else _mid(level)
 
     cols_lo, cols_mid, cols_hi = {}, {}, {}
     for m in markets:

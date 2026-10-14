@@ -69,7 +69,9 @@ class QuotingParams:
     cancels_token: float = param(
         "Write tokens quote creates and moves (10 each) must leave in the bucket, kept for cancels "
         "(2 each). Everything above it is quoting's. Cancels and takes may always use the whole "
-        "bucket. 20 = 10 cancels; sparse cancels were mean 0.7/s, p99 8, max 14 live on 2026-10-11.",
+        "bucket. 20 = 10 cancels; sparse cancels were mean 0.7/s, p99 8, max 14 live on 2026-10-11. "
+        "In a write group (the S&P series) one reserve covers the shared bucket: the largest "
+        "member's value.",
         min=0, step=2.0)
     requote_delay_s: float = param(
         "After our quote on a (market, side) is hit, that side adds no new levels this long "
