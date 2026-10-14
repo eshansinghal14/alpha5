@@ -15,6 +15,7 @@
     "quoting": {
       "max_position": 5.0,
       "constant_edge": 0.01,
+      "constant_edge_ref_s": null,
       "edge_fraction": 0.6,
       "lean_dollars": 0.02,
       "max_markets": 5,
@@ -69,6 +70,7 @@
     "quoting": {
       "max_position": 5.0,
       "constant_edge": 0.01,
+      "constant_edge_ref_s": null,
       "edge_fraction": 0.6,
       "lean_dollars": 0.02,
       "max_markets": 5,
@@ -123,6 +125,7 @@
     "quoting": {
       "max_position": 5.0,
       "constant_edge": 0.01,
+      "constant_edge_ref_s": null,
       "edge_fraction": 1.0,
       "lean_dollars": 0.02,
       "max_markets": null,

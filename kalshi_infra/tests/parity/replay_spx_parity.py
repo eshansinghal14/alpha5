@@ -98,6 +98,7 @@ class Ctx:
 def new_cfg(oc):
     q = P.QuotingParams(
         order_lots=oc.quote_size, max_position=oc.max_position, constant_edge=oc.constant_edge,
+        constant_edge_ref_s=None,
         edge_fraction=oc.edge_fraction, lean_dollars=oc.lean_dollars,
         max_markets=oc.max_markets, atm_hysteresis=oc.atm_hysteresis,
         enable_taking=True, enable_quoting=oc.enable_quoting, quoting_edge=oc.quoting_edge,

@@ -25,7 +25,7 @@ def immediate_takes(monkeypatch):
 
 
 def cfg(**q):
-    base = dict(order_lots=1.0, max_position=10.0, constant_edge=0.01, edge_fraction=1.0,
+    base = dict(order_lots=1.0, max_position=10.0, constant_edge=0.01, constant_edge_ref_s=None, edge_fraction=1.0,
                 lean_dollars=0.02, max_markets=None, atm_hysteresis=0,
                 enable_taking=True, enable_quoting=True, quoting_edge=0.0, max_improve_ticks=1, quote_levels_behind=0,
                 skip_quote_depth_ahead=None, quote_keep_inside=0.0, quote_ahead_grace_s=1.0,
@@ -126,6 +126,28 @@ def test_take_when_fair_clears_ask():
     step(q, ctx, {"A": Fair(0.60, 0.59, 0.61)}, Book("A", 0.40, 0.55))
     # reservation = 0.60 - (0.01 const + 0.01 ci) = 0.58 >= 0.55
     assert [o[:3] for o in takes(ctx)] == [("A", "yes", 0.55)]
+
+
+def _const_at(ref, left_s):
+    """The constant edge the quoter applied with `left_s` seconds to close."""
+    q, ctx = Quoter(cfg(constant_edge=0.03, constant_edge_ref_s=ref), Model(), FREE,
+                    close_time=T0 + pd.Timedelta(seconds=left_s)), Ctx()
+    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, Book("A", 0.30, 0.70))
+    r = q.debug_log[-1]
+    assert r["bid_edge"] == pytest.approx(r["constant_edge"] + 0.01)   # band 0.01, no lean, no fee
+    return r["constant_edge"]
+
+
+def test_constant_edge_flat_all_event_when_ref_is_empty():
+    assert _const_at(None, 600) == pytest.approx(0.03)
+    assert _const_at(None, 20) == pytest.approx(0.03)
+
+
+def test_constant_edge_scales_sqrt_inside_ref_only():
+    assert _const_at(180, 600) == pytest.approx(0.03)               # before the window: flat
+    assert _const_at(180, 180) == pytest.approx(0.03)
+    assert _const_at(180, 90) == pytest.approx(0.03 * 2 ** 0.5)     # half the ref left
+    assert _const_at(180, 60) == pytest.approx(0.03 * 3 ** 0.5)
 
 
 def test_kalshi_taker_fee_is_charged_into_the_edge():

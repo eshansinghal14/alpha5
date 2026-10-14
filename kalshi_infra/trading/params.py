@@ -19,6 +19,11 @@ class QuotingParams:
     constant_edge: float = param(
         "Flat $ edge floor on every take AND every resting quote. The one term that still bites "
         "when the band is tight and the touch is cheap.", min=0, max=0.5, step=0.005)
+    constant_edge_ref_s: float | None = param(
+        "Scale constant_edge by sqrt(this / seconds to close) once fewer than this many seconds "
+        "are left (x1.73 at a third of it). A fixed-size spot shock moves a contested fair like "
+        "1/sqrt(time left), the same way theo_vol grows; this is the part theo_vol doesn't see. "
+        "Empty = constant_edge for the whole event.", min=1, step=30)
     edge_fraction: float = param(
         "Fraction of the distance from fair to the band edge (lo when buying, hi when selling) "
         "demanded as edge. 1.0 = only outside the band.", min=0, max=5, step=0.05)

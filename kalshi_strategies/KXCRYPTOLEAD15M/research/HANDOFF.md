@@ -696,11 +696,34 @@ our ledger before AND after the read, and halt only after AUDIT_STRIKES (2)
 consecutive disagreements (5s apart). A real gap still halts, ~10s instead
 of 5s.
 
+**Tail-conditioned theo_vol (2026-10-14): no.** 2,121 maker fills, pricer
+state rebuilt from composite mids (fair corr 0.98 with the log), repriced
+along each market's steepest 2s move direction from -8 to +8 sigma.
+E[|dfair| given |move| > c] / E|dfair|, relative to a linear fair, is
+0.94-1.00 in every bucket incl. contested <60s (0% of contested fills over
+1.5): over 2s the fair is ~linear even near expiry, so tail conditioning is
+a constant x2.4 on theo_vol. As predictors of 10s adverse cost: R^2 0.091
+(normal reval) vs 0.096 (tail c=3); logged theo_vol 0.048. One pooled fit
+over all buckets: A10 = 4.1c + 1.5 x reval theo_vol (live is 3.5c + 1.2x);
+it leaves >3 min ~0.8c over-charged (t -3..-4) and 1-3 min ~2c under (t
+-0.2). Script: `%TEMP%/opencode/tail_tv.py`.
+
+**Time-scaled constant edge:** `quoting.constant_edge_ref_s` (dashboard,
+under constant_edge; empty = flat). Inside the last ref seconds,
+constant_edge x sqrt(ref / time left): a fixed spot shock moves a contested
+fair like 1/sqrt(time left), as theo_vol grows. One parameter, set from the
+mechanism, not fit: 180 gives x1.22 at 120s, x1.41 at 90s, x1.73 at the 60s
+cutoff (~+1c over 1-3 min at 3.5c, about half the fit's shortfall).
+Evaluate on 10s markout in the 1-3 min window, ideally alternating events.
+
 ### #8 — Open
 
-- 1-3 min edge add-on (flat, time-bucketed); refit edge_fraction on the new
-  theo_vol after a day on fixed settings.
-- Why new theo_vol is 2.4x lower 1-3 min out.
+- Run `constant_edge_ref_s` 180 and judge on 1-3 min 10s markout (~60
+  events/arm for a 2c gap); refit edge_fraction on the new theo_vol after a
+  day on fixed settings. Next if needed: a jump floor (fair change from a
+  fixed 3-5bp spot shock).
+- The 2.4x live gap between theo_vol calcs 1-3 min out is likely different
+  market conditions (the two agree within ~10% on identical inputs).
 - Log spot_burst as a block; consider a shorter burst hold (2-5s pulls were
   slightly positive).
 - Time-of-day and max_signal_age (50ms) once there's a week of data.

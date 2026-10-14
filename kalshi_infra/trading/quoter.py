@@ -13,8 +13,9 @@ Per market and side, every decision is:
     lean    = lean_dollars * ratio
               ratio = effective position / max_position, signed toward the side that GROWS it;
               negative on the reducing side, where the edge then floors at 0
-    take    : prob - (constant_edge + ci + lean + taker_fee) >= ask
-    quote   : prob - (constant_edge + quoting_edge + ci + lean + maker_fee) -> edge limit
+    const   = constant_edge, x sqrt(constant_edge_ref_s / time left) inside the last ref seconds
+    take    : prob - (const + ci + lean + taker_fee) >= ask
+    quote   : prob - (const + quoting_edge + ci + lean + maker_fee) -> edge limit
 
 Fees are Kalshi's own for this event (kalshi.fees.FeeSchedule). The edge before
 fees is floored at 0, so a reservation never lands on the wrong side of fair.
@@ -188,6 +189,20 @@ class Quoter:
     # Gates
     # ------------------------------------------------------------------
 
+    def _constant_edge(self, now: pd.Timestamp) -> float:
+        """constant_edge, scaled by sqrt(ref / time left) inside the last
+        `constant_edge_ref_s` seconds; flat when that's empty or there's no close."""
+        q = self.cfg.quoting
+        ref = getattr(q, "constant_edge_ref_s", None)
+        if not ref or self.close_time is None:
+            return q.constant_edge
+        left = (self.close_time - now).total_seconds()
+        if left >= ref:
+            return q.constant_edge
+        # Floored at 1s: at the close the multiplier would be unbounded, and no
+        # quote rests there anyway (real_trading_cutoff_s).
+        return q.constant_edge * math.sqrt(ref / max(left, 1.0))
+
     def signal_stale(self) -> bool:
         """Fair inputs older than max_signal_age_s. Quotes return the moment
         the age is back under the limit: the old fresh_recovery_s hold was 83%
@@ -284,9 +299,10 @@ class Quoter:
 
         fee_bid = self.fees.taker(market_ask) if market_ask is not None else 0.0
         fee_ask = self.fees.taker(market_bid) if market_bid is not None else 0.0
+        const = self._constant_edge(now)
         # Floored at 0 before the fee: a negative lean may bring a side to fair, never past it.
-        bid_edge = max(q.constant_edge + ci_bid + lean_bid, 0.0) + fee_bid
-        ask_edge = max(q.constant_edge + ci_ask + lean_ask, 0.0) + fee_ask
+        bid_edge = max(const + ci_bid + lean_bid, 0.0) + fee_bid
+        ask_edge = max(const + ci_ask + lean_ask, 0.0) + fee_ask
         bid_res, ask_res = prob - bid_edge, prob + ask_edge
 
         block_bid = block_ask = None
@@ -330,8 +346,8 @@ class Quoter:
         # Quotes: the take edge minus the taker fee, plus quoting_edge on top
         # (a resting quote is picked off by whoever is faster). Maker fee,
         # priced at the pre-fee reservation.
-        q_base_bid = max(q.constant_edge + q.quoting_edge + ci_bid + lean_bid, 0.0)
-        q_base_ask = max(q.constant_edge + q.quoting_edge + ci_ask + lean_ask, 0.0)
+        q_base_bid = max(const + q.quoting_edge + ci_bid + lean_bid, 0.0)
+        q_base_ask = max(const + q.quoting_edge + ci_ask + lean_ask, 0.0)
         mfee_bid = self.fees.maker(prob - q_base_bid)
         mfee_ask = self.fees.maker(prob + q_base_ask)
         qres_bid = prob - (q_base_bid + mfee_bid)
@@ -359,7 +375,7 @@ class Quoter:
         lip_ask = None if lips["no"] is None else round(1.0 - lips["no"].price, 2)
 
         if self.record_debug:
-            self._log_row(ctx, now, ticker, fair, market_bid, market_ask, prob=prob,
+            self._log_row(ctx, now, ticker, fair, market_bid, market_ask, prob=prob, const=const,
                           ci_bid=ci_bid, ci_ask=ci_ask, bid_edge=bid_edge, ask_edge=ask_edge,
                           lean_bid=lean_bid, lean_ask=lean_ask, fee_bid=fee_bid, fee_ask=fee_ask,
                           pos=pos, net=net, eff_yes=eff_yes, eff_no=eff_no, ratio=_ratio(net),
@@ -562,7 +578,8 @@ class Quoter:
             "prob": v.get("prob"), "prob_raw": None if fair is None else fair.prob,
             "prob_lo": None if fair is None else fair.lo, "prob_hi": None if fair is None else fair.hi,
             "ci_edge": v.get("ci_bid"), "ci_edge_ask": v.get("ci_ask"),
-            "constant_edge": self.cfg.quoting.constant_edge,
+            # The constant edge actually applied (time-scaled near close).
+            "constant_edge": v.get("const", self.cfg.quoting.constant_edge),
             # The age the stale gate just saw, so a tighter max_signal_age_s
             # can be costed from history instead of guessed.
             "signal_age_s": self._last_signal_age,

@@ -9,6 +9,8 @@ Findings and numbers: `kalshi_strategies/KXCRYPTOLEAD15M/research/HANDOFF.md` §
 
 - `quoting.enable_taking` (dashboard checkbox): off = maker-only. Takes
   lost money on every window tested; crypto runs with it off.
+- `quoting.constant_edge_ref_s` (all series, default empty = off):
+  constant_edge x sqrt(ref / time left) in the last ref seconds before close.
 - `CONFIRM_S` (0.1s, measured send -> booked fill) and `TAKE_HOLD_S` (0.5s)
   replace `inflight_timeout_s` / `take_confirm_s`. The lean is flat linear
   (`lean_dollars` only; `lean_multiplier` / `lean_exponent` removed);

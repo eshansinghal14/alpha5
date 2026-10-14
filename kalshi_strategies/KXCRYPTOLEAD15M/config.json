@@ -2,6 +2,7 @@
   "quoting": {
     "max_position": 10.0,
     "constant_edge": 0.035,
+    "constant_edge_ref_s": null,
     "edge_fraction": 0.8,
     "lean_dollars": 0.035,
     "max_markets": null,
