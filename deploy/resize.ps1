@@ -29,6 +29,4 @@ aws ec2 wait instance-running --region $Region --instance-ids $id
 $ip = aws ec2 describe-instances --region $Region --instance-ids $id `
     --query "Reservations[0].Instances[0].PublicIpAddress" --output text
 "running as $Type at $ip (services start themselves; check with deploy/status.sh)"
-if ($ip -ne "54.81.109.56") {
-    "NOTE: the IP changed. Update EC2_HOST in kalshi_infra/runtime/review_agent_loop.py and your ssh commands."
-}
+"The public IP changes on every stop/start; review_agent_loop looks it up itself, update your own ssh commands."

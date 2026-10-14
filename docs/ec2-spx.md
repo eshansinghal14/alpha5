@@ -1,7 +1,7 @@
 # S&P on the EC2 box
 
 How to run the S&P strategy (KXINX + KXINXU + KXINXDUD + pricing hub) on
-`alpha5-live` (54.81.109.56, us-east-1) next to KXCRYPTOLEAD15M, with IB
+`alpha5-live` (us-east-1; c7g.xlarge since 2026-10-14). The public IP changes on every stop/start (no Elastic IP); get it with `aws ec2 describe-instances --filters Name=tag:Name,Values=alpha5-live --query "Reservations[0].Instances[0].PublicIpAddress" --output text`, written `<ip>` below, next to KXCRYPTOLEAD15M, with IB
 Gateway on the same box and one dashboard for both.
 
 ## Shape
@@ -59,10 +59,10 @@ powershell -File deploy\resize.ps1 -Type c7g.xlarge
 copy deploy\ibgateway\ib.env.example deploy\ibgateway\ib.env   # then fill it in
 
 # 2. code + deps + docker + units (idempotent; crypto keeps running)
-ssh -i $env:USERPROFILE\.ssh\alpha5-live-key.pem ubuntu@54.81.109.56 'cd /opt/alpha5 && bash deploy/bootstrap.sh ec2-live'
+ssh -i $env:USERPROFILE\.ssh\alpha5-live-key.pem ubuntu@<ip> 'cd /opt/alpha5 && bash deploy/bootstrap.sh ec2-live'
 
 # 3. secrets: keys.py, Kalshi key, ib.env
-powershell -File deploy\push_secrets.ps1 -Target ubuntu@54.81.109.56 -Key $env:USERPROFILE\.ssh\alpha5-live-key.pem
+powershell -File deploy\push_secrets.ps1 -Target ubuntu@<ip> -Key $env:USERPROFILE\.ssh\alpha5-live-key.pem
 
 # 4. start the gateway and approve the 2FA prompt on your phone
 ssh ... 'sudo systemctl enable --now alpha5-ibgateway; sleep 60; timeout 2 bash -c "</dev/tcp/127.0.0.1/4001" && echo API up'
@@ -81,10 +81,10 @@ series and write budget from two machines.
 
 ## Operating
 
-- Dashboard: `ssh -i ... -N -L 8502:127.0.0.1:8502 ubuntu@54.81.109.56`,
+- Dashboard: `ssh -i ... -N -L 8502:127.0.0.1:8502 ubuntu@<ip>`,
   then http://localhost:8502. Crypto and the three S&P series are in one sidebar.
 - Gateway screen (2FA, stuck dialog):
-  `ssh -i ... -N -L 5900:127.0.0.1:5900 ubuntu@54.81.109.56`, then any VNC
+  `ssh -i ... -N -L 5900:127.0.0.1:5900 ubuntu@<ip>`, then any VNC
   client on localhost:5900 with `VNC_SERVER_PASSWORD`.
 - Gateway logs: `ssh ... 'cd /opt/alpha5/deploy/ibgateway && sudo docker compose logs --tail 100'`.
 - `deploy/status.sh` shows every unit, whether port 4001 is open, memory,

@@ -29,11 +29,31 @@ LOG = os.path.join(LIVE_ROOT, "review_agent.log")
 # HYPE 0345 was finalized ~3 min after its 07:45Z close (2026-10-11); 4 min gives margin.
 SETTLE_WAIT_S = 240
 
-EC2_HOST = "ubuntu@54.81.109.56"
 EC2_KEY = os.path.join(os.path.expanduser("~"), ".ssh", "alpha5-live-key.pem")
-EC2_REGION, EC2_SG = "us-east-1", "sg-0ad95e21cd6ad28e0"
-SSH = ["ssh", "-i", EC2_KEY, "-o", "ConnectTimeout=30", "-o", "ConnectionAttempts=3",
-       "-o", "BatchMode=yes", EC2_HOST]
+EC2_REGION, EC2_SG, EC2_NAME = "us-east-1", "sg-0ad95e21cd6ad28e0", "alpha5-live"
+# Fallback only: the box has no Elastic IP, so its address changes on every
+# stop/start (54.81.109.56 -> 3.90.60.158 on the 2026-10-14 resize).
+EC2_IP_FALLBACK = "3.90.60.158"
+
+
+def ec2_host() -> str:
+    """ubuntu@<current public IP> of the live box, looked up by Name tag."""
+    try:
+        r = subprocess.run(["aws", "ec2", "describe-instances", "--region", EC2_REGION,
+                            "--filters", f"Name=tag:Name,Values={EC2_NAME}", "Name=instance-state-name,Values=running",
+                            "--query", "Reservations[0].Instances[0].PublicIpAddress", "--output", "text"],
+                           capture_output=True, text=True, timeout=60)
+        ip = r.stdout.strip()
+        if r.returncode == 0 and ip and ip != "None":
+            return f"ubuntu@{ip}"
+    except Exception:
+        pass
+    return f"ubuntu@{EC2_IP_FALLBACK}"
+
+
+def ssh_cmd() -> list[str]:
+    return ["ssh", "-i", EC2_KEY, "-o", "ConnectTimeout=30", "-o", "ConnectionAttempts=3",
+            "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", ec2_host()]
 # Every python the review runs on the live box goes through this 1 GiB memory
 # cap (deploy/review_py.sh), so a heavy query can't take trading down with it.
 EC2_PY = "/opt/alpha5/deploy/review_py.sh"
@@ -109,7 +129,7 @@ def pull_fills(event: str) -> tuple[str | None, str]:
     cmd = f"{EC2_PY} -m kalshi_infra.runtime.trade_review --series {SERIES} --event {event}"
     for attempt in range(3):
         try:
-            r = subprocess.run(SSH + [cmd], capture_output=True, text=True, encoding="utf-8",
+            r = subprocess.run(ssh_cmd() + [cmd], capture_output=True, text=True, encoding="utf-8",
                                errors="replace", timeout=300)
         except subprocess.TimeoutExpired:
             why = "ssh timed out"
@@ -136,7 +156,7 @@ def review(close_utc: pd.Timestamp):
         with open(JOURNAL, "a", encoding="utf-8") as fh:
             fh.write(UNREACHABLE.format(event=event, close=close, why=why))
         return
-    ssh = " ".join(f'"{a}"' if " " in a else a for a in SSH)
+    ssh = " ".join(f'"{a}"' if " " in a else a for a in ssh_cmd())
     prompt = PROMPT.format(series=SERIES, event=event, journal=JOURNAL, close=close,
                            fills_file=fills_file, ssh=ssh, ec2_py=EC2_PY)
     log(f"reviewing {event}")
