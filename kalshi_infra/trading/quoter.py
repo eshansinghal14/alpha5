@@ -83,6 +83,7 @@ class Quoter:
         self._atm_set: set[str] = set()
         self._take_since: dict[tuple[str, str], float] = {}
         self._take_last: dict[tuple[str, str], float] = {}
+        self._last_signal_age: float | None = None
         # Fresh "since forever" until a stale episode: the recovery hold is
         # for flapping, and applying it at event start held every crypto
         # rollover ~2s stale with good data (2026-10-09).
@@ -196,6 +197,7 @@ class Quoter:
         fresh_recovery_s after a stale episode (no flapping)."""
         r = self.cfg.risk
         age = self.model.signal_age_s()
+        self._last_signal_age = age
         now = pd.Timestamp.now(tz="UTC").timestamp()
         if age is None or age > r.max_signal_age_s:
             self._fresh_since = None
@@ -571,6 +573,9 @@ class Quoter:
             "prob_lo": None if fair is None else fair.lo, "prob_hi": None if fair is None else fair.hi,
             "ci_edge": v.get("ci_bid"), "ci_edge_ask": v.get("ci_ask"),
             "constant_edge": self.cfg.quoting.constant_edge,
+            # The age the stale gate just saw, so a tighter max_signal_age_s
+            # can be costed from history instead of guessed.
+            "signal_age_s": self._last_signal_age,
             "bid_edge": v.get("bid_edge"), "ask_edge": v.get("ask_edge"),
             "lean_bid": v.get("lean_bid"), "lean_ask": v.get("lean_ask"),
             "lean_dollars": self.cfg.quoting.lean_dollars,

@@ -392,9 +392,10 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
             if not engine.live_trading:
                 continue
             try:
+                before = engine.ledger_positions()
                 real = await asyncio.get_running_loop().run_in_executor(
                     None, engine.order_client.positions, ev.event_ticker)
-                engine.audit_positions(real)
+                engine.audit_positions(real, before=before)
             except Exception:
                 _log(S, "WARN: position audit failed:")
                 traceback.print_exc()

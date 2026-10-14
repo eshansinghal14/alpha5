@@ -397,6 +397,49 @@ def test_halt_blocks_new_creates():
     assert client.creates == []
 
 
+def _audit_setup():
+    eng, _, client = setup(real=True, quote_levels_behind=1, order_lots=1.0)
+    fair(eng)
+    yes = [xid(eng, "yes", p) for p in live_prices(eng, "yes")]
+    return eng, yes
+
+
+def test_audit_fills_during_the_positions_read_do_not_halt():
+    """26OCT130915 (2026-10-13): two quotes filled fully while the positions
+    request was out. Kalshi's answer included them, our ledger didn't yet, and
+    with the quotes gone from the book the resting tolerance no longer covered
+    them -- a halt on a ledger that matched Kalshi's fills exactly."""
+    eng, yes = _audit_setup()
+    before = eng.ledger_positions()
+    # Both yes quotes fill in full during the round trip and the no side is
+    # pulled, so nothing is left resting to widen the tolerance -- as in the
+    # real halt, where our websocket had the fills and Kalshi's read didn't.
+    for q in list(eng.om.live("A", "no")):
+        eng.om.on_cancel_done(q.order_id)
+    for i, x in enumerate(yes):
+        fill(eng, x, "yes", trade=f"y{i}")
+    assert eng.om.live("A") == [] and eng.ledger_positions()["A"] == 2.0
+    eng.audit_positions({"A": {"position": 0.0}}, before=before)
+    eng.audit_positions({"A": {"position": 2.0}}, before=eng.ledger_positions())   # next audit: caught up
+    assert not eng.halted and eng._audit_strikes == {}
+
+
+def test_audit_one_off_mismatch_warns_then_clears():
+    eng, _ = _audit_setup()
+    eng.audit_positions({"A": {"position": 50.0}})     # far past tolerance (1 + resting)
+    assert not eng.halted and eng.last_audit_diffs
+    eng.audit_positions({"A": {"position": 0.0}})
+    assert not eng.halted and eng._audit_strikes == {}
+
+
+def test_audit_persistent_mismatch_still_halts():
+    eng, _ = _audit_setup()
+    eng.audit_positions({"A": {"position": 50.0}}, before=eng.ledger_positions())
+    assert not eng.halted
+    eng.audit_positions({"A": {"position": 50.0}}, before=eng.ledger_positions())
+    assert eng.halted and eng.halt_kind == "audit"
+
+
 def test_shadow_bucket_and_cancels_token_meter_creates():
     """Shadow models the 80/s bucket: a 60-token reserve leaves two creates."""
     eng, _, _ = setup(cancels_token=60.0)

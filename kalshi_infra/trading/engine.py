@@ -71,6 +71,9 @@ SHADOW_SEND_S = MEASURED_SEND_S
 # Consecutive REAL order errors before halting. Five in a row is auth,
 # balance or market state, not a moved touch.
 MAX_CONSECUTIVE_ORDER_ERRORS = 5
+# Consecutive position audits (5s apart) a market must disagree on before the
+# audit halts. A real accounting gap persists; a fill racing the read doesn't.
+AUDIT_STRIKES = 2
 # After Kalshi's queue position shows a LIP quote with too little ahead, the
 # LIP target on that side must be strictly deeper than the pulled price for
 # this long: the displayed book (which the target is chosen from) is what
@@ -232,6 +235,8 @@ class LiveEngine:
         self._applied_age_fn = None
         self.last_audit: str | None = None
         self.last_audit_diffs: dict[str, float] = {}
+        # ticker -> consecutive audits that disagreed (see audit_positions).
+        self._audit_strikes: dict[str, int] = {}
         self.over_limit: dict[str, float] = {}
         self._last_abs_position: dict[str, float] = {}
         self.blocked_counts: dict[str, int] = {}
@@ -384,9 +389,22 @@ class LiveEngine:
             self._last_abs_position[ticker] = abs(qty)
         return self.halted
 
-    def audit_positions(self, real: dict | None = None) -> dict:
+    def ledger_positions(self) -> dict[str, float]:
+        """Our signed YES position per ticker, for an audit's before-snapshot."""
+        return {t: p.yes_qty - p.no_qty for t, p in self.portfolio.positions.items()}
+
+    def audit_positions(self, real: dict | None = None, before: dict[str, float] | None = None) -> dict:
         """Compare our ledger against Kalshi's own position record and halt
         on any material disagreement.
+
+        `before` is our ledger as of just before Kalshi's positions were
+        requested. A market agrees if Kalshi matches our ledger at EITHER end
+        of the request: fills booked during the round trip are in one snapshot
+        and not the other, and a quote that filled fully is no longer resting,
+        so the resting-size tolerance doesn't cover it. All four audit halts
+        2026-10-11..13 were that race -- Kalshi's fills and our journal matched
+        execution for execution every time. A market must also disagree on
+        AUDIT_STRIKES consecutive audits before we halt.
 
         This is the guard that does NOT depend on our own bookkeeping being
         right, which is the whole reason it exists: every other check reads
@@ -407,20 +425,28 @@ class LiveEngine:
         if real is None:
             real = self.order_client.positions(self.event_ticker)
         kalshi = {t: v["position"] for t, v in real.items()}
-        ours = {t: p.yes_qty - p.no_qty for t, p in self.portfolio.positions.items()}
+        ours = self.ledger_positions()
+        snaps = [ours] if before is None else [before, ours]
         resting_by_ticker: dict[str, float] = {}
         for q in self.om.live():
             resting_by_ticker[q.ticker] = resting_by_ticker.get(q.ticker, 0.0) + q.remaining
         tol_base = float(self.n_real_in_flight) + 1.0
         diffs = {}
-        for ticker in set(kalshi) | set(ours):
-            d = kalshi.get(ticker, 0.0) - ours.get(ticker, 0.0)
+        for ticker in set(kalshi).union(*snaps):
+            ds = [kalshi.get(ticker, 0.0) - s.get(ticker, 0.0) for s in snaps]
+            d = min(ds, key=abs)
             if abs(d) > tol_base + resting_by_ticker.get(ticker, 0.0):
                 diffs[ticker] = d
+        self._audit_strikes = {t: self._audit_strikes.get(t, 0) + 1 for t in diffs}
         self.last_audit = pd.Timestamp.now(tz="UTC").isoformat()
         self.last_audit_diffs = {t: round(d, 4) for t, d in diffs.items()}
         # Kalshi's numbers, not ours, are what the growth check watches.
         self.check_position_limit(kalshi)
+        confirmed = {t: d for t, d in diffs.items() if self._audit_strikes[t] >= AUDIT_STRIKES}
+        if diffs and not confirmed:
+            print("[live] WARN: position audit mismatch, re-checking next audit: "
+                  + ", ".join(f"{t.split('-')[-1]} {d:+.4g}" for t, d in diffs.items()))
+        diffs = confirmed
         if diffs and not self.halted:
             self.halted = True
             self.halt_kind = "audit"
@@ -597,6 +623,7 @@ class LiveEngine:
         self.blocked_counts = {}
         self.over_limit = {}
         self._last_abs_position = {}
+        self._audit_strikes = {}
         # Anything resting belongs to the session being discarded, and its
         # order ids are about to become invalid -- pull it before the ledger
         # that knows about it is thrown away.
