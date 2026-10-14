@@ -35,7 +35,11 @@ def cfg(**q):
         quoting=P.QuotingParams(**base),
         trading_time=P.TradingTimeParams(real_trading_delay_s=0.0, real_trading_cutoff_s=0.0),
         risk=P.RiskParams(max_loss_usd=80.0, max_signal_age_s=1.0),
-        lip=P.LipSettings(enable_lip_quoting=False, lip_lots=0.0, prop_max_lip=1.0, lip_min_depth_ahead=0.0, lip_hold_s=1.0))
+        lip=P.LipSettings(**LIP_OFF))
+
+
+LIP_OFF = dict(enable_lip_quoting=False, lip_cheap_max_price=0.2, lip_cheap_lots=0.0, lip_rich_min_price=0.8,
+               lip_rich_lots=0.0, lip_min_time_left_s=0.0, lip_hold_s=1.0)
 
 
 class Model:
@@ -385,21 +389,19 @@ def test_quoting_disabled_publishes_unquotable():
 from kalshi_infra.trading.lip import LipParams, LipTracker  # noqa: E402
 
 LIPP = LipParams(target_size=300.0, discount_factor=0.5, period_reward_usd=9.0, snapshots_per_period=900)
-# Yes bids 100 @0.40, 100 @0.39, 100 @0.38 (target reached at 0.38); edge 0.48.
-YES = {0.40: 100.0, 0.39: 100.0, 0.38: 100.0}
-NO = {0.40: 400.0}
+CLOSE = T0 + pd.Timedelta(minutes=10)
+# Yes side: a 0.10 longshot (cheap band). No side: best no bid 0.89 (rich band).
+YES = {0.10: 500.0, 0.09: 300.0}
+NO = {0.89: 120.0, 0.88: 400.0}
 
 
 def lip_cfg(**lip):
     c = cfg()
-    base = dict(enable_lip_quoting=True, lip_lots=20.0, prop_max_lip=1.0, lip_min_depth_ahead=0.0, lip_hold_s=1.0)
+    base = dict(LIP_OFF, enable_lip_quoting=True, lip_cheap_lots=400.0, lip_rich_lots=100.0,
+                lip_min_time_left_s=180.0)
     base.update(lip)
     c.lip = P.LipSettings(**base)
     return c
-
-
-def lips(ctx):
-    return ctx.lip_targets
 
 
 class LipCtx(Ctx):
@@ -415,63 +417,111 @@ class LipCtx(Ctx):
         return self.lip_live.get((ticker, side))
 
 
-def lip_q(**lip):
-    return Quoter(lip_cfg(**lip), Model(), FREE, close_time=None, lip=LipTracker({"A": LIPP})), LipCtx()
+def lip_q(close=CLOSE, own_in_book=False, **lip):
+    return (Quoter(lip_cfg(**lip), Model(), FREE, close_time=close, lip=LipTracker({"A": LIPP})),
+            LipCtx(own_in_book=own_in_book))
 
 
-def test_lip_target_published_outside_edge():
+def lip_step(q, ctx, yes=YES, no=NO, fair=0.10, dt=0.0):
+    # Book: yes bid = best yes bid; yes ask = 1 - best no bid.
+    step(q, ctx, {"A": Fair(fair, fair - 0.01, fair + 0.01)}, lb(yes, no, max(yes), round(1 - max(no), 2)), dt=dt)
+
+
+def test_lip_rests_at_best_bid_sized_by_band():
     q, ctx = lip_q()
-    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, lb(YES, NO, 0.40, 0.60))
-    t = ctx.lip_targets[("A", "yes")]
-    assert t is not None and t.price <= 0.48 and 1 <= t.size <= 20
+    lip_step(q, ctx)
+    y, n = ctx.lip_targets[("A", "yes")], ctx.lip_targets[("A", "no")]
+    assert (y.price, y.size) == (0.10, 400.0)          # cheap side
+    assert (n.price, n.size) == (0.89, 100.0)          # rich side
+
+
+def test_lip_ignores_fair_and_edge():
+    """Fair 0.50 puts the edge reservation far below the 0.10 / 0.89 best
+    bids; the LIP quote is placed regardless."""
+    q, ctx = lip_q()
+    lip_step(q, ctx, fair=0.50)
+    assert ctx.lip_targets[("A", "yes")].price == 0.10
+    assert ctx.lip_targets[("A", "no")].price == 0.89
+
+
+def test_lip_off_in_mid_band():
+    q, ctx = lip_q()
+    lip_step(q, ctx, yes={0.45: 300.0}, no={0.50: 300.0})
+    assert ctx.lip_targets[("A", "yes")] is None and ctx.lip_targets[("A", "no")] is None
+
+
+def test_lip_off_near_close():
+    q, ctx = lip_q(close=T0 + pd.Timedelta(seconds=179))
+    lip_step(q, ctx)
+    assert ctx.lip_targets[("A", "yes")] is None and ctx.lip_targets[("A", "no")] is None
 
 
 def test_lip_off_publishes_none():
     q, ctx = lip_q(enable_lip_quoting=False)
-    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, lb(YES, NO, 0.40, 0.60))
+    lip_step(q, ctx)
     assert ctx.lip_targets[("A", "yes")] is None
+
+
+def test_lip_zero_lots_disables_that_band():
+    q, ctx = lip_q(lip_rich_lots=0.0)
+    lip_step(q, ctx)
+    assert ctx.lip_targets[("A", "yes")] is not None
+    assert ctx.lip_targets[("A", "no")] is None
 
 
 def test_lip_pulled_on_stale_signal():
     q, ctx = lip_q()
-    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, lb(YES, NO, 0.40, 0.60))
+    lip_step(q, ctx)
     q.model.age = 5.0
     step(q, ctx, dt=0.1)
     assert ctx.lip_targets[("A", "yes")] is None and ctx.lip_targets[("A", "no")] is None
 
 
-def test_lip_size_is_lip_lots_minus_position_on_that_side():
-    q, ctx = lip_q(lip_lots=20.0)
-    ctx.portfolio.position("A").yes_qty = 15.0
-    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, lb(YES, NO, 0.40, 0.60))
-    t = ctx.lip_targets[("A", "yes")]
-    assert t is None or t.size <= 5.0
-    ctx.portfolio.position("A").yes_qty = 20.0
-    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, dt=0.1)
+def test_lip_size_net_of_position_on_that_side():
+    q, ctx = lip_q()
+    ctx.portfolio.position("A").yes_qty = 150.0
+    lip_step(q, ctx)
+    assert ctx.lip_targets[("A", "yes")].size == 250.0
+    assert ctx.lip_targets[("A", "no")].size == 100.0   # long yes doesn't use up the no side
+    ctx.portfolio.position("A").yes_qty = 400.0
+    lip_step(q, ctx, dt=0.1)
     assert ctx.lip_targets[("A", "yes")] is None
 
 
-def test_lip_depth_ahead_counts_our_own_quotes():
-    """Shadow: others have 115 at 0.40; our 5-lot edge quote at 0.41 makes 120
-    ahead of a LIP quote at 0.40. With a 120 minimum, 0.40 qualifies only
-    because our size counts."""
-    import kalshi_infra.trading.quoter as Q
-    seen = {}
-    orig = Q.choose_lip_level
+def test_lip_follows_others_best_not_our_own_quote():
+    """Real mode: the book shows our 400-lot LIP quote at 0.11 as the best yes
+    bid. Others' best is 0.10, so the target is 0.10, not 0.11."""
+    q, ctx = lip_q(own_in_book=True)
+    ctx.on_book[("A", "yes")] = [(0.11, 400.0)]
+    lip_step(q, ctx, yes={0.11: 400.0, 0.10: 500.0})
+    assert ctx.lip_targets[("A", "yes")].price == 0.10
 
-    def spy(**kw):
-        if kw["side"] == "yes":
-            seen["ahead"] = kw["depth_ahead_fn"](0.40)
-        return orig(**kw)
 
-    Q.choose_lip_level = spy
-    try:
-        q, ctx = lip_q(lip_lots=50.0, lip_min_depth_ahead=120.0, prop_max_lip=0.0)
-        ctx.ours[("A", "yes")] = [(0.41, 5.0)]
-        step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, lb({0.40: 115.0, 0.30: 300.0}, NO, 0.40, 0.60))
-    finally:
-        Q.choose_lip_level = orig
-    assert seen["ahead"] == pytest.approx(120.0)
+def test_lip_capped_inside_far_touch():
+    # Best yes bid 0.10 with the yes ask at 0.11 (no bid 0.89): fine. Make the
+    # far side cross: no bid 0.91 -> yes ask 0.09 -> cap at 0.08.
+    q, ctx = lip_q()
+    lip_step(q, ctx, yes={0.10: 500.0}, no={0.91: 200.0})
+    assert ctx.lip_targets[("A", "yes")].price == 0.08
+
+
+def test_lip_obeys_side_block_and_enable_quoting_but_not_spot_burst():
+    q, ctx = lip_q()
+    q.model.block[("A", "yes")] = "basis_tie"
+    q.model.quote_block = lambda ticker, now_s: "spot_burst"
+    lip_step(q, ctx)
+    assert ctx.lip_targets[("A", "yes")] is None
+    assert ctx.lip_targets[("A", "no")] is not None
+    q.cfg.quoting = dataclasses.replace(q.cfg.quoting, enable_quoting=False)
+    lip_step(q, ctx, dt=0.1)
+    assert ctx.lip_targets[("A", "no")] is None
+
+
+def test_lips_at_band_edges():
+    s = P.LipSettings(**dict(LIP_OFF, lip_cheap_lots=400.0, lip_rich_lots=100.0))
+    assert s.lots_at(0.20) == 400.0 and s.lots_at(0.21) == 0.0
+    assert s.lots_at(0.79) == 0.0 and s.lots_at(0.80) == 100.0
+    assert s.max_lots() == 400.0
 
 
 def test_model_quote_block_pulls_both_ladders_but_still_takes():

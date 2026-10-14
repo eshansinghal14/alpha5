@@ -145,16 +145,16 @@ Per market and side (`trading/quoter.py` docstring has the formula):
 - **Edge quote** (`quoting.order_lots`): first tick outside fair minus
   (quoting edge + band + lean + maker fee), capped `max_improve_ticks`
   inside the near touch and a tick inside the far one.
-- **LIP quote** (`lip.lip_lots`): exists only to earn LIP. Considers every
-  level at or outside the edge quote's own reservation, finds the best
-  LIP $/s there, and rests at the DEEPEST level still earning
-  ≥ `prop_max_lip` of it with at least `lip_min_depth_ahead` contracts
-  ahead (better prices plus the whole same-price queue). Size is cut to the
-  fewest lots earning the same payout and bounded by `max_position`, since
-  it can fill. Re-chosen every decision; a same-level size increase is an
-  amend (Kalshi sends it to the back), anything else is cancel + new order,
-  so it always sits at the back of the queue. Safety cancels bypass the
-  write-rate limiter.
+- **LIP quote** (`lip.*`): exists only to earn LIP. One order per side at
+  others' best bid on that side (our own orders netted out), capped a tick
+  inside the far touch. Our fair and edge are not consulted. Quoted only when
+  that price is ≤ `lip_cheap_max_price` (size `lip_cheap_lots`) or
+  ≥ `lip_rich_min_price` (size `lip_rich_lots`), and with at least
+  `lip_min_time_left_s` to close. Size is net of the position already held
+  on that side and our resting edge size there. Pulled with the edge quotes
+  on no fair, a stale signal, `enable_quoting` off or a model side block;
+  not on `spot_burst`. Moved at most once per `lip_hold_s`. Why:
+  `kalshi_strategies/KXCRYPTOLEAD15M/research/LIP_REPORT.md`.
 
 Every reason a side doesn't trade (`no_fair`, `stale_signal`,
 `outside_atm_set`, or a series `side_block` string) is logged per decision

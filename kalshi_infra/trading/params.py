@@ -117,26 +117,45 @@ class RuntimeParams:
 @section
 class LipSettings:
     """Program parameters (target, discount, reward, period) come from Kalshi's
-    /incentive_programs per market; these only shape our own LIP quote."""
+    /incentive_programs per market; these only shape our own LIP quote.
+
+    One LIP order per side, at others' best bid on that side, sized by that
+    price. Our fair and edge play no part. Rationale and backtest:
+    kalshi_strategies/KXCRYPTOLEAD15M/research/LIP_REPORT.md."""
     enable_lip_quoting: bool = param(
         "Rest one LIP-farming quote per side, after the edge ladder in priority. Off cancels any "
         "LIP quote. LIP accrual is measured either way.")
-    lip_lots: float = param(
-        "Max |position| a LIP fill may take a side to: the LIP quote rests at most lip_lots minus "
-        "the position on that side (and minus resting edge size there). Fewer are rested when "
-        "fewer earn the same reward. 0 disables.", min=0, step=1.0)
-    prop_max_lip: float = param(
-        "Rest the LIP quote at the DEEPEST level outside the edge that still earns at least this "
-        "fraction of the best LIP/s available outside the edge. 1 = the best level; lower = deeper "
-        "and safer for less reward.", min=0, max=1, step=0.05)
-    lip_min_depth_ahead: float = param(
-        "Min contracts resting AHEAD of the LIP quote -- every order at a better price plus the "
-        "queue ahead at its own price, ours included (they count toward the reference price too). "
-        "A level with less is never used; a resting LIP quote whose queue ahead (Kalshi's own "
-        "queue position, polled) drops below it is cancelled at once.", min=0, step=10.0)
+    lip_cheap_max_price: float = param(
+        "Quote LIP on a side whose best bid (own-side price, others' orders) is at or below this "
+        "-- the cheap side of a longshot. 2026-10-11..14 crypto: <=0.20 paid more LIP than it "
+        "lost to pickoffs; 0.35-0.80 lost money net.", min=0.01, max=0.99, step=0.01)
+    lip_cheap_lots: float = param(
+        "LIP order size on a cheap-side price, less any position already held on that side. "
+        "0 disables the cheap side.", min=0, step=10.0)
+    lip_rich_min_price: float = param(
+        "Quote LIP on a side whose best bid is at or above this -- the expensive side of a "
+        "near-certainty. The weaker leg: clearly adverse on markout, kept for the $1 payout floor.",
+        min=0.01, max=0.99, step=0.01)
+    lip_rich_lots: float = param(
+        "LIP order size on an expensive-side price, less any position already held on that side. "
+        "0 disables the expensive side.", min=0, step=10.0)
+    lip_min_time_left_s: float = param(
+        "No LIP quote with fewer than this many seconds to close. The last 3 min lost money net "
+        "in every cut of the 2026-10-11..14 backtest.", min=0, step=30)
     lip_hold_s: float = param(
         "A resting LIP quote is moved to a new price or size at most this often (one amend). "
-        "Safety cancels (depth ahead, edge, stale, LIP off) are never held.", min=0, max=60, step=0.5)
+        "Safety cancels (stale, band, time, LIP off) are never held.", min=0, max=60, step=0.5)
+
+    def lots_at(self, price: float) -> float:
+        """Order size for a LIP quote at own-side `price`; 0 outside both bands."""
+        if price <= self.lip_cheap_max_price + 1e-9:
+            return self.lip_cheap_lots
+        if price >= self.lip_rich_min_price - 1e-9:
+            return self.lip_rich_lots
+        return 0.0
+
+    def max_lots(self) -> float:
+        return max(self.lip_cheap_lots, self.lip_rich_lots)
 
 
 SHARED_SECTIONS = ("quoting", "trading_time", "risk", "runtime", "lip")

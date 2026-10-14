@@ -74,11 +74,6 @@ MAX_CONSECUTIVE_ORDER_ERRORS = 5
 # Consecutive position audits (5s apart) a market must disagree on before the
 # audit halts. A real accounting gap persists; a fill racing the read doesn't.
 AUDIT_STRIKES = 2
-# After Kalshi's queue position shows a LIP quote with too little ahead, the
-# LIP target on that side must be strictly deeper than the pulled price for
-# this long: the displayed book (which the target is chosen from) is what
-# overstated the queue in the first place.
-LIP_QUEUE_AVOID_S = 5.0
 # Shadow's modelled write bucket when there is no order client to read the
 # account's limit from: Basic tier, 100 tokens/s (GET /account/limits, 2026-10-10).
 SHADOW_WRITE_TOKENS_PER_S = 100.0 * 0.8
@@ -139,15 +134,7 @@ class LiveContext:
 
     def set_lip_quote(self, ticker: str, side: str, target):
         """Publish the LIP quote wanted on one side (order_manager.LipTarget,
-        or None). Lowest priority after the edge ladder. Dropped while a
-        queue-position pull is holding that side to deeper prices."""
-        avoid = self._engine.lip_avoid.get((ticker, side))
-        if target is not None and avoid is not None:
-            px, until = avoid
-            if time.monotonic() < until and target.price >= px - 1e-9:
-                target = None
-            elif time.monotonic() >= until:
-                self._engine.lip_avoid.pop((ticker, side), None)
+        or None). Lowest priority after the edge ladder."""
         self._engine.om.set_lip(ticker, side, target)
 
     def lip_quote(self, ticker: str, side: str):
@@ -277,8 +264,6 @@ class LiveEngine:
         # (a fill that raced the cancel must still find its order).
         self._quote_orders: dict[int, Order] = {}
         self._exchange_to_quote: dict[str, int] = {}
-        # (ticker, side) -> (pulled price, until monotonic): see check_lip_queue.
-        self.lip_avoid: dict[tuple[str, str], tuple[float, float]] = {}
         # Shadow models the account write bucket at the real refill rate
         # (with our headroom), so it sees the same throttling a real session
         # would; real mode uses the order client's own bucket instead.
@@ -337,9 +322,10 @@ class LiveEngine:
 
     def position_limit(self) -> float:
         """The larger of the two caps: a LIP fill may legitimately take a
-        position past max_position, up to lip.lip_lots."""
-        lip_lots = getattr(getattr(self.strategy, "cfg", None), "lip", None)
-        return max(self.quoting.max_position, getattr(lip_lots, "lip_lots", 0.0) or 0.0)
+        position past max_position, up to the largest LIP size."""
+        lip = getattr(getattr(self.strategy, "cfg", None), "lip", None)
+        lip_max = lip.max_lots() if lip is not None and hasattr(lip, "max_lots") else 0.0
+        return max(self.quoting.max_position, lip_max)
 
     def signal_age_limit(self) -> float:
         return self.risk.max_signal_age_s
@@ -1378,28 +1364,6 @@ class LiveEngine:
 
     def has_quotes(self) -> bool:
         return bool(self.om.quotes)
-
-    def check_lip_queue(self, positions: dict[str, float], min_ahead: float):
-        """Cancel any LIP quote with less than `min_ahead` truly ahead of it:
-        Kalshi's queue position at its own price plus every order at a better
-        price on that side (from the book). Ours count -- they count toward the
-        LIP reference price too. Unknown orders (just placed, not yet in the
-        listing) are left to the next poll."""
-        for q in self.om.live(role="lip"):
-            if q.state != om.RESTING or q.exchange_id not in positions:
-                continue
-            book = self.books.get(q.ticker)
-            ladder = getattr(book, "ladder", None) if book is not None else None
-            bids = {} if ladder is None else (ladder.yes_bids if q.side == "yes" else ladder.no_bids)
-            better = sum(z for p, z in bids.items() if p > q.price + 1e-9)
-            ahead = positions[q.exchange_id] + better
-            if ahead + 1e-9 < min_ahead:
-                # Cancel now; don't come back to that price or better until
-                # the book alone shows enough there again (it overstates what's
-                # ahead, which is why we're here), for LIP_QUEUE_AVOID_S.
-                self.om._cancel(q, "lip_queue")
-                self.lip_avoid[(q.ticker, q.side)] = (q.price, time.monotonic() + LIP_QUEUE_AVOID_S)
-        self.om.drain_cancels()
 
     def has_uncancelled_quotes(self) -> bool:
         return any(q.state != om.CANCELLING for q in self.om.quotes.values())

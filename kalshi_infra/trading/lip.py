@@ -292,18 +292,6 @@ def levels_from_ladder(bids: dict[float, float], ours: list[tuple[float, float]]
     return sorted((LipLevel(price=p, size=v[0], mine=v[1]) for p, v in acc.items()), key=lambda lv: -lv.price)
 
 
-def _scored_prefix(bids: dict[float, float], target: float) -> dict[float, float]:
-    """Best-first levels up to and including the one where cumulative size
-    reaches `target`; all of them if it never does."""
-    out, cum = {}, 0.0
-    for p in sorted(bids, reverse=True):
-        out[p] = bids[p]
-        cum += bids[p]
-        if cum >= target:
-            break
-    return out
-
-
 def others_ladder(bids: dict[float, float], ours: list[tuple[float, float]]) -> dict[float, float]:
     """The visible ladder with our own resting size removed."""
     out = dict(bids)
@@ -320,104 +308,6 @@ def reward_rate(yes: list[LipLevel], no: list[LipLevel], params: LipParams) -> f
     if params.max_reward_usd is not None:
         r = min(r, params.max_reward_usd / params.snapshots_per_period)
     return r
-
-
-@dataclasses.dataclass(frozen=True)
-class LipChoice:
-    price: float | None      # own-side price; None = no LIP quote
-    size: float
-    rate: float              # $/s our LIP quote adds at (price, size)
-    max_rate: float          # best $/s available outside the edge at full size
-    depth_ahead: float
-
-
-def choose_lip_level(*, side: str, others_yes: dict, others_no: dict,
-                     ours_yes: list, ours_no: list, params: LipParams,
-                     top_price: float | None, max_size: float, prop_max: float,
-                     min_depth_ahead: float, depth_ahead_fn) -> LipChoice:
-    """Where to rest the LIP-farming quote on `side` (own-side prices).
-
-    Candidates are every tick at or below `top_price` (the first level
-    outside the edge). The best rate over them, at `max_size`, is the
-    reference; the DEEPEST candidate that earns at least prop_max of it and
-    has at least min_depth_ahead resting ahead wins. The size is then cut to
-    the smallest whole number of lots earning the same rate (smaller is
-    strictly safer). `ours_*` are our OTHER resting orders, which stay in
-    the book while scoring."""
-    none = LipChoice(None, 0.0, 0.0, 0.0, 0.0)
-    if top_price is None or max_size < 1 or params.period_reward_usd <= 0:
-        return none
-    # Exact, not an approximation: adding our size only makes a side reach
-    # Target sooner, so levels past where the others alone reach it are
-    # never scored. Scoring the full ladder (hundreds of levels, re-sorted
-    # per candidate) was ~40% of the crypto event loop on 2026-10-09.
-    others_yes = _scored_prefix(others_yes, params.target_size)
-    others_no = _scored_prefix(others_no, params.target_size)
-    others = others_yes if side == "yes" else others_no
-    ours_side = ours_yes if side == "yes" else ours_no
-    # Only `side` changes between candidates: score the other side once, and
-    # build each candidate's ladder from one pre-merged one.
-    fixed = _score_side(levels_from_ladder(others_no, ours_no) if side == "yes"
-                        else levels_from_ladder(others_yes, ours_yes), params)
-    merged = {p: [s, 0.0] for p, s in others.items()}
-    for p, s in ours_side:
-        if s > 0:
-            lv = merged.setdefault(p, [0.0, 0.0])
-            lv[1] += s
-            lv[0] = max(lv[0], lv[1])
-    rps = params.period_reward_usd / max(params.snapshots_per_period, 1) / 2.0   # see score_book
-    cap = None if params.max_reward_usd is None else params.max_reward_usd / params.snapshots_per_period
-
-    def _rate_with(price, size):
-        acc = merged
-        if price is not None and size > 0:
-            acc = dict(merged)
-            cur = acc.get(price)
-            mine = (cur[1] if cur else 0.0) + size
-            acc[price] = [max(cur[0] if cur else 0.0, mine), mine]
-        sc = _score_side(sorted((LipLevel(p, v[0], v[1]) for p, v in acc.items()),
-                                key=lambda lv: -lv.price), params)
-        r = (sc.our_share + fixed.our_share) * rps if (sc.qualifies and fixed.qualifies) else 0.0
-        return r if cap is None else min(r, cap)
-
-    base = _rate_with(None, 0.0)
-
-    def rate(price, size):
-        return _rate_with(price, size) - base
-
-    cands = []
-    p = round(top_price, 2)
-    cum_above = sum(s for q, s in others.items() if q > p + 1e-9)
-    while p >= TICK - 1e-9:
-        # Below the level where the book already reaches target, an order
-        # no longer "helps reach the Target Size" and scores 0 -- as do all
-        # deeper ones.
-        if cum_above >= params.target_size:
-            break
-        cands.append((p, rate(p, max_size)))
-        cum_above += others.get(p, 0.0)
-        p = round(p - TICK, 2)
-    if not cands:
-        return none
-    best = max(r for _, r in cands)
-    if best <= 0:
-        return LipChoice(None, 0.0, 0.0, best, 0.0)
-    for price, r in reversed(cands):          # deepest first
-        if r + 1e-15 < prop_max * best:
-            continue
-        ahead = depth_ahead_fn(price)
-        if ahead + 1e-9 < min_depth_ahead:
-            continue
-        lo, hi = 1, int(max_size)
-        full = rate(price, hi)
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if rate(price, mid) >= full - 1e-15:
-                hi = mid
-            else:
-                lo = mid + 1
-        return LipChoice(price, float(lo), rate(price, lo), best, ahead)
-    return LipChoice(None, 0.0, 0.0, best, 0.0)
 
 
 MAX_CATCHUP_S = 5   # past this a gap is a stall (dead feed), not a quiet book
@@ -485,5 +375,5 @@ __all__ = [
     "LipParams", "LipLevel", "LipSideScore", "LipBookScore",
     "score_book", "marginal_reward_rate", "period_payout",
     "params_from_program", "levels_from_ladder", "others_ladder", "reward_rate",
-    "LipChoice", "choose_lip_level", "LipTracker",
+    "LipTracker",
 ]

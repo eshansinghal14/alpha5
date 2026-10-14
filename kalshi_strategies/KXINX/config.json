@@ -46,9 +46,11 @@
     },
     "lip": {
       "enable_lip_quoting": false,
-      "lip_lots": 0.0,
-      "prop_max_lip": 0.8,
-      "lip_min_depth_ahead": 50.0,
+      "lip_cheap_max_price": 0.2,
+      "lip_cheap_lots": 0.0,
+      "lip_rich_min_price": 0.8,
+      "lip_rich_lots": 0.0,
+      "lip_min_time_left_s": 0.0,
       "lip_hold_s": 1.0
     },
     "pricing": {
@@ -101,9 +103,11 @@
     },
     "lip": {
       "enable_lip_quoting": false,
-      "lip_lots": 0.0,
-      "prop_max_lip": 0.8,
-      "lip_min_depth_ahead": 50.0,
+      "lip_cheap_max_price": 0.2,
+      "lip_cheap_lots": 0.0,
+      "lip_rich_min_price": 0.8,
+      "lip_rich_lots": 0.0,
+      "lip_min_time_left_s": 0.0,
       "lip_hold_s": 1.0
     },
     "pricing": {
@@ -156,9 +160,11 @@
     },
     "lip": {
       "enable_lip_quoting": false,
-      "lip_lots": 0.0,
-      "prop_max_lip": 0.8,
-      "lip_min_depth_ahead": 50.0,
+      "lip_cheap_max_price": 0.2,
+      "lip_cheap_lots": 0.0,
+      "lip_rich_min_price": 0.8,
+      "lip_rich_lots": 0.0,
+      "lip_min_time_left_s": 0.0,
       "lip_hold_s": 1.0
     },
     "pricing": {

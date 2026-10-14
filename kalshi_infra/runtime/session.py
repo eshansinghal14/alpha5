@@ -43,7 +43,6 @@ from kalshi_infra.trading.quoter import Quoter
 
 
 FLUSH_INTERVAL_S = 1.0      # rows shipped to the writer process; serialising happens there
-LIP_QUEUE_POLL_S = 1.0     # LIP queue-position check; read bucket, 200/s on Basic
 PUMP_INTERVAL_S = 0.05      # quote-create queue drain; one create's budget refills in 0.25s at 40/s
 AUDIT_INTERVAL_S = 5.0
 REPRICE_IDLE_S = 1.0        # reprice even without new inputs, so time decay and withhold states advance
@@ -430,24 +429,6 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
                 _log(S, "WARN: quote fill poll failed:")
                 traceback.print_exc()
 
-    async def lip_queue_loop():
-        """Kalshi's own queue position for our LIP quotes (read bucket, no
-        write tokens). The book can't tell us what's really ahead -- displayed
-        size includes orders that joined behind us -- so a LIP quote whose
-        true queue ahead plus everything at better prices falls under
-        lip_min_depth_ahead is cancelled here."""
-        while True:
-            await asyncio.sleep(LIP_QUEUE_POLL_S)
-            if not engine.live_trading or not cfg.lip.enable_lip_quoting or not engine.om.live(role="lip"):
-                continue
-            try:
-                pos = await asyncio.get_running_loop().run_in_executor(
-                    None, engine.order_client.queue_positions, ev.event_ticker)
-                engine.check_lip_queue(pos, cfg.lip.lip_min_depth_ahead)
-            except Exception:
-                _log(S, "WARN: LIP queue-position poll failed:")
-                traceback.print_exc()
-
     async def pump_loop():
         """Drain queued quote creates as the quote budget refills, even when
         no market event is waking the strategy."""
@@ -542,7 +523,7 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
     _log(S, f"starting feeds for {ev.event_ticker} ({len(tickers)} markets, "
             f"{'REAL ORDERS' if engine.live_trading else 'shadow'})")
     coros = [kalshi.run(), *model.feed_tasks(), reprice_loop(), control_loop(), audit_loop(),
-             quote_fill_loop(), pump_loop(), lip_queue_loop(), lag_probe(), flush_loop(), prefetch_next(), lip_lookup()]
+             quote_fill_loop(), pump_loop(), lag_probe(), flush_loop(), prefetch_next(), lip_lookup()]
     tasks = [asyncio.create_task(c) for c in coros]
     try:
         closer, stopped = asyncio.create_task(until_close()), asyncio.create_task(stop_evt.wait())

@@ -3,6 +3,25 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-14 — LIP quote: best bid, price bands, no edge
+
+Backtest and rationale: `kalshi_strategies/KXCRYPTOLEAD15M/research/LIP_REPORT.md`.
+
+- `quoter._lip_target`: one order per side at others' best bid, sized by
+  price band, off near close. No longer held outside the edge reservation:
+  that rule left it almost never at the best bid, where the LIP is.
+- `lip` params replaced: `lip_lots`, `prop_max_lip` and `lip_min_depth_ahead`
+  are gone. New: `lip_cheap_max_price` / `lip_cheap_lots`,
+  `lip_rich_min_price` / `lip_rich_lots`, `lip_min_time_left_s`.
+  `lip_hold_s` and `enable_lip_quoting` are unchanged.
+- Removed: `lip.choose_lip_level`, the queue-position poll
+  (`session.lip_queue_loop`, `engine.check_lip_queue`, `lip_avoid`). The
+  depth-ahead rule didn't protect against sweeps (HANDOFF #5).
+- Crypto config: 0.20 → 400 lots, 0.80 → 100 lots, 180s. Still disabled.
+  KXINX/KXINXU/KXINXDUD: new fields at 0 lots, disabled.
+- `engine.position_limit` uses the largest LIP size. A 400-lot LIP fill can
+  take a market past `max_position`, by design.
+
 ## 2026-10-12..14 — Crypto live tuning, audit race, signal age
 
 Findings and numbers: `kalshi_strategies/KXCRYPTOLEAD15M/research/HANDOFF.md` §7 #5-#8.

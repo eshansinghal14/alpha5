@@ -45,7 +45,7 @@ import pandas as pd
 
 from kalshi_infra.kalshi.venue import MAX_PRICE, MIN_PRICE, TICK
 from kalshi_infra.trading.fair import Fair, FairUpdate
-from kalshi_infra.trading.lip import LipTracker, choose_lip_level, others_ladder
+from kalshi_infra.trading.lip import LipTracker, others_ladder
 from kalshi_infra.trading.order_manager import Desired, LipTarget
 
 # Fair is clipped to [eps, 1-eps] before quoting (logged unclipped). Well
@@ -367,7 +367,11 @@ class Quoter:
             d = self._ladder(ticker, side, res, market_bid, market_ask, ladder, net, now)
             self._publish(ctx, ticker, side, d)
             out[side] = d
-            lips[side] = self._lip_target(ticker, side, res, book, ladder, net)
+            # LIP obeys enable_quoting and the model's side blocks, but not
+            # quote_block (spot_burst): pulling on spot cost more LIP than it
+            # saved in pickoffs (LIP_REPORT.md §5).
+            side_ok = q.enable_quoting and (block_bid if side == "yes" else block_ask) is None
+            lips[side] = self._lip_target(ticker, side, book, ladder, net, now) if side_ok else None
             self._publish_lip(ctx, ticker, side, lips[side])
         quote_bid = _top_yes("yes", out["yes"])
         quote_ask = _top_yes("no", out["no"])
@@ -408,56 +412,42 @@ class Quoter:
     # LIP quote
     # ------------------------------------------------------------------
 
-    def _lip_target(self, ticker, side, res, book, ladder, net) -> LipTarget | None:
+    def _lip_target(self, ticker, side, book, ladder, net, now) -> LipTarget | None:
         """Where the one LIP quote on this side should rest, or None.
 
-        Levels: every tick at or below the first tick outside the quote
-        reservation (never inside the edge) and a tick inside the far touch.
-        Among them, choose_lip_level takes the deepest earning >= prop_max_lip
-        of the best LIP $/s that has >= lip_min_depth_ahead resting ahead --
-        ALL size counts, ours included (it counts toward the reference price
-        too). Our current LIP quote's own size is left out of "ahead" at its
-        price, since it's what's being placed. Size: up to lip_lots minus the
-        position on this side and minus our resting edge size here."""
+        Price: others' best bid on this side (our own orders, LIP included,
+        netted out, so the quote follows the book down rather than holding
+        itself up), capped a tick inside the far touch. Quoted only if that
+        price is in a band (lip.lots_at) and at least lip_min_time_left_s
+        remain. Our fair and edge are deliberately not consulted: holding
+        the quote outside the edge reservation left it almost never at the
+        best bid, where nearly all the LIP is (LIP_REPORT.md §6).
+
+        Size: lots_at(price) minus the position already held on this side and
+        our resting edge size there."""
         lc = self.cfg.lip
         params = self.lip.params.get(ticker) if self.lip is not None else None
-        if (res is None or params is None or ladder is None or not lc.enable_lip_quoting
-                or lc.lip_lots < 1 or book is None):
+        if not lc.enable_lip_quoting or params is None or ladder is None or book is None:
             return None
-        held = net if side == "yes" else -net
-        room = lc.lip_lots - max(held, 0.0) - self._resting(ticker, side)
-        max_size = math.floor(room + 1e-9)
-        if max_size < 1:
+        if self.close_time is not None and (self.close_time - now).total_seconds() < lc.lip_min_time_left_s:
             return None
-        top = _first_outside(side, res)
+        bids = ladder.yes_bids if side == "yes" else ladder.no_bids
+        if self._own_in_book:
+            mine = list(self._shown.get((ticker, side), []))
+            bids = others_ladder(bids, mine)
+        if not bids:
+            return None
+        price = round(max(bids), 2)
         far = book.ask if side == "yes" else (None if book.bid is None else 1.0 - book.bid)
         if far is not None:
-            top = min(top, round(far - TICK, 2))
-        if top < MIN_PRICE:
+            price = min(price, round(far - TICK, 2))
+        if not (MIN_PRICE <= price <= MAX_PRICE):
             return None
-        live = self._lip_live.get((ticker, side))
-        ours = {s: list(self._shown.get((ticker, s), [])) if self._own_in_book else
-                [(p, z) for p, z in self._ours.get((ticker, s), [])] for s in ("yes", "no")}
-        if live is not None:
-            # Our LIP quote is the order being placed: score and count depth
-            # without it, or it would always see itself ahead.
-            lp, lz = live
-            ours[side] = [(p, z) for p, z in ours[side] if not (abs(p - lp) < 1e-9 and abs(z - lz) < 1e-9)]
-        displayed = {"yes": dict(ladder.yes_bids), "no": dict(ladder.no_bids)}
-        others = {s: others_ladder(displayed[s], ours[s]) if self._own_in_book else displayed[s]
-                  for s in ("yes", "no")}
-        everyone = displayed[side] if self._own_in_book else _add(displayed[side], ours[side])
-
-        def depth_ahead(price):
-            return sum(z for p, z in everyone.items() if p >= price - 1e-9)
-
-        choice = choose_lip_level(side=side, others_yes=others["yes"], others_no=others["no"],
-                                  ours_yes=ours["yes"], ours_no=ours["no"], params=params,
-                                  top_price=top, max_size=max_size, prop_max=lc.prop_max_lip,
-                                  min_depth_ahead=lc.lip_min_depth_ahead, depth_ahead_fn=depth_ahead)
-        if choice.price is None:
+        held = net if side == "yes" else -net
+        size = math.floor(lc.lots_at(price) - max(held, 0.0) - self._resting(ticker, side) + 1e-9)
+        if size < 1:
             return None
-        return LipTarget(choice.price, choice.size)
+        return LipTarget(price, float(size))
 
     def _others_bids(self, ticker, side, ladder) -> dict | None:
         """Other participants' bids on one side, own-side prices: the displayed
@@ -611,14 +601,6 @@ class Quoter:
         if self.lip is not None and ticker in self.lip.params:
             row["lip_accrued_usd"] = self.lip.accrued_usd[ticker]
         self.debug_log.append(row)
-
-
-def _add(bids: dict, ours: list) -> dict:
-    """`bids` with our size added (shadow: the feed never shows our orders)."""
-    out = dict(bids)
-    for p, z in ours:
-        out[p] = out.get(p, 0.0) + z
-    return out
 
 
 def _top_yes(side: str, d: Desired | None) -> float | None:
