@@ -69,7 +69,7 @@
     "quoting": {
       "max_position": 5.0,
       "constant_edge": 0.01,
-      "edge_fraction": 1.0,
+      "edge_fraction": 0.6,
       "lean_dollars": 0.02,
       "max_markets": 5,
       "atm_hysteresis": 2,
