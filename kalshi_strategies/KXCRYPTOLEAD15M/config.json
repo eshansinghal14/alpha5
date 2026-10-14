@@ -1,12 +1,12 @@
 {
   "quoting": {
-    "max_position": 3.0,
-    "constant_edge": 0.045,
-    "edge_fraction": 1.0,
-    "lean_dollars": 0.03,
+    "max_position": 10.0,
+    "constant_edge": 0.035,
+    "edge_fraction": 0.8,
+    "lean_dollars": 0.035,
     "max_markets": null,
     "atm_hysteresis": 0,
-    "enable_taking": true,
+    "enable_taking": false,
     "enable_quoting": true,
     "quoting_edge": 0.0,
     "max_improve_ticks": 1,
@@ -15,16 +15,16 @@
     "quote_keep_inside": 0.01,
     "quote_ahead_grace_s": 1.0,
     "cancels_token": 20.0,
-    "requote_delay_s": 0.5,
-    "order_lots": 0.8
+    "requote_delay_s": 0.8,
+    "order_lots": 1.5
   },
   "trading_time": {
     "real_trading_delay_s": 10.0,
-    "real_trading_cutoff_s": 30.0
+    "real_trading_cutoff_s": 60.0
   },
   "risk": {
     "max_loss_usd": 80.0,
-    "max_signal_age_s": 0.2
+    "max_signal_age_s": 0.75
   },
   "runtime": {
     "quote_fill_poll_s": 1.0,
@@ -45,8 +45,7 @@
     "shrinkage_lambda": 0.0,
     "base_rate_window": 500,
     "ci_vol_multiplier": 1.5,
-    "reaction_latency_s": 0.05,
-    "theo_vol_reval_draws": 32,
+    "reaction_latency_s": 2.0,
     "delta_refresh_s": 0.5,
     "max_cross_coin_skew_s": 1.0,
     "basis_tie_gap": 7.5e-05,
@@ -68,6 +67,7 @@
     "market_shift_alpha": 0.25,
     "market_shift_half_life_s": 60.0,
     "market_shift_fit_s": 10.0,
-    "market_shift_max_bp": 5.0
+    "market_shift_max_bp": 5.0,
+    "theo_vol_reval_draws": 32
   }
 }
