@@ -62,6 +62,11 @@ CONFIRM_S = 0.1
 # final-minute leader flips of 26OCT120300/0315 and lost $16 (2026-10-12).
 TAKE_HOLD_S = 0.5
 
+# Kalshi pays nothing for a market-period whose LIP comes to under $1.00
+# (CFTC filing 2026-07-15), so a market whose best case -- accrued plus the
+# current $/s held to the LIP stop, never filled -- is below it isn't quoted.
+LIP_MIN_PAYOUT_USD = 1.0
+
 
 class Quoter:
     def __init__(self, cfg, model, fees, *, close_time: pd.Timestamp | None,
@@ -488,8 +493,8 @@ class Quoter:
         return reward_rate(sides["yes"], sides["no"], params)
 
     def _lip_select(self, ctx, ticker, lips, ladder, now) -> dict:
-        """Apply the per-market LIP gates to this market's side targets:
-        lip_min_payout_usd (best case over the rest of the period) and
+        """Apply the per-market LIP gates to this market's side targets: the
+        $1 payout floor (best case over the rest of the period) and
         lip_max_markets (only the event's top markets by that projection)."""
         lc = self.cfg.lip
         if self.lip is None or all(t is None for t in lips.values()):
@@ -502,7 +507,7 @@ class Quoter:
         proj = self.lip.accrued_usd.get(ticker, 0.0) + rate * (left if left is not None else 0.0)
         self._lip_proj[ticker] = proj
         off = {"yes": None, "no": None}
-        if lc.lip_min_payout_usd > 0 and left is not None and proj < lc.lip_min_payout_usd:
+        if left is not None and proj < LIP_MIN_PAYOUT_USD:
             # Out of the ranking too: a market that can't pay must not hold a slot.
             self._lip_proj.pop(ticker, None)
             self._lip_set.discard(ticker)

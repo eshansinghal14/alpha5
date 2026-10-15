@@ -144,15 +144,10 @@ class LipSettings:
         "the side is worth. null = no fair check. Live 2026-10-14 22:22-22:55 UTC: 613 of 1,109 LIP "
         "lots filled >2c above fair and carried $24.5 of the $28.2 10s markout loss.",
         min=0, max=0.5, step=0.005)
-    lip_min_payout_usd: float = param(
-        "Skip LIP on a market unless its best-case period payout clears this: LIP accrued so far "
-        "plus our current $/s (book as it is now, our quotes never filled) held until LIP stops "
-        "(lip_min_time_left_s before close). Kalshi pays nothing under $1.00 a market-period. "
-        "0 disables.", min=0, step=0.25)
     lip_max_markets: int | None = param(
-        "LIP on at most this many markets per event: the ones with the highest best-case payout "
-        "(lip_min_payout_usd's projection). A member keeps its place unless another projects 25% "
-        "more, so the set doesn't churn writes. null = no limit.", min=1, step=1)
+        "LIP on at most this many markets per event: the ones with the highest best-case period "
+        "payout (see quoter.LIP_MIN_PAYOUT_USD). A member keeps its place unless another projects "
+        "25% more, so the set doesn't churn writes. null = no limit.", min=1, step=1)
     lip_requeue_min_ahead: float | None = param(
         "Real mode: every lip_hold_s, read Kalshi's queue position for each LIP order. One with "
         "fewer than this many contracts ahead at its price, and others queued behind it, is "

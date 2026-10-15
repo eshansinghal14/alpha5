@@ -39,7 +39,7 @@ def cfg(**q):
 
 
 LIP_OFF = dict(enable_lip_quoting=False, lip_cheap_max_price=0.2, lip_cheap_lots=0.0, lip_rich_min_price=0.8,
-               lip_rich_lots=0.0, lip_fair_margin=None, lip_min_payout_usd=0.0, lip_max_markets=None,
+               lip_rich_lots=0.0, lip_fair_margin=None, lip_max_markets=None,
                lip_requeue_min_ahead=None, lip_min_time_left_s=0.0, lip_hold_s=1.0)
 
 
@@ -418,6 +418,14 @@ class LipCtx(Ctx):
         return self.lip_live.get((ticker, side))
 
 
+@pytest.fixture(autouse=True)
+def no_lip_floor(request, monkeypatch):
+    """LIP tests that aren't about the $1 floor use a toy program whose payouts
+    sit under it; `floor` in a test's name keeps the real one."""
+    if "floor" not in request.node.name:
+        monkeypatch.setattr(quoter_mod, "LIP_MIN_PAYOUT_USD", 0.0)
+
+
 def lip_q(close=CLOSE, own_in_book=False, **lip):
     return (Quoter(lip_cfg(**lip), Model(), FREE, close_time=close, lip=LipTracker({"A": LIPP})),
             LipCtx(own_in_book=own_in_book))
@@ -549,21 +557,21 @@ RATE = 0.8 / 2 * 9 / 900
 
 
 def test_lip_floor_blocks_when_best_case_payout_too_small():
-    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_min_payout_usd=1.0, lip_rich_lots=0.0)   # 120s -> $0.48
+    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_rich_lots=0.0)   # 120s -> $0.48
     lip_step(q, ctx, yes=FLOOR_YES)
     assert ctx.lip_targets[("A", "yes")] is None
     assert q.block_counts.get("lip_below_floor", 0) >= 1
 
 
 def test_lip_floor_passes_with_enough_time_left():
-    q, ctx = lip_q(lip_min_payout_usd=1.0, lip_rich_lots=0.0)                                      # 420s -> $1.68
+    q, ctx = lip_q(lip_rich_lots=0.0)                                      # 420s -> $1.68
     lip_step(q, ctx, yes=FLOOR_YES)
     assert ctx.lip_targets[("A", "yes")] is not None
     assert q._lip_proj["A"] == pytest.approx(420 * RATE, rel=1e-6)
 
 
 def test_lip_floor_counts_what_is_already_accrued():
-    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_min_payout_usd=1.0, lip_rich_lots=0.0)
+    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_rich_lots=0.0)
     q.lip.accrued_usd["A"] = 0.60                                               # 0.60 + 0.48
     lip_step(q, ctx, yes=FLOOR_YES)
     assert ctx.lip_targets[("A", "yes")] is not None
@@ -572,13 +580,13 @@ def test_lip_floor_counts_what_is_already_accrued():
 def test_lip_floor_ignores_size_behind_a_level_already_at_target():
     """Others' 500 at the best bid meet the 300 target alone, so our 400 behind
     them scores nothing (lip._score_side) -- the floor sees $0 and blocks."""
-    q, ctx = lip_q(lip_min_payout_usd=1.0, lip_rich_lots=0.0)
+    q, ctx = lip_q(lip_rich_lots=0.0)
     lip_step(q, ctx)
     assert ctx.lip_targets[("A", "yes")] is None
 
 
 def _two_markets(**lip):
-    base = dict(lip_min_payout_usd=0.0, lip_max_markets=1, lip_rich_lots=0.0)
+    base = dict(lip_max_markets=1, lip_rich_lots=0.0)
     base.update(lip)
     q = Quoter(lip_cfg(**base), Model(), FREE, close_time=CLOSE, lip=LipTracker({"A": LIPP, "B": LIPP}))
     return q, LipCtx()

@@ -155,9 +155,10 @@ Per market and side (`trading/quoter.py` docstring has the formula):
   minus `lip_fair_margin`. Pulled with the edge quotes on no fair, a stale
   signal, `enable_quoting` off, a model side block or `spot_burst`. Moved at
   most once per `lip_hold_s`.
-  - **Payout floor** (`lip_min_payout_usd`): a market is LIP-quoted only if
-    LIP accrued so far plus our current $/s (book as it is, our quotes never
-    filled) held to the LIP stop would clear it. Kalshi pays nothing under $1.
+  - **$1 payout floor** (hardcoded, `quoter.LIP_MIN_PAYOUT_USD`): a market is
+    LIP-quoted only if LIP accrued so far plus our current $/s (book as it is,
+    our quotes never filled) held to the LIP stop would reach $1. Kalshi pays
+    nothing under $1.
   - **`lip_max_markets`**: only the event's top markets by that projection; a
     member keeps its slot until another projects 25% more.
   - **Re-queue** (`lip_requeue_min_ahead`, real mode): every `lip_hold_s` the

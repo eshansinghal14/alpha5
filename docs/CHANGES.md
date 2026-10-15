@@ -11,14 +11,15 @@ $28.2 10s loss, and the 19:00 ET event's ~900 lots took the run past the
 $80 halt.
 
 - `lip_fair_margin`: LIP price capped at own-side fair minus the margin.
-- `lip_min_payout_usd`: no LIP on a market whose best case for the period
-  (accrued + current $/s held to the LIP stop) is under it.
+- $1 payout floor (hardcoded, `quoter.LIP_MIN_PAYOUT_USD`): no LIP on a
+  market whose best case for the period (accrued + current $/s held to the
+  LIP stop) is under $1, Kalshi's minimum payout.
 - `lip_max_markets`: LIP only on the event's top markets by that projection.
 - LIP now also pulls on `spot_burst`.
 - `lip_requeue_min_ahead`: queue-position poll every `lip_hold_s` (real
   mode); orders near the front go to the back via a 0.01-lot size amend.
 - Decision rows log `lip_size_*`, `lip_proj_usd`, `lip_ahead_*`.
-- Crypto: margin 0.02, floor $1, 2 markets, re-queue under 200 ahead.
+- Crypto: margin 0.02, 2 markets, re-queue under 200 ahead.
 
 ## 2026-10-14 — LIP quote: best bid, price bands, no edge
 

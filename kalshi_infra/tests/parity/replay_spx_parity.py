@@ -110,7 +110,7 @@ def new_cfg(oc):
         risk=P.RiskParams(max_loss_usd=1e9, max_signal_age_s=1e9),
         lip=P.LipSettings(enable_lip_quoting=False, lip_cheap_max_price=0.2, lip_cheap_lots=0.0,
                           lip_rich_min_price=0.8, lip_rich_lots=0.0, lip_fair_margin=None,
-                          lip_min_payout_usd=0.0, lip_max_markets=None, lip_requeue_min_ahead=None,
+                          lip_max_markets=None, lip_requeue_min_ahead=None,
                           lip_min_time_left_s=0.0, lip_hold_s=1.0))
 
 
