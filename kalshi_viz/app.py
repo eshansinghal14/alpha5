@@ -24,7 +24,8 @@ import streamlit.components.v1 as components  # noqa: E402
 from kalshi_infra.runtime.control import request_trading_mode  # noqa: E402
 from kalshi_strategies.run import registry  # noqa: E402
 from kalshi_viz import config_form, perf_panel  # noqa: E402
-from kalshi_viz.data import load_day, read_summary, stream_url, summary_age_s  # noqa: E402
+from kalshi_viz.data import (latest_summary, load_day, read_summary, read_trading_mode,  # noqa: E402
+                             stream_url, summary_age_s)
 from kalshi_viz.live_chart import IFRAME_HEIGHT, build_live_html  # noqa: E402
 
 st.set_page_config(page_title="Kalshi strategies", layout="wide")
@@ -75,10 +76,26 @@ def _ms(v):
     return "n/a" if v is None else f"{v * 1000:,.0f} ms"
 
 
-def _render_toggle(series: str, s: dict):
-    active = bool(s.get("live_trading"))
-    requested = bool(s.get("arm_requested", active))
-    if active:
+def _idle_request(series: str, s: dict | None) -> bool:
+    """Arm state to show while no event is running. A click made since the
+    last summary was written is only in trading_mode.json; anything older is
+    what the process last reported."""
+    last = pd.Timestamp(s["last_update"]) if s and s.get("last_update") else None
+    tm = read_trading_mode(series)
+    if tm is not None and (last is None or tm[1] > last):
+        return tm[0]
+    return bool(s.get("arm_requested")) if s else False
+
+
+def _render_toggle(series: str, s: dict, idle: bool = False):
+    active = bool(s.get("live_trading")) and not idle
+    requested = _idle_request(series, s) if idle else bool(s.get("arm_requested", active))
+    if idle:
+        st.info("⏸ No event running. "
+                + ("**REAL TRADING is requested** -- the next event arms when it starts trading."
+                   if requested else "The next event starts in SHADOW unless you arm it here.")
+                + " A process restarted after the click starts disarmed.")
+    elif active:
         r = s.get("real") or {}
         st.error(f"🟢 **REAL TRADING IS LIVE** -- {r.get('n_fills', 0)} real fill(s) from "
                  f"{r.get('n_orders', 0)} order(s).")
@@ -91,7 +108,9 @@ def _render_toggle(series: str, s: dict):
                 on_change=lambda: request_trading_mode(series, st.session_state[key]),
                 help="Arms the running process (no restart). Arming starts a fresh session seeded from "
                      "Kalshi's positions; disarming pulls every resting quote. Positions are never flattened.")
-    if st.session_state[key] != requested:
+    if idle:
+        pass
+    elif st.session_state[key] != requested:
         st.warning("Waiting for the process to pick up the request.")
     elif requested and not active:
         st.warning("Armed, but not sending real orders yet -- outside trading_time (the delay after open "
@@ -173,14 +192,22 @@ def _render_series(series: str, spec):
             return
         s = read_summary(series)
         if s is None:
-            st.info(f"No {series} session today. Start one with "
-                    f"`python -m kalshi_strategies.run --series {series}`.")
+            prev = latest_summary(series)
+            s = prev[1] if prev else None
+        age = summary_age_s(s) if s else None
+        idle = s is None or (age is not None and age > STALE_SUMMARY_S)
+        if s is None:
+            st.subheader(series)
+            st.caption(f"No {series} session has written yet. Start the process with "
+                       f"`python -m kalshi_strategies.run --series {series}`.")
+            _render_toggle(series, {}, idle=True)
             return
-        age = summary_age_s(s)
-        if age is not None and age > STALE_SUMMARY_S:
-            st.warning(f"Process stopped writing {age:.0f}s ago (last event {s.get('event_ticker')}).")
-        st.subheader(f"{series} · {s.get('event_ticker')}")
-        _render_toggle(series, s)
+        st.subheader(f"{series} · {s.get('event_ticker')}" + ("  (last event)" if idle else ""))
+        if idle:
+            st.caption(f"Last summary {pd.Timestamp(s['last_update']).strftime('%Y-%m-%d %H:%M:%S')} UTC "
+                       f"({age / 3600:.1f}h ago). Between events this is normal; mid-event it means "
+                       "the process stopped.")
+        _render_toggle(series, s, idle=idle)
         _render_guards(s)
         # Rebuild the chart when the event rolls or a session restarts.
         ident = (s.get("event_ticker"), s.get("session_started"))

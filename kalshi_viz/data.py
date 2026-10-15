@@ -8,7 +8,8 @@ import os
 
 import pandas as pd
 
-from kalshi_infra.runtime.persist import day_dir, stream_filename
+from kalshi_infra.runtime.control import trading_mode_path
+from kalshi_infra.runtime.persist import LIVE_ROOT, day_dir, stream_filename
 
 
 @dataclasses.dataclass
@@ -31,6 +32,31 @@ def read_summary(series: str, date: str | None = None) -> dict | None:
     try:
         with open(path) as fh:
             return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def latest_summary(series: str) -> tuple[str, dict] | None:
+    """(date, summary) of the most recent day that has one."""
+    root = os.path.join(LIVE_ROOT, series)
+    try:
+        dates = sorted((d for d in os.listdir(root) if d[:2] == "20"), reverse=True)
+    except OSError:
+        return None
+    for d in dates:
+        s = read_summary(series, d)
+        if s is not None:
+            return d, s
+    return None
+
+
+def read_trading_mode(series: str) -> tuple[bool, pd.Timestamp] | None:
+    """(live_trading, file mtime) of the last arm/disarm request."""
+    path = trading_mode_path(series)
+    try:
+        with open(path) as fh:
+            want = bool(json.load(fh).get("live_trading", False))
+        return want, pd.Timestamp(os.path.getmtime(path), unit="s", tz="UTC")
     except (OSError, json.JSONDecodeError):
         return None
 
