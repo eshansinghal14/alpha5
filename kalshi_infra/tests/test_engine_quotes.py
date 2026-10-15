@@ -386,6 +386,22 @@ def test_partial_cross_still_books_the_later_maker_fill():
     assert _net(eng) == before + 1.0
 
 
+def test_rearm_does_not_rebook_a_quote_fill_seeded_from_kalshi():
+    """A quote fills, the session re-arms (reset + seed from Kalshi), and the
+    REST poll reports that fill again: it must stay booked once."""
+    eng, _, client = setup(real=True)
+    fair(eng)
+    x = xid(eng, "yes", 0.41)
+    f = {"ticker": "A", "side": "yes", "price": 0.41, "size": 1.0, "fee": 0.0,
+         "time": pd.Timestamp.now(tz="UTC"), "liquidity": "maker", "order_id": x, "trade_id": "t1"}
+    eng.on_real_fill(dict(f))
+    assert _net(eng) == 1.0
+    eng.reset_session()
+    eng.seed_fills_from_kalshi([dict(f)])
+    eng.apply_real_fills([dict(f)])
+    assert _net(eng) == 1.0
+
+
 def test_real_touch_improvement_is_one_amend_not_cancel_plus_create():
     """Others' bid steps up 0.40 -> 0.42: the top follows to 0.43. The
     deepest spare yes level is amended up; no yes create or cancel."""

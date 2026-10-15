@@ -696,6 +696,11 @@ class LiveEngine:
             self.portfolio.record_fill(order, f["price"], f["size"], pd.Timestamp(f["time"]),
                                        f["liquidity"], fee=f["fee"], exchange_order_id=f.get("order_id"),
                                        trade_id=f.get("trade_id"), seeded=True)
+            # reset_session clears the seen set but not _exchange_to_quote, so a
+            # quote filled before a re-arm still matches; without this the fill
+            # poll booked the seeded fill a second time (HYPE 2026-10-15, audit halt).
+            if f.get("trade_id") is not None:
+                self._seen_real_fills.add((f.get("order_id"), f["trade_id"]))
         # Seeded orders must not be resolvable -- they already executed.
         self._min_valid_order_id = self._peek_next_order_id()
         if fills:
