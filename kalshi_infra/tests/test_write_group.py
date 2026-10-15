@@ -113,6 +113,38 @@ def test_shadow_group_shares_one_modelled_bucket():
     assert ms["A"][0].sim_bucket is ms["B"][0].sim_bucket
 
 
+def test_starved_shadow_member_does_not_block_a_live_one():
+    """2026-10-15: shadow KXINX's modelled bucket sat below reserve + create,
+    and its creates (first in the shared queue) stopped every pass before
+    armed KXINXU's real creates: KXINXU quoted nothing on a full real bucket."""
+    c = Clock()
+    g = WriteGroup(sim_tokens_per_s=25.0, clock=c)          # modelled bucket < 20 + 10
+    shadow_ex = Ex(bucket=None)
+    shadow = OrderManager(shadow_ex, cancels_token=20.0, clock=c)
+    g.attach("SHADOW", shadow)
+    live_ex = Ex(bucket=80.0)                              # real bucket, full
+    live = OrderManager(live_ex, cancels_token=20.0, clock=c)
+    g.attach("LIVE", live)
+    shadow.set_desired("S", "yes", D([0.41, 0.40]))
+    live.set_desired("L", "yes", D([0.31, 0.30]))
+    g.pump()
+    assert not shadow_ex.creates                           # its own bucket is short
+    assert [q.price for q in live_ex.creates] == [0.31, 0.30]
+
+
+def test_two_live_members_still_share_one_queue():
+    sh, cl, g = Shared(30.0), Clock(), WriteGroup()        # 30 - 20 reserve: one create
+    exs = {}
+    for name in ("A", "B"):
+        ex = SharedEx(sh)
+        m = OrderManager(ex, cancels_token=20.0, clock=cl)
+        g.attach(name, m)
+        m.set_desired(name, "yes", D([0.41]))
+        exs[name] = ex
+    g.pump()
+    assert sum(len(ex.creates) for ex in exs.values()) == 1
+
+
 def test_clients_share_one_write_budget():
     from kalshi_infra.tests.test_shard_billing import _client
     b = WriteBudget(50.0)                       # 40 usable

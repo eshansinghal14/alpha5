@@ -941,33 +941,40 @@ class WriteGroup:
     def reserve(self) -> float:
         return max((m.own_reserve() for m in self.members.values()), default=0.0)
 
+    def _partitions(self) -> list[list[tuple[str, "OrderManager"]]]:
+        """Members grouped by the bucket they actually draw on: real-money
+        members (executor has a real bucket) vs shadow members (the modelled
+        bucket). Each partition runs its own pass. Mixed in one pass, shadow
+        KXINX's starved modelled bucket stopped every pass before armed
+        KXINXU's real creates were reached: KXINXU sat with 0 quotes and a
+        full 80-token real bucket (2026-10-15)."""
+        real, sim = [], []
+        for name, m in self.members.items():
+            (sim if m.ex.bucket_tokens() is None else real).append((name, m))
+        return [p for p in (real, sim) if p]
+
     def drain_cancels(self) -> int:
-        queued = [(rank, i, name, oid) for i, (name, m) in enumerate(self.members.items())
-                  for rank, oid in m.cancel_order()]
+        return sum(self._drain(p) for p in self._partitions())
+
+    @staticmethod
+    def _drain(members) -> int:
+        queued = [(rank, i, oid) for i, (_, m) in enumerate(members) for rank, oid in m.cancel_order()]
         sent = 0
-        for _, _, name, oid in sorted(queued):
-            m = self.members.get(name)
-            if m is None:
-                continue
-            r = m.send_cancel(oid)
+        for _, i, oid in sorted(queued):
+            r = members[i][1].send_cancel(oid)
             if r == "bucket":
                 break
             sent += r == "sent"
         return sent
 
-    def _cancels_pending(self) -> bool:
-        return any(m._cancel_q for m in self.members.values())
-
-    def _fill_edge(self, which) -> tuple[int, bool]:
-        heap = [(e[0], i, name, *e[1:]) for i, (name, m) in enumerate(self.members.items())
-                for e in m.missing() if which(e[0])]
+    @staticmethod
+    def _fill_edge(members, which) -> tuple[int, bool]:
+        heap = [(e[0], i, *e[1:]) for i, (_, m) in enumerate(members) for e in m.missing() if which(e[0])]
         heapq.heapify(heap)
         sent = 0
         while heap:
-            _, _, name, ticker, side, price, lots = heapq.heappop(heap)
-            m = self.members.get(name)
-            if m is None:
-                continue
+            _, i, ticker, side, price, lots = heapq.heappop(heap)
+            m = members[i][1]
             if not m._can_spend(COST_CREATE):
                 m._bump("create_deferred:reserve")
                 return sent, False
@@ -975,28 +982,32 @@ class WriteGroup:
         return sent, True
 
     def pump(self) -> int:
-        self.drain_cancels()
-        if self._cancels_pending():
-            for m in self.members.values():
+        return sum(self._pump(p) for p in self._partitions())
+
+    def _pump(self, members) -> int:
+        ms = [m for _, m in members]
+        self._drain(members)
+        if any(m._cancel_q for m in ms):
+            for m in ms:
                 if m._cancel_q:
                     m._bump("create_deferred:cancels_pending")
             return 0
-        sent = sum(m._fix_ahead() for m in list(self.members.values()))
-        if self._cancels_pending():
+        sent = sum(m._fix_ahead() for m in ms)
+        if any(m._cancel_q for m in ms):
             return sent
-        n, done = self._fill_edge(lambda dist: dist == 0)
+        n, done = self._fill_edge(members, lambda dist: dist == 0)
         sent += n
         if not done:
             return sent
-        for m in list(self.members.values()):
+        for m in ms:
             n, done = m._lip_work()
             sent += n
             if not done:
                 return sent
-        n, done = self._fill_edge(lambda dist: dist > 0)
+        n, done = self._fill_edge(members, lambda dist: dist > 0)
         sent += n
-        if done and not any(m.missing() for m in self.members.values()):
-            for m in list(self.members.values()):
+        if done and not any(m.missing() for m in ms):
+            for m in ms:
                 m._trim()
         return sent
 
