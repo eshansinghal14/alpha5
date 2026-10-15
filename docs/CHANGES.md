@@ -10,7 +10,9 @@ After the first live LIP session (22:22-23:00 UTC): 1,109 LIP lots filled,
 $28.2 10s loss, and the 19:00 ET event's ~900 lots took the run past the
 $80 halt.
 
-- `lip_fair_margin`: LIP price capped at own-side fair minus the margin.
+- `lip_fair_margin`: most the LIP bid (the best bid) may sit above own-side
+  fair; further above, that side gets no LIP. Not stepped down toward fair:
+  behind the best bid earns a fraction of the LIP.
 - $1 payout floor (hardcoded, `quoter.LIP_MIN_PAYOUT_USD`): no LIP on a
   market whose best case for the period (accrued + current $/s held to the
   LIP stop) is under $1, Kalshi's minimum payout.

@@ -514,20 +514,34 @@ def test_lip_capped_inside_far_touch():
     assert ctx.lip_targets[("A", "yes")].price == 0.08
 
 
-def test_lip_fair_margin_caps_price_below_fair():
-    """Best yes bid 0.10, fair 0.07: with a 2c margin the LIP bid is 0.05, not 0.10.
-    No side: own-side fair 0.93, best no bid 0.89 already under 0.91 -> unchanged."""
-    q, ctx = lip_q(lip_fair_margin=0.02, lip_rich_lots=100.0)
-    lip_step(q, ctx, fair=0.07)
-    assert ctx.lip_targets[("A", "yes")].price == 0.05
-    assert ctx.lip_targets[("A", "no")].price == 0.89
-
-
-def test_lip_fair_margin_can_pull_the_quote():
-    # Fair 0.02: cap at 0.00 -> below the 1c minimum -> no LIP on yes.
+def test_lip_fair_margin_quotes_best_bid_within_margin_above_fair():
+    """Best yes bid 0.10 with fair 0.09: 1c above fair, inside a 2c margin ->
+    quoted at the best bid itself (not stepped down)."""
     q, ctx = lip_q(lip_fair_margin=0.02)
-    lip_step(q, ctx, fair=0.02)
+    lip_step(q, ctx, fair=0.09)
+    assert ctx.lip_targets[("A", "yes")].price == 0.10
+
+
+def test_lip_fair_margin_skips_best_bid_too_far_above_fair():
+    # Best yes bid 0.10, fair 0.07: 3c above -> no LIP on yes.
+    q, ctx = lip_q(lip_fair_margin=0.02)
+    lip_step(q, ctx, fair=0.07)
     assert ctx.lip_targets[("A", "yes")] is None
+    assert q.block_counts.get("lip_above_fair", 0) >= 1
+
+
+def test_lip_fair_margin_at_exactly_the_margin_quotes():
+    q, ctx = lip_q(lip_fair_margin=0.02)
+    lip_step(q, ctx, fair=0.08)
+    assert ctx.lip_targets[("A", "yes")].price == 0.10
+
+
+def test_lip_negative_fair_margin_requires_bid_below_fair():
+    q, ctx = lip_q(lip_fair_margin=-0.01)
+    lip_step(q, ctx, fair=0.10)                     # bid == fair: not 1c below
+    assert ctx.lip_targets[("A", "yes")] is None
+    lip_step(q, ctx, fair=0.115, dt=0.1)            # bid 1.5c below fair
+    assert ctx.lip_targets[("A", "yes")].price == 0.10
 
 
 def test_lip_obeys_side_block_and_enable_quoting():

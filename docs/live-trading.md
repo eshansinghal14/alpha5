@@ -151,8 +151,9 @@ Per market and side (`trading/quoter.py` docstring has the formula):
   that price is ≤ `lip_cheap_max_price` (size `lip_cheap_lots`) or
   ≥ `lip_rich_min_price` (size `lip_rich_lots`), and with at least
   `lip_min_time_left_s` to close. Size is net of the position already held
-  on that side and our resting edge size there. Capped at own-side fair
-  minus `lip_fair_margin`. Pulled with the edge quotes on no fair, a stale
+  on that side and our resting edge size there. Not quoted if that best bid
+  is more than `lip_fair_margin` above own-side fair (negative = must be
+  that far below). Pulled with the edge quotes on no fair, a stale
   signal, `enable_quoting` off, a model side block or `spot_burst`. Moved at
   most once per `lip_hold_s`.
   - **$1 payout floor** (hardcoded, `quoter.LIP_MIN_PAYOUT_USD`): a market is

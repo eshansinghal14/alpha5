@@ -439,10 +439,9 @@ class Quoter:
 
         Price: others' best bid on this side (our own orders, LIP included,
         netted out, so the quote follows the book down rather than holding
-        itself up), capped a tick inside the far touch and, with
-        lip_fair_margin set, at own-side fair minus that margin. Quoted only if
-        the price is in a band (lip.lots_at) and at least lip_min_time_left_s
-        remain. The full edge reservation is NOT used: it left the quote almost
+        itself up), capped a tick inside the far touch. Quoted only if the
+        price is in a band (lip.lots_at), at most lip_fair_margin above
+        own-side fair, and at least lip_min_time_left_s remain. The full edge reservation is NOT used: it left the quote almost
         never at the best bid, where nearly all the LIP is (LIP_REPORT.md §6).
 
         Size: lots_at(price) minus the position already held on this side and
@@ -464,8 +463,12 @@ class Quoter:
         if far is not None:
             price = min(price, round(far - TICK, 2))
         if lc.lip_fair_margin is not None:
+            # Not stepped down to fair: a bid behind the best earns a fraction
+            # of the LIP, so a rich best bid means no LIP here at all.
             fair_own = prob if side == "yes" else 1.0 - prob
-            price = min(price, round(math.floor((fair_own - lc.lip_fair_margin) / TICK + 1e-9) * TICK, 2))
+            if price - fair_own > lc.lip_fair_margin + 1e-9:
+                self._block("lip_above_fair")
+                return None
         if not (MIN_PRICE <= price <= MAX_PRICE):
             return None
         held = net if side == "yes" else -net

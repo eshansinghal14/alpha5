@@ -140,10 +140,11 @@ class LipSettings:
         "LIP order size on an expensive-side price, less any position already held on that side. "
         "0 disables the expensive side.", min=0, step=10.0)
     lip_fair_margin: float | None = param(
-        "Cap the LIP price at own-side fair minus this, so LIP never rests above what the model says "
-        "the side is worth. null = no fair check. Live 2026-10-14 22:22-22:55 UTC: 613 of 1,109 LIP "
-        "lots filled >2c above fair and carried $24.5 of the $28.2 10s markout loss.",
-        min=0, max=0.5, step=0.005)
+        "Most the LIP bid may sit ABOVE own-side fair ($) and still be quoted; a best bid further "
+        "above fair gets no LIP quote. Negative = must be at least that far below fair. null = no "
+        "fair check. Live 2026-10-14 22:22-22:55 UTC: 613 of 1,109 LIP lots filled >2c above fair "
+        "and carried $24.5 of the $28.2 10s markout loss.",
+        min=-0.5, max=0.5, step=0.005)
     lip_max_markets: int | None = param(
         "LIP on at most this many markets per event: the ones with the highest best-case period "
         "payout (see quoter.LIP_MIN_PAYOUT_USD). A member keeps its place unless another projects "
