@@ -12,28 +12,35 @@ The headline test is the Kalshi help page's own worked example:
 import math
 import types
 
-from kalshi_infra.trading.lip import (LipLevel, LipParams, LipTracker, levels_from_ladder,
+from kalshi_infra.trading.lip import (LipLevel, LipParams, LipTracker, levels_from_ladder, levels_with_ours,
                                       marginal_reward_rate, params_from_program, period_payout,
-                                      reward_rate,
+                                      remaining_cap_usd, reward_rate,
                                       score_book)
 
 
 def test_help_page_payout_example():
     """From Kalshi's own help page: 20% share * $100 * 8000/10000 =
-    $16.00 payout, rounded down to the cent, min $1.00."""
+    $16.00 payout, rounded down to the cent."""
     payout = period_payout(user_total_score=0.20, all_users_total_score=1.0,
                            non_excluded=8000, total_snapshots=10_000,
                            period_reward_usd=100.0)
     assert math.isclose(payout, 16.00, abs_tol=1e-9)
 
 
-def test_payout_min_one_dollar():
-    """A positive payout below $1 rounds UP to $1 per the rules."""
-    payout = period_payout(user_total_score=0.005, all_users_total_score=1.0,
-                           non_excluded=10, total_snapshots=100,
-                           period_reward_usd=100.0)
-    # 0.005 * 100 * 0.1 = 0.05 raw; min $1.00 kicks in.
-    assert math.isclose(payout, 1.00, abs_tol=1e-9)
+def test_payout_under_one_dollar_pays_nothing():
+    """CFTC filing: paid only if the result is >= $1.00."""
+    assert period_payout(user_total_score=0.005, all_users_total_score=1.0,
+                         non_excluded=10, total_snapshots=100, period_reward_usd=100.0) == 0.0
+    assert period_payout(user_total_score=0.0999, all_users_total_score=1.0,
+                         non_excluded=100, total_snapshots=100, period_reward_usd=10.0) == 0.0
+    assert period_payout(user_total_score=0.1, all_users_total_score=1.0,
+                         non_excluded=100, total_snapshots=100, period_reward_usd=10.0) == 1.00
+
+
+def test_payout_rounds_down_without_losing_a_cent_to_float_error():
+    # 0.29 * 100 is 28.999999999999996 in floats.
+    assert period_payout(0.29, 1.0, 100, 100, 100.0) == 29.0
+    assert period_payout(0.12345, 1.0, 100, 100, 100.0) == 12.34
 
 
 def test_reference_price_at_target_over_five():
@@ -154,28 +161,68 @@ def test_levels_merge_our_quote():
     assert lv[0] == LipLevel(price=0.41, size=5.0, mine=5.0)
 
 
-def test_reward_capped_per_account():
+def test_cap_is_on_the_period_total_not_the_rate():
+    """Owning the book early can earn the whole cap in the first seconds; the
+    rate isn't spread evenly over the period."""
     params = LipParams(target_size=100.0, discount_factor=0.5, period_reward_usd=900.0,
                        snapshots_per_period=900, max_reward_usd=9.0)
     yes = levels_from_ladder({0.40: 100.0}, [(0.40, 100.0)])
     no = levels_from_ladder({0.55: 100.0}, [(0.55, 100.0)])
-    assert math.isclose(reward_rate(yes, no, params), 9.0 / 900)
+    assert math.isclose(reward_rate(yes, no, params), 1.0)
+    assert remaining_cap_usd(params, 0.0) == 9.0
+    assert remaining_cap_usd(params, 7.5) == 1.5
+    assert remaining_cap_usd(params, 12.0) == 0.0
+    assert remaining_cap_usd(LipParams(100.0, 0.5, 9.0, 900), 5.0) == math.inf
 
 
-def test_size_behind_a_level_that_already_meets_target_scores_nothing():
-    """We join at the back: behind a wall that alone reaches Target, our size
-    doesn't help reach it and earns nothing (BTC 2026-10-09, 3,981 at 0.12)."""
+def test_tracker_caps_the_period_total():
+    params = LipParams(target_size=100.0, discount_factor=0.5, period_reward_usd=900.0,
+                       snapshots_per_period=900, max_reward_usd=2.5)
+    ladder = types.SimpleNamespace(yes_bids={0.40: 100.0}, no_bids={0.55: 100.0})
+    books = {"T": types.SimpleNamespace(ladder=ladder)}
+    quotes = {("T", "yes"): [(0.40, 100.0)], ("T", "no"): [(0.55, 100.0)]}
+    tr = LipTracker({"T": params})
+    for s in range(5):
+        tr.snapshot(float(s), books, quotes)
+    assert math.isclose(tr.accrued_usd["T"], 2.5)
+
+
+def test_whole_level_qualifies_regardless_of_queue_position():
+    """CFTC filing adds "all bids at the current bid price": our 30 at the back
+    of a wall that alone meets Target still scores (BTC 2026-10-09 book)."""
     params = LipParams(target_size=1000.0, discount_factor=0.5, period_reward_usd=9.0,
                        snapshots_per_period=900)
     no = levels_from_ladder({0.80: 2000.0}, [])
-    wall = levels_from_ladder({0.13: 3.0, 0.12: 4000.0}, [(0.12, 30.0)])
-    above = levels_from_ladder({0.13: 3.0, 0.12: 4000.0}, [(0.13, 30.0)])
-    assert reward_rate(wall, no, params) == 0.0
-    assert reward_rate(above, no, params) > 0.0
+    others = {0.13: 3.0, 0.12: 4000.0}
+    wall = levels_with_ours(others, [(0.12, 30.0)])
+    above = levels_with_ours(others, [(0.13, 30.0)])
+    s = score_book(wall, no, params)
+    assert s.yes.reference_price == 0.12
+    assert math.isclose(s.yes.our_share, 30.0 / 4033.0)
+    # Ref is 0.12 either way, so both prices get full weight and pay the same.
+    assert math.isclose(reward_rate(wall, no, params), reward_rate(above, no, params))
+
+
+def test_level_that_crosses_target_counts_in_full():
+    """600 @0.50 + 600 @0.49, Target 1000: all 1,200 qualify, nothing below."""
+    params = LipParams(target_size=1000.0, discount_factor=0.5, period_reward_usd=9.0,
+                       snapshots_per_period=900)
+    yes = [LipLevel(0.50, 600.0), LipLevel(0.49, 600.0, mine=200.0), LipLevel(0.48, 5000.0)]
+    s = score_book(yes, [LipLevel(0.45, 2000.0)], params).yes
+    assert s.reference_price == 0.50
+    assert [lv.price for lv in s.levels_in_window] == [0.50, 0.49]
+    assert math.isclose(s.all_raw_score, 600 + 600 * 0.5)
+    assert math.isclose(s.our_share, 100.0 / 900.0)
+
+
+def test_best_bid_at_highest_price_has_no_qualifying_bids():
+    params = LipParams(target_size=200.0, discount_factor=0.5, period_reward_usd=9.0,
+                       snapshots_per_period=900)
+    s = score_book([LipLevel(0.99, 500.0, mine=100.0)], [LipLevel(0.40, 500.0)], params)
+    assert not s.yes.qualifies and not s.qualifies
 
 
 def test_tracker_accrues_once_per_second_on_qualifying_book():
-    # Target above the others' 150 at 0.40, so our 50 (at the back) still helps reach it.
     params = LipParams(target_size=250.0, discount_factor=0.5, period_reward_usd=9.0,
                        snapshots_per_period=900)
     ladder = types.SimpleNamespace(yes_bids={0.40: 200.0, 0.39: 100.0}, no_bids={0.55: 300.0})

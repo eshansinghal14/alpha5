@@ -45,7 +45,7 @@ import pandas as pd
 
 from kalshi_infra.kalshi.venue import MAX_PRICE, MIN_PRICE, TICK
 from kalshi_infra.trading.fair import Fair, FairUpdate
-from kalshi_infra.trading.lip import LipTracker, levels_with_ours, others_ladder, reward_rate
+from kalshi_infra.trading.lip import LipTracker, levels_with_ours, others_ladder, remaining_cap_usd, reward_rate
 from kalshi_infra.trading.order_manager import Desired, LipTarget
 
 # Fair is clipped to [eps, 1-eps] before quoting (logged unclipped). Well
@@ -76,6 +76,9 @@ LIP_START_PAYOUT_USD = 1.2
 # long. Live 2026-10-15 16:02-17:08 UTC: 513 LIP creates vs 22 moves, the order
 # up ~20% of its eligible time, mostly from sub-second fair-margin / burst flicker.
 LIP_PULL_DEBOUNCE_S = 2.0
+# A LIP side (or an exit's band size on top of its inventory) must add more
+# than this $/s of reward to rest; otherwise it is only fill risk.
+LIP_MIN_RATE_USD_S = 1e-9
 
 
 class Quoter:
@@ -439,7 +442,16 @@ class Quoter:
                 self._lip_exit(ticker, side, book, ladder, net, prob)
             if exit_t is not None:
                 # One order per side: the exit wins (front of the book), sized to
-                # the inventory plus this side's band size.
+                # the inventory plus this side's band size. The band part is only
+                # there to farm LIP: dropped when it earns none (e.g. a one-sided
+                # book), so the exit rests at the inventory alone.
+                inv = self._lip_exit_qty.get((ticker, side), 0.0)
+                if exit_t.size > inv + 1e-9 and self.lip is not None:
+                    gain = (self._lip_rate(ticker, {**lips, side: exit_t}, ladder)
+                            - self._lip_rate(ticker, {**lips, side: LipTarget(exit_t.price, inv, front=True)}, ladder))
+                    if gain <= LIP_MIN_RATE_USD_S:
+                        self._block("lip_no_reward")
+                        exit_t = LipTarget(exit_t.price, inv, front=True)
                 lips[side] = exit_t
             t = lips[side]
             if t is not None:
@@ -564,10 +576,16 @@ class Quoter:
         bids = ladder.yes_bids if side == "yes" else ladder.no_bids
         if self._own_in_book:
             bids = others_ladder(bids, list(self._shown.get((ticker, side), [])))
-        if not bids:
-            return None
-        price = round(max(bids) + TICK, 2)
         far = book.ask if side == "yes" else (None if book.bid is None else 1.0 - book.bid)
+        if bids:
+            price = round(max(bids) + TICK, 2)
+        elif far is not None:
+            # Nobody else bids this side (one-sided book): still offer the
+            # inventory back, a tick inside the far touch; the fair cap below
+            # keeps it from paying up.
+            price = round(far - TICK, 2)
+        else:
+            return None
         if far is not None:
             price = min(price, round(far - TICK, 2))
         lc = self.cfg.lip
@@ -710,10 +728,29 @@ class Quoter:
             self._lip_set.discard(ticker)
             return lips
         rate = self._lip_rate(ticker, lips, ladder)
+        # A side whose quote adds no reward is fill risk for nothing: a one-
+        # sided book (Kalshi excludes the snapshot), or size behind a level
+        # that already meets the target. The payout floor alone missed this
+        # once $1 was accrued (shortfall 0, so a $0/s quote still passed).
+        lips = dict(lips)
+        for side in ("yes", "no"):
+            if lips[side] is not None:
+                without = self._lip_rate(ticker, {**lips, side: None}, ladder)
+                if rate - without <= LIP_MIN_RATE_USD_S:
+                    lips[side] = None
+                    self._block("lip_no_reward")
+        if all(t is None for t in lips.values()):
+            self._lip_proj.pop(ticker, None)
+            self._lip_set.discard(ticker)
+            return lips
+        rate = self._lip_rate(ticker, lips, ladder)
         left = None if self.close_time is None else \
             max((self.close_time - now).total_seconds() - lc.lip_min_time_left_s, 0.0)
         accrued = self.lip.accrued_usd.get(ticker, 0.0)
         future = rate * (left if left is not None else 0.0)
+        params = self.lip.params.get(ticker)
+        if params is not None:
+            future = min(future, remaining_cap_usd(params, accrued))
         proj = accrued + future
         self._lip_proj[ticker] = proj
         off = {"yes": None, "no": None}

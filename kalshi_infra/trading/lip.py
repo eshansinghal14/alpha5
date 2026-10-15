@@ -10,25 +10,26 @@ Mechanics:
   2. Each side is scored independently: YES side = YES bids; NO side =
      NO bids. A YES ASK at p counts as a NO BID at (1 - p) -- they are
      the same resting liquidity, just priced in different terms.
-  3. Walking down from best bid, accumulating size:
-       - The REFERENCE PRICE is the first level whose cumulative size
-         reaches Target / 5.
-       - Stop accumulating once cumulative size reaches Target.
-       - If total size on the side is below Target, that side has no
-         qualifying orders.
+  3. Walking down from best bid one whole price level at a time:
+        - The REFERENCE PRICE is the first level whose cumulative size
+          reaches Target / 5.
+        - Stop after the level where cumulative size reaches Target; every
+          bid at that level qualifies, regardless of queue position.
+        - If total size on the side is below Target, or the best bid is at
+          the highest possible price, that side has no qualifying orders.
   4. Score of a qualifying order = `size * DF^N`, where N = ticks below
      the Reference Price (0 if at or above it).
   5. Normalize across all users on that side.
-    6. User's snapshot score = normalized YES share + normalized NO share
-       (max 2.0 across all users on that market).
-    7. SNAPSHOT EXCLUSION: if EITHER side fails to reach Target, the
-       snapshot is excluded. Payout for the period scales by
-       (non_excluded / total).
-    8. Payout = (user_total_score / all_users_total_score) *
-               period_reward * (non_excluded / total), rounded down to the
-               cent, min $1.00. all_users_total_score is 2.0 per qualifying
-               snapshot, so one snapshot is worth
-               (yes_share + no_share) / 2 * period_reward / total.
+  6. User's snapshot score = normalized YES share + normalized NO share
+     (max 2.0 across all users on that market).
+  7. SNAPSHOT EXCLUSION: if EITHER side fails to reach Target, the
+     snapshot is excluded. Payout for the period scales by
+     (non_excluded / total).
+  8. Payout = (user_total_score / all_users_total_score) *
+              period_reward * (non_excluded / total), rounded down to the
+              cent, paid only if >= $1.00. all_users_total_score is 2.0 per
+              qualifying snapshot, so one snapshot is worth
+              (yes_share + no_share) / 2 * period_reward / total.
 
 Scoring functions are pure: the caller provides the book (qualifying
 levels per side) and its own resting size. Hand-example from the Kalshi
@@ -41,7 +42,7 @@ from __future__ import annotations
 import dataclasses
 import math
 
-from kalshi_infra.kalshi.venue import TICK
+from kalshi_infra.kalshi.venue import MAX_PRICE, TICK
 
 
 @dataclasses.dataclass(frozen=True)
@@ -94,7 +95,9 @@ def _score_side(levels: list[LipLevel], params: LipParams) -> LipSideScore:
     from the touch into the book, which is what the Kalshi rules
     describe.
     """
-    if not levels:
+    # The filing gives a side no qualifying bids if its best bid is at the
+    # highest possible price.
+    if not levels or levels[0].price >= MAX_PRICE - 1e-9:
         return LipSideScore(reference_price=None, our_raw_score=0.0,
                             all_raw_score=0.0, our_share=0.0, qualifies=False,
                             levels_in_window=[])
@@ -118,31 +121,18 @@ def _score_side(levels: list[LipLevel], params: LipParams) -> LipSideScore:
                             all_raw_score=0.0, our_share=0.0, qualifies=False,
                             levels_in_window=[])
 
-    # Score each level within [best .. stop_idx] inclusive. N = ticks
-    # below the Reference Price (0 if at or ABOVE it).
-    #
-    # Only size that "helps reach the Target Size" scores, in price-time
-    # priority. Within a level our size is assumed to be at the BACK (we
-    # always join there), so ours counts only if the size ahead of it is
-    # still short of Target. Counting a whole level made the chooser park
-    # LIP size behind a 3,981-lot wall that met a 1,000 target on its own,
-    # earning nothing (BTC 2026-10-09). Others at a level are counted in
-    # full (their orders are ahead of ours and do help reach Target), which
-    # keeps our share a lower bound.
+    # Every bid at every level through stop_idx scores in full, including
+    # the level that crosses Target: the CFTC filing (2026-07-15) adds "all
+    # bids at the current bid price" with no time priority, so queue
+    # position within a level doesn't affect reward.
     DF = params.discount_factor
-    T = params.target_size
     scored: list[LipLevel] = []
     our_score = 0.0
     all_score = 0.0
-    before = 0.0
     for lv in levels[:stop_idx + 1]:
-        ticks_below = max(0, int(round((reference_price - lv.price) / TICK)))
-        weight = DF ** ticks_below
-        others = max(lv.size - lv.mine, 0.0)
-        ours_q = lv.mine if before + others < T - 1e-9 else 0.0
-        all_score += (others + ours_q) * weight
-        our_score += ours_q * weight
-        before += lv.size
+        weight = DF ** max(0, int(round((reference_price - lv.price) / TICK)))
+        all_score += lv.size * weight
+        our_score += min(lv.mine, lv.size) * weight
         scored.append(lv)
     share = (our_score / all_score) if all_score > 0 else 0.0
     return LipSideScore(
@@ -238,18 +228,16 @@ def marginal_reward_rate(
 def period_payout(user_total_score: float, all_users_total_score: float,
                   non_excluded: int, total_snapshots: int,
                   period_reward_usd: float) -> float:
-    """End-of-period dollars paid. Spec:
-         payout = user_total / all_users_total * period_reward * (non_excl / total)
-         rounded DOWN to the cent, min $1.00 (if > 0).
-    """
+    """End-of-period dollars paid: user_total / all_users_total * period_reward
+    * (non_excl / total), rounded down to the cent. Under $1.00 pays nothing
+    (CFTC filing 2026-07-15)."""
     if all_users_total_score <= 0 or total_snapshots <= 0:
         return 0.0
     gross = (user_total_score / all_users_total_score) * period_reward_usd \
             * (non_excluded / total_snapshots)
-    rounded = math.floor(gross * 100.0) / 100.0
-    if rounded > 0 and rounded < 1.00:
-        return 1.00
-    return rounded
+    # The epsilon keeps float error from dropping a cent (16.00 -> 15.99).
+    rounded = math.floor(gross * 100.0 + 1e-6) / 100.0
+    return rounded if rounded >= 1.00 else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -315,12 +303,17 @@ def others_ladder(bids: dict[float, float], ours: list[tuple[float, float]]) -> 
 
 
 def reward_rate(yes: list[LipLevel], no: list[LipLevel], params: LipParams) -> float:
-    """Our expected $ this snapshot (= $/s), capped at the per-account limit
-    spread evenly over the period."""
-    r = score_book(yes, no, params).expected_reward_this_snapshot_usd
-    if params.max_reward_usd is not None:
-        r = min(r, params.max_reward_usd / params.snapshots_per_period)
-    return r
+    """Our expected $ this snapshot (= $/s). Not capped: the per-account cap is
+    on the period total, so callers projecting rate x time must cap the sum
+    (see remaining_cap_usd)."""
+    return score_book(yes, no, params).expected_reward_this_snapshot_usd
+
+
+def remaining_cap_usd(params: LipParams, accrued_usd: float) -> float:
+    """What the per-account cap still allows this period; inf with no cap."""
+    if params.max_reward_usd is None:
+        return math.inf
+    return max(params.max_reward_usd - accrued_usd, 0.0)
 
 
 MAX_CATCHUP_S = 5   # past this a gap is a stall (dead feed), not a quiet book
@@ -388,5 +381,6 @@ __all__ = [
     "LipParams", "LipLevel", "LipSideScore", "LipBookScore",
     "score_book", "marginal_reward_rate", "period_payout",
     "params_from_program", "levels_from_ladder", "levels_with_ours", "others_ladder", "reward_rate",
+    "remaining_cap_usd",
     "LipTracker",
 ]

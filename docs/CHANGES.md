@@ -3,6 +3,21 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-15 — LIP scorer aligned with the CFTC filing
+
+Source: Appendix A of the 2026-07-15 LIP amendment (CFTC filing).
+
+- `lip._score_side`: every bid at each level through the one that crosses
+  Target scores in full. The back-of-queue rule (ours scored 0 when the size
+  ahead already met Target, added 2026-10-09) is gone. The filing adds "all
+  bids at the current bid price" with no time priority.
+- A side whose best bid is at the highest price has no qualifying bids.
+- `period_payout`: under $1.00 pays $0 (was rounded up to $1). The cent
+  floor no longer loses a cent to float error.
+- Per-account cap: `reward_rate` is uncapped. The quoter's projection caps
+  accrued + future at `max_reward_usd` (`lip.remaining_cap_usd`) instead of
+  capping each second's rate at cap/N.
+
 ## 2026-10-14 (late) — LIP: fair margin, payout floor, max markets, re-queue
 
 After the first live LIP session (22:22-23:00 UTC): 1,109 LIP lots filled,
