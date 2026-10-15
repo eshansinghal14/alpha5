@@ -30,6 +30,10 @@ from kalshi_infra import DATA_ROOT, REPO_ROOT
 LIVE_ROOT = os.environ.get("ALPHA5_LIVE_ROOT") or os.path.join(DATA_ROOT, "live")
 _STREAM_ROOT = os.environ.get("ALPHA5_STREAM_ROOT") or os.path.join(REPO_ROOT, "kalshi_viz", "static")
 STREAM_POINTS = 400            # chart points per market after decimation
+# Plus a denser tail for the dashboard's 1m/15m chart windows: 400 points over
+# a 7h S&P session is one per ~60s, too coarse to read a 1-minute window.
+STREAM_RECENT_S = 900.0
+STREAM_RECENT_POINTS = 600
 
 
 def day_dir(series: str, date: str) -> str:
@@ -251,16 +255,24 @@ def reset_session_files(series: str):
 # Per-market chart streams
 # ---------------------------------------------------------------------------
 
-def _decimate(df: pd.DataFrame, n: int = STREAM_POINTS) -> pd.DataFrame:
+def _decimate(df: pd.DataFrame, n: int = STREAM_POINTS, recent_s: float = 0.0,
+              recent_n: int = 0) -> pd.DataFrame:
     """Thin across the whole session (a tail would show only the last
     minute of an active market), always keeping the last row and every row
-    that produced a take -- those are what the chart is read to check."""
-    if len(df) <= n:
+    that produced a take -- those are what the chart is read to check.
+    With `recent_n`, also keep up to that many rows from the last `recent_s`
+    seconds, for the dashboard's short windows."""
+    if len(df) <= n + recent_n:
         return df
     step = len(df) // n + 1
     keep = np.zeros(len(df), dtype=bool)
     keep[::step] = True
     keep[-1] = True
+    if recent_n and "time" in df.columns:
+        t = pd.to_datetime(df["time"], utc=True)
+        idx = np.flatnonzero((t >= t.iloc[-1] - pd.Timedelta(seconds=recent_s)).to_numpy())
+        if len(idx):
+            keep[idx[::len(idx) // recent_n + 1]] = True
     for col in ("bid_final", "ask_final"):
         if col in df.columns:
             keep |= df[col].notna().to_numpy()
@@ -372,7 +384,7 @@ def write_streams(series: str, quote_df: pd.DataFrame, fills_df: pd.DataFrame, p
     nothing = pd.DataFrame()
     for tk in wanted:
         q = market_timeline(q_groups.get(tk, nothing), b_groups.get(tk, nothing), fa_groups.get(tk, nothing))
-        q = _decimate(q) if len(q) else q
+        q = _decimate(q, recent_s=STREAM_RECENT_S, recent_n=STREAM_RECENT_POINTS) if len(q) else q
         f = f_groups.get(tk, empty)
         liq = f["liquidity"] if "liquidity" in f.columns else pd.Series("taker", index=f.index)
         groups = {("y", "m"): f[(f["side"] == "yes") & (liq == "maker")],

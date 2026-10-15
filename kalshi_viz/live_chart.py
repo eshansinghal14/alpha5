@@ -161,10 +161,47 @@ def build_live_html(series: str, market: str, json_url: str, x_start_ms: float, 
     # The body is one viewport plus the pos/pnl chart wide, so the
     # stretch_width theo chart takes exactly the visible width.
     poller = """
-<style>html, body { margin: 0; } body { width: calc(100vw + %dpx); overflow-y: hidden; }</style>
+<style>html, body { margin: 0; } body { width: calc(100vw + %dpx); overflow-y: hidden; }
+#a5win { position: absolute; top: 2px; right: calc(%dpx + 12px); z-index: 10; font: 11px sans-serif; }
+#a5win button { background: #222; color: #aaa; border: 1px solid #444; padding: 1px 7px; cursor: pointer; }
+#a5win button.on { background: #1e88e5; color: #fff; border-color: #1e88e5; }</style>
+<div id="a5win"><button data-w="0">All</button><button data-w="900000">15m</button><button data-w="60000">1m</button></div>
 <script>
 (function () {
   const URL = %s, POLL = %d, START = %f;
+  // Rolling window on the x-axis: 0 = whole session, else the last N ms.
+  // Kept per market in localStorage so it survives the 2s Streamlit reruns.
+  const WKEY = 'a5win:' + URL;
+  let WIN = Number(localStorage.getItem(WKEY) || 0);
+  function paintWin() {
+    document.querySelectorAll('#a5win button').forEach(b => b.classList.toggle('on', Number(b.dataset.w) === WIN));
+  }
+  document.querySelectorAll('#a5win button').forEach(b => b.addEventListener('click', () => {
+    WIN = Number(b.dataset.w); localStorage.setItem(WKEY, String(WIN)); paintWin();
+    if (window.a5Reset) window.a5Reset();
+  }));
+  paintWin();
+  function winStart(now) { return WIN > 0 ? Math.max(START, now - WIN) : START; }
+  // Fit the theo chart's y-axis to what's in view (touch, fair, band) on
+  // the short windows; the full 0-1 range hides a 1c move.
+  function fitTheo(doc, lo, hi) {
+    const p = doc.get_model_by_name('theo'); if (!p) return;
+    if (WIN === 0) { p.y_range.start = -0.03; p.y_range.end = 1.0; return; }
+    const q = doc.get_model_by_name('quote'), b = doc.get_model_by_name('band');
+    const vals = [];
+    for (const [s, keys] of [[q, ['bid', 'ask', 'prob']], [b, ['lo', 'hi']]]) {
+      if (!s) continue;
+      const t = s.data.t || [];
+      for (let i = 0; i < t.length; i++) {
+        if (t[i] < lo || t[i] > hi) continue;
+        for (const k of keys) { const v = s.data[k][i]; if (v !== null && !Number.isNaN(v)) vals.push(v); }
+      }
+    }
+    if (!vals.length) return;
+    let a = Math.min(...vals), z = Math.max(...vals);
+    const pad = Math.max((z - a) * 0.15, 0.01);
+    p.y_range.start = Math.max(-0.03, a - pad); p.y_range.end = Math.min(1.0, z + pad);
+  }
   function fit(range, vals, minSpan) {
     vals = vals.filter(v => v !== null && !Number.isNaN(v));
     if (!vals.length) return;
@@ -185,15 +222,17 @@ def build_live_html(series: str, market: str, json_url: str, x_start_ms: float, 
   let lastSet = null;
   function follow(doc) {
     const xr = doc.get_model_by_name('theo').x_range;
-    if (lastSet && (xr.start !== lastSet[0] || xr.end !== lastSet[1])) return;
-    xr.start = START; xr.end = Date.now(); lastSet = [xr.start, xr.end];
+    if (lastSet && (xr.start !== lastSet[0] || xr.end !== lastSet[1])) return false;
+    const now = Date.now();
+    xr.start = winStart(now); xr.end = now; lastSet = [xr.start, xr.end];
+    return true;
   }
   async function poll() {
     let j;
     try { const r = await fetch(URL + '?t=' + Date.now(), { cache: 'no-store' }); if (!r.ok) return; j = await r.json(); }
     catch (e) { return; }
     const doc = Bokeh.documents[0]; if (!doc) return;
-    follow(doc);
+    const following = follow(doc);
     const m = j.market; if (!m) return;
     // JSON has no NaN, so a gap (no quote, withheld fair) arrives as null, and
     // BokehJS draws null as 0 -- every pulled LIP quote dove to the axis.
@@ -216,6 +255,7 @@ def build_live_html(series: str, market: str, json_url: str, x_start_ms: float, 
     put('pos', pos); put('pnl', { t: m.pnl_t, v: m.pnl_v });
     const pp = doc.get_model_by_name('pospnl');
     if (pp) { fit(pp.y_range, pos.v, 2); fit(pp.extra_y_ranges['pnl'], m.pnl_v || [], 1); }
+    if (following) { const xr = doc.get_model_by_name('theo').x_range; fitTheo(doc, xr.start, xr.end); }
   }
   window.a5Reset = function () {
     const doc = Bokeh.documents[0]; if (!doc) return;
@@ -224,5 +264,5 @@ def build_live_html(series: str, market: str, json_url: str, x_start_ms: float, 
   poll(); setInterval(poll, POLL);
 })();
 </script>
-""" % (POSPNL_WIDTH, json.dumps(json_url), POLL_MS, x_start_ms)
+""" % (POSPNL_WIDTH, POSPNL_WIDTH, json.dumps(json_url), POLL_MS, x_start_ms)
     return html.replace("</body>", poller + "</body>")
