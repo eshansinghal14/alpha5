@@ -63,6 +63,9 @@ class Series:
     # bucket, one cancels_token reserve and one quote priority queue
     # (runtime.write_groups). None = its own process and its own budget slice.
     write_group: str | None = None
+    # Within a write group, lower goes first: this series' writes get first
+    # claim on the shared bucket at every step (order_manager.WriteGroup).
+    write_priority: int = 0
 
 
 @dataclasses.dataclass(frozen=True)

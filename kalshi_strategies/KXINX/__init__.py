@@ -17,6 +17,10 @@ _ET = "America/New_York"
 # All three series run in one process on one write bucket, cancel reserve
 # and quote priority queue (they are all on shard 0).
 WRITE_GROUP = "spx-daily"
+# Who gets the shared bucket first (lower first). KXINXDUD is one market and
+# needs few writes; KXINXU's 5-market ladder takes whatever it is given (88%
+# of the 240 tokens/s on 2026-10-15), so it goes after DUD.
+WRITE_PRIORITY = {"KXINXDUD": 0, "KXINX": 1, "KXINXU": 2}
 
 
 def _pick_event(events, cfg):
@@ -45,7 +49,7 @@ def _make(ticker: str) -> Series:
         return SpxEventModel(ev, cfg, ticker)
     return Series(ticker=ticker, config_cls=SpxConfig, config_path=CONFIG_PATH, config_key=ticker,
                   pick_event=_pick_event, build_model=build, trade_from=_trade_from,
-                  write_group=WRITE_GROUP)
+                  write_group=WRITE_GROUP, write_priority=WRITE_PRIORITY[ticker])
 
 
 def _hub_port() -> int:

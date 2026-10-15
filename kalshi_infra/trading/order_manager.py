@@ -938,7 +938,8 @@ class WriteGroup:
     members), then too-far-ahead fixes, then every member's touch levels,
     then LIP, then the levels behind the touch, then trims. A deferred step
     in any member stops the pass for everyone, so a quiet series' backlog
-    can't be starved by a busy one and vice versa.
+    can't be starved by a busy one and vice versa. Within each step, a
+    member with a lower `priority` (attach) goes entirely first.
 
     `bucket` is the shared token count (None = unmetered); the reserve is
     the largest member's own cancels_token, so tightening one series'
@@ -948,16 +949,23 @@ class WriteGroup:
         """`sim_tokens_per_s`: the shadow model of the shared bucket, used by
         members whose executor has no real bucket (shadow mode)."""
         self.members: dict[str, OrderManager] = {}
+        self.priority: dict[str, int] = {}
         self.sim_bucket = TokenBucket(sim_tokens_per_s, clock) if sim_tokens_per_s else None
 
-    def attach(self, name: str, m: OrderManager):
+    def attach(self, name: str, m: OrderManager, priority: int = 0):
+        """`priority`: lower goes first. A member's whole step (its creates,
+        cancels, moves) runs before any higher-numbered member's same step,
+        so it gets first claim on the bucket; members of equal priority
+        interleave nearest-the-touch first."""
         m.group = self
         if self.sim_bucket is not None:
             m.sim_bucket = self.sim_bucket
         self.members[name] = m
+        self.priority[name] = int(priority)
 
     def detach(self, name: str):
         m = self.members.pop(name, None)
+        self.priority.pop(name, None)
         if m is not None:
             m.group = None
 
@@ -972,31 +980,34 @@ class WriteGroup:
         KXINXU's real creates were reached: KXINXU sat with 0 quotes and a
         full 80-token real bucket (2026-10-15)."""
         real, sim = [], []
-        for name, m in self.members.items():
+        for name, m in sorted(self.members.items(), key=lambda kv: self.priority.get(kv[0], 0)):
             (sim if m.ex.bucket_tokens() is None else real).append((name, m))
         return [p for p in (real, sim) if p]
 
     def drain_cancels(self) -> int:
         return sum(self._drain(p) for p in self._partitions())
 
-    @staticmethod
-    def _drain(members) -> int:
-        queued = [(rank, i, oid) for i, (_, m) in enumerate(members) for rank, oid in m.cancel_order()]
+    def _prio(self, members, i: int) -> int:
+        return self.priority.get(members[i][0], 0)
+
+    def _drain(self, members) -> int:
+        queued = [(self._prio(members, i), rank, i, oid) for i, (_, m) in enumerate(members)
+                  for rank, oid in m.cancel_order()]
         sent = 0
-        for _, i, oid in sorted(queued):
+        for _, _, i, oid in sorted(queued):
             r = members[i][1].send_cancel(oid)
             if r == "bucket":
                 break
             sent += r == "sent"
         return sent
 
-    @staticmethod
-    def _fill_edge(members, which) -> tuple[int, bool]:
-        heap = [(e[0], i, *e[1:]) for i, (_, m) in enumerate(members) for e in m.missing() if which(e[0])]
+    def _fill_edge(self, members, which) -> tuple[int, bool]:
+        heap = [(self._prio(members, i), e[0], i, *e[1:]) for i, (_, m) in enumerate(members)
+                for e in m.missing() if which(e[0])]
         heapq.heapify(heap)
         sent = 0
         while heap:
-            _, i, ticker, side, price, lots = heapq.heappop(heap)
+            _, _, i, ticker, side, price, lots = heapq.heappop(heap)
             m = members[i][1]
             if not m._can_spend(COST_CREATE):
                 m._bump("create_deferred:reserve")
@@ -1036,4 +1047,5 @@ class WriteGroup:
 
     def summary(self) -> dict:
         return {"members": list(self.members), "reserve": self.reserve(),
+                "priority": dict(self.priority),
                 "queued_cancels": sum(len(m._cancel_q) for m in self.members.values())}

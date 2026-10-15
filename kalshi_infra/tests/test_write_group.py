@@ -155,3 +155,47 @@ def test_clients_share_one_write_budget():
     assert a.allow_now("order") and c.allow_now("order")
     assert not a.allow_now("order")            # 40 spent between them
     assert abs(c.tokens_now()) < 1.0
+
+
+def test_priority_member_gets_the_bucket_first():
+    """KXINXDUD before KXINXU: with room for one create above the reserve,
+    the high-priority member's touch level gets it even though the other
+    member's level is nearer its own touch."""
+    sh, cl, g = Shared(30.0), Clock(), WriteGroup()          # 30 - 20 reserve: one create
+    lo_ex, hi_ex = SharedEx(sh), SharedEx(sh)
+    lo = OrderManager(lo_ex, cancels_token=20.0, clock=cl)
+    hi = OrderManager(hi_ex, cancels_token=20.0, clock=cl)
+    g.attach("U", lo, priority=2)                           # attached first, lower priority
+    g.attach("DUD", hi, priority=0)
+    lo.set_desired("U", "yes", D([0.41]))
+    hi.set_desired("D", "yes", D([0.31]))
+    g.pump()
+    assert [q.price for q in hi_ex.creates] == [0.31]
+    assert not lo_ex.creates
+
+
+def test_priority_member_second_level_beats_others_touch():
+    sh, cl, g = Shared(40.0), Clock(), WriteGroup()          # two creates above the reserve
+    u_ex, d_ex = SharedEx(sh), SharedEx(sh)
+    u = OrderManager(u_ex, cancels_token=20.0, clock=cl)
+    d = OrderManager(d_ex, cancels_token=20.0, clock=cl)
+    g.attach("U", u, priority=2)
+    g.attach("DUD", d, priority=0)
+    u.set_desired("U", "yes", D([0.41, 0.40]))
+    d.set_desired("D", "yes", D([0.31, 0.30]))
+    g.pump()
+    # Touch levels go first across members, DUD's before U's; then levels behind.
+    assert [q.price for q in d_ex.creates] == [0.31] and [q.price for q in u_ex.creates] == [0.41]
+
+
+def test_equal_priority_keeps_touch_first_interleave():
+    sh, cl, g = Shared(50.0), Clock(), WriteGroup()          # three creates
+    exs = {}
+    for name in ("A", "B"):
+        ex = SharedEx(sh)
+        m = OrderManager(ex, cancels_token=20.0, clock=cl)
+        g.attach(name, m)
+        m.set_desired(name, "yes", D([0.41, 0.40]))
+        exs[name] = ex
+    g.pump()
+    assert sorted(q.price for ex in exs.values() for q in ex.creates) == [0.40, 0.41, 0.41]

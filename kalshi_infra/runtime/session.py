@@ -261,7 +261,7 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
     if series.write_group is not None:
         shard = order_client.shard if order_client is not None else None
         group = write_groups.get(series.write_group, shard).group
-        group.attach(S, engine.om)
+        group.attach(S, engine.om, priority=series.write_priority)
         _log(S, f"write group {series.write_group}: sharing one bucket and quote queue with "
                 f"{', '.join(n for n in group.members if n != S) or 'no other series yet'}")
     run_state = {"real_pnl": 0.0} if run_state is None else run_state
