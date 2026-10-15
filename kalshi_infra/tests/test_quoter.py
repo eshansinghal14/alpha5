@@ -523,12 +523,21 @@ def test_lip_fair_margin_quotes_best_bid_within_margin_above_fair():
     assert ctx.lip_targets[("A", "yes")].price == 0.10
 
 
-def test_lip_fair_margin_skips_best_bid_too_far_above_fair():
-    # Best yes bid 0.10, fair 0.07: 3c above -> no LIP on yes.
+def test_lip_fair_margin_caps_rich_best_bid_at_fair_plus_margin():
+    # Best yes bid 0.10, fair 0.07: 3c above -> quote at 0.07 + 0.02 = 0.09.
     q, ctx = lip_q(lip_fair_margin=0.02)
     lip_step(q, ctx, fair=0.07)
+    assert ctx.lip_targets[("A", "yes")].price == 0.09
+    assert q.block_counts.get("lip_capped_at_fair", 0) >= 1
+
+
+def test_lip_capped_price_still_has_to_clear_the_floor():
+    """Capped below the best bid the quote earns DF^N less; with the real $1
+    floor (test name has 'floor') it isn't placed if that can't pay."""
+    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_fair_margin=0.0, lip_rich_lots=0.0)
+    lip_step(q, ctx, yes=FLOOR_YES, fair=0.08)          # capped 0.08: two ticks back
     assert ctx.lip_targets[("A", "yes")] is None
-    assert q.block_counts.get("lip_above_fair", 0) >= 1
+    assert q.block_counts.get("lip_below_floor", 0) >= 1
 
 
 def test_lip_fair_margin_at_exactly_the_margin_quotes():
@@ -537,12 +546,72 @@ def test_lip_fair_margin_at_exactly_the_margin_quotes():
     assert ctx.lip_targets[("A", "yes")].price == 0.10
 
 
-def test_lip_negative_fair_margin_requires_bid_below_fair():
+def test_lip_negative_fair_margin_quotes_below_fair():
     q, ctx = lip_q(lip_fair_margin=-0.01)
-    lip_step(q, ctx, fair=0.10)                     # bid == fair: not 1c below
-    assert ctx.lip_targets[("A", "yes")] is None
-    lip_step(q, ctx, fair=0.115, dt=0.1)            # bid 1.5c below fair
+    lip_step(q, ctx, fair=0.10)                     # cap 0.09
+    assert ctx.lip_targets[("A", "yes")].price == 0.09
+    lip_step(q, ctx, fair=0.115, dt=0.1)            # cap 0.105 -> 0.10, the best bid
     assert ctx.lip_targets[("A", "yes")].price == 0.10
+
+
+def _resting_lip(q, ctx, fair=0.10):
+    lip_step(q, ctx, fair=fair)
+    t = ctx.lip_targets[("A", "yes")]
+    ctx.lip_live[("A", "yes")] = (t.price, t.size)
+    return t
+
+
+def test_lip_soft_pull_held_for_debounce():
+    q, ctx = lip_q()
+    t = _resting_lip(q, ctx)
+    q.model.quote_block = lambda ticker, now_s: "spot_burst"
+    lip_step(q, ctx, dt=0.5)                                  # pull starts here
+    assert ctx.lip_targets[("A", "yes")] == t
+    lip_step(q, ctx, dt=1.5)
+    assert ctx.lip_targets[("A", "yes")] == t                # 1.5s in: still held
+    lip_step(q, ctx, dt=0.6)
+    assert ctx.lip_targets[("A", "yes")] is None             # 2.1s in: pulled
+
+
+def test_lip_soft_pull_that_clears_resets_the_clock():
+    q, ctx = lip_q()
+    t = _resting_lip(q, ctx)
+    q.model.quote_block = lambda ticker, now_s: "spot_burst"
+    lip_step(q, ctx, dt=1.5)
+    q.model.quote_block = lambda ticker, now_s: None
+    lip_step(q, ctx, dt=0.1)
+    q.model.quote_block = lambda ticker, now_s: "spot_burst"
+    lip_step(q, ctx, dt=1.5)
+    assert ctx.lip_targets[("A", "yes")] == t                # a new 1.5s, not 3.1s
+
+
+def test_lip_hard_pulls_skip_the_debounce():
+    q, ctx = lip_q()
+    _resting_lip(q, ctx)
+    q.model.block[("A", "yes")] = "basis_tie"
+    lip_step(q, ctx, dt=0.1)
+    assert ctx.lip_targets[("A", "yes")] is None
+    q, ctx = lip_q()
+    _resting_lip(q, ctx)
+    q.model.age = 5.0                                         # stale signal
+    step(q, ctx, dt=0.1)
+    assert ctx.lip_targets[("A", "yes")] is None
+
+
+def test_lip_soft_pull_with_nothing_resting_is_immediate():
+    q, ctx = lip_q()
+    q.model.quote_block = lambda ticker, now_s: "spot_burst"
+    lip_step(q, ctx)
+    assert ctx.lip_targets[("A", "yes")] is None
+
+
+def test_lip_held_quote_never_grows_after_a_partial_fill():
+    q, ctx = lip_q()
+    t = _resting_lip(q, ctx)
+    ctx.lip_live[("A", "yes")] = (t.price, 150.0)            # 250 of 400 filled
+    q.model.quote_block = lambda ticker, now_s: "spot_burst"
+    lip_step(q, ctx, dt=0.5)
+    assert ctx.lip_targets[("A", "yes")].size == 150.0
 
 
 def test_lip_obeys_side_block_and_enable_quoting():

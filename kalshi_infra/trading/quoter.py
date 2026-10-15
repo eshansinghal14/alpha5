@@ -72,6 +72,10 @@ LIP_MIN_PAYOUT_USD = 1.0
 # projected $1.00-1.30 and a single threshold cancelled and re-created its
 # 200-lot order on every small book change (10 creates, 8 cancels in 3 min).
 LIP_START_PAYOUT_USD = 1.2
+# A resting LIP quote is pulled for a soft reason only once it has lasted this
+# long. Live 2026-10-15 16:02-17:08 UTC: 513 LIP creates vs 22 moves, the order
+# up ~20% of its eligible time, mostly from sub-second fair-margin / burst flicker.
+LIP_PULL_DEBOUNCE_S = 2.0
 
 
 class Quoter:
@@ -112,6 +116,10 @@ class Quoter:
         # currently holding a lip_max_markets slot.
         self._lip_proj: dict[str, float] = {}
         self._lip_set: set[str] = set()
+        # Soft-pull debounce per (ticker, side): when the pull started, and the
+        # last target published (held while the pull is younger than the debounce).
+        self._lip_soft_since: dict[tuple[str, str], float] = {}
+        self._lip_last: dict[tuple[str, str], LipTarget] = {}
 
     # ------------------------------------------------------------------
     # Engine interface
@@ -283,6 +291,9 @@ class Quoter:
                 self._publish_lip(ctx, ticker, side, None)    # a stale fill is the big adverse one
             self._lip_proj.pop(ticker, None)
             self._lip_set.discard(ticker)
+            for side in ("yes", "no"):
+                self._lip_soft_since.pop((ticker, side), None)
+                self._lip_last.pop((ticker, side), None)
             if self.record_debug:
                 # The fair still exists under a stale_signal block; logging it
                 # as None drew a theo gap on every block (~12% of rows,
@@ -391,7 +402,13 @@ class Quoter:
                        and (block_bid if side == "yes" else block_ask) is None)
             lips[side] = self._lip_target(ticker, side, book, ladder, net, now, prob) if side_ok else None
         lips = self._lip_select(ctx, ticker, lips, ladder, now)
+        lc = self.cfg.lip
+        hard_off = (not lc.enable_lip_quoting or not q.enable_quoting
+                    or (self.close_time is not None
+                        and (self.close_time - now).total_seconds() < lc.lip_min_time_left_s))
         for side in ("yes", "no"):
+            side_blocked = (block_bid if side == "yes" else block_ask) is not None
+            lips[side] = self._lip_debounce(ticker, side, lips[side], now_s, hard_off or side_blocked)
             self._publish_lip(ctx, ticker, side, lips[side])
         quote_bid = _top_yes("yes", out["yes"])
         quote_ask = _top_yes("no", out["no"])
@@ -445,10 +462,11 @@ class Quoter:
 
         Price: others' best bid on this side (our own orders, LIP included,
         netted out, so the quote follows the book down rather than holding
-        itself up), capped a tick inside the far touch. Quoted only if the
-        price is in a band (lip.lots_at), at most lip_fair_margin above
-        own-side fair, and at least lip_min_time_left_s remain. The full edge reservation is NOT used: it left the quote almost
-        never at the best bid, where nearly all the LIP is (LIP_REPORT.md §6).
+        itself up), capped a tick inside the far touch and at own-side fair
+        plus lip_fair_margin. Quoted only if that price is in a band
+        (lip.lots_at) and at least lip_min_time_left_s remain. The full edge
+        reservation is NOT used: it left the quote almost never at the best
+        bid, where nearly all the LIP is (LIP_REPORT.md §6).
 
         Size: lots_at(price) minus the position already held on this side and
         our resting edge size there."""
@@ -469,12 +487,14 @@ class Quoter:
         if far is not None:
             price = min(price, round(far - TICK, 2))
         if lc.lip_fair_margin is not None:
-            # Not stepped down to fair: a bid behind the best earns a fraction
-            # of the LIP, so a rich best bid means no LIP here at all.
+            # Cap at fair + margin rather than skip the side: a bid behind the
+            # best earns less LIP, but _lip_select scores it at this price, so
+            # it only rests if it can still clear the payout floor.
             fair_own = prob if side == "yes" else 1.0 - prob
-            if price - fair_own > lc.lip_fair_margin + 1e-9:
-                self._block("lip_above_fair")
-                return None
+            cap = round(math.floor((fair_own + lc.lip_fair_margin) / TICK + 1e-9) * TICK, 2)
+            if price > cap + 1e-9:
+                self._block("lip_capped_at_fair")
+                price = cap
         if not (MIN_PRICE <= price <= MAX_PRICE):
             return None
         held = net if side == "yes" else -net
@@ -482,6 +502,35 @@ class Quoter:
         if size < 1:
             return None
         return LipTarget(price, float(size))
+
+    def _lip_debounce(self, ticker, side, target, now_s, hard: bool):
+        """Hold a resting LIP quote through a SOFT pull (spot_burst, payout
+        floor, max-markets slot, out of band) until it has lasted
+        LIP_PULL_DEBOUNCE_S: each pull is a cancel, and coming back means a new
+        order at the back of the queue. `hard` pulls (LIP or quoting off, side
+        block, end-of-event cutoff) go through at once; stale signal and no
+        fair never get here (the gate publishes None directly)."""
+        key = (ticker, side)
+        if target is not None:
+            self._lip_soft_since.pop(key, None)
+            self._lip_last[key] = target
+            return target
+        live = self._lip_live.get(key)
+        last = self._lip_last.get(key)
+        if hard or live is None or last is None:
+            self._lip_soft_since.pop(key, None)
+            self._lip_last.pop(key, None)
+            return None
+        since = self._lip_soft_since.setdefault(key, now_s)
+        if now_s - since < LIP_PULL_DEBOUNCE_S:
+            self._block("lip_pull_held")
+            # Hold what's resting, never more: a fill during the hold must not
+            # be topped back up by an amend. _lip_last is left alone, so the
+            # clock keeps running until a real target comes back.
+            return LipTarget(live[0], min(last.size, live[1]))
+        self._lip_soft_since.pop(key, None)
+        self._lip_last.pop(key, None)
+        return None
 
     def _lip_rate(self, ticker, lips, ladder) -> float:
         """$/s this market's LIP targets would earn against the book as it is
