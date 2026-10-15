@@ -66,6 +66,11 @@ TAKE_HOLD_S = 0.5
 # (CFTC filing 2026-07-15), so a market whose best case -- accrued plus the
 # current $/s held to the LIP stop, never filled -- is below it isn't quoted.
 LIP_MIN_PAYOUT_USD = 1.0
+# A market not yet LIP-quoted must project this to start; one already quoted
+# stops only under LIP_MIN_PAYOUT_USD. Live 2026-10-15 16:02-16:05 UTC: BTC
+# projected $1.00-1.30 and a single threshold cancelled and re-created its
+# 200-lot order on every small book change (10 creates, 8 cancels in 3 min).
+LIP_START_PAYOUT_USD = 1.2
 
 
 class Quoter:
@@ -497,7 +502,8 @@ class Quoter:
 
     def _lip_select(self, ctx, ticker, lips, ladder, now) -> dict:
         """Apply the per-market LIP gates to this market's side targets: the
-        $1 payout floor (best case over the rest of the period) and
+        payout floor (best case over the rest of the period; LIP_START_PAYOUT_USD
+        to start, LIP_MIN_PAYOUT_USD to keep a live LIP quote) and
         lip_max_markets (only the event's top markets by that projection)."""
         lc = self.cfg.lip
         if self.lip is None or all(t is None for t in lips.values()):
@@ -510,7 +516,9 @@ class Quoter:
         proj = self.lip.accrued_usd.get(ticker, 0.0) + rate * (left if left is not None else 0.0)
         self._lip_proj[ticker] = proj
         off = {"yes": None, "no": None}
-        if left is not None and proj < LIP_MIN_PAYOUT_USD:
+        quoting_now = any(self._lip_live.get((ticker, s)) is not None for s in ("yes", "no"))
+        floor = LIP_MIN_PAYOUT_USD if quoting_now else max(LIP_START_PAYOUT_USD, LIP_MIN_PAYOUT_USD)
+        if left is not None and proj < floor:
             # Out of the ranking too: a market that can't pay must not hold a slot.
             self._lip_proj.pop(ticker, None)
             self._lip_set.discard(ticker)

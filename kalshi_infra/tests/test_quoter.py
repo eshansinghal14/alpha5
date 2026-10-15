@@ -424,6 +424,7 @@ def no_lip_floor(request, monkeypatch):
     sit under it; `floor` in a test's name keeps the real one."""
     if "floor" not in request.node.name:
         monkeypatch.setattr(quoter_mod, "LIP_MIN_PAYOUT_USD", 0.0)
+        monkeypatch.setattr(quoter_mod, "LIP_START_PAYOUT_USD", 0.0)
 
 
 def lip_q(close=CLOSE, own_in_book=False, **lip):
@@ -586,7 +587,7 @@ def test_lip_floor_passes_with_enough_time_left():
 
 def test_lip_floor_counts_what_is_already_accrued():
     q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_rich_lots=0.0)
-    q.lip.accrued_usd["A"] = 0.60                                               # 0.60 + 0.48
+    q.lip.accrued_usd["A"] = 0.75                                               # 0.75 + 0.48 >= 1.20
     lip_step(q, ctx, yes=FLOOR_YES)
     assert ctx.lip_targets[("A", "yes")] is not None
 
@@ -633,6 +634,57 @@ def test_lip_max_markets_member_holds_until_beaten_by_25pct():
     assert ctx.lip_targets[("A", "yes")] is not None and ctx.lip_targets[("B", "yes")] is None
     _step2(q, ctx, a=250.0, b=50.0, dt=0.1)         # B 0.89 vs A 0.62: +44%, swap
     assert ctx.lip_targets[("B", "yes")] is not None and ctx.lip_targets[("A", "yes")] is None
+
+
+def test_lip_floor_hysteresis_start_needs_more_than_keep():
+    """$1.08 projected: not enough to START (needs 1.20) ..."""
+    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_rich_lots=0.0)
+    q.lip.accrued_usd["A"] = 0.60                                       # 0.60 + 0.48 = $1.08
+    lip_step(q, ctx, yes=FLOOR_YES)
+    assert ctx.lip_targets[("A", "yes")] is None
+    # ... but enough to KEEP a LIP quote that's already resting.
+    ctx.lip_live[("A", "yes")] = (0.10, 400.0)
+    lip_step(q, ctx, yes=FLOOR_YES, dt=0.1)
+    assert ctx.lip_targets[("A", "yes")] is not None
+
+
+def test_lip_floor_resting_quote_still_pulled_under_one_dollar():
+    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_rich_lots=0.0)   # $0.48
+    ctx.lip_live[("A", "yes")] = (0.10, 400.0)
+    lip_step(q, ctx, yes=FLOOR_YES)
+    assert ctx.lip_targets[("A", "yes")] is None
+
+
+def test_lip_floor_slot_passes_to_next_market_that_clears_it():
+    """A holds the one slot; when A's best case falls under $1, B (still over)
+    takes it on the same decision pass."""
+    q, ctx = _two_markets()
+    _step2(q, ctx, a=100.0, b=150.0)               # A $1.68, B $1.53: A
+    assert ctx.lip_targets[("A", "yes")] is not None and ctx.lip_targets[("B", "yes")] is None
+    _step2(q, ctx, a=600.0, b=150.0, dt=0.1)        # A $0.84 < $1
+    assert ctx.lip_targets[("A", "yes")] is None
+    assert ctx.lip_targets[("B", "yes")] is not None
+    assert q.block_counts.get("lip_below_floor", 0) >= 1
+
+
+def test_lip_floor_no_slot_when_no_market_clears_it():
+    q, ctx = _two_markets()
+    _step2(q, ctx, a=600.0, b=700.0)                # $0.84 and $0.76
+    assert ctx.lip_targets[("A", "yes")] is None and ctx.lip_targets[("B", "yes")] is None
+    assert q._lip_set == set()
+
+
+def test_lip_slot_passes_on_when_holder_loses_its_target():
+    """A loses its LIP quote to the fair margin (best bid 0.10, fair 0.07);
+    B takes the slot."""
+    q, ctx = _two_markets(lip_fair_margin=0.02)
+    _step2(q, ctx, a=100.0, b=150.0)
+    assert ctx.lip_targets[("A", "yes")] is not None
+    ctx.time = ctx.time + pd.Timedelta(seconds=0.1)
+    ctx.books["A"], ctx.books["B"] = _book("A", 100.0), _book("B", 150.0)
+    ctx.last_event = FairUpdate({"A": Fair(0.07, 0.06, 0.08), "B": Fair(0.10, 0.09, 0.11)})
+    q(ctx)
+    assert ctx.lip_targets[("A", "yes")] is None and ctx.lip_targets[("B", "yes")] is not None
 
 
 def test_lips_at_band_edges():
