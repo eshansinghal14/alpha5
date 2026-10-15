@@ -41,6 +41,11 @@ SETTLE_RETRY_S = 60
 SETTLE_PER_REFRESH = 25
 _DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _FILL_KEY = ["exchange_order_id", "trade_id", "time", "price", "size"]
+# A decision row is only written when something it records changes, so the
+# last one before a print can be old and still current. This caps how old,
+# so a print after a restart or gap isn't priced off the pre-gap theo. A
+# safety bound, not a measurement.
+THEO_TOL = pd.Timedelta("5min")
 
 
 @functools.lru_cache(maxsize=4096)
@@ -107,6 +112,10 @@ class Perf:
         self._last_mid: dict[str, float] = {}
         self._lip_parts: set[str] = set()
         self._lip: dict[str, tuple[pd.Timestamp, float]] = {}   # ticker -> (last time, accrued $)
+        self._dec: dict[str, tuple[pd.Timestamp, pd.Timestamp]] = {}
+        self._trade_parts: set[str] = set()
+        self._prints_pending: list[pd.DataFrame] = []
+        self._prints = pd.DataFrame(columns=["time", "ticker", "trade_id", "yes_price", "size", "theo"])
         self._settle_path = os.path.join(self.root, "settlements.json")
         self._settle: dict[str, str] = self._load_settlements()
         self._settle_tried: dict[str, float] = {}
@@ -202,6 +211,25 @@ class Perf:
                     f["role"] = None
                 if len(f):
                     self._pending.append(f[["time", "ticker", "side", "price", "size", "fee", "liquidity", "role"]])
+            # Theo is only used for edge share, which needs the tape: days
+            # before it was journaled would cost a stat read per decisions
+            # part (7k parts, ~30s) for nothing.
+            has_tape = os.path.isdir(os.path.join(j, "trades"))
+            for p in sorted(glob.glob(os.path.join(j, "decisions", "part-*.parquet"))) if has_tape else ():
+                if p not in self._dec:
+                    r = _time_range(p)
+                    if r is not None:
+                        self._dec[p] = r
+            for p in sorted(glob.glob(os.path.join(j, "trades", "part-*.parquet"))):
+                if p in self._trade_parts:
+                    continue
+                try:
+                    x = pd.read_parquet(p, columns=["time", "ticker", "trade_id", "yes_price", "size"])
+                except Exception:
+                    continue          # mid-write; next refresh
+                self._trade_parts.add(p)
+                if len(x):
+                    self._prints_pending.append(x)
             self._scan_lip(j)
 
     def _scan_lip(self, journal: str) -> None:
@@ -251,6 +279,39 @@ class Perf:
         b["mid"] = (b.bid + b.ask) / 2
         return b[["time", "ticker", "mid"]]
 
+    def _theo(self, lo, hi, tickers) -> pd.DataFrame:
+        """(time, ticker, theo) from the decisions journal; theo is NaN on
+        shadow rows and rows with no usable fair (blocked, or parts written
+        before the live column existed)."""
+        out = []
+        for p, (a, b) in self._dec.items():
+            if b < lo or a > hi:
+                continue
+            try:
+                if not {"prob", "live"} <= set(pq.read_schema(p).names):
+                    continue
+                x = pq.read_table(p, columns=["time", "ticker", "prob", "live"],
+                                  filters=[("ticker", "in", list(tickers))]).to_pandas()
+            except Exception:
+                continue
+            if len(x):
+                out.append(x)
+        if not out:
+            return pd.DataFrame({"time": pd.Series(dtype="datetime64[ns, UTC]"),
+                                 "ticker": pd.Series(dtype=object), "theo": pd.Series(dtype=float)})
+        x = pd.concat(out, ignore_index=True)
+        x = x[(x.time >= lo) & (x.time <= hi)].sort_values("time")
+        live = x["live"].fillna(False).astype(bool)
+        x["theo"] = pd.to_numeric(x["prob"], errors="coerce").where(live)
+        return x[["time", "ticker", "theo"]]
+
+    def _with_theo(self, f: pd.DataFrame) -> pd.Series:
+        """Our theo in force at each row's time (aligned to f's index)."""
+        t = self._theo(f.time.min() - THEO_TOL, f.time.max(), set(f.ticker))
+        m = pd.merge_asof(f[["time", "ticker"]].reset_index().sort_values("time"), t, on="time", by="ticker",
+                          direction="backward", tolerance=THEO_TOL)
+        return m.set_index("index").sort_index()["theo"]
+
     def _mark(self, f: pd.DataFrame) -> pd.DataFrame:
         f = f.sort_values("time").reset_index(drop=True)
         f["yes_px"] = np.where(f.side == "yes", f.price, 1.0 - f.price)
@@ -263,6 +324,7 @@ class Perf:
             m = pd.merge_asof(q.reset_index().sort_values("time"), b, on="time", by="ticker",
                               direction="backward").set_index("index").sort_index()
             f[name] = (f.dir * (m.mid - f.yes_px) - f.fee / f["size"]) * 100
+        f["theo"] = self._with_theo(f)
         if len(b):
             self._last_mid.update(b.groupby("ticker").mid.last().dropna().to_dict())
         return f
@@ -270,8 +332,9 @@ class Perf:
     def refresh(self, settle_all: bool = False) -> pd.DataFrame:
         """Every real fill so far, one row each: time, ticker, event, close,
         side, liquidity, size, yes_px, fee, mo0/mo1/mo10/mo60 and settled
-        (cents per contract, fee included), and pnl_c (settled, else marked
-        at the latest mid). Settlements are fetched SETTLE_PER_REFRESH at a
+        (cents per contract, fee included), pnl_c (settled, else marked
+        at the latest mid) and theo (our armed fair at the fill, NaN if
+        none). Settlements are fetched SETTLE_PER_REFRESH at a
         time unless `settle_all`."""
         with self._lock:
             self._scan()
@@ -285,6 +348,7 @@ class Perf:
                 if done:
                     self._done = pd.concat([self._done] + done, ignore_index=True)
                 self._pending = [p[~ready]] if (~ready).any() else []
+            self._price_prints()
             if newest is not None:
                 recent = [pp for pp, (_, b) in self._bbo.items() if b >= newest - pd.Timedelta("2min")]
                 for pp in recent:
@@ -307,6 +371,33 @@ class Perf:
             d["open_c"] = (d.dir * (last - d.yes_px) - d.fee / d["size"]) * 100
             d["pnl_c"] = d.settled.where(d.settled.notna(), d.open_c)
             return d
+
+    def _price_prints(self) -> None:
+        """Attach our theo to every journaled public print once the decisions
+        journal covers its time."""
+        newest = max((b for _, b in self._dec.values()), default=None)
+        if not self._prints_pending or newest is None:
+            return
+        p = pd.concat(self._prints_pending, ignore_index=True)
+        ready = p.time <= newest
+        done = []
+        for _, g in p[ready].groupby(p[ready].time.dt.floor(CHUNK)):
+            g = g.sort_values("time").reset_index(drop=True)
+            done.append(g.assign(theo=self._with_theo(g)))
+        if done:
+            x = pd.concat(([self._prints] if len(self._prints) else []) + done, ignore_index=True)
+            # A print is journaled once per process; a restart mid-event can't
+            # replay it, but two parts of one day can still overlap a reconnect.
+            has_id = x.trade_id.notna()
+            self._prints = pd.concat([x[has_id].drop_duplicates(["ticker", "trade_id"]), x[~has_id]],
+                                     ignore_index=True).sort_values("time", ignore_index=True)
+        self._prints_pending = [p[~ready]] if (~ready).any() else []
+
+    def prints_frame(self) -> pd.DataFrame:
+        """(time, ticker, trade_id, yes_price, size, theo): every public print
+        on this series' markets since the tape started being journaled."""
+        with self._lock:
+            return self._prints.copy()
 
     def lip_frame(self) -> pd.DataFrame:
         """(time, ticker, event, usd): LIP accrued per market while armed,
@@ -403,6 +494,38 @@ def summarize_lip(df: pd.DataFrame, lip: pd.DataFrame, since: pd.Timestamp | Non
     # Reward per contract the LIP quote got filled for: what each fill "earned"
     # from the program, to set against its markout.
     out["reward_per_contract_c"] = (100 * reward / out["lip_contracts"]) if out["lip_contracts"] else math.nan
+    return out
+
+
+def summarize_edge(df: pd.DataFrame, prints: pd.DataFrame, since: pd.Timestamp | None = None) -> dict:
+    """Our edge vs theo against all the edge vs theo that traded.
+
+    Every print has a buyer of YES at `yes_price` and a buyer of NO at
+    1 - yes_price; whichever side bought below our theo took
+    size x |theo - yes_price|, so that sum is the market's total edge.
+    Ours is our fills' signed edge (negative when we bought above theo). Both
+    are before fees, counted only while armed with a usable theo, and our
+    fills are on the tape so they sit inside the market total.
+
+    share: our edge / market edge (can go negative). vol_share: our
+    contracts / market contracts over the same priced prints."""
+    P = window(prints, since)
+    P = P[P.theo.notna()] if len(P) else P
+    d = window(df, since)
+    d = d[d.theo.notna()] if len(d) and "theo" in d.columns else d.iloc[0:0]
+    mkt = float((P["size"] * (P.theo - P.yes_price).abs()).sum()) if len(P) else 0.0
+    mkt_lots = float(P["size"].sum()) if len(P) else 0.0
+    edge = d.dir * (d.theo - d.yes_px) * d["size"] if len(d) else pd.Series(dtype=float)
+    ours = float(edge.sum()) if len(d) else 0.0
+    lots = float(d["size"].sum()) if len(d) else 0.0
+    out = {"prints": len(P), "market_usd": mkt, "market_lots": mkt_lots, "ours_usd": ours, "our_lots": lots,
+           "share": ours / mkt if mkt > 0 else math.nan,
+           "vol_share": lots / mkt_lots if mkt_lots > 0 else math.nan,
+           "market_c": 100 * mkt / mkt_lots if mkt_lots else math.nan,
+           "ours_c": 100 * ours / lots if lots else math.nan}
+    if len(d):
+        for lab, g in (("maker", d.liquidity == "maker"), ("taker", d.liquidity == "taker")):
+            out[f"{lab}_usd"] = float(edge[g].sum())
     return out
 
 

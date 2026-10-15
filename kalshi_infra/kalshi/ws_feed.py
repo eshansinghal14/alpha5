@@ -50,18 +50,35 @@ def parse_ws_fill(msg: dict) -> dict | None:
             "order_id": msg.get("order_id"), "trade_id": msg.get("trade_id")}
 
 
+def parse_ws_print(msg: dict, received: pd.Timestamp) -> dict | None:
+    """A public `trade` message as one row: yes price, size, taker side and
+    both clocks. `time` is Kalshi's ts_ms when present (the clock our WS
+    fills carry), else `received`."""
+    try:
+        yes = float(msg["yes_price_dollars"])
+        size = float(msg["count_fp"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    ts = msg.get("ts_ms")
+    return {"time": received if ts is None else pd.Timestamp(int(ts), unit="ms", tz="UTC"),
+            "received": received, "ticker": msg.get("market_ticker"), "trade_id": msg.get("trade_id"),
+            "yes_price": yes, "size": size, "taker_side": msg.get("taker_side")}
+
+
 class LiveKalshiFeed:
     """`on_quote(BookView)` / `on_trade(ticker, Trade)` fire synchronously
     on this coroutine's task."""
 
-    def __init__(self, tickers: list[str], on_quote, on_trade, *, label: str, on_fill=None):
+    def __init__(self, tickers: list[str], on_quote, on_trade, *, label: str, on_fill=None, on_print=None):
         """`on_fill(dict)` (optional): OUR fills from the authenticated `fill`
         channel, in KalshiOrderClient.fills' dict shape. Only fills on these
-        tickers are delivered."""
+        tickers are delivered. `on_print(dict)` (optional): every public
+        trade once, in yes terms (see parse_ws_print)."""
         self._tickers = list(tickers)
         self._on_quote = on_quote
         self._on_trade = on_trade
         self._on_fill = on_fill
+        self._on_print = on_print
         self.n_fills = 0
         self._books: dict[str, L2Book] = {t: L2Book(t) for t in self._tickers}
         self.label = label
@@ -155,6 +172,10 @@ class LiveKalshiFeed:
             self._emit_book(book)
         elif mtype == "trade":
             now = pd.Timestamp.now(tz="UTC")
+            if self._on_print is not None:
+                row = parse_ws_print(msg, now)
+                if row is not None:
+                    self._on_print(row)
             # Priced in the MAKER's side terms (see core.Trade): an aggressive
             # yes buy depletes the resting NO queue at no_price. Sending the
             # yes price unconditionally meant no-side quotes never matched a

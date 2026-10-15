@@ -71,6 +71,7 @@ class _Event:
             self.journal.record_decision(r)
         for r in d["bbo"]:
             self.journal._buf["bbo"].append(r)
+        self.journal.record_trades(d.get("trades") or [])
         self.bbo.extend(d["bbo"])
         _thin(self.bbo, MAX_HISTORY_ROWS)
         self.fair.extend(d["fair"])
@@ -231,7 +232,7 @@ class SnapshotWriter:
         self._proc.start()
 
     def _clear_buffers(self):
-        self._decisions, self._bbo, self._fair, self._pnl = [], [], [], []
+        self._decisions, self._bbo, self._fair, self._pnl, self._trades = [], [], [], [], []
         self._pnl_by_ticker: dict[str, list] = {}
 
     def _put(self, msg):
@@ -314,6 +315,10 @@ class SnapshotWriter:
     def fair(self, row: dict):
         self._fair.append(row)
 
+    def trade(self, row: dict):
+        """A public print (ws_feed.parse_ws_print), for the journal only."""
+        self._trades.append(row)
+
     def pnl(self, now, value: float):
         self._pnl.append((now, value))
 
@@ -327,7 +332,7 @@ class SnapshotWriter:
         self._fills_sent = len(fills)
         self._put(("data", {"summary": summary, "decisions": self._decisions, "bbo": self._bbo,
                             "fair": self._fair, "pnl": self._pnl, "pnl_by_ticker": self._pnl_by_ticker,
-                            "fills": new_fills, "live_trading": live_trading}))
+                            "fills": new_fills, "live_trading": live_trading, "trades": self._trades}))
         self._clear_buffers()
 
 

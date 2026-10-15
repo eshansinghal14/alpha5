@@ -90,6 +90,33 @@ def _lip_side(L: dict):
                    "Reward above |markout| = LIP pays for the adverse selection.")
 
 
+def _pct(v: float) -> str:
+    return "n/a" if v is None or (isinstance(v, float) and math.isnan(v)) else f"{v:.1%}"
+
+
+def _edge_share(E: dict):
+    """Our edge vs theo as a share of all the edge vs theo that traded."""
+    if not E.get("prints"):
+        st.caption("Edge market share: no public prints journaled while armed in this window "
+                   "(the trade tape is journaled from 2026-10-15).")
+        return
+    a, b, c = st.columns(3)
+    a.metric("Edge market share", _pct(E["share"]), f"{_usd(E['ours_usd'])} of ${E['market_usd']:.2f}",
+             delta_color="off",
+             help="Edge our fills took vs our theo, over the edge every trade in these markets gave up vs "
+                  "the same theo (size x |theo - price| per print). Before fees, armed only. Negative = "
+                  "on net we bought above our own theo.")
+    b.metric("Volume share", _pct(E["vol_share"]),
+             f"{E['our_lots']:,.0f} of {E['market_lots']:,.0f} lots", delta_color="off",
+             help="Our contracts over all contracts printed. Edge share above volume share = we take the "
+                  "better-priced part of the flow.")
+    c.metric("Edge per lot (c)", _c(E["ours_c"]), f"market {_c(E['market_c'])}", delta_color="off",
+             help="Cents of edge vs theo per contract: ours vs the average print.")
+    if "maker_usd" in E:
+        st.caption(f"Our edge: maker {_usd(E['maker_usd'])} · taker {_usd(E['taker_usd'])} · "
+                   f"{E['prints']:,} prints priced")
+
+
 def _table(s: dict):
     rows = s.get("markouts") or {}
     if not rows:
@@ -135,6 +162,7 @@ def render(series: str, lip: bool = False):
             _chart(df, since, lf)
         with right:
             _side(s)
+        _edge_share(perf.summarize_edge(df, p.prints_frame(), since))
         with st.expander("Markout by fill type"):
             _table(s)
         if p.updated is not None:

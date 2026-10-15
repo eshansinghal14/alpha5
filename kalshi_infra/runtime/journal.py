@@ -1,6 +1,6 @@
 """
-Append-only day journal for a live session: Kalshi BBO, strategy decisions
-and fills, written as immutable part files under
+Append-only day journal for a live session: Kalshi BBO, strategy decisions,
+our fills and the public trade tape, written as immutable part files under
 data/live/{series}/{date}/journal/{stream}/.
 
 The snapshot (runtime.persist) is a view of the CURRENT session and is
@@ -21,7 +21,7 @@ import pandas as pd
 
 from kalshi_infra.runtime.persist import LIVE_ROOT
 
-STREAMS = ("bbo", "decisions", "fills")
+STREAMS = ("bbo", "decisions", "fills", "trades")
 
 
 def journal_dir(series: str, date: str, out_root: str = None) -> str:
@@ -64,6 +64,7 @@ class DayJournal:
         self._seen_fills: set = set()
         self._seen_orders: set = set()
         self._seen_trades: set = set()
+        self._seen_prints: set = set()
         self._load_seen_exchange_ids()
         self._seq = self._next_seq()
         self.n_written: dict[str, int] = {s: 0 for s in STREAMS}
@@ -100,6 +101,16 @@ class DayJournal:
 
     def record_decision(self, row: dict) -> None:
         self._buf["decisions"].append(row)
+
+    def record_trades(self, rows) -> None:
+        """Public prints, once per trade_id within this process."""
+        for r in rows:
+            tid = r.get("trade_id")
+            if tid is not None:
+                if tid in self._seen_prints:
+                    continue
+                self._seen_prints.add(tid)
+            self._buf["trades"].append(r)
 
     def _load_seen_exchange_ids(self) -> None:
         """Ids already journaled today, so a restarted process's replayed

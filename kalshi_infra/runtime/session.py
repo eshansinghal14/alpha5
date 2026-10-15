@@ -351,7 +351,7 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
         if engine.live_trading:
             engine.on_real_fill(f)
 
-    kalshi = LiveKalshiFeed(tickers, on_quote, on_trade, label=S, on_fill=on_fill)
+    kalshi = LiveKalshiFeed(tickers, on_quote, on_trade, label=S, on_fill=on_fill, on_print=writer.trade)
 
     # --- loops ---
     wake = asyncio.Event()
