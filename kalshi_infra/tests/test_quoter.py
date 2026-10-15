@@ -39,7 +39,7 @@ def cfg(**q):
 
 
 LIP_OFF = dict(enable_lip_quoting=False, lip_cheap_max_price=0.2, lip_cheap_lots=0.0, lip_rich_min_price=0.8,
-               lip_rich_lots=0.0, lip_fair_margin=None, lip_max_markets=None,
+               lip_rich_lots=0.0, lip_constant_edge=None, lip_max_markets=None,
                lip_requeue_min_ahead=None, lip_min_time_left_s=0.0, lip_hold_s=1.0)
 
 
@@ -517,18 +517,18 @@ def test_lip_capped_inside_far_touch():
     assert ctx.lip_targets[("A", "yes")].price == 0.08
 
 
-def test_lip_fair_margin_quotes_best_bid_within_margin_above_fair():
-    """Best yes bid 0.10 with fair 0.09: 1c above fair, inside a 2c margin ->
+def test_lip_constant_edge_quotes_best_bid_with_edge_to_spare():
+    """Best yes bid 0.10 with fair 0.13: 3c under fair, more than a 2c edge ->
     quoted at the best bid itself (not stepped down)."""
-    q, ctx = lip_q(lip_fair_margin=0.02)
-    lip_step(q, ctx, fair=0.09)
+    q, ctx = lip_q(lip_constant_edge=0.02)
+    lip_step(q, ctx, fair=0.13)
     assert ctx.lip_targets[("A", "yes")].price == 0.10
 
 
-def test_lip_fair_margin_caps_rich_best_bid_at_fair_plus_margin():
-    # Best yes bid 0.10, fair 0.07: 3c above -> quote at 0.07 + 0.02 = 0.09.
-    q, ctx = lip_q(lip_fair_margin=0.02)
-    lip_step(q, ctx, fair=0.07)
+def test_lip_constant_edge_caps_best_bid_at_fair_minus_edge():
+    # Best yes bid 0.10, fair 0.11: only 1c under -> quote at 0.11 - 0.02 = 0.09.
+    q, ctx = lip_q(lip_constant_edge=0.02)
+    lip_step(q, ctx, fair=0.11)
     assert ctx.lip_targets[("A", "yes")].price == 0.09
     assert q.block_counts.get("lip_capped_at_fair", 0) >= 1
 
@@ -536,24 +536,30 @@ def test_lip_fair_margin_caps_rich_best_bid_at_fair_plus_margin():
 def test_lip_capped_price_still_has_to_clear_the_floor():
     """Capped below the best bid the quote earns DF^N less; with the real $1
     floor (test name has 'floor') it isn't placed if that can't pay."""
-    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_fair_margin=0.0, lip_rich_lots=0.0)
+    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_constant_edge=0.0, lip_rich_lots=0.0)
     lip_step(q, ctx, yes=FLOOR_YES, fair=0.08)          # capped 0.08: two ticks back
     assert ctx.lip_targets[("A", "yes")] is None
     assert q.block_counts.get("lip_below_floor", 0) >= 1
 
 
-def test_lip_fair_margin_at_exactly_the_margin_quotes():
-    q, ctx = lip_q(lip_fair_margin=0.02)
-    lip_step(q, ctx, fair=0.08)
+def test_lip_constant_edge_at_exactly_the_edge_quotes():
+    q, ctx = lip_q(lip_constant_edge=0.02)
+    lip_step(q, ctx, fair=0.12)
     assert ctx.lip_targets[("A", "yes")].price == 0.10
 
 
-def test_lip_negative_fair_margin_quotes_below_fair():
-    q, ctx = lip_q(lip_fair_margin=-0.01)
-    lip_step(q, ctx, fair=0.10)                     # cap 0.09
+def test_lip_constant_edge_rounds_the_cap_down():
+    q, ctx = lip_q(lip_constant_edge=0.01)
+    lip_step(q, ctx, fair=0.105)                    # cap 0.095 -> 0.09
     assert ctx.lip_targets[("A", "yes")].price == 0.09
     lip_step(q, ctx, fair=0.115, dt=0.1)            # cap 0.105 -> 0.10, the best bid
     assert ctx.lip_targets[("A", "yes")].price == 0.10
+
+
+def test_lip_constant_edge_zero_never_bids_above_fair():
+    q, ctx = lip_q(lip_constant_edge=0.0)
+    lip_step(q, ctx, fair=0.085)                    # best bid 0.10 > fair -> 0.08
+    assert ctx.lip_targets[("A", "yes")].price == 0.08
 
 
 def _resting_lip(q, ctx, fair=0.10):
@@ -774,14 +780,14 @@ def test_lip_floor_no_slot_when_no_market_clears_it():
 
 
 def test_lip_slot_passes_on_when_holder_loses_its_target():
-    """A loses its LIP quote to the fair margin (best bid 0.10, fair 0.07);
-    B takes the slot."""
-    q, ctx = _two_markets(lip_fair_margin=0.02)
+    """A loses its LIP quote to the fair cap (fair 0.005: capped under the
+    minimum price); B takes the slot."""
+    q, ctx = _two_markets(lip_constant_edge=0.0)
     _step2(q, ctx, a=100.0, b=150.0)
     assert ctx.lip_targets[("A", "yes")] is not None
     ctx.time = ctx.time + pd.Timedelta(seconds=0.1)
     ctx.books["A"], ctx.books["B"] = _book("A", 100.0), _book("B", 150.0)
-    ctx.last_event = FairUpdate({"A": Fair(0.07, 0.06, 0.08), "B": Fair(0.10, 0.09, 0.11)})
+    ctx.last_event = FairUpdate({"A": Fair(0.005, 0.0, 0.01), "B": Fair(0.10, 0.09, 0.11)})
     q(ctx)
     assert ctx.lip_targets[("A", "yes")] is None and ctx.lip_targets[("B", "yes")] is not None
 

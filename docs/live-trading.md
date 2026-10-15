@@ -127,7 +127,7 @@ or at the next event) if the toggle is still on.
 
 | Trigger | Effect |
 |---|---|
-| PnL ≤ −`risk.max_loss_usd` on the worse of touch / fair marking | halt (one-way for the session); quotes pulled |
+| This event's PnL ≤ −`risk.max_loss_usd` on the worse of touch / fair marking | halt; quotes pulled. If armed, real trading is off for that series until the process restarts (shadow continues, other series unaffected) |
 | Fair inputs older than `risk.max_signal_age_s` | no takes, quotes pulled; resumes as soon as the age is back under the limit (age logged as `signal_age_s` on every decision row) |
 | 5 consecutive real-order errors | halt new orders (auth/balance/market state) |
 | Ledger disagrees with Kalshi `/positions` (audit, every 5s) on 2 audits in a row, against our ledger both before and after the read | halt |

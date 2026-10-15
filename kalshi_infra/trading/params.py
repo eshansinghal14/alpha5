@@ -99,7 +99,9 @@ class TradingTimeParams:
 @section
 class RiskParams:
     max_loss_usd: float = param(
-        "Halt new orders once session PnL reaches -this on the worse of touch/fair marking.",
+        "Per event: halt once this event's PnL reaches -this on the worse of touch/fair marking. A real-"
+        "money trip turns real trading off for this series until the process restarts (shadow continues; "
+        "other series are unaffected). Also caps each event's worst-case settlement loss when sizing orders.",
         min=0, step=5)
     max_signal_age_s: float = param(
         "Pull quotes and stop taking when the fair's newest input is older than this; they return "
@@ -139,12 +141,11 @@ class LipSettings:
     lip_rich_lots: float = param(
         "LIP order size on an expensive-side price, less any position already held on that side. "
         "0 disables the expensive side.", min=0, step=10.0)
-    lip_fair_margin: float | None = param(
-        "Most the LIP bid may sit ABOVE own-side fair ($) and still be quoted; a best bid further "
-        "above fair gets no LIP quote. Negative = must be at least that far below fair. null = no "
-        "fair check. Live 2026-10-14 22:22-22:55 UTC: 613 of 1,109 LIP lots filled >2c above fair "
-        "and carried $24.5 of the $28.2 10s markout loss.",
-        min=-0.5, max=0.5, step=0.005)
+    lip_constant_edge: float | None = param(
+        "Edge the LIP bid must keep below own-side fair ($): a best bid above fair - this is capped "
+        "there. 0 = never above fair. null = no fair check. Live 2026-10-14 22:22-22:55 UTC: 613 of "
+        "1,109 LIP lots filled >2c above fair and carried $24.5 of the $28.2 10s markout loss.",
+        min=0, max=0.5, step=0.005)
     lip_max_markets: int | None = param(
         "LIP on at most this many markets per event: the ones with the highest best-case period "
         "payout (see quoter.LIP_MIN_PAYOUT_USD). A member keeps its place unless another projects "

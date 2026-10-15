@@ -37,7 +37,7 @@
     "lip_cheap_lots": 400.0,
     "lip_rich_min_price": 0.8,
     "lip_rich_lots": 100.0,
-    "lip_fair_margin": 0.02,
+    "lip_constant_edge": 0.0,
     "lip_max_markets": 2,
     "lip_requeue_min_ahead": 200.0,
     "lip_min_time_left_s": 180.0,

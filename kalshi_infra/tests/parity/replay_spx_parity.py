@@ -109,7 +109,7 @@ def new_cfg(oc):
         quoting=q, trading_time=P.TradingTimeParams(real_trading_delay_s=0, real_trading_cutoff_s=0),
         risk=P.RiskParams(max_loss_usd=1e9, max_signal_age_s=1e9),
         lip=P.LipSettings(enable_lip_quoting=False, lip_cheap_max_price=0.2, lip_cheap_lots=0.0,
-                          lip_rich_min_price=0.8, lip_rich_lots=0.0, lip_fair_margin=None,
+                          lip_rich_min_price=0.8, lip_rich_lots=0.0, lip_constant_edge=None,
                           lip_max_markets=None, lip_requeue_min_ahead=None,
                           lip_min_time_left_s=0.0, lip_hold_s=1.0))
 

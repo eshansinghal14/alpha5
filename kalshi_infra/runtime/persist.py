@@ -136,6 +136,7 @@ def build_summary(*, series: str, event_ticker: str, engine, quoter, store, mode
         "live_trading": engine.live_trading,
         "arm_requested": engine.live_trading if arm_requested is None else bool(arm_requested),
         "halted": engine.halted, "halt_reason": engine.halt_reason,
+        "real_lock": getattr(engine, "real_lock", None),
         "blocked_reason": engine.blocked_reason(),
         "blocked_counts": dict(engine.blocked_counts),
         "quote_block_counts": dict(quoter.block_counts),

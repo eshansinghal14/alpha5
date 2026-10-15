@@ -32,7 +32,7 @@ from kalshi_infra.kalshi import markets as km
 from kalshi_infra.kalshi.orders import KalshiOrderClient
 from kalshi_infra.kalshi.ws_feed import LiveKalshiFeed
 from kalshi_infra.runtime import persist, write_groups
-from kalshi_infra.runtime.control import StopWatcher, TradingModeWatcher, request_stop_all, resumable_arm
+from kalshi_infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
 from kalshi_infra.runtime.series import Series
 from kalshi_infra.runtime.writer import DecisionLog, SnapshotWriter
 from kalshi_infra.trading import lip as lipmod
@@ -70,7 +70,7 @@ def _decision_key(row: dict) -> tuple:
 
 
 class StopAll(Exception):
-    """The run is over: the loss limit tripped here or another series' did."""
+    """The run is over: a stop-all was requested (dashboard, balance watchdog)."""
 
 
 async def session_loop(series: Series, *, live_trading: bool, carry_arm: bool,
@@ -99,8 +99,9 @@ async def _session_loop(series: Series, writer: SnapshotWriter, *, live_trading:
          + (f" [{series.config_key}]" if series.config_key else ""))
     trading = TradingModeWatcher(series.ticker)
     stopper = StopWatcher()
-    # Real PnL of finished events, carried so max_loss_usd bounds the run.
-    run_state = {"real_pnl": 0.0}
+    # max_loss_usd is per event; once one trips, "lock" keeps this series in
+    # shadow for the rest of the process (other series are unaffected).
+    run_state = {"real_pnl": 0.0, "lock": None}
     armed = live_trading
     done: set[str] = set()
     rolled = False
@@ -108,11 +109,6 @@ async def _session_loop(series: Series, writer: SnapshotWriter, *, live_trading:
     while True:
         if (reason := stopper.poll()) is not None:
             _log(series.ticker, f"STOPPING: {reason}")
-            return
-        lim = store.config.risk.max_loss_usd
-        if run_state["real_pnl"] <= -lim:
-            request_stop_all(f"{series.ticker} real PnL this run {run_state['real_pnl']:+.2f} <= -{lim:g}")
-            _log(series.ticker, f"STOPPING: real PnL this run {run_state['real_pnl']:+.2f} <= -{lim:g}")
             return
         for c in store.poll():
             _log(series.ticker, f"config: {c}")
@@ -264,8 +260,8 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
         group.attach(S, engine.om, priority=series.write_priority)
         _log(S, f"write group {series.write_group}: sharing one bucket and quote queue with "
                 f"{', '.join(n for n in group.members if n != S) or 'no other series yet'}")
-    run_state = {"real_pnl": 0.0} if run_state is None else run_state
-    engine.loss_offset = run_state["real_pnl"]
+    run_state = {"real_pnl": 0.0, "lock": None} if run_state is None else run_state
+    engine.real_lock = run_state.get("lock")
     # This event's real PnL, worse of touch/fair, as of the last moment it
     # was armed -- after a cutoff disarm the ledger keeps taking paper fills.
     event_real = {"pnl": None}
@@ -314,7 +310,7 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
                         f"paper continues, arms once the delay passes")
             engine.set_live_trading(False)
         elif (arm["want"] and not engine.live_trading and not outside_trading_time()
-              and not engine.halted and time.monotonic() >= arm["retry_at"]):
+              and not engine.halted and engine.real_lock is None and time.monotonic() >= arm["retry_at"]):
             if not engine.set_live_trading(True):
                 arm["retry_at"] = time.monotonic() + RETRY_S
                 _log(S, f"arm failed; retrying in {RETRY_S:.0f}s (disarm from the dashboard to stop)")
@@ -494,9 +490,14 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
                 engine.check_failsafe()
                 if engine.live_trading:
                     event_real["pnl"] = min(engine.current_pnl(mark="touch"), engine.current_pnl(mark="prob"))
-                if engine.halt_kind == "loss":
-                    request_stop_all(f"{S} loss limit: {engine.halt_reason}")
-                    _stop(f"loss limit -- {engine.halt_reason}")
+                if engine.halt_kind == "loss" and run_state["lock"] is None:
+                    # This series only, and the process stays up in shadow: a
+                    # restart is what re-enables real trading.
+                    run_state["lock"] = f"loss limit tripped in {ev.event_ticker}: {engine.halt_reason}"
+                    engine.real_lock = run_state["lock"]
+                    _log(S, f"LOSS LIMIT: {engine.halt_reason} -- real trading OFF for {S} until restart; "
+                            f"shadow resumes next event, other series unaffected")
+                    engine.set_live_trading(False)
                 elif stopper is not None and (reason := stopper.poll()) is not None:
                     _stop(reason)
                 blocked = engine.blocked_reason()
@@ -598,10 +599,11 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
             traceback.print_exc()
         # Marked at the last armed moment (worse of touch/fair), not at
         # settlement, so it can differ from the account by the move after.
+        # The run total is informational; the loss limit is per event.
         if event_real["pnl"] is not None:
             run_state["real_pnl"] += event_real["pnl"]
-            _log(S, f"{ev.event_ticker} real PnL {event_real['pnl']:+.2f}; "
-                    f"this run {run_state['real_pnl']:+.2f} (halt at -{cfg.risk.max_loss_usd:g})")
+            _log(S, f"{ev.event_ticker} real PnL {event_real['pnl']:+.2f} (halt at -{cfg.risk.max_loss_usd:g} "
+                    f"per event); this run {run_state['real_pnl']:+.2f}")
     if stop["reason"] is not None:
         raise StopAll(stop["reason"])
     return arm["want"]

@@ -506,7 +506,7 @@ class Quoter:
         Price: others' best bid on this side (our own orders, LIP included,
         netted out, so the quote follows the book down rather than holding
         itself up), capped a tick inside the far touch and at own-side fair
-        plus lip_fair_margin. Quoted only if that price is in a band
+        minus lip_constant_edge. Quoted only if that price is in a band
         (lip.lots_at) and at least lip_min_time_left_s remain. The full edge
         reservation is NOT used: it left the quote almost never at the best
         bid, where nearly all the LIP is (LIP_REPORT.md §6).
@@ -529,12 +529,11 @@ class Quoter:
         far = book.ask if side == "yes" else (None if book.bid is None else 1.0 - book.bid)
         if far is not None:
             price = min(price, round(far - TICK, 2))
-        if lc.lip_fair_margin is not None:
-            # Cap at fair + margin rather than skip the side: a bid behind the
+        if lc.lip_constant_edge is not None:
+            # Cap at fair - edge rather than skip the side: a bid behind the
             # best earns less LIP, but _lip_select scores it at this price, so
             # it only rests if it can still clear the payout floor.
-            fair_own = prob if side == "yes" else 1.0 - prob
-            cap = round(math.floor((fair_own + lc.lip_fair_margin) / TICK + 1e-9) * TICK, 2)
+            cap = self._lip_fair_cap(side, prob)
             if price > cap + 1e-9:
                 self._block("lip_capped_at_fair")
                 price = cap
@@ -556,7 +555,7 @@ class Quoter:
         fill: it steps a tick in front of others' best bid (alone at the front
         of the book) and is marked `front`, so it is never re-queued. Bypasses
         the bands, lots, payout floor, max-markets and the LIP time cutoff;
-        keeps the far-touch and fair-margin price caps."""
+        keeps the far-touch and lip_constant_edge price caps."""
         inv = self._lip_inv.get(ticker, 0.0)
         qty = min(max(inv, 0.0), max(net, 0.0)) if side == "no" else min(max(-inv, 0.0), max(-net, 0.0))
         qty = math.floor(qty * 100 + 1e-9) / 100
@@ -572,9 +571,8 @@ class Quoter:
         if far is not None:
             price = min(price, round(far - TICK, 2))
         lc = self.cfg.lip
-        if lc.lip_fair_margin is not None:
-            fair_own = prob if side == "yes" else 1.0 - prob
-            price = min(price, round(math.floor((fair_own + lc.lip_fair_margin) / TICK + 1e-9) * TICK, 2))
+        if lc.lip_constant_edge is not None:
+            price = min(price, self._lip_fair_cap(side, prob))
         if not (MIN_PRICE <= price <= MAX_PRICE):
             return None
         self._block("lip_exit")
@@ -583,6 +581,11 @@ class Quoter:
         extra = float(math.floor(lc.lots_at(price) + 1e-9)) if lc.lots_at(price) > 0 else 0.0
         self._lip_exit_qty[(ticker, side)] = float(qty)
         return LipTarget(price, float(qty) + extra, front=True)
+
+    def _lip_fair_cap(self, side, prob) -> float:
+        """Highest own-side LIP price that keeps lip_constant_edge below fair."""
+        fair_own = prob if side == "yes" else 1.0 - prob
+        return round(math.floor((fair_own - self.cfg.lip.lip_constant_edge) / TICK + 1e-9) * TICK, 2)
 
     # ------------------------------------------------------------------
     # Worst-case loss budget

@@ -121,6 +121,8 @@ def _render_toggle(series: str, s: dict, idle: bool = False):
 
 def _render_guards(s: dict):
     blocked = s.get("blocked_reason")
+    if s.get("real_lock"):
+        st.error(f"🔒 **Real trading off until restart -- {s['real_lock']}.** Shadow continues.")
     if blocked == "halted":
         st.warning(f"⛔ **Halted -- {s.get('halt_reason') or 'reason not recorded'}.** Restart to resume.")
     elif blocked:
