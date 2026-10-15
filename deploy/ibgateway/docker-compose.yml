@@ -21,6 +21,11 @@ services:
       # the session alive without a phone tap every day. 23:45 ET is after
       # the 16:00 close and before the next 09:00 open.
       AUTO_RESTART_TIME: "11:45 PM"
+      # IBKR voids the restart token at its weekly reset (Sunday 01:00 ET), so
+      # once a week a full login with a push is unavoidable. A cold restart
+      # Sunday 22:00 ET makes that push arrive then, before the week's first
+      # 23:45 restart, instead of whenever the token happens to lapse.
+      TWS_COLD_RESTART: "22:00"
       # An unanswered push times out after ~3 min; IBC then logs in again and
       # sends a new one, until one is approved.
       TWOFA_TIMEOUT_ACTION: restart
