@@ -121,6 +121,8 @@ class Quoter:
         self._lip_soft_since: dict[tuple[str, str], float] = {}
         # Net yes bought by LIP fills per market (exit fills count against it).
         self._lip_inv: dict[str, float] = {}
+        # Inventory part of this decision's exit target, per (ticker, side).
+        self._lip_exit_qty: dict[tuple[str, str], float] = {}
         self._lip_last: dict[tuple[str, str], LipTarget] = {}
 
     # ------------------------------------------------------------------
@@ -436,18 +438,20 @@ class Quoter:
             exit_t = None if (side_blocked or not lc.enable_lip_quoting or not q.enable_quoting) else \
                 self._lip_exit(ticker, side, book, ladder, net, prob)
             if exit_t is not None:
-                # One order per side: the exit wins, at the inventory size only.
-                # It sits in front of the book, so extra size there would be
-                # new risk at the price most likely to fill.
+                # One order per side: the exit wins (front of the book), sized to
+                # the inventory plus this side's band size.
                 lips[side] = exit_t
             t = lips[side]
-            if t is not None and not t.front:
-                # Exits reduce risk and are never cut; entries are sized to fit
-                # what's left of the worst-case loss budget.
+            if t is not None:
+                # The worst-case loss budget sizes everything beyond the exit
+                # inventory; the inventory part reduces risk and is never cut.
+                floor_qty = self._lip_exit_qty.get((ticker, side), 0.0) if t.front else 0.0
                 z = self._fit_to_loss(ctx, ticker, side, "lip", [t.price], t.size)
                 if z < t.size - 1e-9:
                     self._block("max_loss_budget")
-                    lips[side] = LipTarget(t.price, math.floor(z)) if z >= 1 else None
+                    z = max(math.floor(z), floor_qty)
+                    lips[side] = LipTarget(t.price, float(z), front=t.front) if z >= 0.01 else None
+            self._lip_exit_qty.pop((ticker, side), None)
             self._publish_lip(ctx, ticker, side, lips[side])
         quote_bid = _top_yes("yes", out["yes"])
         quote_ask = _top_yes("no", out["no"])
@@ -536,8 +540,11 @@ class Quoter:
                 price = cap
         if not (MIN_PRICE <= price <= MAX_PRICE):
             return None
+        # The band size is the most position we want on this side: quote up to
+        # it. Signed, so a position the other way (e.g. 9 bought on the cheap
+        # side) is added: the expensive side quotes rich_lots + 9.
         held = net if side == "yes" else -net
-        size = math.floor(lc.lots_at(price) - max(held, 0.0) - self._resting(ticker, side) + 1e-9)
+        size = math.floor(lc.lots_at(price) - held - self._resting(ticker, side) + 1e-9)
         if size < 1:
             return None
         return LipTarget(price, float(size))
@@ -571,7 +578,11 @@ class Quoter:
         if not (MIN_PRICE <= price <= MAX_PRICE):
             return None
         self._block("lip_exit")
-        return LipTarget(price, float(qty), front=True)
+        # Exit the inventory, then keep quoting up to this side's band size
+        # (0 outside the bands): the band is the max position wanted here.
+        extra = float(math.floor(lc.lots_at(price) + 1e-9)) if lc.lots_at(price) > 0 else 0.0
+        self._lip_exit_qty[(ticker, side)] = float(qty)
+        return LipTarget(price, float(qty) + extra, front=True)
 
     # ------------------------------------------------------------------
     # Worst-case loss budget
@@ -616,10 +627,8 @@ class Quoter:
         return out
 
     def _worst_case(self, ctx, extra=None, skip=None) -> float:
-        """Worst settlement PnL over every outcome, plus real PnL already booked
-        this run (engine.loss_offset)."""
-        offset = float(getattr(getattr(ctx, "_engine", None), "loss_offset", 0.0) or 0.0)
-        return min(self._settle_pnl(ctx, extra, skip).values()) + offset
+        """Worst settlement PnL of this event over every outcome."""
+        return min(self._settle_pnl(ctx, extra, skip).values())
 
     def _fit_to_loss(self, ctx, ticker, side, role, prices, size) -> float:
         """Largest per-level size <= `size` for orders at `prices` (one level

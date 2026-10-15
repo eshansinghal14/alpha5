@@ -494,7 +494,7 @@ def test_lip_size_net_of_position_on_that_side():
     ctx.portfolio.position("A").yes_qty = 150.0
     lip_step(q, ctx)
     assert ctx.lip_targets[("A", "yes")].size == 250.0
-    assert ctx.lip_targets[("A", "no")].size == 100.0   # long yes doesn't use up the no side
+    assert ctx.lip_targets[("A", "no")].size == 250.0   # band is max position: 100 + the 150 long
     ctx.portfolio.position("A").yes_qty = 400.0
     lip_step(q, ctx, dt=0.1)
     assert ctx.lip_targets[("A", "yes")] is None
@@ -814,6 +814,23 @@ def test_lip_exit_steps_in_front_when_spread_allows():
     assert ctx.lip_targets[("A", "no")].price == 0.90
 
 
+def test_lip_exit_adds_band_size_on_top_of_inventory():
+    """9 lots bought on the cheap yes side: the no side (0.89, rich band)
+    quotes rich_lots + 9 = 109, so the max short it can reach is the band."""
+    q, ctx = lip_q(lip_rich_lots=100.0)
+    _lip_fill(ctx, "yes", 9.0, 0.10)
+    lip_step(q, ctx)
+    t = ctx.lip_targets[("A", "no")]
+    assert t.size == 109.0 and t.front is True
+
+
+def test_lip_exit_inventory_never_cut_by_loss_budget():
+    q, ctx = lip_q(max_loss=1.0, lip_rich_lots=100.0)
+    _lip_fill(ctx, "yes", 120.0, 0.10)
+    lip_step(q, ctx)
+    assert ctx.lip_targets[("A", "no")].size >= 120.0
+
+
 def test_lip_exit_shrinks_as_it_fills_and_ignores_edge_fills():
     q, ctx = lip_q(lip_rich_lots=0.0)
     _lip_fill(ctx, "yes", 120.0, 0.10)
@@ -857,11 +874,12 @@ def test_loss_budget_blocks_lip_when_exhausted():
     assert q.block_counts.get("max_loss_budget", 0) >= 1
 
 
-def test_loss_budget_counts_held_position_and_run_offset():
-    q, ctx = lip_q(max_loss=50.0, lip_rich_lots=0.0)
-    ctx._engine = types.SimpleNamespace(loss_offset=-20.0)  # earlier events lost $20
+def test_loss_budget_is_per_event():
+    q, ctx = lip_q(max_loss=30.0, lip_rich_lots=0.0)
+    # Earlier events' losses no longer shrink this event's budget.
+    ctx._engine = types.SimpleNamespace(loss_offset=-20.0)
     lip_step(q, ctx)
-    assert ctx.lip_targets[("A", "yes")].size == 300.0    # $30 left / $0.10
+    assert ctx.lip_targets[("A", "yes")].size == 300.0    # $30 / $0.10
 
 
 def test_loss_budget_never_cuts_a_lip_exit():
