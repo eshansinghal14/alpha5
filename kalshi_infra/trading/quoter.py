@@ -119,6 +119,8 @@ class Quoter:
         # Soft-pull debounce per (ticker, side): when the pull started, and the
         # last target published (held while the pull is younger than the debounce).
         self._lip_soft_since: dict[tuple[str, str], float] = {}
+        # Net yes bought by LIP fills per market (exit fills count against it).
+        self._lip_inv: dict[str, float] = {}
         self._lip_last: dict[tuple[str, str], LipTarget] = {}
 
     # ------------------------------------------------------------------
@@ -172,7 +174,12 @@ class Quoter:
         if len(fills) < self._fills_seen:
             self._fills_seen = 0
         delay = pd.Timedelta(seconds=self.cfg.quoting.requote_delay_s)
+        if self._fills_seen == 0:
+            self._lip_inv = {}
         for f in fills[self._fills_seen:]:
+            if getattr(f, "role", None) == "lip":
+                # Net yes bought by LIP orders, per market: what the LIP exit offers back.
+                self._lip_inv[f.ticker] = self._lip_inv.get(f.ticker, 0.0) + (f.size if f.side == "yes" else -f.size)
             if f.liquidity == "maker":
                 self._quote_block_until[(f.ticker, f.side)] = f.time + delay
         self._fills_seen = len(fills)
@@ -409,6 +416,10 @@ class Quoter:
         for side in ("yes", "no"):
             side_blocked = (block_bid if side == "yes" else block_ask) is not None
             lips[side] = self._lip_debounce(ticker, side, lips[side], now_s, hard_off or side_blocked)
+            exit_t = None if (side_blocked or not lc.enable_lip_quoting or not q.enable_quoting) else \
+                self._lip_exit(ticker, side, book, ladder, net, prob)
+            if exit_t is not None:
+                lips[side] = exit_t
             self._publish_lip(ctx, ticker, side, lips[side])
         quote_bid = _top_yes("yes", out["yes"])
         quote_ask = _top_yes("no", out["no"])
@@ -502,6 +513,36 @@ class Quoter:
         if size < 1:
             return None
         return LipTarget(price, float(size))
+
+    def _lip_exit(self, ticker, side, book, ladder, net, prob) -> LipTarget | None:
+        """Offer back what LIP orders bought: inventory long yes from LIP fills
+        is offered on the no side (and vice versa) at others' best bid there,
+        sized to that inventory (capped at the position actually held), as if
+        it were an expensive-side LIP quote. Bypasses the bands, lots, payout
+        floor, max-markets and the LIP time cutoff; keeps the far-touch and
+        fair-margin price caps."""
+        inv = self._lip_inv.get(ticker, 0.0)
+        qty = min(max(inv, 0.0), max(net, 0.0)) if side == "no" else min(max(-inv, 0.0), max(-net, 0.0))
+        qty = math.floor(qty * 100 + 1e-9) / 100
+        if qty < 0.01 or ladder is None or book is None:
+            return None
+        bids = ladder.yes_bids if side == "yes" else ladder.no_bids
+        if self._own_in_book:
+            bids = others_ladder(bids, list(self._shown.get((ticker, side), [])))
+        if not bids:
+            return None
+        price = round(max(bids), 2)
+        far = book.ask if side == "yes" else (None if book.bid is None else 1.0 - book.bid)
+        if far is not None:
+            price = min(price, round(far - TICK, 2))
+        lc = self.cfg.lip
+        if lc.lip_fair_margin is not None:
+            fair_own = prob if side == "yes" else 1.0 - prob
+            price = min(price, round(math.floor((fair_own + lc.lip_fair_margin) / TICK + 1e-9) * TICK, 2))
+        if not (MIN_PRICE <= price <= MAX_PRICE):
+            return None
+        self._block("lip_exit")
+        return LipTarget(price, float(qty))
 
     def _lip_debounce(self, ticker, side, target, now_s, hard: bool):
         """Hold a resting LIP quote through a SOFT pull (spot_burst, payout

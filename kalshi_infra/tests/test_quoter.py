@@ -784,6 +784,43 @@ def test_lip_slot_passes_on_when_holder_loses_its_target():
     assert ctx.lip_targets[("A", "yes")] is None and ctx.lip_targets[("B", "yes")] is not None
 
 
+def _lip_fill(ctx, side, size, price):
+    o = Order(777, "A", side, "limit", price, size, ctx.time, "quote")
+    o.role = "lip"
+    ctx.portfolio.record_fill(o, price, size, ctx.time, "maker", fee=0.0)
+    ctx.portfolio.fills[-1].role = "lip"
+
+
+def test_lip_fill_is_offered_back_at_best_on_other_side():
+    """Filled 120 yes on the LIP bid: rest a 120-lot LIP offer (no bid) at the
+    best no bid even though the rich side is off (lip_rich_lots 0)."""
+    q, ctx = lip_q(lip_rich_lots=0.0)
+    _lip_fill(ctx, "yes", 120.0, 0.10)
+    lip_step(q, ctx)
+    t = ctx.lip_targets[("A", "no")]
+    assert t is not None and t.price == 0.89 and t.size == 120.0
+
+
+def test_lip_exit_shrinks_as_it_fills_and_ignores_edge_fills():
+    q, ctx = lip_q(lip_rich_lots=0.0)
+    _lip_fill(ctx, "yes", 120.0, 0.10)
+    _lip_fill(ctx, "no", 50.0, 0.89)                    # 50 of the exit filled
+    lip_step(q, ctx)
+    assert ctx.lip_targets[("A", "no")].size == 70.0
+    o = Order(778, "A", "yes", "limit", 0.10, 3.0, ctx.time, "quote")   # edge fill: not LIP inventory
+    ctx.portfolio.record_fill(o, 0.10, 3.0, ctx.time, "maker", fee=0.0)
+    lip_step(q, ctx, dt=0.1)
+    assert ctx.lip_targets[("A", "no")].size == 70.0
+
+
+def test_lip_exit_continues_past_the_lip_time_cutoff():
+    q, ctx = lip_q(close=T0 + pd.Timedelta(seconds=100), lip_rich_lots=0.0)
+    _lip_fill(ctx, "yes", 120.0, 0.10)
+    lip_step(q, ctx)
+    assert ctx.lip_targets[("A", "yes")] is None
+    assert ctx.lip_targets[("A", "no")].size == 120.0
+
+
 def test_lips_at_band_edges():
     s = P.LipSettings(**dict(LIP_OFF, lip_cheap_lots=400.0, lip_rich_lots=100.0))
     assert s.lots_at(0.20) == 400.0 and s.lots_at(0.21) == 0.0
