@@ -83,6 +83,20 @@ def http_status(exc) -> int | None:
     return getattr(resp, "status_code", None)
 
 
+def is_post_only_reject(exc) -> bool:
+    """A resting create refused because it would have crossed (post_only).
+    Matched on Kalshi's error body: the exact code isn't documented, so any
+    4xx whose body mentions post-only / cross counts."""
+    st = http_status(exc)
+    if st is None or not (400 <= st < 500) or st == 429:
+        return False
+    try:
+        body = (exc.response.text or "").lower()
+    except Exception:
+        body = str(exc).lower()
+    return "post" in body and ("only" in body or "cross" in body)
+
+
 def write_budget_tokens_per_s() -> float:
     """The account's write-token refill rate from Kalshi (tier-dependent:
     100/s on Basic, 2026-10-09). Read at session start, so a tier upgrade
@@ -403,13 +417,14 @@ class KalshiOrderClient:
         quote came back 400 Bad Request until the circuit breaker opened
         (2026-10-08, KXCRYPTOLEAD15M).
 
-        Post-only is deliberately NOT requested. Our quote is priced a tick
-        inside the opposite touch when we send it, so it only ever crosses if
-        the book moved during the round trip -- in which case we'd rather
-        take at a better price than our limit than have the order rejected.
-        `fill` on the returned ack is what crossed; the remainder rests.
+        Post-only: an order that would cross is rejected instead of taking.
+        It only crosses when the book moved through it in flight, and those
+        takes paid the taker fee (~1.4c/lot) on edge that wasn't there:
+        2026-10-14/15, 539 crossed fills netted -0.5 to -1.1c/lot at 10s
+        after fees. The next decision re-quotes against the new book. `fill`
+        on the ack stays for safety but should never be set.
         """
-        payload = self._create(order, time_in_force="good_till_canceled")
+        payload = self._create(order, time_in_force="good_till_canceled", post_only=True)
         o = payload.get("order") if isinstance(payload.get("order"), dict) else payload
         # Read BEFORE parsing the fill: an unparseable fill must not also cost
         # us the id that pulls the order back off the book.
@@ -420,7 +435,7 @@ class KalshiOrderClient:
             return RestingAck(exchange_order_id=exchange_order_id, fill=None, parse_error=exc)
         return RestingAck(exchange_order_id=exchange_order_id, fill=fill)
 
-    def _create(self, order: Order, time_in_force: str) -> dict:
+    def _create(self, order: Order, time_in_force: str, post_only: bool = False) -> dict:
         """POST one create-order and return its JSON. `time_in_force` is
         required by the API: "immediate_or_cancel" for takes,
         "good_till_canceled" for resting quotes."""
@@ -437,6 +452,8 @@ class KalshiOrderClient:
             "time_in_force": time_in_force,
             **self._shard_field(),
         }
+        if post_only:
+            body["post_only"] = True
         path = ORDERS_PATH
         resp = self._session.post(BASE_URL + path, headers=self._headers("POST", path),
                                   json=body, timeout=self.timeout_s)

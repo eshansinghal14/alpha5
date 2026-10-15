@@ -56,7 +56,7 @@ import pandas as pd
 from kalshi_backtest.book import BookView
 from kalshi_backtest.core import Order, Portfolio, Trade
 from kalshi_backtest.data import STALE_THRESHOLD_S as MAX_BOOK_AGE_S
-from kalshi_infra.kalshi.orders import WRITE_HEADROOM, http_status
+from kalshi_infra.kalshi.orders import WRITE_HEADROOM, http_status, is_post_only_reject
 from kalshi_infra.trading import order_manager as om
 from kalshi_backtest.execution import (MEASURED_SEND_S, QueueTracker, resolve_marketable,
                                        resolve_resting)
@@ -211,11 +211,11 @@ class LiveEngine:
         self.halted = False
         self.halt_reason: str | None = None
         # "loss" when the PnL failsafe tripped while sending real orders --
-        # the runtime stops every series on that one (see runtime.session).
+        # the session then locks real trading for this series (see real_lock).
         self.halt_kind: str | None = None
-        # Real PnL already booked by earlier events of this process; set by
-        # the session so max_loss_usd bounds the whole run, not one event.
-        self.loss_offset = 0.0
+        # Set by the session once this series has tripped its loss limit in
+        # any event: arming is refused until the process restarts.
+        self.real_lock: str | None = None
 
         # --- trading guards (see blocked_reason) ---
         self.close_time = close_time
@@ -286,6 +286,7 @@ class LiveEngine:
         lip_cfg = getattr(getattr(strategy, "cfg", None), "lip", None)
         self.om.lip_hold_fn = lambda: getattr(lip_cfg, "lip_hold_s", 1.0)
         self.n_real_quotes = 0
+        self.n_post_only_rejects = 0
         self.n_real_cancelled = 0
         self.n_real_amends = 0
         self.failed_amends = 0
@@ -468,21 +469,19 @@ class LiveEngine:
         model -- that is why touch is kept in the test rather than replaced
         by the markout number.
 
-        While live, loss_offset (earlier events' real PnL) is added, so the
-        limit is on the whole process's real PnL. Shadow PnL never counts
-        toward it. Safe to call repeatedly; halting is one-way for the session.
+        The limit is per event: this engine's ledger is one event's fills
+        (an arm re-seeds them from Kalshi), and earlier events don't count.
+        Safe to call repeatedly; halting is one-way for the engine.
         """
         if self.halted:
             return True
         touch, prob = self.current_pnl(mark="touch"), self.current_pnl(mark="prob")
-        offset = self.loss_offset if self.live_trading else 0.0
-        worst = min(touch, prob) + offset
+        worst = min(touch, prob)
         if worst <= -self.risk.max_loss_usd:
             self.halted = True
             self.halt_kind = "loss" if self.live_trading else "shadow_loss"
-            self.halt_reason = (f"PnL {worst:.2f} <= -{self.risk.max_loss_usd:.2f} "
-                                f"(this event: touch {touch:.2f}, markout {prob:.2f}; "
-                                f"earlier events {offset:+.2f})")
+            self.halt_reason = (f"event PnL {worst:.2f} <= -{self.risk.max_loss_usd:.2f} "
+                                f"(touch {touch:.2f}, markout {prob:.2f})")
             print(f"[live] FAILSAFE: {self.halt_reason} -- halting new orders. Existing resting "
                   f"orders are left to resolve normally; restart the process to resume trading.")
         return self.halted
@@ -548,6 +547,9 @@ class LiveEngine:
         if self.order_client is None:
             print("[live] WARN: cannot enable real trading -- no order client configured.")
             return False
+        if self.real_lock is not None:
+            print(f"[live] REFUSING to enable real trading -- {self.real_lock}. Restart the process to resume.")
+            return False
         if self.halted:
             print(f"[live] REFUSING to enable real trading -- session is halted ({self.halt_reason}). "
                   f"Restart the process to resume.")
@@ -589,8 +591,7 @@ class LiveEngine:
         self.balance_at_arm = balance
         self.live_trading = True
         print(f"[live] *** REAL TRADING ENABLED -- orders are now being sent to Kalshi. "
-              f"Balance ${balance:.2f}, halt at -${self.risk.max_loss_usd:.0f} real PnL this run "
-              f"({self.loss_offset:+.2f} so far). ***")
+              f"Balance ${balance:.2f}, halt at -${self.risk.max_loss_usd:.0f} PnL this event. ***")
         return True
 
     def add_session_reset_hook(self, fn):
@@ -1191,6 +1192,14 @@ class LiveEngine:
                 q.state = om.CANCELLING
             self._run_blocking(lambda: self._find_lost(order),
                                lambda res: self._on_lost_found(order, res))
+            return
+        if exc is not None and is_post_only_reject(exc):
+            # The book moved through our price in flight: expected, not an
+            # error. Backing off that price (rejected=True) is right -- the
+            # next decision re-quotes against the new book.
+            self.n_post_only_rejects += 1
+            self.om.on_create_failed(order.order_id, rejected=True)
+            self._unresolved(order, "post_only_reject")
             return
         if exc is not None:
             self.real_order_errors += 1

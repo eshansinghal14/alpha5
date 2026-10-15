@@ -329,6 +329,43 @@ def test_rejected_create_frees_slot_and_backs_off_that_price():
     assert eng.om.counts.get("create", 0) == 2
 
 
+def test_post_only_reject_is_not_an_order_error():
+    import requests
+    eng, _, client = setup(real=True, quote_levels_behind=0)
+
+    class Resp:
+        status_code = 400
+        text = '{"error":{"code":"invalid_order","message":"post only order would cross"}}'
+
+    def reject(order):
+        e = requests.HTTPError("400 bad")
+        e.response = Resp()
+        raise e
+
+    client.place_resting = reject
+    for _ in range(8):                          # more than MAX_CONSECUTIVE_ORDER_ERRORS
+        fair(eng)
+    assert eng.consecutive_order_errors == 0 and eng.n_post_only_rejects >= 2
+    assert eng.blocked_reason() is None
+    assert eng.om.live() == []
+
+
+def test_post_only_match_is_specific():
+    import requests
+    from kalshi_infra.kalshi.orders import is_post_only_reject
+
+    def err(status, text):
+        class R:
+            pass
+        r = R(); r.status_code = status; r.text = text
+        e = requests.HTTPError(text); e.response = r
+        return e
+    assert is_post_only_reject(err(400, "Post only order would cross the book"))
+    assert not is_post_only_reject(err(400, "insufficient balance"))
+    assert not is_post_only_reject(err(429, "post only"))
+    assert not is_post_only_reject(err(500, "post only"))
+
+
 def _crossing_client(client, size):
     from kalshi_infra.kalshi.orders import RealFill
 
@@ -437,6 +474,30 @@ def test_halt_blocks_new_creates():
     eng.halted, eng.halt_reason = True, "test"
     fair(eng)
     assert client.creates == []
+
+
+def _losing(eng, loss=30.0):
+    """A yes position bought at 0.90 with the bid at 0.40: touch PnL -0.50/lot."""
+    eng.portfolio.position("A").yes_qty = loss / 0.50
+    eng.portfolio.position("A").yes_cost = loss / 0.50 * 0.90
+
+
+def test_loss_limit_is_per_event_not_run():
+    eng, _, _ = setup(real=True)
+    eng.risk.max_loss_usd = 25.0
+    _losing(eng, 20.0)
+    eng.loss_offset = -100.0           # an old run total must not count any more
+    assert not eng.check_failsafe()
+    _losing(eng, 26.0)
+    assert eng.check_failsafe() and eng.halt_kind == "loss"
+    assert "event PnL" in eng.halt_reason
+
+
+def test_real_lock_refuses_arm():
+    eng, _, _ = setup(real=False)
+    eng.order_client = FakeClient()
+    eng.real_lock = "loss limit tripped in E0"
+    assert eng.set_live_trading(True) is False and not eng.live_trading
 
 
 def _audit_setup():

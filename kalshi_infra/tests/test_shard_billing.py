@@ -55,6 +55,15 @@ def test_create_amend_cancel_carry_exchange_index():
     assert cancel["exchange_index"] == 2 and cancel["market_ticker"] == "KXCRYPTOLEAD15M-X-BTC"
 
 
+def test_resting_quotes_are_post_only_takes_are_not():
+    c = _client(2)
+    c.place_resting(_order())
+    c.place_ioc(_order())
+    resting, take = c._session.calls[0][2], c._session.calls[1][2]
+    assert resting["post_only"] is True and resting["time_in_force"] == "good_till_canceled"
+    assert "post_only" not in take and take["time_in_force"] == "immediate_or_cancel"
+
+
 def test_unpinned_client_sends_no_index():
     c = _client(None)
     c.place_resting(_order())
