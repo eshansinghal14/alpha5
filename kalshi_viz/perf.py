@@ -105,6 +105,8 @@ class Perf:
         self._done = pd.DataFrame()
         self._bbo: dict[str, tuple[pd.Timestamp, pd.Timestamp]] = {}
         self._last_mid: dict[str, float] = {}
+        self._lip_parts: set[str] = set()
+        self._lip: dict[str, tuple[pd.Timestamp, float]] = {}   # ticker -> (last time, accrued $)
         self._settle_path = os.path.join(self.root, "settlements.json")
         self._settle: dict[str, str] = self._load_settlements()
         self._settle_tried: dict[str, float] = {}
@@ -196,8 +198,36 @@ class Perf:
                 new = [k not in self._keys for k in keys]
                 self._keys.update(keys)
                 f = f[new]
+                if "role" not in f.columns:
+                    f["role"] = None
                 if len(f):
-                    self._pending.append(f[["time", "ticker", "side", "price", "size", "fee", "liquidity"]])
+                    self._pending.append(f[["time", "ticker", "side", "price", "size", "fee", "liquidity", "role"]])
+            self._scan_lip(j)
+
+    def _scan_lip(self, journal: str) -> None:
+        """Per-ticker LIP accrued while armed: the last real-mode decision
+        row's lip_accrued_usd. The quoter's tracker is per event and resets
+        at a re-arm (reset_session), so per ticker the max over the day's real
+        rows is that event's accrual. Rows written before the "live" column
+        existed are skipped (no way to tell shadow from real)."""
+        for p in sorted(glob.glob(os.path.join(journal, "decisions", "part-*.parquet"))):
+            if p in self._lip_parts:
+                continue
+            try:
+                names = pq.read_schema(p).names
+                if "lip_accrued_usd" not in names or "live" not in names:
+                    self._lip_parts.add(p)
+                    continue
+                x = pq.read_table(p, columns=["time", "ticker", "lip_accrued_usd", "live"]).to_pandas()
+            except Exception:
+                continue              # mid-write; next refresh
+            self._lip_parts.add(p)
+            x = x[x["live"].fillna(False).astype(bool) & x["lip_accrued_usd"].notna()]
+            for t, g in x.groupby("ticker"):
+                v = float(g["lip_accrued_usd"].max())
+                prev = self._lip.get(t)
+                if prev is None or v > prev[1]:
+                    self._lip[t] = (pd.Timestamp(g["time"].max()), v)
 
     def _book(self, lo, hi, tickers) -> pd.DataFrame:
         parts = [p for p, (a, b) in self._bbo.items() if b >= lo and a <= hi]
@@ -266,7 +296,7 @@ class Perf:
                     self._last_mid.update(((x.bid + x.ask) / 2).groupby(x.ticker).last().dropna().to_dict())
             d = self._done
             if d.empty:
-                return d
+                return d.assign(**{"role": pd.Series(dtype=object)}) if len(d.columns) else d
             self._update_settlements(sorted(d.ticker.unique()), None if settle_all else SETTLE_PER_REFRESH)
             d = d.copy()
             d["event"] = d.ticker.str.rsplit("-", n=1).str[0]
@@ -277,6 +307,17 @@ class Perf:
             d["open_c"] = (d.dir * (last - d.yes_px) - d.fee / d["size"]) * 100
             d["pnl_c"] = d.settled.where(d.settled.notna(), d.open_c)
             return d
+
+    def lip_frame(self) -> pd.DataFrame:
+        """(time, ticker, event, usd): LIP accrued per market while armed,
+        stamped at the last armed decision row."""
+        with self._lock:
+            rows = [(t, tk, v) for tk, (t, v) in self._lip.items() if v > 0]
+        if not rows:
+            return pd.DataFrame(columns=["time", "ticker", "event", "usd"])
+        df = pd.DataFrame(rows, columns=["time", "ticker", "usd"]).sort_values("time")
+        df["event"] = df.ticker.str.rsplit("-", n=1).str[0]
+        return df
 
 
 _STORE: dict[str, Perf] = {}
@@ -321,26 +362,75 @@ def summarize(df: pd.DataFrame, since: pd.Timestamp | None = None) -> dict:
         "max_dd": float((cum - cum.cummax()).min()) if len(cum) else 0.0,
     }
     rows = {}
-    for lab, g in (("all", d), ("maker", d[d.liquidity == "maker"]), ("taker", d[d.liquidity == "taker"])):
+    role = d["role"] if "role" in d.columns else pd.Series(None, index=d.index)
+    groups = [("all", d), ("maker", d[d.liquidity == "maker"]), ("taker", d[d.liquidity == "taker"])]
+    if (role == "lip").any():
+        groups += [("LIP quote", d[role == "lip"]), ("edge quote", d[(role != "lip") & (d.liquidity == "maker")])]
+    for lab, g in groups:
         if len(g):
             rows[lab] = {"fills": len(g), **{c: _wavg(g[c], g["size"]) for c in (*HORIZONS, "pnl_c")}}
     out["markouts"] = rows
     return out
 
 
-def curves(df: pd.DataFrame, since: pd.Timestamp | None = None) -> pd.DataFrame:
-    """Long frame (time, line, usd): cumulative PnL and 1s/10s markout $ by fill time."""
+def summarize_lip(df: pd.DataFrame, lip: pd.DataFrame, since: pd.Timestamp | None = None) -> dict:
+    """LIP reward against what the LIP quote's own fills cost.
+
+    reward: expected LIP $ accrued while armed (the scoring replica's
+    estimate of Kalshi's payout, not a payment received).
+    adverse: $ the LIP-quote fills lost vs Kalshi mid 10s/60s later; the
+    price of sitting where LIP pays. net = reward + LIP-fill PnL (settled,
+    else marked at mid). Fills before the role column existed are unlabelled
+    and count as edge."""
+    now = pd.Timestamp.now(tz="UTC")
+    L = window(lip, since)
     d = window(df, since)
+    reward = float(L.usd.sum()) if len(L) else 0.0
+    start = since if since is not None else (min(x.time.min() for x in (L, d) if len(x)) if len(L) or len(d) else now)
+    hours = max((now - start).total_seconds() / 3600, 1e-9)
+    out = {"reward": reward, "per_h": reward / hours, "markets": len(L), "events": int(L.event.nunique()) if len(L) else 0}
+    lf = d[d["role"] == "lip"] if len(d) and "role" in d.columns else d.iloc[0:0]
+    out["lip_fills"], out["lip_contracts"] = len(lf), float(lf["size"].sum()) if len(lf) else 0.0
+    if len(lf):
+        usd = lambda c: float((lf[c].fillna(0) * lf["size"] / 100).sum())  # noqa: E731
+        out.update({"lip_fill_pnl": usd("pnl_c"), "adverse_10s": usd("mo10"), "adverse_60s": usd("mo60"),
+                    "mo10_c": _wavg(lf.mo10, lf["size"]), "mo60_c": _wavg(lf.mo60, lf["size"]),
+                    "spread_c": _wavg(lf.mo0, lf["size"])})
+    else:
+        out.update({"lip_fill_pnl": 0.0, "adverse_10s": 0.0, "adverse_60s": 0.0,
+                    "mo10_c": math.nan, "mo60_c": math.nan, "spread_c": math.nan})
+    out["net"] = reward + out["lip_fill_pnl"]
+    # Reward per contract the LIP quote got filled for: what each fill "earned"
+    # from the program, to set against its markout.
+    out["reward_per_contract_c"] = (100 * reward / out["lip_contracts"]) if out["lip_contracts"] else math.nan
+    return out
+
+
+def curves(df: pd.DataFrame, since: pd.Timestamp | None = None, lip: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Long frame (time, line, usd): cumulative PnL and 1s/10s markout $ by
+    fill time; with `lip`, also cumulative LIP reward and PnL incl. LIP."""
+    d = window(df, since)
+    L = window(lip, since) if lip is not None and len(lip) else None
     # A series with no real fills has a column-less empty frame.
-    if d.empty:
+    if d.empty and L is None:
         return pd.DataFrame(columns=["time", "line", "usd"])
-    d = d.sort_values("time")
-    start = since if since is not None else d.time.min()
-    lines = {"PnL (settled; open at mid)": d.pnl_c, "1s markout": d.mo1, "10s markout": d.mo10}
+    times = [x.time.min() for x in (d, L) if x is not None and len(x)]
+    start = since if since is not None else min(times)
     out = []
-    for name, c in lines.items():
-        v = (c.fillna(0) * d["size"] / 100).cumsum()
-        out.append(pd.DataFrame({"time": [start] + list(d.time), "line": name, "usd": [0.0] + list(v)}))
+    if len(d):
+        d = d.sort_values("time")
+        lines = {"PnL (settled; open at mid)": d.pnl_c, "1s markout": d.mo1, "10s markout": d.mo10}
+        for name, c in lines.items():
+            v = (c.fillna(0) * d["size"] / 100).cumsum()
+            out.append(pd.DataFrame({"time": [start] + list(d.time), "line": name, "usd": [0.0] + list(v)}))
+    if L is not None:
+        L = L.sort_values("time")
+        out.append(pd.DataFrame({"time": [start] + list(L.time), "line": "LIP reward",
+                                 "usd": [0.0] + list(L.usd.cumsum())}))
+        ev = pd.concat([d[["time"]].assign(v=d.pnl_c.fillna(0) * d["size"] / 100) if len(d) else None,
+                        L[["time"]].assign(v=L.usd)]).sort_values("time")
+        out.append(pd.DataFrame({"time": [start] + list(ev.time), "line": "PnL incl. LIP",
+                                 "usd": [0.0] + list(ev.v.cumsum())}))
     return pd.concat(out, ignore_index=True)
 
 

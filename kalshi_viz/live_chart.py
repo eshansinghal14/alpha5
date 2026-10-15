@@ -67,7 +67,7 @@ def _legend(p):
 
 
 def build_live_html(series: str, market: str, json_url: str, x_start_ms: float, x_end_ms: float,
-                    max_position: float | None, quoting: bool) -> str:
+                    max_position: float | None, quoting: bool, lip: bool = True) -> str:
     """Standalone HTML for one market. Contains NO data (that's what keeps
     the string constant across reruns). The x-axis is fixed to [session
     start, now] and clamped per-edge in JS; DataRange1d would chase incoming
@@ -115,6 +115,7 @@ def build_live_html(series: str, market: str, json_url: str, x_start_ms: float, 
                 line_dash="dotted", legend_label="our quote (bid)")
         p1.step(x="t", y="qa", source=src["quote"], mode="after", color=PINK, line_width=1.4,
                 line_dash="dotted", legend_label="our quote (ask)")
+    if quoting and lip:
         p1.step(x="t", y="lb", source=src["quote"], mode="after", color=GREEN, line_width=1.0,
                 line_dash="dashdot", alpha=0.6, legend_label="LIP quote (bid)")
         p1.step(x="t", y="la", source=src["quote"], mode="after", color=PINK, line_width=1.0,

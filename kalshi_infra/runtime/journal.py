@@ -147,6 +147,7 @@ class DayJournal:
                 "size": f.size, "fee": f.fee, "liquidity": f.liquidity,
                 "order_id": f.order_id, "exchange_order_id": xo, "trade_id": tid,
                 "seeded": bool(getattr(f, "seeded", False)),
+                "role": getattr(f, "role", None),
                 # Which ledger this fill belongs to. A day can contain both,
                 # and averaging shadow fills into a real session's PnL is
                 # exactly the splice reset_session exists to prevent.

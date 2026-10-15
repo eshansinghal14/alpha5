@@ -24,7 +24,7 @@ import streamlit.components.v1 as components  # noqa: E402
 from kalshi_infra.runtime.control import request_trading_mode  # noqa: E402
 from kalshi_strategies.run import registry  # noqa: E402
 from kalshi_viz import config_form, perf_panel  # noqa: E402
-from kalshi_viz.data import (latest_summary, load_day, read_summary, read_trading_mode,  # noqa: E402
+from kalshi_viz.data import (has_lip, latest_summary, load_day, read_summary, read_trading_mode,  # noqa: E402
                              stream_url, summary_age_s)
 from kalshi_viz.live_chart import IFRAME_HEIGHT, build_live_html  # noqa: E402
 
@@ -65,11 +65,11 @@ def _stale(series: str) -> bool:
 
 
 @st.cache_data(max_entries=64, show_spinner=False)
-def _chart_html(series, market, t0_ms, max_position, quoting):
-    """~0.7s of Bokeh per build; shared across browser tabs. The x end is
+def _chart_html(series, market, t0_ms, max_position, quoting, lip):
+    """~0.2s of Bokeh per build; shared across browser tabs. The x end is
     t0 + 1s: the chart's own poller moves it to now on its first fetch."""
     return build_live_html(series, market, stream_url(series, market), t0_ms, t0_ms + 1000,
-                           max_position, quoting)
+                           max_position, quoting, lip)
 
 
 def _ms(v):
@@ -138,15 +138,17 @@ def _render_guards(s: dict):
     if problem:
         st.error(f"📡 Signal feed: {problem}")
 
-    c = st.columns(3)
+    lip = has_lip(s)
+    c = st.columns(3 if lip else 2)
     age, lim = s.get("signal_age_s"), s.get("signal_age_limit_s")
     c[0].metric("Signal age", _ms(age), delta="STALE" if age is not None and lim and age > lim else None,
                 delta_color="inverse", help=f"Limit {_ms(lim)}.")
     pnl = s.get("pnl") or {}
     c[1].metric("PnL (fair / touch)", f"${pnl.get('fair', 0):+.2f}", f"touch ${pnl.get('touch', 0):+.2f}",
                 delta_color="off")
-    c[2].metric("LIP accrued", f"${pnl.get('lip_accrued', 0):.2f}",
-                help="Expected LIP reward from the scoring replica (program terms from Kalshi).")
+    if lip:
+        c[2].metric("LIP accrued", f"${pnl.get('lip_accrued', 0):.2f}",
+                    help="Expected LIP reward from the scoring replica (program terms from Kalshi).")
 
     qb, eb = s.get("quote_block_counts") or {}, s.get("blocked_counts") or {}
     if qb or eb:
@@ -184,7 +186,8 @@ def _markets(day, show_all: bool = False) -> list[str]:
 
 def _render_series(series: str, spec):
     st.title(series)
-    perf_panel.render(series)
+    last = read_summary(series) or ((latest_summary(series) or (None, None))[1])
+    perf_panel.render(series, lip=has_lip(last))
 
     @st.fragment(run_every="2s")
     def status():
@@ -272,19 +275,21 @@ def _render_markets(series: str):
     q = (s.get("config") or {}).get("quoting") or {}
     sess = s.get("session_started") or ""
     quoting = bool(q.get("enable_quoting"))
+    lip_on = has_lip(s)
     t0 = pd.Timestamp(sess) if sess else pd.Timestamp.now(tz="UTC") - pd.Timedelta(minutes=15)
     for tk in markets:
         m = _market_stats(day, tk)
-        c = st.columns([3, 2, 2, 2, 2], vertical_alignment="bottom")
+        c = st.columns([3, 2, 2, 2, 2] if lip_on else [3, 2, 2, 2], vertical_alignment="bottom")
         c[0].markdown(f"#### {_market_label(tk, s.get('event_ticker'))}")
         c[1].metric("PnL", "n/a" if m.get("pnl") is None else f"${m['pnl']:+.2f}")
         c[2].metric("Contracts traded", f"{m.get('contracts') or 0:.4g}")
         c[3].metric("Position", f"{m.get('position') or 0:+.4g}")
-        lip, qf = m.get("lip"), m.get("lip_qualifying")
-        c[4].metric("LIP", "no program" if lip is None else f"${lip:.2f}",
-                    None if qf is None else f"{qf:.0%} snapshots qualify", delta_color="off")
+        if lip_on:
+            lip, qf = m.get("lip"), m.get("lip_qualifying")
+            c[4].metric("LIP", "no program" if lip is None else f"${lip:.2f}",
+                        None if qf is None else f"{qf:.0%} snapshots qualify", delta_color="off")
         # Same args -> same html string -> Streamlit keeps the iframe mounted.
-        html = _chart_html(series, tk, t0.value // 10**6, q.get("max_position"), quoting)
+        html = _chart_html(series, tk, t0.value // 10**6, q.get("max_position"), quoting, lip_on)
         components.html(html, height=IFRAME_HEIGHT, scrolling=True)
     with st.expander("Fills"):
         st.dataframe(day.fills_df, use_container_width=True)

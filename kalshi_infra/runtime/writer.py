@@ -335,11 +335,14 @@ class DecisionLog(list):
     """Stands in for Quoter.debug_log in a live session: forwards each row to
     the writer and keeps nothing (the writer owns the session's history)."""
 
-    def __init__(self, writer: SnapshotWriter, key_fn):
+    def __init__(self, writer: SnapshotWriter, key_fn, extra=None):
+        """`extra()` -> dict merged into every row (e.g. the live flag)."""
         super().__init__()
-        self._writer, self._key_fn = writer, key_fn
+        self._writer, self._key_fn, self._extra = writer, key_fn, extra
 
     def append(self, row):
+        if self._extra is not None:
+            row.update(self._extra())
         self._writer.decision(row, self._key_fn(row))
 
     def clear(self):

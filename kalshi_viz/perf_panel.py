@@ -13,7 +13,9 @@ from kalshi_viz import perf
 
 WINDOWS = {"1h": pd.Timedelta(hours=1), "6h": pd.Timedelta(hours=6), "24h": pd.Timedelta(hours=24),
            "7d": pd.Timedelta(days=7), "All": None}
-COLORS = {"PnL (settled; open at mid)": "#1e88e5", "1s markout": "#fb8c00", "10s markout": "#e53935"}
+COLORS = {"PnL (settled; open at mid)": "#1e88e5", "1s markout": "#fb8c00", "10s markout": "#e53935",
+          "LIP reward": "#43a047", "PnL incl. LIP": "#8e24aa"}
+SOLID = ("PnL (settled; open at mid)", "PnL incl. LIP")
 
 
 def _usd(v: float) -> str:
@@ -24,17 +26,19 @@ def _c(v: float) -> str:
     return "n/a" if v is None or (isinstance(v, float) and math.isnan(v)) else f"{v:+.2f}c"
 
 
-def _chart(df: pd.DataFrame, since: pd.Timestamp | None):
-    c = perf.curves(df, since)
+def _chart(df: pd.DataFrame, since: pd.Timestamp | None, lip: pd.DataFrame | None = None):
+    c = perf.curves(df, since, lip)
     if c.empty:
         st.caption("No real fills in this window.")
         return
+    shown = [k for k in COLORS if k in set(c.line)]
     base = alt.Chart(c).encode(
         x=alt.X("time:T", title=None, axis=alt.Axis(format="%H:%M")),
         y=alt.Y("usd:Q", title="$ (cumulative)"),
-        color=alt.Color("line:N", title=None, scale=alt.Scale(domain=list(COLORS), range=list(COLORS.values())),
+        color=alt.Color("line:N", title=None, scale=alt.Scale(domain=shown, range=[COLORS[k] for k in shown]),
                         legend=alt.Legend(orient="top-left")),
-        strokeDash=alt.condition(alt.datum.line == "PnL (settled; open at mid)", alt.value([1, 0]), alt.value([5, 3])),
+        strokeDash=alt.condition(alt.FieldOneOfPredicate(field="line", oneOf=list(SOLID)),
+                                 alt.value([1, 0]), alt.value([5, 3])),
         tooltip=[alt.Tooltip("time:T", format="%m-%d %H:%M:%S"), "line:N", alt.Tooltip("usd:Q", format="+.2f")])
     zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#888", strokeWidth=0.7).encode(y="y:Q")
     st.altair_chart((base.mark_line(interpolate="step-after", strokeWidth=2) + zero).properties(height=280),
@@ -66,6 +70,26 @@ def _side(s: dict):
                + (f" · t={t:+.2f} (under ~2 is within noise)" if not math.isnan(t) else ""))
 
 
+def _lip_side(L: dict):
+    """LIP reward vs what the LIP quote's fills gave back."""
+    st.markdown("**LIP**")
+    if not L.get("markets") and not L.get("lip_fills"):
+        st.caption("No LIP accrued while armed in this window.")
+        return
+    st.metric("Net (reward + LIP-fill PnL)", _usd(L["net"]), f"reward {_usd(L['reward'])}", delta_color="off",
+              help="Expected LIP payout from the scoring replica while armed (an estimate, not money "
+                   "received), plus the settled/marked PnL of fills on the LIP quote itself.")
+    st.metric("Reward", _usd(L["reward"]), f"{_usd(L['per_h'])}/h", delta_color="off",
+              help=f"Across {L['markets']} markets in {L['events']} events.")
+    st.metric("LIP fills adverse", _usd(L["adverse_10s"]), f"60s {_usd(L['adverse_60s'])}", delta_color="off",
+              help="$ the LIP quote's own fills were worth vs Kalshi mid 10s / 60s later, fee included. "
+                   "Negative = picked off.")
+    st.metric("LIP fills", f"{L['lip_contracts']:,.0f} lots", f"{L['lip_fills']} fills", delta_color="off")
+    st.metric("Per contract (c)", _c(L["mo10_c"]), f"reward {_c(L['reward_per_contract_c'])}", delta_color="off",
+              help="10s markout per LIP-filled contract vs the LIP reward earned per contract filled. "
+                   "Reward above |markout| = LIP pays for the adverse selection.")
+
+
 def _table(s: dict):
     rows = s.get("markouts") or {}
     if not rows:
@@ -78,7 +102,8 @@ def _table(s: dict):
                "PnL is settled (or open at mid).")
 
 
-def render(series: str):
+def render(series: str, lip: bool = False):
+    """`lip`: the series' events carry LIP programs; adds the LIP column."""
     p = perf.get(series)
     p.ensure_background()
 
@@ -99,9 +124,15 @@ def render(series: str):
                        label_visibility="collapsed")
         since = None if WINDOWS[win] is None else pd.Timestamp.now(tz="UTC") - WINDOWS[win]
         s = perf.summarize(df, since)
-        left, right = st.columns([3, 2])
+        lf = p.lip_frame() if lip else None
+        if lip:
+            left, right, third = st.columns([3, 2, 1.4])
+            with third:
+                _lip_side(perf.summarize_lip(df, lf, since))
+        else:
+            left, right = st.columns([3, 2])
         with left:
-            _chart(df, since)
+            _chart(df, since, lf)
         with right:
             _side(s)
         with st.expander("Markout by fill type"):

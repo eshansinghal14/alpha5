@@ -270,7 +270,9 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
             stop["reason"] = reason
             stop_evt.set()
 
-    quoter.debug_log = DecisionLog(writer, _decision_key)
+    # "live" lets the journal tell real-money decisions (and the LIP accrual
+    # on their rows) from shadow ones; kalshi_viz.perf counts only real.
+    quoter.debug_log = DecisionLog(writer, _decision_key, extra=lambda: {"live": engine.live_trading})
     engine.add_session_reset_hook(writer.reset_session)
 
     def remaining_s() -> float | None:

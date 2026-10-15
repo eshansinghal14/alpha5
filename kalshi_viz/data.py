@@ -121,6 +121,12 @@ def stream_url(series: str, ticker: str) -> str:
     return f"/app/static/{series}/{stream_filename(ticker)}"
 
 
+def has_lip(summary: dict | None) -> bool:
+    """Whether the running event has any LIP program (S&P events have none)."""
+    lip = (summary or {}).get("lip") or {}
+    return bool(lip.get("period_reward_usd"))
+
+
 def summary_age_s(summary: dict) -> float | None:
     ts = summary.get("last_update")
     return None if ts is None else (pd.Timestamp.now(tz="UTC") - pd.Timestamp(ts)).total_seconds()

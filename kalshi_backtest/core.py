@@ -83,6 +83,9 @@ class Fill:
     # Replayed from Kalshi into a fresh session (LiveEngine.seed_fills_from_kalshi),
     # not a new execution -- usually already journaled by the session that made it.
     seeded: bool = False
+    # The order's role: "edge" (ladder quote or take) or "lip" (the LIP quote).
+    # None for fills replayed from Kalshi, whose order is unknown.
+    role: str | None = None
 
 
 def kalshi_fee(price: float, contracts: float, fee_multiplier: float = 0.07) -> float:
@@ -195,7 +198,8 @@ class Portfolio:
             fee = kalshi_fee(price, size, mult)
         fill = Fill(order_id=order.order_id, ticker=order.ticker, side=order.side,
                     price=price, size=size, time=time, fee=fee, liquidity=liquidity,
-                    exchange_order_id=exchange_order_id, trade_id=trade_id, seeded=seeded)
+                    exchange_order_id=exchange_order_id, trade_id=trade_id, seeded=seeded,
+                    role=None if seeded else getattr(order, "role", "edge"))
         self.position(order.ticker).apply_fill(fill)
         self.fills.append(fill)
         return fill
