@@ -792,13 +792,24 @@ def _lip_fill(ctx, side, size, price):
 
 
 def test_lip_fill_is_offered_back_at_best_on_other_side():
-    """Filled 120 yes on the LIP bid: rest a 120-lot LIP offer (no bid) at the
-    best no bid even though the rich side is off (lip_rich_lots 0)."""
+    """Filled 120 yes on the LIP bid: offer 120 back on the no side, marked
+    front, even though the rich side is off. One tick in front of the 0.89 best
+    no bid would cross the far touch (yes bid 0.10), so it joins at 0.89."""
     q, ctx = lip_q(lip_rich_lots=0.0)
     _lip_fill(ctx, "yes", 120.0, 0.10)
     lip_step(q, ctx)
     t = ctx.lip_targets[("A", "no")]
-    assert t is not None and t.price == 0.89 and t.size == 120.0
+    assert t is not None and t.size == 120.0 and t.front is True
+    # Best no bid 0.89, far touch (yes bid 0.10) caps a no bid at 0.89: the step-in
+    # is capped there, so the exit joins the best rather than crossing.
+    assert t.price == 0.89
+
+
+def test_lip_exit_steps_in_front_when_spread_allows():
+    q, ctx = lip_q(lip_rich_lots=0.0)
+    _lip_fill(ctx, "yes", 120.0, 0.10)
+    lip_step(q, ctx, yes={0.06: 500.0}, no={0.89: 120.0})    # far cap for no = 1 - 0.06 - 0.01 = 0.93
+    assert ctx.lip_targets[("A", "no")].price == 0.90
 
 
 def test_lip_exit_shrinks_as_it_fills_and_ignores_edge_fills():

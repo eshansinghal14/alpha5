@@ -419,6 +419,9 @@ class Quoter:
             exit_t = None if (side_blocked or not lc.enable_lip_quoting or not q.enable_quoting) else \
                 self._lip_exit(ticker, side, book, ladder, net, prob)
             if exit_t is not None:
+                # One order per side: the exit wins, at the inventory size only.
+                # It sits in front of the book, so extra size there would be
+                # new risk at the price most likely to fill.
                 lips[side] = exit_t
             self._publish_lip(ctx, ticker, side, lips[side])
         quote_bid = _top_yes("yes", out["yes"])
@@ -516,11 +519,12 @@ class Quoter:
 
     def _lip_exit(self, ticker, side, book, ladder, net, prob) -> LipTarget | None:
         """Offer back what LIP orders bought: inventory long yes from LIP fills
-        is offered on the no side (and vice versa) at others' best bid there,
-        sized to that inventory (capped at the position actually held), as if
-        it were an expensive-side LIP quote. Bypasses the bands, lots, payout
-        floor, max-markets and the LIP time cutoff; keeps the far-touch and
-        fair-margin price caps."""
+        is offered on the no side (and vice versa), sized to that inventory
+        (capped at the position actually held). Unlike a LIP quote it WANTS the
+        fill: it steps a tick in front of others' best bid (alone at the front
+        of the book) and is marked `front`, so it is never re-queued. Bypasses
+        the bands, lots, payout floor, max-markets and the LIP time cutoff;
+        keeps the far-touch and fair-margin price caps."""
         inv = self._lip_inv.get(ticker, 0.0)
         qty = min(max(inv, 0.0), max(net, 0.0)) if side == "no" else min(max(-inv, 0.0), max(-net, 0.0))
         qty = math.floor(qty * 100 + 1e-9) / 100
@@ -531,7 +535,7 @@ class Quoter:
             bids = others_ladder(bids, list(self._shown.get((ticker, side), [])))
         if not bids:
             return None
-        price = round(max(bids), 2)
+        price = round(max(bids) + TICK, 2)
         far = book.ask if side == "yes" else (None if book.bid is None else 1.0 - book.bid)
         if far is not None:
             price = min(price, round(far - TICK, 2))
@@ -542,7 +546,7 @@ class Quoter:
         if not (MIN_PRICE <= price <= MAX_PRICE):
             return None
         self._block("lip_exit")
-        return LipTarget(price, float(qty))
+        return LipTarget(price, float(qty), front=True)
 
     def _lip_debounce(self, ticker, side, target, now_s, hard: bool):
         """Hold a resting LIP quote through a SOFT pull (spot_burst, payout

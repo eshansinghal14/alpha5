@@ -244,15 +244,15 @@ def test_requeue_lip_moves_front_of_queue_to_back():
     # 30 ahead at 0.10, 500 displayed: 370 behind us.
     out = eng.requeue_lip({q.exchange_id: 30.0}, min_ahead=200.0)
     assert out == [("A", "yes", 0.10, 30.0, 370.0, True)]
-    assert client.amends[-1] == (q.exchange_id, 0.10)
+    assert client.cancels[-1] == q.exchange_id
 
 
 def test_requeue_lip_leaves_deep_or_last_quotes():
     eng, client, q = _lip_engine()
-    n = len(client.amends)
+    n = len(client.cancels)
     assert eng.requeue_lip({q.exchange_id: 300.0}, min_ahead=200.0)[0][-1] is False   # deep enough
     assert eng.requeue_lip({q.exchange_id: 400.0}, min_ahead=500.0)[0][-1] is False   # nobody behind
-    assert len(client.amends) == n
+    assert len(client.cancels) == n
 
 
 def test_position_cap_limits_ladder_depth():

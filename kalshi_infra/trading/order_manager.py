@@ -85,15 +85,9 @@ EDGE, LIP = "edge", "lip"
 # burn the bucket once per decision.
 REJECT_BACKOFF_S = 2.0
 
-# LIP re-queue: an amend adding this many lots (Kalshi's minimum size step)
-# moves the order to the back of its queue. A side is re-queued at most once
-# per LIP_REQUEUE_MIN_S: five sides at that rate is 10 tokens/s, an eighth of
-# the 80/s crypto bucket.
-LIP_REQUEUE_BUMP = 0.01
+# LIP re-queue (cancel + re-create, 12 tokens): at most once per side per this.
+# Five sides at that rate is ~12 tokens/s of the 240/s crypto bucket.
 LIP_REQUEUE_MIN_S = 5.0
-# Bumps accumulate (each re-queue adds another 0.01); a LIP quote this far over
-# its target is left alone rather than amended back down. 100 re-queues.
-LIP_REQUEUE_SLACK = 1.0
 
 # Window for the live cancel-rate stats in summary().
 CANCEL_STATS_WINDOW_S = 900
@@ -148,9 +142,11 @@ class Desired:
 
 @dataclasses.dataclass
 class LipTarget:
-    """The LIP quote wanted on one side: one order, own-side price."""
+    """The LIP quote wanted on one side: one order, own-side price. `front`:
+    this order wants to be filled (a LIP exit), so it is never re-queued."""
     price: float
     size: float
+    front: bool = False
 
 
 class TokenBucket:
@@ -350,28 +346,33 @@ class OrderManager:
         self.drain_cancels()
 
     def requeue_lip(self, q: Quote, urgent: bool) -> bool:
-        """Send `q` (a resting LIP quote) to the back of its queue with one
-        amend that adds LIP_REQUEUE_BUMP lots: Kalshi puts a size increase at
-        the back. One write, and no moment with no order (or two) resting.
+        """Send `q` (a resting LIP quote) to the back of its queue: cancel it;
+        the next pump re-creates it at its current target, behind everyone now
+        there. Not an amend: a 0.01-lot size bump kept the order's place
+        (2026-10-15, BTC yes @0.19 logged "7 ahead" across repeated requeues).
 
         `urgent` (almost nothing ahead) may spend anything above the cancel
         reserve, like a LIP create; otherwise it needs two creates' worth
         spare on top, so it only uses tokens the edge ladder isn't waiting
-        for. At most once per side per LIP_REQUEUE_MIN_S. Returns whether
-        the amend was sent."""
+        for. At most once per side per LIP_REQUEUE_MIN_S. A target marked
+        `front` (a LIP exit, which wants the fill) is never re-queued.
+        Returns whether the cancel was queued."""
         if q.role != LIP or q.state != RESTING or q.exchange_id is None or q.order_id in self._cancel_q:
+            return False
+        t = self.lip.get((q.ticker, q.side))
+        if t is not None and getattr(t, "front", False):
             return False
         key = (q.ticker, q.side)
         now = self.clock()
         if now - self._requeued_at.get(key, -1e18) < LIP_REQUEUE_MIN_S:
             return False
-        if not self._can_spend(COST_AMEND if urgent else COST_AMEND + 2 * COST_CREATE):
+        if not self._can_spend(COST_CANCEL + COST_CREATE if urgent else COST_CANCEL + 3 * COST_CREATE):
             self._bump("lip_requeue_deferred:reserve")
-            return False
-        if not self._move(q, q.price, q.filled + q.remaining + LIP_REQUEUE_BUMP):
             return False
         self._requeued_at[key] = now
         self._bump("lip_requeue")
+        self._cancel(q, "lip_requeue")
+        self.drain_cancels()
         return True
 
     def set_lip(self, ticker: str, side: str, t: LipTarget | None):
@@ -673,10 +674,7 @@ class OrderManager:
                 continue
             if q.state != RESTING or q.exchange_id is None or q.order_id in self._cancel_q:
                 continue
-            # A re-queued quote rests LIP_REQUEUE_BUMP over its target; amending
-            # that back down would spend a write for nothing.
-            extra = q.remaining - t.size
-            same = abs(q.price - t.price) < 1e-9 and -1e-9 <= extra <= LIP_REQUEUE_SLACK + 1e-9
+            same = abs(q.price - t.price) < 1e-9 and abs(q.remaining - t.size) < 1e-9
             if not same and now - q.sent_at >= hold - 1e-9:
                 moves.append((q, t))
         sent = 0
