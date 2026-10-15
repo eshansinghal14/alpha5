@@ -715,6 +715,50 @@ fair like 1/sqrt(time left), as theo_vol grows. One parameter, set from the
 mechanism, not fit: 180 gives x1.22 at 120s, x1.41 at 90s, x1.73 at the 60s
 cutoff (~+1c over 1-3 min at 3.5c, about half the fit's shortfall).
 Evaluate on 10s markout in the 1-3 min window, ideally alternating events.
+First read (10-14 21:12 -> 10-15 07:00, edge quotes only): 1-3 min 10s
+markout -3.4c -> +2.2c (se 2.1c, 23 events). Confounded: order_lots 1.5 -> 2,
+max_signal_age 0.75 -> 0.05s and max_position 12 changed in the same window.
+
+**Sizing (10-15).** 2,157 maker fills matched to Kalshi prints (one sweep =
+same ticker/taker side within 50ms). Sweeps > 50 lots are 30% of our fills
+and the adverse ones (10s -2.2c); <= 50 lots are +0.3..+2.8c. 86% of > 50-lot
+sweeps walked past our price, so extra size fills mostly there. If each quote
+had been 2x: +68% lots at -0.0c 10s, +1.8c settled; but by time left the
+extra lots are +1.3..+1.6c > 3 min out and -3.1c in the last 3 min (pre
+constant_edge_ref_s). Upper bound (ignores queue). Size up early, not late.
+
+**LIP (10-14).** Turned on 22:30 UTC with lip_cheap_lots stepped 25 -> 300;
+26OCT141900 lost $101 (622 of 928 lots LIP): 120-lot BTC/HYPE/ETH-yes LIP
+bids at 5-18c swept within 7s at 22:52, all three lost. Tripped the run's
+loss limit (-$84 vs -$80). Same pickoff as #5, at 120-300 lots per order.
+
+**Fair bias / calibration (10-15).** All five coins, 322 settled events
+10-11..15, snapshots every minute 870..90s, winner from Kalshi's own values.
+- Pooled calibration is good: realized - fair within +-1c from 5% to 50%,
+  ~-2.7c over 50% (z -1.2), +1.0c under 5% (z 2.2). No trailer/leader bias
+  by race position or time left (all |z| < 1.6).
+- Per coin, realized - fair: BTC +2.0c, ETH +2.1c, SOL +1.8c (all |z| ~1),
+  HYPE -1.4c, XRP -4.4c (z -3.0). BTC's "below NBBO" on the 10-14/15
+  session was that session (-1.8c, 26/30 events); over 3 days fair - mid is
+  +0.2c.
+- Not a start/end price error: our 60s TWAP vs Kalshi's expiration_value is
+  BTC +0.02bp, ETH -0.25, SOL -0.27, XRP -2.13, HYPE -2.14 (level offsets,
+  cancel in the return); the relative race-return error averages ~0 for every
+  coin (|t| < 0.4). Kalshi start anchoring is no better on average.
+- Not the vol model: on held-out days (fit 10-11..13, score 10-14..15),
+  flattening (p^0.85), shrink to 1/5 (0.05), vol x1.1-1.5 and t_nu 3/4 are
+  all no better than live; t_nu 3 and vol x1.5 are clearly worse.
+- XRP is not a vol-forecast problem: realized / forecast variance of the
+  relative return is 0.70 for XRP vs 0.62-0.99 for the others (the scale
+  monitor inflates every coin ~1.2-1.3x, 0.94-1.45 without it), and removing
+  the scale for XRP only gains 0.002 log loss (CI spans 0). Removing it for
+  all coins is clearly worse (+0.068): the extra width pays. No drift (XRP
+  relative race return -0.2bp, t -0.3). Kalshi's mid overprices XRP more
+  than we do (17.8c vs our 16.9c, realized 13.4%): likely sample luck across
+  five coins tested. Recheck in a week.
+- Kalshi mid vs live fair: log loss 1.245 vs 1.262 on common states (CI -0.037
+  to +0.003); supports market_shift_alpha 0.25, not more.
+Scripts: `%TEMP%/opencode/{all_cal,start_bias,xrp_vol,scale_test,btc_cal}.py`.
 
 ### #8 — Open
 
@@ -722,6 +766,13 @@ Evaluate on 10s markout in the 1-3 min window, ideally alternating events.
   events/arm for a 2c gap); refit edge_fraction on the new theo_vol after a
   day on fixed settings. Next if needed: a jump floor (fair change from a
   fixed 3-5bp spot shock).
+- Time-scaled size cut (e.g. half size in the last 3 min), like
+  constant_edge_ref_s, to size up early without the late pickoffs.
+- LIP needs sweep protection that works at 100+ lots before it's re-enabled.
+- XRP over-pricing and ETH's low relative vol: recheck after a week.
+- The $1,000 balance watchdog was disabled on EC2 (10-15, by request);
+  `risk.max_loss_usd` is the only automatic stop. The service file is still
+  in deploy/systemd and a redeploy could re-enable it.
 - The 2.4x live gap between theo_vol calcs 1-3 min out is likely different
   market conditions (the two agree within ~10% on identical inputs).
 - Log spot_burst as a block; consider a shorter burst hold (2-5s pulls were
