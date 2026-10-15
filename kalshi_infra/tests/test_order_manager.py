@@ -428,24 +428,24 @@ def test_trim_never_touches_quotes_above_the_ladder():
 # LIP
 # ---------------------------------------------------------------------------
 
-def test_lip_goes_after_best_level_but_before_levels_behind_it():
+def test_lip_goes_before_the_edge_ladder():
     m, ex, _ = mk(bucket=20.0, reserve=0.0)          # two writes' worth
     m.set_desired("A", "yes", D([0.41, 0.40, 0.39]))
     m.set_lip("A", "yes", LipTarget(0.30, 20.0))
     m.pump()
-    assert [(q.role, q.price) for q in ex.creates] == [("edge", 0.41), ("lip", 0.30)]
+    assert [(q.role, q.price) for q in ex.creates] == [("lip", 0.30), ("edge", 0.41)]
     ex.bucket = 20.0
     m.pump()
     assert [q.price for q in ex.creates[2:]] == [0.40, 0.39]
 
 
-def test_every_sides_best_level_before_any_lip():
-    m, ex, _ = mk(bucket=20.0, reserve=0.0)
+def test_any_lip_before_any_sides_best_edge_level():
+    m, ex, _ = mk(bucket=10.0, reserve=0.0)          # one write
     m.set_desired("A", "yes", D([0.41, 0.40]))
     m.set_desired("B", "yes", D([0.31, 0.30]))
     m.set_lip("A", "yes", LipTarget(0.20, 20.0))
     m.pump()
-    assert sorted(q.price for q in ex.creates) == [0.31, 0.41] and all(q.role == "edge" for q in ex.creates)
+    assert [(q.role, q.price) for q in ex.creates] == [("lip", 0.20)]
 
 
 def test_lip_creates_before_lip_moves():
@@ -454,7 +454,7 @@ def test_lip_creates_before_lip_moves():
     m.set_lip("A", "yes", LipTarget(0.30, 20.0))
     m.pump(); ack_all(m, ex)
     ex.bucket = 10.0                                   # one write
-    m.set_lip("A", "yes", LipTarget(0.29, 20.0))       # A wants a move
+    m.set_lip("A", "yes", LipTarget(0.30, 15.0))       # A wants a (size) move
     m.set_lip("B", "yes", LipTarget(0.25, 20.0))       # B has no LIP quote yet
     m.pump()
     assert ex.amends == [] and ex.creates[-1].ticker == "B"
@@ -468,17 +468,44 @@ def test_lip_off_cancels_at_once():
     assert ex.cancels == [(1, "lip_off")]
 
 
-def test_lip_move_waits_for_hold_then_one_amend():
+def test_lip_resting_above_target_is_cancelled_at_once():
+    """Target drops below the resting price: cancel now (no lip_hold_s wait,
+    no amend queued behind anything), then re-create at the new price."""
+    m, ex, c = mk()
+    m.lip_hold_s = 5.0
+    m.set_lip("A", "yes", LipTarget(0.13, 200.0))
+    m.pump(); ack_all(m, ex)
+    m.set_lip("A", "yes", LipTarget(0.11, 200.0))
+    assert ex.cancels == [(1, "lip_stale")] and ex.amends == []
+    m.on_cancel_done(1)
+    m.pump()
+    assert ex.creates[-1].price == 0.11
+
+
+def test_lip_stale_cancel_goes_before_edge_cancels():
+    m, ex, _ = mk(bucket=None)
+    m.set_desired("A", "yes", D([0.41, 0.40]))
+    m.set_lip("A", "yes", LipTarget(0.13, 200.0))
+    m.pump(); ack_all(m, ex)
+    ex.bucket = 2.0                                    # one cancel's worth
+    m.set_desired("A", "yes", D([], edge=None))        # edge side pulled: 2 cancels queued
+    ex.bucket = 2.0
+    m.set_lip("A", "yes", LipTarget(0.11, 200.0))      # and the LIP is stale
+    lip_ids = {q.order_id for q in ex.creates if q.role == "lip"}
+    assert any(oid in lip_ids for oid, _ in ex.cancels)
+
+
+def test_lip_move_up_waits_for_hold_then_one_amend():
     m, ex, c = mk()
     m.lip_hold_s = 1.0
     m.set_lip("A", "yes", LipTarget(0.30, 20.0))
     m.pump(); ack_all(m, ex)
-    m.set_lip("A", "yes", LipTarget(0.29, 15.0))
+    m.set_lip("A", "yes", LipTarget(0.31, 15.0))       # price UP: not stale, an amend
     m.pump()
     assert ex.amends == []
     c.t += 1.0
     m.pump()
-    assert ex.amends == [(1, 0.29, 15.0)] and ex.cancels == [] and len(ex.creates) == 1
+    assert ex.amends == [(1, 0.31, 15.0)] and ex.cancels == [] and len(ex.creates) == 1
 
 
 def test_pull_all_cancels_lip_too():

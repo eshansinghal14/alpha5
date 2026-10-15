@@ -385,6 +385,17 @@ class OrderManager:
                 if q.state != CANCELLING:
                     self._cancel(q, "lip_off")
             self.drain_cancels()
+            return
+        # Resting above the target price is a stale LIP quote (fair or the book
+        # moved down): cancel now instead of waiting for an amend behind the
+        # edge ladder and lip_hold_s. SOL 26OCT151430 swept 197 lots at 0.13
+        # while the target was 0.11 and the move sat in the deferred queue.
+        stale = [q for q in self.live(ticker, side, LIP)
+                 if q.state != CANCELLING and q.price > t.price + 1e-9]
+        for q in stale:
+            self._cancel(q, "lip_stale")
+        if stale:
+            self.drain_cancels()
 
     def _unsafe(self, ticker, side, d: Desired) -> list[Quote]:
         """Live edge quotes more than keep_inside inside the edge, or every
@@ -476,12 +487,17 @@ class OrderManager:
         return int(round((top - q.price) / TICK))
 
     def cancel_order(self) -> list[tuple[int, int]]:
-        """Queued cancels as (rank, order_id), lowest rank first: distance
-        from the side's touch (touch levels of every side first), except
-        "room" and "trim" cancels, which shed the deepest first."""
+        """Queued cancels as (rank, order_id), lowest rank first. LIP safety
+        cancels (stale, off) go before everything: one LIP order is 50-200
+        lots, an edge level a few. Then distance from the side's touch (touch
+        levels of every side first), except "room" and "trim" cancels, which
+        shed the deepest first."""
         out = []
         for oid, reason in list(self._cancel_q.items()):
             q = self.quotes.get(oid)
+            if q is not None and q.role == LIP and reason != "lip_requeue":
+                out.append((-10**6, oid))
+                continue
             d = 0 if q is None else self._distance(q)
             out.append((-d if reason in ("room", "trim") else d, oid))
         return out
@@ -741,11 +757,14 @@ class OrderManager:
         sent = self._fix_ahead()
         if self._cancel_q:
             return sent
-        n, done = self._fill_edge(lambda dist: dist == 0)
+        # LIP before the edge ladder: a handful of orders (~14 tok/s live on
+        # 2026-10-15), and with the ladder saturating the bucket a LIP reprice
+        # behind it was deferred 3,699 times in one session.
+        n, done = self._lip_work()
         sent += n
         if not done:
             return sent
-        n, done = self._lip_work()
+        n, done = self._fill_edge(lambda dist: dist == 0)
         sent += n
         if not done:
             return sent
@@ -1027,15 +1046,15 @@ class WriteGroup:
         sent = sum(m._fix_ahead() for m in ms)
         if any(m._cancel_q for m in ms):
             return sent
-        n, done = self._fill_edge(members, lambda dist: dist == 0)
-        sent += n
-        if not done:
-            return sent
-        for m in ms:
+        for m in ms:                                   # LIP first, as in OrderManager.pump
             n, done = m._lip_work()
             sent += n
             if not done:
                 return sent
+        n, done = self._fill_edge(members, lambda dist: dist == 0)
+        sent += n
+        if not done:
+            return sent
         n, done = self._fill_edge(members, lambda dist: dist > 0)
         sent += n
         if done and not any(m.missing() for m in ms):
