@@ -592,6 +592,34 @@ def test_lip_floor_counts_what_is_already_accrued():
     assert ctx.lip_targets[("A", "yes")] is not None
 
 
+def test_lip_floor_shortfall_shrinks_with_accrued():
+    """$0.50 already earned: the rest needs only $0.50 to keep a live quote and
+    $0.60 to start one. 120s left x $0.004/s = $0.48 future."""
+    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_rich_lots=0.0)
+    q.lip.accrued_usd["A"] = 0.50
+    lip_step(q, ctx, yes=FLOOR_YES)                       # need 0.60 to start, have 0.48
+    assert ctx.lip_targets[("A", "yes")] is None
+    q.lip.accrued_usd["A"] = 0.62                          # need 0.456 to start; 0.48 left
+    lip_step(q, ctx, yes=FLOOR_YES, dt=0.1)
+    assert ctx.lip_targets[("A", "yes")] is not None
+
+
+def test_lip_floor_already_resting_needs_just_the_shortfall():
+    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_rich_lots=0.0)
+    q.lip.accrued_usd["A"] = 0.53                          # need 0.47 to keep, 0.564 to start
+    ctx.lip_live[("A", "yes")] = (0.10, 400.0)
+    lip_step(q, ctx, yes=FLOOR_YES)
+    assert ctx.lip_targets[("A", "yes")] is not None
+
+
+def test_lip_floor_gone_once_period_already_pays():
+    """Over $1 already earned: no floor at all, even with ~nothing left to earn."""
+    q, ctx = lip_q(close=T0 + pd.Timedelta(seconds=181), lip_rich_lots=0.0)
+    q.lip.accrued_usd["A"] = 1.05
+    lip_step(q, ctx, yes=FLOOR_YES)
+    assert ctx.lip_targets[("A", "yes")] is not None
+
+
 def test_lip_floor_ignores_size_behind_a_level_already_at_target():
     """Others' 500 at the best bid meet the 300 target alone, so our 400 behind
     them scores nothing (lip._score_side) -- the floor sees $0 and blocks."""
@@ -637,9 +665,9 @@ def test_lip_max_markets_member_holds_until_beaten_by_25pct():
 
 
 def test_lip_floor_hysteresis_start_needs_more_than_keep():
-    """$1.08 projected: not enough to START (needs 1.20) ..."""
+    """$0.55 accrued, $0.48 still to earn: shortfall 0.45, so START needs 0.54 ..."""
     q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_rich_lots=0.0)
-    q.lip.accrued_usd["A"] = 0.60                                       # 0.60 + 0.48 = $1.08
+    q.lip.accrued_usd["A"] = 0.55
     lip_step(q, ctx, yes=FLOOR_YES)
     assert ctx.lip_targets[("A", "yes")] is None
     # ... but enough to KEEP a LIP quote that's already resting.
