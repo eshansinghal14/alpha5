@@ -427,8 +427,10 @@ def no_lip_floor(request, monkeypatch):
         monkeypatch.setattr(quoter_mod, "LIP_START_PAYOUT_USD", 0.0)
 
 
-def lip_q(close=CLOSE, own_in_book=False, **lip):
-    return (Quoter(lip_cfg(**lip), Model(), FREE, close_time=close, lip=LipTracker({"A": LIPP})),
+def lip_q(close=CLOSE, own_in_book=False, max_loss=1e6, **lip):
+    c = lip_cfg(**lip)
+    c.risk = P.RiskParams(max_loss_usd=max_loss, max_signal_age_s=1.0)
+    return (Quoter(c, Model(), FREE, close_time=close, lip=LipTracker({"A": LIPP})),
             LipCtx(own_in_book=own_in_book))
 
 
@@ -830,6 +832,53 @@ def test_lip_exit_continues_past_the_lip_time_cutoff():
     lip_step(q, ctx)
     assert ctx.lip_targets[("A", "yes")] is None
     assert ctx.lip_targets[("A", "no")].size == 120.0
+
+
+def test_loss_budget_shrinks_lip_entry_to_fit():
+    """Worst case = every order fills and settles against us. Yes 400 @0.10
+    risks $40 if A loses; no @0.89 risks $0.89/lot if A wins. With $60 of
+    budget and only one market, the outcomes are 'A wins' (-0.89n + 360)
+    and 'A loses' (-40 + 0.11n): the yes leg alone already uses $40, so the
+    no side gets what keeps both >= -60."""
+    q, ctx = lip_q(max_loss=60.0)
+    lip_step(q, ctx)
+    y, n = ctx.lip_targets[("A", "yes")], ctx.lip_targets[("A", "no")]
+    assert y.size == 400.0
+    assert n is not None and n.size <= 100.0
+    worst = q._worst_case(ctx, {("A", "yes", "lip"): [(y.price, y.size)], ("A", "no", "lip"): [(n.price, n.size)]})
+    assert worst >= -60.0 - 1e-6
+
+
+def test_loss_budget_blocks_lip_when_exhausted():
+    q, ctx = lip_q(max_loss=30.0, lip_rich_lots=0.0)       # yes 400 @0.10 alone would risk $40
+    lip_step(q, ctx)
+    y = ctx.lip_targets[("A", "yes")]
+    assert y is not None and y.size == 300.0              # $30 / $0.10
+    assert q.block_counts.get("max_loss_budget", 0) >= 1
+
+
+def test_loss_budget_counts_held_position_and_run_offset():
+    q, ctx = lip_q(max_loss=50.0, lip_rich_lots=0.0)
+    ctx._engine = types.SimpleNamespace(loss_offset=-20.0)  # earlier events lost $20
+    lip_step(q, ctx)
+    assert ctx.lip_targets[("A", "yes")].size == 300.0    # $30 left / $0.10
+
+
+def test_loss_budget_never_cuts_a_lip_exit():
+    q, ctx = lip_q(max_loss=1.0, lip_rich_lots=0.0)
+    _lip_fill(ctx, "yes", 120.0, 0.10)                     # $12 at risk already, over budget
+    lip_step(q, ctx)
+    assert ctx.lip_targets[("A", "no")].size == 120.0      # the exit still rests in full
+
+
+def test_loss_budget_shrinks_edge_ladder_and_takes():
+    q, ctx = Quoter(cfg(order_lots=10.0, quote_levels_behind=1), Model(), FREE, close_time=None), Ctx()
+    q.cfg.risk = P.RiskParams(max_loss_usd=5.0, max_signal_age_s=1.0)
+    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, Book("A", 0.30, 0.70))
+    d = ctx.desired[("A", "yes")]
+    # Two yes levels near 0.48/0.47 at 10 lots would risk ~$9.5 if A loses.
+    assert d.lots * sum(d.prices) <= 5.0 + 1e-6
+    assert q.block_counts.get("max_loss_budget", 0) >= 1
 
 
 def test_lips_at_band_edges():

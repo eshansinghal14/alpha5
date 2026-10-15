@@ -369,14 +369,20 @@ class Quoter:
             self._take_since.pop(key_a, None)
 
         if bid_final is not None:
-            ctx.buy(ticker=ticker, side="yes", size=q.order_lots, price=round(bid_final, 2),
-                    order_type="limit")
-            self._sent.setdefault((ticker, "yes"), []).append((now, q.order_lots))
+            z = self._fit_to_loss(ctx, ticker, "yes", "take", [round(bid_final, 2)], q.order_lots)
+            if z >= 0.01:
+                ctx.buy(ticker=ticker, side="yes", size=z, price=round(bid_final, 2), order_type="limit")
+                self._sent.setdefault((ticker, "yes"), []).append((now, z))
+            else:
+                self._block("max_loss_budget")
         if ask_final is not None:
             # Selling yes at p == buying no at 1 - p.
-            ctx.buy(ticker=ticker, side="no", size=q.order_lots, price=round(1.0 - ask_final, 2),
-                    order_type="limit")
-            self._sent.setdefault((ticker, "no"), []).append((now, q.order_lots))
+            z = self._fit_to_loss(ctx, ticker, "no", "take", [round(1.0 - ask_final, 2)], q.order_lots)
+            if z >= 0.01:
+                ctx.buy(ticker=ticker, side="no", size=z, price=round(1.0 - ask_final, 2), order_type="limit")
+                self._sent.setdefault((ticker, "no"), []).append((now, z))
+            else:
+                self._block("max_loss_budget")
 
         # Quotes: the take edge minus the taker fee, plus quoting_edge on top
         # (a resting quote is picked off by whoever is faster). Maker fee,
@@ -400,6 +406,17 @@ class Quoter:
         out, lips = {}, {}
         for side, res in (("yes", res_b), ("no", res_a)):
             d = self._ladder(ticker, side, res, market_bid, market_ask, ladder, net, now)
+            if d.prices:
+                # Worst case assumes every level fills; shrink the lots (and the
+                # side's room) until the whole ladder fits under max_loss_usd.
+                z = self._fit_to_loss(ctx, ticker, side, "edge", d.prices, d.lots)
+                if z < d.lots - 1e-9:
+                    self._block("max_loss_budget")
+                    if z < 0.01:
+                        d = Desired([], d.lots, d.edge_limit, 0.0, d.max_ahead_price, max_levels=d.max_levels)
+                    else:
+                        d = Desired(d.prices, z, d.edge_limit, min(d.room, z * len(d.prices)),
+                                    d.max_ahead_price, max_levels=d.max_levels)
             self._publish(ctx, ticker, side, d)
             out[side] = d
             # LIP obeys enable_quoting, the model's side blocks and quote_block
@@ -423,6 +440,14 @@ class Quoter:
                 # It sits in front of the book, so extra size there would be
                 # new risk at the price most likely to fill.
                 lips[side] = exit_t
+            t = lips[side]
+            if t is not None and not t.front:
+                # Exits reduce risk and are never cut; entries are sized to fit
+                # what's left of the worst-case loss budget.
+                z = self._fit_to_loss(ctx, ticker, side, "lip", [t.price], t.size)
+                if z < t.size - 1e-9:
+                    self._block("max_loss_budget")
+                    lips[side] = LipTarget(t.price, math.floor(z)) if z >= 1 else None
             self._publish_lip(ctx, ticker, side, lips[side])
         quote_bid = _top_yes("yes", out["yes"])
         quote_ask = _top_yes("no", out["no"])
@@ -547,6 +572,73 @@ class Quoter:
             return None
         self._block("lip_exit")
         return LipTarget(price, float(qty), front=True)
+
+    # ------------------------------------------------------------------
+    # Worst-case loss budget
+    # ------------------------------------------------------------------
+
+    def _settle_pnl(self, ctx, extra: dict | None = None, skip: set | None = None) -> dict:
+        """Settlement PnL of the event's positions plus every live order (edge
+        and LIP, all assumed filled at its price), plus `extra`
+        {(ticker, side, role): [(price, size)]}, for each possible winner.
+        `skip` {(ticker, side, role)}: live orders left out (the ones `extra`
+        replaces). Keys of the result are the winning ticker or None (an
+        outcome where none of our markets win). Each market of the event
+        settles YES only if its coin wins."""
+        skip = skip or set()
+        legs: dict[str, list] = {}
+        for t in self.fairs:
+            pos = ctx.position(t)
+            legs[t] = [("yes", pos.yes_qty, pos.yes_cost), ("no", pos.no_qty, pos.no_cost), ("fee", pos.fees_paid, 0.0)]
+        live = [((t, s, "edge"), z) for (t, s), z in self._ours.items()]
+        live += [((t, s, "lip"), [v]) for (t, s), v in self._lip_live.items() if v]
+        for key, ours in live:
+            if key in skip:
+                continue
+            for p, z in ours:
+                legs.setdefault(key[0], []).append((key[1], z, p * z))
+        for (t, side, _role), ours in (extra or {}).items():
+            for p, z in ours:
+                legs.setdefault(t, []).append((side, z, p * z))
+        out = {}
+        for winner in list(legs) + [None]:
+            total = 0.0
+            for t, ls in legs.items():
+                yes_wins = t == winner
+                for side, qty, cost in ls:
+                    if side == "fee":
+                        total -= qty
+                    elif side == "yes":
+                        total += (qty if yes_wins else 0.0) - cost
+                    else:
+                        total += (0.0 if yes_wins else qty) - cost
+            out[winner] = total
+        return out
+
+    def _worst_case(self, ctx, extra=None, skip=None) -> float:
+        """Worst settlement PnL over every outcome, plus real PnL already booked
+        this run (engine.loss_offset)."""
+        offset = float(getattr(getattr(ctx, "_engine", None), "loss_offset", 0.0) or 0.0)
+        return min(self._settle_pnl(ctx, extra, skip).values()) + offset
+
+    def _fit_to_loss(self, ctx, ticker, side, role, prices, size) -> float:
+        """Largest per-level size <= `size` for orders at `prices` (one level
+        each) on (ticker, side, role), REPLACING what that role has resting
+        there, that keeps the worst-case loss inside risk.max_loss_usd. Whole
+        hundredths; 0 if none fits. Every order is assumed to fill: a sweep can
+        take all of them."""
+        lim = -self.cfg.risk.max_loss_usd
+        key = (ticker, side, role)
+
+        def ok(z):
+            return self._worst_case(ctx, {key: [(p, z) for p in prices]}, {key}) >= lim - 1e-9
+        if size <= 0 or not prices or ok(size):
+            return size
+        lo, hi = 0.0, size
+        for _ in range(24):
+            mid = (lo + hi) / 2
+            lo, hi = (mid, hi) if ok(mid) else (lo, mid)
+        return math.floor(lo * 100 + 1e-9) / 100
 
     def _lip_debounce(self, ticker, side, target, now_s, hard: bool):
         """Hold a resting LIP quote through a SOFT pull (spot_burst, payout
