@@ -280,7 +280,14 @@ def _render_markets(series: str):
     for tk in markets:
         m = _market_stats(day, tk)
         c = st.columns([3, 2, 2, 2, 2] if lip_on else [3, 2, 2, 2], vertical_alignment="bottom")
-        c[0].markdown(f"#### {_market_label(tk, s.get('event_ticker'))}")
+        label = _market_label(tk, s.get("event_ticker"))
+        lq = m.get("lip_quotes") or []
+        if lq:
+            # e.g. "🏳 LIP yes 200@0.12" -- the market we're farming LIP on right now.
+            flag = ", ".join(f"{side} {size:g}@{px:.2f}" for side, px, size in lq)
+            c[0].markdown(f"#### {label} :orange-background[🏳 LIP {flag}]")
+        else:
+            c[0].markdown(f"#### {label}")
         c[1].metric("PnL", "n/a" if m.get("pnl") is None else f"${m['pnl']:+.2f}")
         c[2].metric("Contracts traded", f"{m.get('contracts') or 0:.4g}")
         c[3].metric("Position", f"{m.get('position') or 0:+.4g}")

@@ -107,11 +107,17 @@ def build_summary(*, series: str, event_ticker: str, engine, quoter, store, mode
     for f in fills:
         volume[f.ticker] = volume.get(f.ticker, 0.0) + f.size
     positions = engine.portfolio.positions
+    # Our live LIP orders per market: [(side, own-side price, remaining)].
+    lip_live: dict[str, list] = {}
+    for q in engine.om.live(role="lip"):
+        if q.state != "cancelling":
+            lip_live.setdefault(q.ticker, []).append((q.side, round(q.price, 2), round(q.remaining, 2)))
     markets = {t: {"pnl": by_tk.get(t, 0.0),
                    "contracts": volume.get(t, 0.0),
                    "position": (positions[t].yes_qty - positions[t].no_qty) if t in positions else 0.0,
                    "lip": (lip["accrued_usd"].get(t) if lip else None),
-                   "lip_qualifying": (lip["qualifying_fraction"].get(t) if lip else None)}
+                   "lip_qualifying": (lip["qualifying_fraction"].get(t) if lip else None),
+                   "lip_quotes": lip_live.get(t, [])}
                for t in set(model.tickers) | set(by_tk) | set(volume)}
     from kalshi_infra.config import to_dict
     return {
