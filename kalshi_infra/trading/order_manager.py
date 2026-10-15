@@ -33,6 +33,10 @@ A queued create carries no price of its own: it's re-derived from the
 CURRENT desired set each pump, so a queue that lagged behind a fair move can
 never send a stale quote.
 
+A side whose ladder moved while one of its creates or amends was in flight
+gets no new create or move until Kalshi answers (see `missing`); cancels
+are never held back.
+
 An edge quote is cancelled when (a) it is more than `keep_inside` inside the
 edge, (b) a pull, (c) its size is needed under the position cap, (d) it has
 sat above others' touch + max_improve_ticks for `ahead_grace_s` with no
@@ -521,15 +525,34 @@ class OrderManager:
     # Edge moves and creates
     # ------------------------------------------------------------------
 
+    def _stale_in_flight(self, ticker: str, side: str, wanted: set[float]) -> bool:
+        """An edge create or amend on this side is still unanswered for a
+        price the current ladder no longer wants: the ladder moved while it
+        was in flight."""
+        return any(q.state in (CREATING, AMENDING) and round(q.price, 2) not in wanted
+                   for q in self.live(ticker, side, EDGE))
+
     def missing(self) -> list[tuple[int, str, str, float, float]]:
         """Every wanted edge level that has nothing at it, as heap entries
         (distance-from-touch, ticker, side, price, lots). Distance is ticks
         below the side's first wanted price, so the touch level of every
-        market goes before any market's second level."""
+        market goes before any market's second level.
+
+        While a create or amend on a side is in flight for a price the
+        ladder has since moved off, the side gets nothing new until Kalshi
+        answers: the ladder is still moving, and whatever we send now is
+        sent for a price that may be gone too. Building a fresh ladder
+        (every in-flight order still wanted) is not held back. KXINXDUD's top
+        quote flipped 1 tick and back ~300x/min, each flip queued a create on
+        top of the unacked one, and 27% of its creates were cancelled the
+        moment they were acked (2026-10-15)."""
         out = []
         now = self.clock()
         for (ticker, side), d in self.desired.items():
             if not d.prices or d.edge_limit is None:
+                continue
+            if self._stale_in_flight(ticker, side, {round(p, 2) for p in d.prices}):
+                self._bump("create_deferred:in_flight")
                 continue
             # A cancelling order still occupies its price until confirmed gone:
             # re-creating there would stack a second order on one that may be

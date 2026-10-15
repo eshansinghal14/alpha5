@@ -5,6 +5,8 @@ Kept separate from config.json on purpose: the switch that moves real money
 must not ride along with an edge tweak, and it has different startup
 semantics -- a leftover `live_trading: true` from a previous session must
 NOT re-arm on start, so only a file written after the process started counts.
+The one exception is opt-in (`run --resume-arm`, used by the EC2 units):
+see resumable_arm.
 """
 from __future__ import annotations
 
@@ -52,6 +54,38 @@ class StopWatcher:
                 return str(json.load(fh).get("reason") or "stop requested")
         except (OSError, json.JSONDecodeError):
             return None
+
+
+def resumable_arm(series: str, max_age_s: float) -> str | None:
+    """Why a restarted process may re-arm `series`, or None if it may not.
+
+    Only an arm request made in the last `max_age_s`, and only if no
+    STOP.json (stop-all, loss halt, balance watchdog) was written after it:
+    a deliberate stop must never be undone by a restart. Restarts that
+    dropped armed S&P to shadow for 7+ min each happened twice on
+    2026-10-15."""
+    try:
+        with open(trading_mode_path(series)) as fh:
+            tm = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not tm.get("live_trading"):
+        return None
+    try:
+        at = pd.Timestamp(tm["requested_at"])
+    except (KeyError, ValueError):
+        return None
+    age = (pd.Timestamp.now(tz="UTC") - at).total_seconds()
+    if age > max_age_s:
+        return None
+    try:
+        with open(STOP_PATH) as fh:
+            stop_at = pd.Timestamp(json.load(fh)["requested_at"])
+        if stop_at >= at:
+            return None
+    except (OSError, json.JSONDecodeError, KeyError, ValueError):
+        pass
+    return f"armed {age / 3600:.1f}h ago ({at.isoformat()}), no stop since"
 
 
 class TradingModeWatcher:

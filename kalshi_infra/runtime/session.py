@@ -32,7 +32,7 @@ from kalshi_infra.kalshi import markets as km
 from kalshi_infra.kalshi.orders import KalshiOrderClient
 from kalshi_infra.kalshi.ws_feed import LiveKalshiFeed
 from kalshi_infra.runtime import persist, write_groups
-from kalshi_infra.runtime.control import StopWatcher, TradingModeWatcher, request_stop_all
+from kalshi_infra.runtime.control import StopWatcher, TradingModeWatcher, request_stop_all, resumable_arm
 from kalshi_infra.runtime.series import Series
 from kalshi_infra.runtime.writer import DecisionLog, SnapshotWriter
 from kalshi_infra.trading import lip as lipmod
@@ -74,8 +74,15 @@ class StopAll(Exception):
 
 
 async def session_loop(series: Series, *, live_trading: bool, carry_arm: bool,
-                       event_ticker: str | None = None):
-    """`event_ticker` names a one-off event (no rollover)."""
+                       event_ticker: str | None = None, resume_arm_s: float | None = None):
+    """`event_ticker` names a one-off event (no rollover). `resume_arm_s`:
+    start armed if the dashboard's last request was an arm made within this
+    many seconds and nothing stopped trading since (control.resumable_arm)."""
+    if not live_trading and resume_arm_s:
+        why = resumable_arm(series.ticker, resume_arm_s)
+        if why is not None:
+            _log(series.ticker, f"resuming REAL TRADING after restart: {why}")
+            live_trading = True
     writer = SnapshotWriter(series.ticker)
     try:
         await _session_loop(series, writer, live_trading=live_trading, carry_arm=carry_arm,

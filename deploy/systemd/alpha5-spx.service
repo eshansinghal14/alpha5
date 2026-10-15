@@ -12,7 +12,9 @@ Environment=PYTHONIOENCODING=utf-8
 # (alpha5-ibgateway's docker port). Without it the hub reports "not
 # connected", every series goes stale and nothing quotes; it reconnects by
 # itself once the gateway is up.
-ExecStart=/opt/alpha5/.venv/bin/python -u -m kalshi_strategies.run --series KXINX
+# --resume-arm-h 18: a restart re-arms any series whose last dashboard request
+# was an arm in the last 18h (overnight between events) with no STOP since.
+ExecStart=/opt/alpha5/.venv/bin/python -u -m kalshi_strategies.run --series KXINX --resume-arm-h 18
 # Below crypto (nice -5): crypto trades real money and must win the CPU.
 # run.py would otherwise raise itself to above_normal like crypto.
 Environment=ALPHA5_PRIORITY=normal

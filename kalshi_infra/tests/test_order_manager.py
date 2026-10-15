@@ -602,3 +602,33 @@ def test_no_level_cap_keeps_old_behaviour():
     _resting(m, [0.56, 0.55, 0.54])
     m.set_desired("A", "yes", Desired([0.52, 0.51], 1.0, 0.56, 10.0, None))
     assert ex.cancels == []
+
+
+def test_no_new_create_while_a_moved_off_create_is_in_flight():
+    """2026-10-15 KXINXDUD: the top quote flipped 1 tick and back while the
+    first create was unacked; every flip sent another create."""
+    m, ex, _ = mk()
+    m.set_desired("A", "yes", D([0.41]))
+    m.pump()
+    assert [q.price for q in ex.creates] == [0.41]
+    m.set_desired("A", "yes", D([0.42, 0.41]))      # 0.41 still wanted: not stale
+    m.pump()
+    assert [q.price for q in ex.creates] == [0.41, 0.42]
+    m.set_desired("A", "yes", D([0.40, 0.39]))      # ladder moved off both unacked prices
+    m.pump()
+    assert [q.price for q in ex.creates] == [0.41, 0.42]
+    assert m.counts["create_deferred:in_flight"] >= 1
+    ack_all(m, ex)                                  # answers land: resume
+    m.pump()
+    assert 0.40 in [q.price for q in ex.creates] or any(a[1] == 0.40 for a in ex.amends)
+
+
+def test_in_flight_hold_is_per_side():
+    m, ex, _ = mk()
+    m.set_desired("A", "yes", D([0.41]))
+    m.pump()
+    m.set_desired("A", "yes", D([0.38]))            # yes side now stale in flight
+    m.set_desired("A", "no", D([0.45]))
+    m.pump()
+    assert ("no", 0.45) in [(q.side, q.price) for q in ex.creates]
+    assert 0.38 not in [q.price for q in ex.creates if q.side == "yes"]
