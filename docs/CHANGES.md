@@ -3,6 +3,17 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-16 (evening, later) — LIP gate is the yes price; bid and offer on longshots
+
+- The 0.50 gate, the band and the taper are now by each order's price in yes
+  terms (the yes bid; 1 − the no bid for the offer), not its own-side price.
+  So a longshot market (yes under 0.50) quotes both: the yes bid
+  (`lip_bid_lots`) and the yes offer, a no bid near 0.80-0.90
+  (`lip_offer_lots`). A favourite market quotes neither. The previous version
+  gated the no bid on its own price, which put the offer on favourites only.
+- The LIP exit follows the same gate: cheap-yes inventory is offered back as a
+  no bid at a yes offer under 0.50 again.
+
 ## 2026-10-16 (evening) — per-side LIP sizes; nothing at or above 0.50
 
 - `lip_cheap_lots` -> `lip_bid_lots` (yes bid) and `lip_offer_lots` (yes
