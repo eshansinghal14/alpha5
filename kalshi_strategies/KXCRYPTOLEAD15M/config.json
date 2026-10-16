@@ -62,7 +62,7 @@
       "XRP": 17200,
       "HYPE": 3650
     },
-    "burst_hold_s": 1.5,
+    "burst_hold_s": 0.5,
     "quote_before_start": false,
     "soft_stale_s": 3.0,
     "hard_stale_s": 15.0,

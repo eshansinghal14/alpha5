@@ -55,7 +55,10 @@ class CryptoPricingParams:
         "time covered 66 of 231 maker fills and $90 of their $153 5s adverse markout. Takes are left "
         "alone: takes in those windows were not worse. null disables.", editable=False)
     burst_hold_s: float = param(
-        "How long a burst keeps quotes pulled after the last print over the threshold.", min=0, step=0.25)
+        "How long a burst keeps quotes pulled after the last print over the threshold. Replay of every "
+        "Kalshi print 10-15 17:00 to 10-16 08:45 UTC: the toxic flow is while the trailing-1s trigger is "
+        "still over (+1.1c/lot to the taker at 10s); from 0.25s after it the flow favours makers, so 1.5s "
+        "sat out good trades. 0.5s leaves margin for the cancel/requote round trip.", min=0, step=0.25)
     quote_before_start: bool = param(
         "Quote before the start TWAP is locked (pre-open / forming start average).")
     soft_stale_s: float = param("Feed health: a coin older than this is DEGRADED (priced off last value).",

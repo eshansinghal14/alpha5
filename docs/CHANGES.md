@@ -10,6 +10,12 @@ Reverse chronological. One section per material change. Entries before
   07:45 UTC, ~9 of 48 big LIP sweeps landed inside the 2s hold. The hold
   still covers the other soft pulls (payout floor, max-markets slot, band,
   fair cap).
+- `pricing.burst_hold_s` 1.5 -> 0.5 (crypto). Replayed over every public
+  Kalshi print 10-15 17:00 to 10-16 08:45 UTC: prints while the trailing-1s
+  burst trigger is still over ran +1.1c/lot to the taker at 10s; every bucket
+  from 0.25s to 5s after it ran against the taker. Time pulled 19.5% -> 12.6%
+  in the replay. State-based release (stay out while any coin is in its top
+  2-5% of 1s notional or spot is moving) did no better than fixed 0.5s.
 - Dashboard LIP column leads with net = payable reward + 10s markout $ (60s
   and settled below). Settlement PnL is too noisy to judge LIP on. Every
   column's markout tile shows 1s, 10s and 60s.
