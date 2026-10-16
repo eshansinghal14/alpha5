@@ -66,12 +66,9 @@ TAKE_HOLD_S = 0.5
 # (CFTC filing 2026-07-15), so a market whose best case -- accrued plus the
 # current $/s held to the LIP stop, never filled -- is below it isn't quoted.
 LIP_MIN_PAYOUT_USD = 1.0
-# A market not yet LIP-quoted must be able to earn this / LIP_MIN_PAYOUT_USD
-# times its remaining shortfall to start; one already quoted only needs the
-# shortfall itself. Live 2026-10-15 16:02-16:05 UTC: BTC
-# projected $1.00-1.30 and a single threshold cancelled and re-created its
-# 200-lot order on every small book change (10 creates, 8 cancels in 3 min).
-LIP_START_PAYOUT_USD = 1.2
+# Kalshi rounds the payout down to the cent, so once a market pays without a
+# side, a side adding under this over the rest of the period earns nothing.
+LIP_PAYOUT_TICK_USD = 0.01
 # A resting LIP quote is pulled for a soft reason only once it has lasted this
 # long. Live 2026-10-15 16:02-17:08 UTC: 513 LIP creates vs 22 moves, the order
 # up ~20% of its eligible time, mostly from sub-second fair-margin flicker.
@@ -447,15 +444,14 @@ class Quoter:
             if exit_t is not None:
                 # One order per side: the exit wins (front of the book), sized to
                 # the inventory plus this side's band size. The band part is only
-                # there to farm LIP: dropped when it earns none (e.g. a one-sided
-                # book), so the exit rests at the inventory alone.
+                # there to farm LIP: dropped when it adds nothing payable (e.g. a
+                # one-sided book), so the exit rests at the inventory alone.
                 inv = self._lip_exit_qty.get((ticker, side), 0.0)
                 if exit_t.size > inv + 1e-9 and self.lip is not None:
-                    gain = (self._lip_rate(ticker, {**lips, side: exit_t}, ladder)
-                            - self._lip_rate(ticker, {**lips, side: LipTarget(exit_t.price, inv, front=True)}, ladder))
-                    if gain <= LIP_MIN_RATE_USD_S:
+                    bare = LipTarget(exit_t.price, inv, front=True)
+                    if not self._lip_adds(ticker, {**lips, side: exit_t}, {**lips, side: bare}, ladder, now):
                         self._block("lip_no_reward")
-                        exit_t = LipTarget(exit_t.price, inv, front=True)
+                        exit_t = bare
                 lips[side] = exit_t
             t = lips[side]
             if t is not None:
@@ -721,51 +717,72 @@ class Quoter:
             sides[side] = levels_with_ours(bids, ours)
         return reward_rate(sides["yes"], sides["no"], params)
 
+    def _lip_left_s(self, now) -> float | None:
+        """Seconds of LIP quoting left this period (to the LIP stop); None
+        without a close time."""
+        if self.close_time is None:
+            return None
+        return max((self.close_time - now).total_seconds() - self.cfg.lip.lip_min_time_left_s, 0.0)
+
+    def _lip_future(self, ticker, rate, now) -> float:
+        """$ a `rate` ($/s) adds over the rest of the LIP window, never filled,
+        capped at what the account cap still allows."""
+        future = rate * (self._lip_left_s(now) or 0.0)
+        params = self.lip.params.get(ticker)
+        return min(future, remaining_cap_usd(params, self.lip.accrued_usd.get(ticker, 0.0))) if params else future
+
+    def _lip_adds(self, ticker, with_lips, without_lips, ladder, now) -> bool:
+        """Whether going from `without_lips` to `with_lips` can change what
+        Kalshi pays for this market: it must earn something, and once the
+        market reaches $1 without it, at least a cent over the rest of the
+        period (payouts round down to the cent). A part the market needs to
+        reach $1 is always kept; the payout floor judges the whole market."""
+        r_with = self._lip_rate(ticker, with_lips, ladder)
+        r_without = self._lip_rate(ticker, without_lips, ladder)
+        if r_with - r_without <= LIP_MIN_RATE_USD_S:
+            return False
+        if self._lip_left_s(now) is None:
+            return True
+        accrued = self.lip.accrued_usd.get(ticker, 0.0)
+        with_usd = accrued + self._lip_future(ticker, r_with, now)
+        without_usd = accrued + self._lip_future(ticker, r_without, now)
+        return without_usd < LIP_MIN_PAYOUT_USD or with_usd - without_usd >= LIP_PAYOUT_TICK_USD - 1e-12
+
     def _lip_select(self, ctx, ticker, lips, ladder, now) -> dict:
         """Apply the per-market LIP gates to this market's side targets: the
         payout floor (the rest of the period must be able to earn what's still
-        short of $1, never filled; x1.2 to start a quote) and
-        lip_max_markets (only the event's top markets by that projection)."""
+        short of $1, never filled) and lip_max_markets (only the event's top
+        markets by that projection)."""
         lc = self.cfg.lip
         if self.lip is None or all(t is None for t in lips.values()):
             self._lip_proj.pop(ticker, None)
             self._lip_set.discard(ticker)
             return lips
-        rate = self._lip_rate(ticker, lips, ladder)
-        # A side whose quote adds no reward is fill risk for nothing: a one-
-        # sided book (Kalshi excludes the snapshot), or size behind a level
-        # that already meets the target. The payout floor alone missed this
-        # once $1 was accrued (shortfall 0, so a $0/s quote still passed).
+        # A side that can't change the payout is fill risk for nothing: a one-
+        # sided book (Kalshi excludes the snapshot), or a cheap side behind a
+        # 100k-lot wall (SOL @0.01 at a 0.1% share: under a cent a period,
+        # 10-16 10:05 UTC). Each side is judged with the other as it stands, so
+        # two sides the market needs together to reach $1 both stay.
         lips = dict(lips)
         for side in ("yes", "no"):
-            if lips[side] is not None:
-                without = self._lip_rate(ticker, {**lips, side: None}, ladder)
-                if rate - without <= LIP_MIN_RATE_USD_S:
-                    lips[side] = None
-                    self._block("lip_no_reward")
+            if lips[side] is not None and not self._lip_adds(ticker, lips, {**lips, side: None}, ladder, now):
+                lips[side] = None
+                self._block("lip_no_reward")
         if all(t is None for t in lips.values()):
             self._lip_proj.pop(ticker, None)
             self._lip_set.discard(ticker)
             return lips
-        rate = self._lip_rate(ticker, lips, ladder)
-        left = None if self.close_time is None else \
-            max((self.close_time - now).total_seconds() - lc.lip_min_time_left_s, 0.0)
+        left = self._lip_left_s(now)
         accrued = self.lip.accrued_usd.get(ticker, 0.0)
-        future = rate * (left if left is not None else 0.0)
-        params = self.lip.params.get(ticker)
-        if params is not None:
-            future = min(future, remaining_cap_usd(params, accrued))
+        future = self._lip_future(ticker, self._lip_rate(ticker, lips, ladder), now)
         proj = accrued + future
         self._lip_proj[ticker] = proj
         off = {"yes": None, "no": None}
         # What the rest of the period still has to earn: $1 less what's already
-        # accrued (0 once we're past $1). The start margin scales that shortfall,
-        # not the $1 total, so $0.50 already earned needs ~$0.60 more to start,
-        # not $0.70.
+        # accrued (0 once we're past $1). One threshold for starting and keeping
+        # a quote: a x1.2 start margin re-applied after every burst pull (~every
+        # 11s) and kept LIP up only 5.6% of its window (10-16 09:10-10:15 UTC).
         need = max(LIP_MIN_PAYOUT_USD - accrued, 0.0)
-        quoting_now = any(self._lip_live.get((ticker, s)) is not None for s in ("yes", "no"))
-        if not quoting_now:
-            need *= LIP_START_PAYOUT_USD / LIP_MIN_PAYOUT_USD if LIP_MIN_PAYOUT_USD > 0 else 1.0
         if left is not None and future < need:
             # Out of the ranking too: a market that can't pay must not hold a slot.
             self._lip_proj.pop(ticker, None)

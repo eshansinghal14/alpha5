@@ -421,10 +421,11 @@ class LipCtx(Ctx):
 @pytest.fixture(autouse=True)
 def no_lip_floor(request, monkeypatch):
     """LIP tests that aren't about the $1 floor use a toy program whose payouts
-    sit under it; `floor` in a test's name keeps the real one."""
+    sit under it; `floor` in a test's name keeps the real one (and the
+    cent-a-period test for dropping a side)."""
     if "floor" not in request.node.name:
         monkeypatch.setattr(quoter_mod, "LIP_MIN_PAYOUT_USD", 0.0)
-        monkeypatch.setattr(quoter_mod, "LIP_START_PAYOUT_USD", 0.0)
+        monkeypatch.setattr(quoter_mod, "LIP_PAYOUT_TICK_USD", 0.0)
 
 
 def lip_q(close=CLOSE, own_in_book=False, max_loss=1e6, **lip):
@@ -725,34 +726,45 @@ def test_lip_floor_passes_with_enough_time_left():
 
 def test_lip_floor_counts_what_is_already_accrued():
     q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_rich_lots=0.0)
-    q.lip.accrued_usd["A"] = 0.75                                               # 0.75 + 0.48 >= 1.20
+    q.lip.accrued_usd["A"] = 0.75                                               # 0.75 + 0.48 >= 1.00
     lip_step(q, ctx, yes=FLOOR_YES)
     assert ctx.lip_targets[("A", "yes")] is not None
 
 
 def test_lip_floor_shortfall_shrinks_with_accrued():
-    """$0.50 already earned: the rest needs only $0.50 to keep a live quote and
-    $0.60 to start one. 120s left x $0.004/s = $0.48 future."""
+    """$0.50 already earned: the rest needs $0.50. 120s left x $0.004/s = $0.48."""
     q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_rich_lots=0.0)
     q.lip.accrued_usd["A"] = 0.50
-    lip_step(q, ctx, yes=FLOOR_YES)                       # need 0.60 to start, have 0.48
+    lip_step(q, ctx, yes=FLOOR_YES)                       # need 0.50, have 0.48
     assert ctx.lip_targets[("A", "yes")] is None
-    q.lip.accrued_usd["A"] = 0.62                          # need 0.456 to start; 0.48 left
+    q.lip.accrued_usd["A"] = 0.53                          # need 0.47; 0.48 left
     lip_step(q, ctx, yes=FLOOR_YES, dt=0.1)
     assert ctx.lip_targets[("A", "yes")] is not None
 
 
-def test_lip_floor_already_resting_needs_just_the_shortfall():
+def test_lip_floor_same_threshold_to_start_and_keep():
+    """$0.53 accrued, $0.48 still to earn, shortfall $0.47: a new quote starts
+    on exactly what a resting one needs to stay (no x1.2 start margin)."""
     q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_rich_lots=0.0)
-    q.lip.accrued_usd["A"] = 0.53                          # need 0.47 to keep, 0.564 to start
+    q.lip.accrued_usd["A"] = 0.53
+    lip_step(q, ctx, yes=FLOOR_YES)
+    assert ctx.lip_targets[("A", "yes")] is not None
+    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_rich_lots=0.0)
+    q.lip.accrued_usd["A"] = 0.53
     ctx.lip_live[("A", "yes")] = (0.10, 400.0)
     lip_step(q, ctx, yes=FLOOR_YES)
     assert ctx.lip_targets[("A", "yes")] is not None
 
 
-def test_lip_floor_gone_once_period_already_pays():
-    """Over $1 already earned: no floor at all, even with ~nothing left to earn."""
+def test_lip_floor_once_period_pays_a_side_needs_only_a_cent():
+    """Over $1 already earned: no $1 floor, but the side must still add a
+    payable cent. 1s of window x $0.004/s is $0.004: dropped. 5s is $0.02: quoted."""
     q, ctx = lip_q(close=T0 + pd.Timedelta(seconds=181), lip_rich_lots=0.0)
+    q.lip.accrued_usd["A"] = 1.05
+    lip_step(q, ctx, yes=FLOOR_YES)
+    assert ctx.lip_targets[("A", "yes")] is None
+    assert q.block_counts.get("lip_no_reward", 0) >= 1
+    q, ctx = lip_q(close=T0 + pd.Timedelta(seconds=185), lip_rich_lots=0.0)
     q.lip.accrued_usd["A"] = 1.05
     lip_step(q, ctx, yes=FLOOR_YES)
     assert ctx.lip_targets[("A", "yes")] is not None
@@ -767,9 +779,8 @@ def test_lip_floor_counts_size_behind_a_level_already_at_target():
     assert q._lip_proj.get("A") is None
     assert ctx.lip_targets[("A", "yes")] is None
     assert q.block_counts.get("lip_below_floor", 0) >= 1
-    # Others' 400 alone meet target; share 400/800 -> $1.05, enough to keep a resting quote.
+    # Others' 400 alone meet target; share 400/800 -> $1.05, over $1.
     q2, ctx2 = lip_q(lip_rich_lots=0.0)
-    ctx2.lip_live[("A", "yes")] = (0.10, 400.0)
     lip_step(q2, ctx2, yes={0.10: 400.0, 0.09: 300.0})
     assert ctx2.lip_targets[("A", "yes")] is not None
     assert q2._lip_proj["A"] == pytest.approx(420 * (400 / 800) / 2 * 9 / 900, rel=1e-6)
@@ -823,16 +834,25 @@ def test_lip_max_markets_member_holds_until_beaten_by_25pct():
     assert ctx.lip_targets[("B", "yes")] is not None and ctx.lip_targets[("A", "yes")] is None
 
 
-def test_lip_floor_hysteresis_start_needs_more_than_keep():
-    """$0.55 accrued, $0.48 still to earn: shortfall 0.45, so START needs 0.54 ..."""
-    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_rich_lots=0.0)
-    q.lip.accrued_usd["A"] = 0.55
-    lip_step(q, ctx, yes=FLOOR_YES)
+def test_lip_floor_drops_a_side_worth_under_a_cent_once_the_market_pays():
+    """Rich no side alone takes the market past $1: 300 of the 320 at 0.89
+    (which meets the 300 target), 0.94/2 x $0.01/s x 420s = $1.97. The cheap
+    yes side, 1 lot behind a 1M-lot wall, adds ~$2e-6: dropped, no side kept."""
+    q, ctx = lip_q(lip_rich_lots=300.0, lip_cheap_lots=1.0)
+    lip_step(q, ctx, yes={0.10: 1_000_000.0}, no={0.89: 20.0, 0.88: 400.0})
     assert ctx.lip_targets[("A", "yes")] is None
-    # ... but enough to KEEP a LIP quote that's already resting.
-    ctx.lip_live[("A", "yes")] = (0.10, 400.0)
-    lip_step(q, ctx, yes=FLOOR_YES, dt=0.1)
-    assert ctx.lip_targets[("A", "yes")] is not None
+    assert ctx.lip_targets[("A", "no")] is not None
+    assert q.block_counts.get("lip_no_reward", 0) >= 1
+
+
+def test_lip_floor_keeps_a_small_side_the_market_needs_to_reach_a_dollar():
+    """Same tiny cheap side, but the market is short of $1 without it
+    (100 of 2,100 on the no side, ~$0.10): the side rule keeps it and the $1
+    floor judges the whole market instead."""
+    q, ctx = lip_q(lip_rich_lots=100.0, lip_cheap_lots=1.0)
+    lip_step(q, ctx, yes={0.10: 1_000_000.0}, no={0.89: 2000.0, 0.88: 400.0})
+    assert q.block_counts.get("lip_no_reward", 0) == 0
+    assert q.block_counts.get("lip_below_floor", 0) >= 1
 
 
 def test_lip_floor_resting_quote_still_pulled_under_one_dollar():

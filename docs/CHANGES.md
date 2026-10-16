@@ -3,6 +3,21 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-16 (later) — one $1 LIP threshold; drop sides that add no payable cent
+
+Armed 10-16 09:10-10:15 UTC, LIP was up 5.6% of its window and 72% of the
+downtime was the payout floor; no market reached $1.
+
+- `LIP_START_PAYOUT_USD` (x1.2 to start a quote) removed: one threshold,
+  the $1 shortfall, to start and to keep. Every burst pull now cancels LIP,
+  so the start margin was re-applied every ~11s.
+- A LIP side (and an exit's band size) is dropped when it can't change the
+  payout: once the market reaches $1 without it, it must add at least a cent
+  (`LIP_PAYOUT_TICK_USD`; payouts round down to the cent) over the rest of
+  the window. A side the market needs to reach $1 is kept and the floor
+  judges the whole market. Cuts the cheap side behind 10k-125k-lot walls
+  (SOL @0.01 at a 0.1% share) where the other side already pays.
+
 ## 2026-10-16 — spot_burst pulls LIP at once; LIP judged on markout
 
 - `spot_burst` is now a hard pull for the LIP quote and the LIP exit, like
