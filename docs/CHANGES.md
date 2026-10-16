@@ -3,6 +3,15 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-16 (evening) — per-side LIP sizes; nothing at or above 0.50
+
+- `lip_cheap_lots` -> `lip_bid_lots` (yes bid) and `lip_offer_lots` (yes
+  offer = no bid), each on a cheap own-side price only, same band and taper.
+- Hard 0.50 cap on every LIP order. The LIP exit used to rest at any price:
+  after a cheap yes fill it offered the inventory back as a ~0.89 no bid.
+  Now it only rests under 0.50 (`lip_exit_over_half` when it can't), and the
+  quote's position-netting can't add size back above 0.50 either.
+
 ## 2026-10-16 (late) — LIP cheap side only, tapered past the cutoff
 
 - Expensive-side LIP removed: `lip_rich_min_price` and `lip_rich_lots` are

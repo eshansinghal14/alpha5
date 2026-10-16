@@ -47,6 +47,7 @@ from kalshi_infra.kalshi.venue import MAX_PRICE, MIN_PRICE, TICK
 from kalshi_infra.trading.fair import Fair, FairUpdate
 from kalshi_infra.trading.lip import LipTracker, levels_with_ours, others_ladder, remaining_cap_usd, reward_rate
 from kalshi_infra.trading.order_manager import Desired, LipTarget
+from kalshi_infra.trading.params import LIP_TAPER_END
 
 # Fair is clipped to [eps, 1-eps] before quoting (logged unclipped). Well
 # inside Kalshi's 1c minimum price, so it only guards against a 0/1 fair.
@@ -551,11 +552,16 @@ class Quoter:
                 price = cap
         if not (MIN_PRICE <= price <= MAX_PRICE):
             return None
+        # Hard cap before sizing: the sizing below adds back a position held
+        # the other way, which with a 0 band would still rest a 0.89 no bid
+        # sized to the yes inventory.
+        if price >= LIP_TAPER_END - 1e-9:
+            return None
         # The band size is the most position we want on this side: quote up to
         # it, net of the signed position held there (a position the other way
         # adds to it).
         held = net if side == "yes" else -net
-        size = math.floor(lc.lots_at(price) - held - self._resting(ticker, side) + 1e-9)
+        size = math.floor(lc.lots_at(price, side) - held - self._resting(ticker, side) + 1e-9)
         if size < 1:
             return None
         return LipTarget(price, float(size))
@@ -567,7 +573,8 @@ class Quoter:
         fill: it steps a tick in front of others' best bid (alone at the front
         of the book) and is marked `front`, so it is never re-queued. Bypasses
         the bands, lots, payout floor, max-markets and the LIP time cutoff;
-        keeps the far-touch and lip_constant_edge price caps."""
+        keeps the far-touch and lip_constant_edge price caps, and like every
+        LIP order never rests at or above LIP_TAPER_END."""
         inv = self._lip_inv.get(ticker, 0.0)
         qty = min(max(inv, 0.0), max(net, 0.0)) if side == "no" else min(max(-inv, 0.0), max(-net, 0.0))
         qty = math.floor(qty * 100 + 1e-9) / 100
@@ -593,10 +600,13 @@ class Quoter:
             price = min(price, self._lip_fair_cap(side, prob))
         if not (MIN_PRICE <= price <= MAX_PRICE):
             return None
+        if price >= LIP_TAPER_END - 1e-9:
+            self._block("lip_exit_over_half")
+            return None
         self._block("lip_exit")
-        # Exit the inventory, then keep quoting up to this side's band size
-        # (0 above the cheap taper, so an expensive-side exit is the inventory alone).
-        extra = float(math.floor(lc.lots_at(price) + 1e-9)) if lc.lots_at(price) > 0 else 0.0
+        # Exit the inventory, then keep quoting up to this side's band size.
+        band = lc.lots_at(price, side)
+        extra = float(math.floor(band + 1e-9)) if band > 0 else 0.0
         self._lip_exit_qty[(ticker, side)] = float(qty)
         return LipTarget(price, float(qty) + extra, front=True)
 

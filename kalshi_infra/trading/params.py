@@ -7,8 +7,9 @@ from __future__ import annotations
 
 from kalshi_infra.config import APPLY_NEXT_EVENT, param, section  # noqa: F401
 
-# Cheap-side LIP size tapers to 0 here. Public prints 10-15 17:00 to 10-16
-# 12:00 UTC: makers resting at 0.20-0.45 made +0.1 to +3.4c/lot at 10s;
+# No LIP order (quote or exit) at or above this own-side price; both sizes
+# taper to 0 here from lip_cheap_max_price. Public prints 10-15 17:00 to
+# 10-16 12:00 UTC: makers resting at 0.20-0.45 made +0.1 to +3.4c/lot at 10s;
 # 0.45-0.55 was the first adverse bucket (-1.3c).
 LIP_TAPER_END = 0.50
 
@@ -127,19 +128,25 @@ class LipSettings:
     /incentive_programs per market; these only shape our own LIP quote.
 
     One LIP order per side, at others' best bid on that side, sized by that
-    price: the cheap side of a longshot only (no expensive-side LIP). Our fair
-    caps the price (lip_constant_edge). Rationale and backtest:
-    kalshi_strategies/KXCRYPTOLEAD15M/research/LIP_REPORT.md."""
+    price, and only while that own-side price is under 0.50 (LIP_TAPER_END):
+    the yes bid sized by lip_bid_lots, the yes offer (a no bid) by
+    lip_offer_lots. Our fair caps the price (lip_constant_edge). Rationale and
+    backtest: kalshi_strategies/KXCRYPTOLEAD15M/research/LIP_REPORT.md."""
     enable_lip_quoting: bool = param(
         "Rest one LIP-farming quote per side, after the edge ladder in priority. Off cancels any "
         "LIP quote. LIP accrual is measured either way.")
     lip_cheap_max_price: float = param(
         "Full LIP size on a side whose best bid (own-side price, others' orders) is at or below "
         "this; above it the size tapers linearly to 0 at 0.50 (LIP_TAPER_END), so crossing the "
-        "cutoff shrinks the order instead of cancelling it.", min=0.01, max=0.49, step=0.01)
-    lip_cheap_lots: float = param(
-        "LIP order size at or below lip_cheap_max_price, less any position already held on that "
-        "side. 0 disables LIP quoting (the exit still offers LIP inventory back).", min=0, step=10.0)
+        "cutoff shrinks the order instead of cancelling it. Nothing at or above 0.50.",
+        min=0.01, max=0.49, step=0.01)
+    lip_bid_lots: float = param(
+        "LIP yes-bid size at a yes price at or below lip_cheap_max_price (tapered above), less any "
+        "yes position already held. 0 = no yes-side LIP.", min=0, step=10.0)
+    lip_offer_lots: float = param(
+        "LIP yes-offer size, i.e. the no bid, at a no price at or below lip_cheap_max_price (yes "
+        "offer at or above 1 - it; tapered past that), less any no position already held. "
+        "0 = no no-side LIP.", min=0, step=10.0)
     lip_constant_edge: float | None = param(
         "Edge the LIP bid must keep below own-side fair ($): a best bid above fair - this is capped "
         "there. 0 = never above fair. null = no fair check. Live 2026-10-14 22:22-22:55 UTC: 613 of "
@@ -161,17 +168,19 @@ class LipSettings:
         "A resting LIP quote is moved to a new price or size at most this often (one amend). "
         "Safety cancels (stale, band, time, LIP off) are never held.", min=0, max=60, step=0.5)
 
-    def lots_at(self, price: float) -> float:
-        """Order size for a LIP quote at own-side `price`: lip_cheap_lots up to
-        lip_cheap_max_price, linear down to 0 at LIP_TAPER_END, 0 above."""
+    def lots_at(self, price: float, side: str) -> float:
+        """Order size for a LIP quote on `side` ("yes" = the bid, "no" = the
+        offer) at own-side `price`: full size up to lip_cheap_max_price, linear
+        to 0 at LIP_TAPER_END, 0 at or above it."""
+        lots = self.lip_bid_lots if side == "yes" else self.lip_offer_lots
         if price <= self.lip_cheap_max_price + 1e-9:
-            return self.lip_cheap_lots
+            return lots
         if price < LIP_TAPER_END - 1e-9:
-            return self.lip_cheap_lots * (LIP_TAPER_END - price) / (LIP_TAPER_END - self.lip_cheap_max_price)
+            return lots * (LIP_TAPER_END - price) / (LIP_TAPER_END - self.lip_cheap_max_price)
         return 0.0
 
     def max_lots(self) -> float:
-        return self.lip_cheap_lots
+        return max(self.lip_bid_lots, self.lip_offer_lots)
 
 
 SHARED_SECTIONS = ("quoting", "trading_time", "risk", "runtime", "lip")

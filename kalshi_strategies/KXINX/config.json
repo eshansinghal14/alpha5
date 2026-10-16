@@ -47,7 +47,8 @@
     "lip": {
       "enable_lip_quoting": false,
       "lip_cheap_max_price": 0.2,
-      "lip_cheap_lots": 0.0,
+      "lip_bid_lots": 0.0,
+      "lip_offer_lots": 0.0,
       "lip_constant_edge": null,
       "lip_max_markets": null,
       "lip_requeue_min_ahead": null,
@@ -105,7 +106,8 @@
     "lip": {
       "enable_lip_quoting": false,
       "lip_cheap_max_price": 0.2,
-      "lip_cheap_lots": 0.0,
+      "lip_bid_lots": 0.0,
+      "lip_offer_lots": 0.0,
       "lip_constant_edge": null,
       "lip_max_markets": null,
       "lip_requeue_min_ahead": null,
@@ -163,7 +165,8 @@
     "lip": {
       "enable_lip_quoting": false,
       "lip_cheap_max_price": 0.2,
-      "lip_cheap_lots": 0.0,
+      "lip_bid_lots": 0.0,
+      "lip_offer_lots": 0.0,
       "lip_constant_edge": null,
       "lip_max_markets": null,
       "lip_requeue_min_ahead": null,
