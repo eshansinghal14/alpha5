@@ -494,8 +494,10 @@ class KalshiOrderClient:
         resp = self._session.get(BASE_URL + path, headers=self._headers("GET", path),
                                  params={"event_ticker": event_ticker}, timeout=self.timeout_s)
         resp.raise_for_status()
+        # Kalshi sends "queue_positions": null, not [], with nothing resting
+        # (894 TypeErrors in run.err.log by 2026-10-16 11:04 UTC).
         return {q["order_id"]: float(q.get("queue_position_fp") or 0.0)
-                for q in resp.json().get("queue_positions", []) if q.get("order_id")}
+                for q in resp.json().get("queue_positions") or [] if q.get("order_id")}
 
     def find_by_client_id(self, event_ticker: str, client_order_id: str) -> tuple[str, str] | None:
         """(exchange order id, ticker) of our RESTING order with this client
