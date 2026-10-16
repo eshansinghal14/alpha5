@@ -7,6 +7,11 @@ from __future__ import annotations
 
 from kalshi_infra.config import APPLY_NEXT_EVENT, param, section  # noqa: F401
 
+# Cheap-side LIP size tapers to 0 here. Public prints 10-15 17:00 to 10-16
+# 12:00 UTC: makers resting at 0.20-0.45 made +0.1 to +3.4c/lot at 10s;
+# 0.45-0.55 was the first adverse bucket (-1.3c).
+LIP_TAPER_END = 0.50
+
 
 @section
 class QuotingParams:
@@ -122,25 +127,19 @@ class LipSettings:
     /incentive_programs per market; these only shape our own LIP quote.
 
     One LIP order per side, at others' best bid on that side, sized by that
-    price. Our fair and edge play no part. Rationale and backtest:
+    price: the cheap side of a longshot only (no expensive-side LIP). Our fair
+    caps the price (lip_constant_edge). Rationale and backtest:
     kalshi_strategies/KXCRYPTOLEAD15M/research/LIP_REPORT.md."""
     enable_lip_quoting: bool = param(
         "Rest one LIP-farming quote per side, after the edge ladder in priority. Off cancels any "
         "LIP quote. LIP accrual is measured either way.")
     lip_cheap_max_price: float = param(
-        "Quote LIP on a side whose best bid (own-side price, others' orders) is at or below this "
-        "-- the cheap side of a longshot. 2026-10-11..14 crypto: <=0.20 paid more LIP than it "
-        "lost to pickoffs; 0.35-0.80 lost money net.", min=0.01, max=0.99, step=0.01)
+        "Full LIP size on a side whose best bid (own-side price, others' orders) is at or below "
+        "this; above it the size tapers linearly to 0 at 0.50 (LIP_TAPER_END), so crossing the "
+        "cutoff shrinks the order instead of cancelling it.", min=0.01, max=0.49, step=0.01)
     lip_cheap_lots: float = param(
-        "LIP order size on a cheap-side price, less any position already held on that side. "
-        "0 disables the cheap side.", min=0, step=10.0)
-    lip_rich_min_price: float = param(
-        "Quote LIP on a side whose best bid is at or above this -- the expensive side of a "
-        "near-certainty. The weaker leg: clearly adverse on markout, kept for the $1 payout floor.",
-        min=0.01, max=0.99, step=0.01)
-    lip_rich_lots: float = param(
-        "LIP order size on an expensive-side price, less any position already held on that side. "
-        "0 disables the expensive side.", min=0, step=10.0)
+        "LIP order size at or below lip_cheap_max_price, less any position already held on that "
+        "side. 0 disables LIP quoting (the exit still offers LIP inventory back).", min=0, step=10.0)
     lip_constant_edge: float | None = param(
         "Edge the LIP bid must keep below own-side fair ($): a best bid above fair - this is capped "
         "there. 0 = never above fair. null = no fair check. Live 2026-10-14 22:22-22:55 UTC: 613 of "
@@ -163,15 +162,16 @@ class LipSettings:
         "Safety cancels (stale, band, time, LIP off) are never held.", min=0, max=60, step=0.5)
 
     def lots_at(self, price: float) -> float:
-        """Order size for a LIP quote at own-side `price`; 0 outside both bands."""
+        """Order size for a LIP quote at own-side `price`: lip_cheap_lots up to
+        lip_cheap_max_price, linear down to 0 at LIP_TAPER_END, 0 above."""
         if price <= self.lip_cheap_max_price + 1e-9:
             return self.lip_cheap_lots
-        if price >= self.lip_rich_min_price - 1e-9:
-            return self.lip_rich_lots
+        if price < LIP_TAPER_END - 1e-9:
+            return self.lip_cheap_lots * (LIP_TAPER_END - price) / (LIP_TAPER_END - self.lip_cheap_max_price)
         return 0.0
 
     def max_lots(self) -> float:
-        return max(self.lip_cheap_lots, self.lip_rich_lots)
+        return self.lip_cheap_lots
 
 
 SHARED_SECTIONS = ("quoting", "trading_time", "risk", "runtime", "lip")

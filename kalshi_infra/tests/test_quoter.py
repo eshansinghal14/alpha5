@@ -38,8 +38,8 @@ def cfg(**q):
         lip=P.LipSettings(**LIP_OFF))
 
 
-LIP_OFF = dict(enable_lip_quoting=False, lip_cheap_max_price=0.2, lip_cheap_lots=0.0, lip_rich_min_price=0.8,
-               lip_rich_lots=0.0, lip_constant_edge=None, lip_max_markets=None,
+LIP_OFF = dict(enable_lip_quoting=False, lip_cheap_max_price=0.2, lip_cheap_lots=0.0,
+               lip_constant_edge=None, lip_max_markets=None,
                lip_requeue_min_ahead=None, lip_min_time_left_s=0.0, lip_hold_s=1.0)
 
 
@@ -391,15 +391,15 @@ from kalshi_infra.trading.lip import LipParams, LipTracker  # noqa: E402
 
 LIPP = LipParams(target_size=300.0, discount_factor=0.5, period_reward_usd=9.0, snapshots_per_period=900)
 CLOSE = T0 + pd.Timedelta(minutes=10)
-# Yes side: a 0.10 longshot (cheap band). No side: best no bid 0.89 (rich band).
+# Yes side: a 0.10 longshot (cheap band). No side: best no bid 0.89 (expensive:
+# no LIP there).
 YES = {0.10: 500.0, 0.09: 300.0}
 NO = {0.89: 120.0, 0.88: 400.0}
 
 
 def lip_cfg(**lip):
     c = cfg()
-    base = dict(LIP_OFF, enable_lip_quoting=True, lip_cheap_lots=400.0, lip_rich_lots=100.0,
-                lip_min_time_left_s=180.0)
+    base = dict(LIP_OFF, enable_lip_quoting=True, lip_cheap_lots=400.0, lip_min_time_left_s=180.0)
     base.update(lip)
     c.lip = P.LipSettings(**base)
     return c
@@ -442,27 +442,38 @@ def lip_step(q, ctx, yes=YES, no=NO, fair=0.10, dt=0.0):
     step(q, ctx, {"A": Fair(fair, fair - 0.01, fair + 0.01)}, lb(yes, no, bid, ask), dt=dt)
 
 
-def test_lip_rests_at_best_bid_sized_by_band():
+def test_lip_rests_at_best_bid_cheap_side_only():
     q, ctx = lip_q()
     lip_step(q, ctx)
-    y, n = ctx.lip_targets[("A", "yes")], ctx.lip_targets[("A", "no")]
+    y = ctx.lip_targets[("A", "yes")]
     assert (y.price, y.size) == (0.10, 400.0)          # cheap side
-    assert (n.price, n.size) == (0.89, 100.0)          # rich side
+    assert ctx.lip_targets[("A", "no")] is None        # 0.89: no expensive-side LIP
 
 
 def test_lip_ignores_fair_and_edge():
-    """Fair 0.50 puts the edge reservation far below the 0.10 / 0.89 best
-    bids; the LIP quote is placed regardless."""
+    """Fair 0.50 puts the edge reservation far below the 0.10 best bid; the
+    LIP quote is placed regardless."""
     q, ctx = lip_q()
     lip_step(q, ctx, fair=0.50)
     assert ctx.lip_targets[("A", "yes")].price == 0.10
-    assert ctx.lip_targets[("A", "no")].price == 0.89
 
 
-def test_lip_off_in_mid_band():
+def test_lip_cheap_side_tapers_past_the_cutoff():
+    """400 lots up to 0.20, linear to 0 at 0.50: 0.30 -> 266, 0.45 -> 66."""
     q, ctx = lip_q()
-    lip_step(q, ctx, yes={0.45: 300.0}, no={0.50: 300.0})
-    assert ctx.lip_targets[("A", "yes")] is None and ctx.lip_targets[("A", "no")] is None
+    lip_step(q, ctx, yes={0.30: 500.0, 0.29: 300.0}, no={0.65: 500.0}, fair=0.32)
+    assert ctx.lip_targets[("A", "yes")].size == 266.0
+    lip_step(q, ctx, yes={0.45: 500.0, 0.44: 300.0}, no={0.50: 500.0}, fair=0.47, dt=0.1)
+    assert ctx.lip_targets[("A", "yes")].size == 66.0
+
+
+def test_lip_off_at_and_above_half():
+    q, ctx = lip_q()
+    lip_step(q, ctx, yes={0.50: 300.0}, no={0.49: 300.0})
+    assert ctx.lip_targets[("A", "yes")] is None           # 0.50: taper ends
+    q, ctx = lip_q()
+    lip_step(q, ctx, yes={0.10: 500.0}, no={0.80: 2000.0, 0.79: 300.0})
+    assert ctx.lip_targets[("A", "no")] is None            # 0.80: no expensive-side LIP
 
 
 def test_lip_off_near_close():
@@ -477,11 +488,10 @@ def test_lip_off_publishes_none():
     assert ctx.lip_targets[("A", "yes")] is None
 
 
-def test_lip_zero_lots_disables_that_band():
-    q, ctx = lip_q(lip_rich_lots=0.0)
+def test_lip_zero_lots_disables_lip():
+    q, ctx = lip_q(lip_cheap_lots=0.0)
     lip_step(q, ctx)
-    assert ctx.lip_targets[("A", "yes")] is not None
-    assert ctx.lip_targets[("A", "no")] is None
+    assert ctx.lip_targets[("A", "yes")] is None and ctx.lip_targets[("A", "no")] is None
 
 
 def test_lip_pulled_on_stale_signal():
@@ -493,13 +503,16 @@ def test_lip_pulled_on_stale_signal():
 
 
 def test_lip_size_net_of_position_on_that_side():
+    """Both sides cheap (yes 0.10, no 0.15). 150 yes held: yes quotes 400 - 150,
+    no quotes 400 + 150 (the band is the max position on that side)."""
     q, ctx = lip_q()
     ctx.portfolio.position("A").yes_qty = 150.0
-    lip_step(q, ctx)
+    cheap_no = {0.15: 120.0, 0.14: 400.0}
+    lip_step(q, ctx, no=cheap_no, fair=0.12)
     assert ctx.lip_targets[("A", "yes")].size == 250.0
-    assert ctx.lip_targets[("A", "no")].size == 250.0   # band is max position: 100 + the 150 long
+    assert ctx.lip_targets[("A", "no")].size == 550.0
     ctx.portfolio.position("A").yes_qty = 400.0
-    lip_step(q, ctx, dt=0.1)
+    lip_step(q, ctx, no=cheap_no, fair=0.12, dt=0.1)
     assert ctx.lip_targets[("A", "yes")] is None
 
 
@@ -515,9 +528,10 @@ def test_lip_follows_others_best_not_our_own_quote():
 def test_lip_capped_inside_far_touch():
     # Best yes bid 0.10 with the yes ask at 0.11 (no bid 0.89): fine. Make the
     # far side cross: no bid 0.91 -> yes ask 0.09 -> cap at 0.08. Others' 50 at
-    # 0.10 is under target, so our 0.08 still scores.
+    # 0.10 is under target, so our 0.08 still scores. The no side needs the 300
+    # target on its own (no expensive-side LIP of ours to make it up).
     q, ctx = lip_q()
-    lip_step(q, ctx, yes={0.10: 50.0}, no={0.91: 200.0})
+    lip_step(q, ctx, yes={0.10: 50.0}, no={0.91: 400.0})
     assert ctx.lip_targets[("A", "yes")].price == 0.08
 
 
@@ -545,7 +559,7 @@ def test_lip_constant_edge_caps_best_bid_at_fair_minus_edge():
 def test_lip_capped_price_still_has_to_clear_the_floor():
     """Capped below the best bid the quote earns DF^N less; with the real $1
     floor (test name has 'floor') it isn't placed if that can't pay."""
-    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_constant_edge=0.0, lip_rich_lots=0.0)
+    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_constant_edge=0.0)
     lip_step(q, ctx, yes={0.10: 50.0, 0.09: 100.0, 0.08: 600.0}, fair=0.08)   # capped 0.08, scores DF^1
     assert ctx.lip_targets[("A", "yes")] is None
     assert q.block_counts.get("lip_below_floor", 0) >= 1
@@ -554,7 +568,7 @@ def test_lip_capped_price_still_has_to_clear_the_floor():
 def test_lip_capped_behind_a_full_level_earns_nothing_and_is_not_quoted():
     """FLOOR_YES meets the 300 target by 0.09; capped at 0.08 the quote scores
     nothing, so it isn't placed."""
-    q, ctx = lip_q(lip_constant_edge=0.0, lip_rich_lots=0.0)
+    q, ctx = lip_q(lip_constant_edge=0.0)
     lip_step(q, ctx, yes=FLOOR_YES, fair=0.08)
     assert ctx.lip_targets[("A", "yes")] is None
     assert q.block_counts.get("lip_no_reward", 0) >= 1
@@ -584,7 +598,7 @@ def test_lip_one_sided_book_farms_nothing():
     """No bids at all on the no side: Kalshi excludes every snapshot, so a
     yes LIP quote earns nothing whatever its size -- not quoted, even with the
     $1 floor already met (shortfall 0)."""
-    q, ctx = lip_q(lip_rich_lots=0.0)
+    q, ctx = lip_q()
     q.lip.accrued_usd["A"] = 1.5
     lip_step(q, ctx, no={})
     assert ctx.lip_targets[("A", "yes")] is None and ctx.lip_targets[("A", "no")] is None
@@ -592,10 +606,11 @@ def test_lip_one_sided_book_farms_nothing():
 
 
 def test_lip_side_that_adds_nothing_is_dropped_other_side_kept():
-    """Others' 500 at the yes best bid meet the target alone and the cap puts
-    us a tick back: our yes adds nothing. The no side still earns."""
+    """Both sides cheap (yes 0.10, no 0.15). Others' 500 at the yes best bid
+    meet the target alone and the cap puts us a tick back: our yes adds
+    nothing. The no side still earns."""
     q, ctx = lip_q(lip_constant_edge=0.0)
-    lip_step(q, ctx, yes={0.10: 500.0, 0.09: 300.0}, fair=0.095)   # yes capped at 0.09
+    lip_step(q, ctx, yes={0.10: 500.0, 0.09: 300.0}, no={0.15: 120.0, 0.14: 400.0}, fair=0.095)
     assert ctx.lip_targets[("A", "yes")] is None
     assert ctx.lip_targets[("A", "no")] is not None
 
@@ -608,8 +623,10 @@ def _resting_lip(q, ctx, fair=0.10):
 
 
 def _soft_pull(q, on: bool):
-    """Out of band is a soft pull: cheap band capped below the 0.10 best bid."""
-    q.cfg.lip = dataclasses.replace(q.cfg.lip, lip_cheap_max_price=0.05 if on else 0.20)
+    """A soft pull: the payout floor. A $100 target that nothing reaches
+    makes A's side qualify for no snapshot, so its best case is $0 < $1."""
+    q.lip.params["A"] = dataclasses.replace(LIPP, target_size=100_000.0) if on else LIPP
+    quoter_mod.LIP_MIN_PAYOUT_USD = 1.0 if on else 0.0
 
 
 def test_lip_soft_pull_held_for_debounce():
@@ -646,7 +663,7 @@ def test_lip_spot_burst_pulls_resting_quote_at_once():
 
 
 def test_lip_spot_burst_pulls_the_exit_too():
-    q, ctx = lip_q(lip_rich_lots=0.0)
+    q, ctx = lip_q()
     _lip_fill(ctx, "yes", 120.0, 0.10)
     lip_step(q, ctx)
     assert ctx.lip_targets[("A", "no")] is not None
@@ -686,12 +703,13 @@ def test_lip_held_quote_never_grows_after_a_partial_fill():
 
 def test_lip_obeys_side_block_and_enable_quoting():
     q, ctx = lip_q()
+    cheap_no = {0.15: 120.0, 0.14: 400.0}
     q.model.block[("A", "yes")] = "basis_tie"
-    lip_step(q, ctx)
+    lip_step(q, ctx, no=cheap_no, fair=0.12)
     assert ctx.lip_targets[("A", "yes")] is None
     assert ctx.lip_targets[("A", "no")] is not None
     q.cfg.quoting = dataclasses.replace(q.cfg.quoting, enable_quoting=False)
-    lip_step(q, ctx, dt=0.1)
+    lip_step(q, ctx, no=cheap_no, fair=0.12, dt=0.1)
     assert ctx.lip_targets[("A", "no")] is None
 
 
@@ -704,28 +722,28 @@ def test_lip_pulled_on_spot_burst():
 
 # Program: $9 per 900s period, target 300. Yes side others 100 @0.10 + 300
 # @0.09; our 400 at the best bid. Only the 0.10 level scores (cum 500 >= 300
-# there): our share 400/500 = 0.8. No side: LIP rich side off, share 0.
+# there): our share 400/500 = 0.8. No side (0.89): no LIP, share 0.
 # Rate = 0.8 / 2 * 9/900 = 0.004 $/s. LIP stops 180s before close.
 FLOOR_YES = {0.10: 100.0, 0.09: 300.0}
 RATE = 0.8 / 2 * 9 / 900
 
 
 def test_lip_floor_blocks_when_best_case_payout_too_small():
-    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_rich_lots=0.0)   # 120s -> $0.48
+    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5))   # 120s -> $0.48
     lip_step(q, ctx, yes=FLOOR_YES)
     assert ctx.lip_targets[("A", "yes")] is None
     assert q.block_counts.get("lip_below_floor", 0) >= 1
 
 
 def test_lip_floor_passes_with_enough_time_left():
-    q, ctx = lip_q(lip_rich_lots=0.0)                                      # 420s -> $1.68
+    q, ctx = lip_q()                                      # 420s -> $1.68
     lip_step(q, ctx, yes=FLOOR_YES)
     assert ctx.lip_targets[("A", "yes")] is not None
     assert q._lip_proj["A"] == pytest.approx(420 * RATE, rel=1e-6)
 
 
 def test_lip_floor_counts_what_is_already_accrued():
-    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_rich_lots=0.0)
+    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5))
     q.lip.accrued_usd["A"] = 0.75                                               # 0.75 + 0.48 >= 1.00
     lip_step(q, ctx, yes=FLOOR_YES)
     assert ctx.lip_targets[("A", "yes")] is not None
@@ -733,7 +751,7 @@ def test_lip_floor_counts_what_is_already_accrued():
 
 def test_lip_floor_shortfall_shrinks_with_accrued():
     """$0.50 already earned: the rest needs $0.50. 120s left x $0.004/s = $0.48."""
-    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_rich_lots=0.0)
+    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5))
     q.lip.accrued_usd["A"] = 0.50
     lip_step(q, ctx, yes=FLOOR_YES)                       # need 0.50, have 0.48
     assert ctx.lip_targets[("A", "yes")] is None
@@ -745,11 +763,11 @@ def test_lip_floor_shortfall_shrinks_with_accrued():
 def test_lip_floor_same_threshold_to_start_and_keep():
     """$0.53 accrued, $0.48 still to earn, shortfall $0.47: a new quote starts
     on exactly what a resting one needs to stay (no x1.2 start margin)."""
-    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_rich_lots=0.0)
+    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5))
     q.lip.accrued_usd["A"] = 0.53
     lip_step(q, ctx, yes=FLOOR_YES)
     assert ctx.lip_targets[("A", "yes")] is not None
-    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_rich_lots=0.0)
+    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5))
     q.lip.accrued_usd["A"] = 0.53
     ctx.lip_live[("A", "yes")] = (0.10, 400.0)
     lip_step(q, ctx, yes=FLOOR_YES)
@@ -759,12 +777,12 @@ def test_lip_floor_same_threshold_to_start_and_keep():
 def test_lip_floor_once_period_pays_a_side_needs_only_a_cent():
     """Over $1 already earned: no $1 floor, but the side must still add a
     payable cent. 1s of window x $0.004/s is $0.004: dropped. 5s is $0.02: quoted."""
-    q, ctx = lip_q(close=T0 + pd.Timedelta(seconds=181), lip_rich_lots=0.0)
+    q, ctx = lip_q(close=T0 + pd.Timedelta(seconds=181))
     q.lip.accrued_usd["A"] = 1.05
     lip_step(q, ctx, yes=FLOOR_YES)
     assert ctx.lip_targets[("A", "yes")] is None
     assert q.block_counts.get("lip_no_reward", 0) >= 1
-    q, ctx = lip_q(close=T0 + pd.Timedelta(seconds=185), lip_rich_lots=0.0)
+    q, ctx = lip_q(close=T0 + pd.Timedelta(seconds=185))
     q.lip.accrued_usd["A"] = 1.05
     lip_step(q, ctx, yes=FLOOR_YES)
     assert ctx.lip_targets[("A", "yes")] is not None
@@ -774,13 +792,13 @@ def test_lip_floor_counts_size_behind_a_level_already_at_target():
     """Others' 500 at the best bid meet the 300 target alone; our 400 there
     still scores (whole level qualifies), share 400/900. 420s x that rate is
     $0.93, under $1, so the floor blocks on size, not on zero credit."""
-    q, ctx = lip_q(lip_rich_lots=0.0)
+    q, ctx = lip_q()
     lip_step(q, ctx)
     assert q._lip_proj.get("A") is None
     assert ctx.lip_targets[("A", "yes")] is None
     assert q.block_counts.get("lip_below_floor", 0) >= 1
     # Others' 400 alone meet target; share 400/800 -> $1.05, over $1.
-    q2, ctx2 = lip_q(lip_rich_lots=0.0)
+    q2, ctx2 = lip_q()
     lip_step(q2, ctx2, yes={0.10: 400.0, 0.09: 300.0})
     assert ctx2.lip_targets[("A", "yes")] is not None
     assert q2._lip_proj["A"] == pytest.approx(420 * (400 / 800) / 2 * 9 / 900, rel=1e-6)
@@ -789,7 +807,7 @@ def test_lip_floor_counts_size_behind_a_level_already_at_target():
 def test_lip_floor_projection_caps_at_the_period_total():
     """The per-account cap limits the period sum, not each second: $0.90 cap,
     already $0.50 accrued, so at most $0.40 more however high the rate."""
-    q, ctx = lip_q(lip_rich_lots=0.0)
+    q, ctx = lip_q()
     q.lip.params["A"] = LipParams(target_size=300.0, discount_factor=0.5, period_reward_usd=9.0,
                                   snapshots_per_period=900, max_reward_usd=0.90)
     q.lip.accrued_usd["A"] = 0.50
@@ -799,7 +817,7 @@ def test_lip_floor_projection_caps_at_the_period_total():
 
 
 def _two_markets(**lip):
-    base = dict(lip_max_markets=1, lip_rich_lots=0.0)
+    base = dict(lip_max_markets=1)
     base.update(lip)
     q = Quoter(lip_cfg(**base), Model(), FREE, close_time=CLOSE, lip=LipTracker({"A": LIPP, "B": LIPP}))
     return q, LipCtx()
@@ -835,28 +853,29 @@ def test_lip_max_markets_member_holds_until_beaten_by_25pct():
 
 
 def test_lip_floor_drops_a_side_worth_under_a_cent_once_the_market_pays():
-    """Rich no side alone takes the market past $1: 300 of the 320 at 0.89
-    (which meets the 300 target), 0.94/2 x $0.01/s x 420s = $1.97. The cheap
-    yes side, 1 lot behind a 1M-lot wall, adds ~$2e-6: dropped, no side kept."""
-    q, ctx = lip_q(lip_rich_lots=300.0, lip_cheap_lots=1.0)
-    lip_step(q, ctx, yes={0.10: 1_000_000.0}, no={0.89: 20.0, 0.88: 400.0})
+    """Both sides cheap. The no side alone takes the market past $1: 300 of
+    the 320 at 0.15 (which meets the 300 target), 0.94/2 x $0.01/s x 420s =
+    $1.97. The yes side behind a 1M-lot wall adds ~$2e-4 over the window:
+    dropped, no side kept."""
+    q, ctx = lip_q(lip_cheap_lots=300.0)
+    lip_step(q, ctx, yes={0.10: 1_000_000.0}, no={0.15: 20.0, 0.14: 400.0}, fair=0.12)
     assert ctx.lip_targets[("A", "yes")] is None
     assert ctx.lip_targets[("A", "no")] is not None
     assert q.block_counts.get("lip_no_reward", 0) >= 1
 
 
 def test_lip_floor_keeps_a_small_side_the_market_needs_to_reach_a_dollar():
-    """Same tiny cheap side, but the market is short of $1 without it
-    (100 of 2,100 on the no side, ~$0.10): the side rule keeps it and the $1
+    """Same walled yes side, but the market is short of $1 without it
+    (300 of 2,300 on the no side, ~$0.27): the side rule keeps it and the $1
     floor judges the whole market instead."""
-    q, ctx = lip_q(lip_rich_lots=100.0, lip_cheap_lots=1.0)
-    lip_step(q, ctx, yes={0.10: 1_000_000.0}, no={0.89: 2000.0, 0.88: 400.0})
+    q, ctx = lip_q(lip_cheap_lots=300.0)
+    lip_step(q, ctx, yes={0.10: 1_000_000.0}, no={0.15: 2000.0, 0.14: 400.0}, fair=0.12)
     assert q.block_counts.get("lip_no_reward", 0) == 0
     assert q.block_counts.get("lip_below_floor", 0) >= 1
 
 
 def test_lip_floor_resting_quote_still_pulled_under_one_dollar():
-    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5), lip_rich_lots=0.0)   # $0.48
+    q, ctx = lip_q(close=T0 + pd.Timedelta(minutes=5))   # $0.48
     ctx.lip_live[("A", "yes")] = (0.10, 400.0)
     lip_step(q, ctx, yes=FLOOR_YES)
     assert ctx.lip_targets[("A", "yes")] is None
@@ -903,9 +922,9 @@ def _lip_fill(ctx, side, size, price):
 
 def test_lip_fill_is_offered_back_at_best_on_other_side():
     """Filled 120 yes on the LIP bid: offer 120 back on the no side, marked
-    front, even though the rich side is off. One tick in front of the 0.89 best
+    front, though the 0.89 no side gets no LIP. One tick in front of the 0.89 best
     no bid would cross the far touch (yes bid 0.10), so it joins at 0.89."""
-    q, ctx = lip_q(lip_rich_lots=0.0)
+    q, ctx = lip_q()
     _lip_fill(ctx, "yes", 120.0, 0.10)
     lip_step(q, ctx)
     t = ctx.lip_targets[("A", "no")]
@@ -916,28 +935,37 @@ def test_lip_fill_is_offered_back_at_best_on_other_side():
 
 
 def test_lip_exit_steps_in_front_when_spread_allows():
-    q, ctx = lip_q(lip_rich_lots=0.0)
+    q, ctx = lip_q()
     _lip_fill(ctx, "yes", 120.0, 0.10)
     lip_step(q, ctx, yes={0.06: 500.0}, no={0.89: 120.0})    # far cap for no = 1 - 0.06 - 0.01 = 0.93
     assert ctx.lip_targets[("A", "no")].price == 0.90
 
 
-def test_lip_exit_adds_band_size_on_top_of_inventory():
-    """9 lots bought on the cheap yes side: the no side (0.89, rich band)
-    quotes rich_lots + 9 = 109, so the max short it can reach is the band."""
-    q, ctx = lip_q(lip_rich_lots=100.0)
+def test_lip_exit_on_expensive_side_is_inventory_only():
+    """9 lots bought on the cheap yes side: the no exit at 0.89 offers the 9
+    back and nothing more -- no expensive-side LIP size on top."""
+    q, ctx = lip_q()
     _lip_fill(ctx, "yes", 9.0, 0.10)
     lip_step(q, ctx)
     t = ctx.lip_targets[("A", "no")]
-    assert t.size == 109.0 and t.front is True
+    assert t.size == 9.0 and t.front is True
+
+
+def test_lip_exit_adds_band_size_on_a_cheap_side():
+    """9 no bought on a cheap no side (0.15): the yes exit at the cheap 0.10
+    offers the 9 back plus the band, 400 + 9."""
+    q, ctx = lip_q()
+    _lip_fill(ctx, "no", 9.0, 0.15)
+    lip_step(q, ctx, yes={0.10: 120.0, 0.09: 400.0}, no={0.15: 120.0, 0.14: 400.0}, fair=0.12)
+    t = ctx.lip_targets[("A", "yes")]
+    assert t.size == 409.0 and t.front is True
 
 
 def test_lip_exit_one_sided_book_offers_inventory_only():
-    """120 yes bought on LIP; then every no bid leaves. No LIP can be earned,
-    so the band size is dropped, but the inventory is still offered back --
-    a tick inside the far touch (yes bid 0.10 -> no 0.89), since nobody else
-    is on the no side to step in front of."""
-    q, ctx = lip_q(lip_rich_lots=100.0)
+    """120 yes bought on LIP; then every no bid leaves. The inventory is still
+    offered back -- a tick inside the far touch (yes bid 0.10 -> no 0.89),
+    since nobody else is on the no side to step in front of."""
+    q, ctx = lip_q()
     _lip_fill(ctx, "yes", 120.0, 0.10)
     lip_step(q, ctx, no={})
     t = ctx.lip_targets[("A", "no")]
@@ -947,14 +975,14 @@ def test_lip_exit_one_sided_book_offers_inventory_only():
 
 
 def test_lip_exit_inventory_never_cut_by_loss_budget():
-    q, ctx = lip_q(max_loss=1.0, lip_rich_lots=100.0)
+    q, ctx = lip_q(max_loss=1.0)
     _lip_fill(ctx, "yes", 120.0, 0.10)
     lip_step(q, ctx)
     assert ctx.lip_targets[("A", "no")].size >= 120.0
 
 
 def test_lip_exit_shrinks_as_it_fills_and_ignores_edge_fills():
-    q, ctx = lip_q(lip_rich_lots=0.0)
+    q, ctx = lip_q()
     _lip_fill(ctx, "yes", 120.0, 0.10)
     _lip_fill(ctx, "no", 50.0, 0.89)                    # 50 of the exit filled
     lip_step(q, ctx)
@@ -966,7 +994,7 @@ def test_lip_exit_shrinks_as_it_fills_and_ignores_edge_fills():
 
 
 def test_lip_exit_continues_past_the_lip_time_cutoff():
-    q, ctx = lip_q(close=T0 + pd.Timedelta(seconds=100), lip_rich_lots=0.0)
+    q, ctx = lip_q(close=T0 + pd.Timedelta(seconds=100))
     _lip_fill(ctx, "yes", 120.0, 0.10)
     lip_step(q, ctx)
     assert ctx.lip_targets[("A", "yes")] is None
@@ -974,22 +1002,20 @@ def test_lip_exit_continues_past_the_lip_time_cutoff():
 
 
 def test_loss_budget_shrinks_lip_entry_to_fit():
-    """Worst case = every order fills and settles against us. Yes 400 @0.10
-    risks $40 if A loses; no @0.89 risks $0.89/lot if A wins. With $60 of
-    budget and only one market, the outcomes are 'A wins' (-0.89n + 360)
-    and 'A loses' (-40 + 0.11n): the yes leg alone already uses $40, so the
-    no side gets what keeps both >= -60."""
-    q, ctx = lip_q(max_loss=60.0)
-    lip_step(q, ctx)
+    """Worst case = every order fills and settles against us. Both sides
+    cheap: yes 400 @0.10 risks $40 if A loses, no @0.15 risks $0.15/lot if A
+    wins. With $45 of budget the no side gets what keeps both outcomes >= -45."""
+    q, ctx = lip_q(max_loss=45.0)
+    lip_step(q, ctx, yes={0.10: 120.0, 0.09: 400.0}, no={0.15: 120.0, 0.14: 400.0}, fair=0.12)
     y, n = ctx.lip_targets[("A", "yes")], ctx.lip_targets[("A", "no")]
     assert y.size == 400.0
-    assert n is not None and n.size <= 100.0
+    assert n is not None and n.size < 400.0
     worst = q._worst_case(ctx, {("A", "yes", "lip"): [(y.price, y.size)], ("A", "no", "lip"): [(n.price, n.size)]})
-    assert worst >= -60.0 - 1e-6
+    assert worst >= -45.0 - 1e-6
 
 
 def test_loss_budget_blocks_lip_when_exhausted():
-    q, ctx = lip_q(max_loss=30.0, lip_rich_lots=0.0)       # yes 400 @0.10 alone would risk $40
+    q, ctx = lip_q(max_loss=30.0)       # yes 400 @0.10 alone would risk $40
     lip_step(q, ctx)
     y = ctx.lip_targets[("A", "yes")]
     assert y is not None and y.size == 300.0              # $30 / $0.10
@@ -997,7 +1023,7 @@ def test_loss_budget_blocks_lip_when_exhausted():
 
 
 def test_loss_budget_is_per_event():
-    q, ctx = lip_q(max_loss=30.0, lip_rich_lots=0.0)
+    q, ctx = lip_q(max_loss=30.0)
     # Earlier events' losses no longer shrink this event's budget.
     ctx._engine = types.SimpleNamespace(loss_offset=-20.0)
     lip_step(q, ctx)
@@ -1005,7 +1031,7 @@ def test_loss_budget_is_per_event():
 
 
 def test_loss_budget_never_cuts_a_lip_exit():
-    q, ctx = lip_q(max_loss=1.0, lip_rich_lots=0.0)
+    q, ctx = lip_q(max_loss=1.0)
     _lip_fill(ctx, "yes", 120.0, 0.10)                     # $12 at risk already, over budget
     lip_step(q, ctx)
     assert ctx.lip_targets[("A", "no")].size == 120.0      # the exit still rests in full
@@ -1021,10 +1047,12 @@ def test_loss_budget_shrinks_edge_ladder_and_takes():
     assert q.block_counts.get("max_loss_budget", 0) >= 1
 
 
-def test_lips_at_band_edges():
-    s = P.LipSettings(**dict(LIP_OFF, lip_cheap_lots=400.0, lip_rich_lots=100.0))
-    assert s.lots_at(0.20) == 400.0 and s.lots_at(0.21) == 0.0
-    assert s.lots_at(0.79) == 0.0 and s.lots_at(0.80) == 100.0
+def test_lips_cheap_band_and_taper():
+    s = P.LipSettings(**dict(LIP_OFF, lip_cheap_lots=400.0))
+    assert s.lots_at(0.05) == 400.0 and s.lots_at(0.20) == 400.0
+    assert s.lots_at(0.35) == pytest.approx(200.0)
+    assert s.lots_at(0.49) == pytest.approx(400.0 * 0.01 / 0.30)
+    assert s.lots_at(0.50) == 0.0 and s.lots_at(0.80) == 0.0 and s.lots_at(0.95) == 0.0
     assert s.max_lots() == 400.0
 
 

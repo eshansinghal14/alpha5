@@ -147,15 +147,15 @@ Per market and side (`trading/quoter.py` docstring has the formula):
   inside the near touch and a tick inside the far one.
 - **LIP quote** (`lip.*`): exists only to earn LIP. One order per side at
   others' best bid on that side (our own orders netted out), capped a tick
-  inside the far touch. Our fair and edge are not consulted. Quoted only when
-  that price is ≤ `lip_cheap_max_price` (size `lip_cheap_lots`) or
-  ≥ `lip_rich_min_price` (size `lip_rich_lots`), and with at least
+  inside the far touch. Cheap side only: `lip_cheap_lots` at a best bid
+  ≤ `lip_cheap_max_price`, tapering linearly to 0 at 0.50
+  (`params.LIP_TAPER_END`); no LIP on an expensive side. Needs at least
   `lip_min_time_left_s` to close. Size is net of the position already held
-  on that side and our resting edge size there. Not quoted if that best bid
-  is more than `lip_fair_margin` above own-side fair (negative = must be
-  that far below). Pulled with the edge quotes on no fair, a stale
+  on that side and our resting edge size there. Capped at own-side fair minus
+  `lip_constant_edge`. Pulled with the edge quotes on no fair, a stale
   signal, `enable_quoting` off, a model side block or `spot_burst`. Moved at
-  most once per `lip_hold_s`.
+  most once per `lip_hold_s`. The LIP exit (inventory offered back on the
+  other side) still runs on an expensive side, sized to the inventory alone.
   - **$1 payout floor** (hardcoded, `quoter.LIP_MIN_PAYOUT_USD`): a market is
     LIP-quoted only if LIP accrued so far plus our current $/s (book as it is,
     our quotes never filled) held to the LIP stop would reach $1. Kalshi pays

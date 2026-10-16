@@ -3,6 +3,22 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-16 (late) — LIP cheap side only, tapered past the cutoff
+
+- Expensive-side LIP removed: `lip_rich_min_price` and `lip_rich_lots` are
+  gone (a config still carrying them is rejected as unknown keys). 10-16
+  12:10 UTC: a 192-lot HYPE no bid at 0.81 was swept for 166 lots while the
+  fair had moved under it (no fair 0.17-0.19, capped price 0.16 vs our 0.19
+  for the 1.8s before the sweep), leaving us short 161 yes. Public prints
+  10-15 17:00 to 10-16 12:00 UTC: makers at 0.80-1.00 ran -1.8 to +0.3c/lot
+  at 10s. The LIP exit still offers inventory back on an expensive side,
+  sized to the inventory alone.
+- Cheap-side size tapers instead of stopping: `lip_cheap_lots` up to
+  `lip_cheap_max_price`, linear to 0 at 0.50 (`params.LIP_TAPER_END`).
+  Same prints: makers at 0.20-0.45 made +0.1 to +3.4c/lot at 10s, no worse
+  than <=0.20; 0.45-0.55 was the first adverse bucket (-1.3c). A side
+  crossing 0.20 is amended smaller rather than cancelled.
+
 ## 2026-10-16 (later) — one $1 LIP threshold; drop sides that add no payable cent
 
 Armed 10-16 09:10-10:15 UTC, LIP was up 5.6% of its window and 72% of the

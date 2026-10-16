@@ -552,8 +552,8 @@ class Quoter:
         if not (MIN_PRICE <= price <= MAX_PRICE):
             return None
         # The band size is the most position we want on this side: quote up to
-        # it. Signed, so a position the other way (e.g. 9 bought on the cheap
-        # side) is added: the expensive side quotes rich_lots + 9.
+        # it, net of the signed position held there (a position the other way
+        # adds to it).
         held = net if side == "yes" else -net
         size = math.floor(lc.lots_at(price) - held - self._resting(ticker, side) + 1e-9)
         if size < 1:
@@ -595,7 +595,7 @@ class Quoter:
             return None
         self._block("lip_exit")
         # Exit the inventory, then keep quoting up to this side's band size
-        # (0 outside the bands): the band is the max position wanted here.
+        # (0 above the cheap taper, so an expensive-side exit is the inventory alone).
         extra = float(math.floor(lc.lots_at(price) + 1e-9)) if lc.lots_at(price) > 0 else 0.0
         self._lip_exit_qty[(ticker, side)] = float(qty)
         return LipTarget(price, float(qty) + extra, front=True)
