@@ -127,6 +127,9 @@ class Quoter:
         # Inventory part of this decision's exit target, per (ticker, side).
         self._lip_exit_qty: dict[tuple[str, str], float] = {}
         self._lip_last: dict[tuple[str, str], LipTarget] = {}
+        # Per ticker: epoch seconds until which its fair is held as suspect.
+        self._suspect_until: dict[str, float] = {}
+        self._now_s = 0.0
 
     # ------------------------------------------------------------------
     # Engine interface
@@ -146,6 +149,7 @@ class Quoter:
         self._sync_quote_fills(ctx)
 
         now_s = ctx.time.timestamp()
+        self._now_s = now_s
         evt = ctx.last_event
         if isinstance(evt, FairUpdate):
             self.fairs.update(evt.fairs)
@@ -161,6 +165,11 @@ class Quoter:
                 return  # no fair for this market yet
             targets = [ticker]
 
+        # Before any _act: the ATM ranking reads every fair, so one market's
+        # new broken fair must be flagged before another market is ranked.
+        changed = evt.fairs if isinstance(evt, FairUpdate) else {**(refreshed or {}), ticker: None}
+        for t in changed:
+            self._check_fair(ctx, t, now_s)
         for ticker in targets:
             self._act(ctx, ticker, now_s)
 
@@ -246,14 +255,35 @@ class Quoter:
         self._last_signal_age = age
         return age is None or age > self.cfg.risk.max_signal_age_s
 
+    def _check_fair(self, ctx, ticker: str, now_s: float) -> None:
+        """Flag a fair that can't be right: band wider than risk.max_fair_band,
+        or more than risk.max_fair_outside_touch outside Kalshi's touch."""
+        r = self.cfg.risk
+        fair = self.fairs.get(ticker)
+        if fair is None:
+            return
+        bad = r.max_fair_band is not None and fair.hi - fair.lo > r.max_fair_band
+        lim = r.max_fair_outside_touch
+        book = ctx.book(ticker)
+        if not bad and lim is not None and book is not None:
+            bad = ((book.bid is not None and fair.prob < book.bid - lim)
+                   or (book.ask is not None and fair.prob > book.ask + lim))
+        if bad:
+            self._suspect_until[ticker] = now_s + r.fair_suspect_hold_s
+
+    def _fair_suspect(self, ticker: str, now_s: float) -> bool:
+        # Inclusive, so a 0s hold still blocks the failing reading itself.
+        return now_s <= self._suspect_until.get(ticker, -math.inf)
+
     def _atm_tradeable(self, ticker: str) -> bool:
-        """Among the max_markets fairs closest to 0.5. Ties break on ticker;
-        members stay until they rank below max_markets + atm_hysteresis."""
+        """Among the max_markets fairs closest to 0.5, suspect fairs excluded.
+        Ties break on ticker; members stay until they rank below max_markets +
+        atm_hysteresis."""
         q = self.cfg.quoting
         n = q.max_markets
         if n is None:
             return True
-        ranked = sorted((t for t, f in self.fairs.items() if f is not None),
+        ranked = sorted((t for t, f in self.fairs.items() if f is not None and not self._fair_suspect(t, self._now_s)),
                         key=lambda t: (abs(self.fairs[t].prob - 0.5), t))
         keep_within = set(ranked[:n + max(q.atm_hysteresis, 0)])
         members = [t for t in ranked if t in self._atm_set and t in keep_within]
@@ -297,6 +327,8 @@ class Quoter:
             gate = self._block("no_fair")
         elif self.signal_stale():
             gate = self._block("stale_signal")
+        elif self._fair_suspect(ticker, now_s):
+            gate = self._block("fair_suspect")
         if gate is not None:
             for side in ("yes", "no"):
                 self._publish(ctx, ticker, side, None)
@@ -443,16 +475,8 @@ class Quoter:
             exit_t = None if (side_blocked or quote_gate or not lc.enable_lip_quoting or not q.enable_quoting) else \
                 self._lip_exit(ticker, side, book, ladder, net, prob)
             if exit_t is not None:
-                # One order per side: the exit wins (front of the book), sized to
-                # the inventory plus this side's band size. The band part is only
-                # there to farm LIP: dropped when it adds nothing payable (e.g. a
-                # one-sided book), so the exit rests at the inventory alone.
-                inv = self._lip_exit_qty.get((ticker, side), 0.0)
-                if exit_t.size > inv + 1e-9 and self.lip is not None:
-                    bare = LipTarget(exit_t.price, inv, front=True)
-                    if not self._lip_adds(ticker, {**lips, side: exit_t}, {**lips, side: bare}, ladder, now):
-                        self._block("lip_no_reward")
-                        exit_t = bare
+                # One order per side: the exit (inventory only, front of the
+                # book) replaces the farming quote until the inventory is gone.
                 lips[side] = exit_t
             t = lips[side]
             if t is not None:
@@ -569,7 +593,8 @@ class Quoter:
     def _lip_exit(self, ticker, side, book, ladder, net, prob) -> LipTarget | None:
         """Offer back what LIP orders bought: inventory long yes from LIP fills
         is offered on the no side (and vice versa), sized to that inventory
-        (capped at the position actually held). Unlike a LIP quote it WANTS the
+        (capped at the position actually held) and nothing more, so a full
+        fill flattens rather than flips. Unlike a LIP quote it WANTS the
         fill: it steps a tick in front of others' best bid (alone at the front
         of the book) and is marked `front`, so it is never re-queued. Bypasses
         the bands, lots, payout floor, max-markets and the LIP time cutoff;
@@ -604,11 +629,11 @@ class Quoter:
             self._block("lip_exit_over_half")
             return None
         self._block("lip_exit")
-        # Exit the inventory, then keep quoting up to this side's band size.
-        band = lc.lots_at(price, side)
-        extra = float(math.floor(band + 1e-9)) if band > 0 else 0.0
+        # The inventory alone. Band size on top flipped the position at the
+        # front of the book: ETH 10-16 14:23 UTC went -70 -> +18, and HYPE
+        # 07:32 -53 -> +101, each in one sweep.
         self._lip_exit_qty[(ticker, side)] = float(qty)
-        return LipTarget(price, float(qty) + extra, front=True)
+        return LipTarget(price, float(qty), front=True)
 
     def _lip_fair_cap(self, side, prob) -> float:
         """Highest own-side LIP price that keeps lip_constant_edge below fair."""

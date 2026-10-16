@@ -3,6 +3,31 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-16 (night) — constant-$ LIP sizing; exit = inventory; one LIP order per side; burst-threshold check
+
+- LIP size above `lip_cheap_max_price` keeps the cutoff's $ worst case
+  instead of tapering linearly: the bid is `lip_bid_lots x cutoff / y`, the
+  offer `lip_offer_lots x (1 - cutoff) / (1 - y)`. The offer's per-lot loss is
+  1 - y, so it now grows toward 0.50 rather than shrinking where it is
+  cheapest to hold. Hard 0 at a yes price of 0.50 unchanged. `max_lots`
+  (the position guard) is the offer's peak just under 0.50.
+- The LIP exit is the inventory alone. Inventory plus band size flipped the
+  position when the front-of-book exit was swept (ETH 10-16 14:23 UTC
+  -70 -> +18; HYPE 07:32 -53 -> +101).
+- No new LIP create on a side while that side's previous LIP order is still
+  cancelling. ETH 14:24:07 UTC: a stale-cancel and a create raced, two no
+  bids rested (41.65 @0.60, 38.65 @0.59) and both filled.
+- Saved / fallback burst thresholds crossed by more than 5% of the last 5 min
+  of samples are ignored (source record-only for that coin until its live
+  quantile is ready). After the 18:34 UTC restart saved values ~1,000x too low
+  (HL ETH $91/s) held every quote pulled for 12 minutes.
+- Crypto params from bid+offer trading 13:18-18:48 UTC (24 LIP fills, 762
+  lots): the offer leg lost $107 settled vs the bid's +$31 at similar 10s
+  markout (-3.5c both); its $ risk per lot is ~4x the bid's. `lip_offer_lots`
+  100 -> 30 (cutoff $ risk $27 vs the bid's $15), `lip_bid_lots` 150,
+  `lip_cheap_max_price` 0.10 kept. Payable reward over the same window was
+  $10.08 on 7 of 40 markets.
+
 ## 2026-10-16 (evening, later) — LIP gate is the yes price; bid and offer on longshots
 
 - The 0.50 gate, the band and the taper are now by each order's price in yes

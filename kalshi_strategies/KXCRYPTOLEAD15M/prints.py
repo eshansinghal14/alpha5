@@ -54,6 +54,12 @@ REFRESH_S = 60.0
 # top: simulated over 2026-10-11 ~18:00-21:00 UTC, the perps took the share of
 # time quotes are pulled from 5.7% (Coinbase + Hyperliquid) to 9.0%.
 AUTO_SOURCES = ("coinbase", "hyperliquid", *PERP_SOURCES)
+# A p99.5 threshold is crossed 0.5% of the time on the samples it came from;
+# bursts cluster, so allow 10x that over 5 min before calling it mis-scaled.
+# Needs a minute of samples first.
+SANITY_WINDOW_S = 300.0
+SANITY_MIN_S = 60.0
+SANITY_MAX_TRIP = 0.05
 
 
 # Calibrated thresholds, saved on every refresh so a restart can reuse them
@@ -180,10 +186,25 @@ class BurstCalibrator:
 
     def threshold(self, coin: str) -> float | None:
         if self.ready and coin in self.live:
-            return self.live[coin]
-        if coin in self.saved:
-            return self.saved[coin]
-        return self.fallback.get(coin)
+            return self.live[coin]          # a quantile of these same samples: consistent by construction
+        v = self.saved.get(coin, self.fallback.get(coin))
+        if v is not None and self.too_hot(coin, v):
+            return None
+        return v
+
+    def too_hot(self, coin: str, thr: float) -> bool:
+        """Whether a saved or fallback `thr` is crossed far more often than a
+        p99.5 can be on the last SANITY_WINDOW_S of samples: a mis-scaled
+        value, so the source is record-only for that coin until it recalibrates
+        (its live quantile then takes over). Saved values ~1,000x
+        too low (HL ETH $91/s) held every quote pulled for 12 min after the
+        2026-10-16 18:34 UTC restart."""
+        n = min(self._n, int(SANITY_WINDOW_S / SAMPLE_S))
+        if n < int(SANITY_MIN_S / SAMPLE_S) or coin not in self.coins:
+            return False
+        k = self.coins.index(coin)
+        idx = (self._i - 1 - np.arange(n)) % self._buf.shape[1]
+        return float(np.mean(self._buf[k, idx] >= thr)) > SANITY_MAX_TRIP
 
     @property
     def source(self) -> str:

@@ -685,6 +685,13 @@ class OrderManager:
                 continue
             q = self.lip_quote(ticker, side)
             if q is None:
+                # A LIP quote still being cancelled can rest at Kalshi until the
+                # cancel lands: creating now puts two up. ETH 10-16 14:24:07 UTC,
+                # a flickering exit target left 41.65 @0.60 and 38.65 @0.59 both
+                # resting, and both filled (80 lots for a ~58-lot target).
+                if any(o.state == CANCELLING for o in self.live(ticker, side, LIP)):
+                    self._bump("lip_create_deferred:cancelling")
+                    continue
                 if self._reject_until.get((ticker, side, LIP, round(t.price, 2)), 0.0) <= now:
                     creates.append((ticker, side, t))
                 continue

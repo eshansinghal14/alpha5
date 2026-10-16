@@ -482,6 +482,23 @@ def test_lip_resting_above_target_is_cancelled_at_once():
     assert ex.creates[-1].price == 0.11
 
 
+def test_lip_no_new_create_while_the_old_one_is_still_cancelling():
+    """The old LIP order can still rest (and fill) until its cancel lands: a
+    pump in between must not put a second one up. ETH 10-16 14:24:07 UTC: two
+    no bids resting at once, both filled."""
+    m, ex, c = mk()
+    m.set_lip("A", "no", LipTarget(0.60, 40.0))
+    m.pump(); ack_all(m, ex)
+    m.set_lip("A", "no", LipTarget(0.59, 40.0))           # stale -> cancel in flight
+    assert ex.cancels == [(1, "lip_stale")]
+    m.pump()
+    assert len(ex.creates) == 1                            # no second order yet
+    assert m.counts.get("lip_create_deferred:cancelling", 0) >= 1
+    m.on_cancel_done(1)
+    m.pump()
+    assert len(ex.creates) == 2 and ex.creates[-1].price == 0.59
+
+
 def test_lip_stale_cancel_goes_before_edge_cancels():
     m, ex, _ = mk(bucket=None)
     m.set_desired("A", "yes", D([0.41, 0.40]))

@@ -24,7 +24,14 @@ def immediate_takes(monkeypatch):
     monkeypatch.setattr(quoter_mod, "TAKE_HOLD_S", 0.0)
 
 
-def cfg(**q):
+GUARD_OFF = dict(max_fair_band=None, max_fair_outside_touch=None, fair_suspect_hold_s=0.0)
+
+
+def risk(**r):
+    return P.RiskParams(**{"max_loss_usd": 80.0, "max_signal_age_s": 1.0, **GUARD_OFF, **r})
+
+
+def cfg(risk_kw=None, **q):
     base = dict(order_lots=1.0, max_position=10.0, constant_edge=0.01, constant_edge_ref_s=None, edge_fraction=1.0,
                 lean_dollars=0.02, max_markets=None, atm_hysteresis=0,
                 enable_taking=True, enable_quoting=True, quoting_edge=0.0, max_improve_ticks=1, quote_levels_behind=0,
@@ -34,7 +41,7 @@ def cfg(**q):
     return types.SimpleNamespace(
         quoting=P.QuotingParams(**base),
         trading_time=P.TradingTimeParams(real_trading_delay_s=0.0, real_trading_cutoff_s=0.0),
-        risk=P.RiskParams(max_loss_usd=80.0, max_signal_age_s=1.0),
+        risk=risk(**(risk_kw or {})),
         lip=P.LipSettings(**LIP_OFF))
 
 
@@ -322,6 +329,76 @@ def test_max_markets_blocks_far_markets():
     assert by["A"]["block_bid"] is None and by["B"]["block_bid"] == "outside_atm_set"
 
 
+GUARD = dict(max_fair_band=0.30, max_fair_outside_touch=0.15, fair_suspect_hold_s=30.0)
+
+
+def test_wide_band_fair_pulls_quotes_lip_and_takes():
+    """10-16 17:41 T7624: market 0.94/0.96, fair 0.48 with band 0.00-0.96."""
+    q, ctx = Quoter(cfg(risk_kw=GUARD), Model(), FREE, close_time=None), Ctx()
+    step(q, ctx, {"A": Fair(0.95, 0.94, 0.96)}, Book("A", 0.94, 0.96))
+    assert ladder(ctx, "yes")
+    step(q, ctx, {"A": Fair(0.48, 0.0, 0.96)}, dt=0.1)
+    assert ctx.desired[("A", "yes")] is None and ctx.desired[("A", "no")] is None
+    assert takes(ctx) == []
+    r = q.debug_log[-1]
+    assert r["block_bid"] == "fair_suspect" and q.block_counts["fair_suspect"] == 1
+    assert r["prob_raw"] == 0.48
+
+
+def test_fair_far_outside_touch_is_blocked_even_with_a_narrow_band():
+    q, ctx = Quoter(cfg(risk_kw=GUARD), Model(), FREE, close_time=None), Ctx()
+    step(q, ctx, {"A": Fair(0.55, 0.54, 0.56)}, Book("A", 0.74, 0.76))   # 19c under the bid
+    assert takes(ctx) == [] and ctx.desired[("A", "yes")] is None
+    assert q.debug_log[-1]["block_bid"] == "fair_suspect"
+
+
+def test_fair_just_outside_touch_still_trades():
+    """A real edge: fair 5c through the ask is a take, not a broken fair."""
+    q, ctx = Quoter(cfg(risk_kw=GUARD), Model(), FREE, close_time=None), Ctx()
+    step(q, ctx, {"A": Fair(0.65, 0.64, 0.66)}, Book("A", 0.40, 0.60))
+    assert takes(ctx) and q.debug_log[-1]["block_bid"] is None
+
+
+def test_suspect_fair_is_held_through_plausible_readings():
+    """The break flickered: a reading inside the limits right after a bad one
+    stays blocked until fair_suspect_hold_s has passed with no failure."""
+    q, ctx = Quoter(cfg(risk_kw=GUARD), Model(), FREE, close_time=None), Ctx()
+    step(q, ctx, {"A": Fair(0.48, 0.0, 0.96)}, Book("A", 0.94, 0.96))
+    step(q, ctx, {"A": Fair(0.90, 0.89, 0.91)}, dt=5.0)
+    assert ctx.desired[("A", "yes")] is None and q.debug_log[-1]["block_bid"] == "fair_suspect"
+    step(q, ctx, {"A": Fair(0.48, 0.0, 0.96)}, dt=20.0)            # fails again: hold restarts
+    step(q, ctx, {"A": Fair(0.95, 0.94, 0.96)}, dt=25.0)
+    assert q.debug_log[-1]["block_bid"] == "fair_suspect"
+    step(q, ctx, {"A": Fair(0.95, 0.94, 0.96)}, dt=10.0)            # 35s after the last failure
+    assert ladder(ctx, "yes") and q.debug_log[-1]["block_bid"] is None
+
+
+def test_suspect_fair_cannot_pull_a_deep_market_into_the_atm_set():
+    """A broken 0.48 on a deep market ranked closest to 0.5 and took an ATM
+    slot from a real one (10-16 17:41: deep KXINXU markets quoted)."""
+    q, ctx = Quoter(cfg(risk_kw=GUARD, max_markets=1), Model(), FREE, close_time=None), Ctx()
+    ctx.books["D"] = Book("D", 0.94, 0.96)
+    step(q, ctx, {"A": Fair(0.40, 0.39, 0.41), "D": Fair(0.95, 0.94, 0.96)}, Book("A", 0.38, 0.42))
+    step(q, ctx, {"A": Fair(0.40, 0.39, 0.41), "D": Fair(0.48, 0.0, 0.96)}, dt=0.1)
+    by = {r["ticker"]: r for r in q.debug_log[-2:]}
+    assert by["A"]["block_bid"] is None and by["A"]["atm_tradeable"]
+    assert by["D"]["block_bid"] == "fair_suspect"
+
+
+def test_book_move_alone_can_flag_a_fair():
+    """Kalshi moves away from an unchanged fair: checked on the book event."""
+    q, ctx = Quoter(cfg(risk_kw=GUARD), Model(), FREE, close_time=None), Ctx()
+    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, Book("A", 0.48, 0.52))
+    step(q, ctx, book=Book("A", 0.80, 0.82), dt=0.1)
+    assert ctx.desired[("A", "yes")] is None and q.debug_log[-1]["block_bid"] == "fair_suspect"
+
+
+def test_guard_off_by_default():
+    q, ctx = Quoter(cfg(), Model(), FREE, close_time=None), Ctx()
+    step(q, ctx, {"A": Fair(0.48, 0.0, 0.96)}, Book("A", 0.94, 0.96))
+    assert "fair_suspect" not in q.block_counts
+
+
 def test_fair_clip_applies_to_quoting_not_log():
     q, ctx = Quoter(cfg(), Model(), FREE, close_time=None), Ctx()
     step(q, ctx, {"A": Fair(0.0, 0.0, 0.002)}, Book("A", 0.01, 0.03))
@@ -431,7 +508,7 @@ def no_lip_floor(request, monkeypatch):
 
 def lip_q(close=CLOSE, own_in_book=False, max_loss=1e6, **lip):
     c = lip_cfg(**lip)
-    c.risk = P.RiskParams(max_loss_usd=max_loss, max_signal_age_s=1.0)
+    c.risk = risk(max_loss_usd=max_loss)
     return (Quoter(c, Model(), FREE, close_time=close, lip=LipTracker({"A": LIPP})),
             LipCtx(own_in_book=own_in_book))
 
@@ -461,13 +538,13 @@ def test_lip_ignores_fair_and_edge():
     assert ctx.lip_targets[("A", "yes")].price == 0.10
 
 
-def test_lip_cheap_side_tapers_past_the_cutoff():
-    """400 lots up to 0.20, linear to 0 at 0.50: 0.30 -> 266, 0.45 -> 66."""
+def test_lip_bid_keeps_constant_dollars_past_the_cutoff():
+    """400 lots ($80) at 0.20; above it $80 / y: 0.30 -> 266, 0.45 -> 177."""
     q, ctx = lip_q()
     lip_step(q, ctx, yes={0.30: 500.0, 0.29: 300.0}, no={0.65: 500.0}, fair=0.32)
     assert ctx.lip_targets[("A", "yes")].size == 266.0
     lip_step(q, ctx, yes={0.45: 500.0, 0.44: 300.0}, no={0.50: 500.0}, fair=0.47, dt=0.1)
-    assert ctx.lip_targets[("A", "yes")].size == 66.0
+    assert ctx.lip_targets[("A", "yes")].size == 177.0
 
 
 def test_lip_off_on_a_market_at_or_over_half():
@@ -958,14 +1035,14 @@ def test_lip_never_quotes_at_or_over_half_whatever_the_sizes():
     assert ctx.lip_targets[("A", "yes")] is None and ctx.lip_targets[("A", "no")] is None
 
 
-def test_lip_exit_adds_band_size_on_top_of_inventory():
-    """9 yes bought: the no exit at 0.89 (yes offer 0.11) offers the 9 back
-    plus the offer band, 400 + 9."""
+def test_lip_exit_is_inventory_only_so_a_full_fill_flattens():
+    """9 yes bought: the no exit offers exactly the 9 back, not 9 + the offer
+    band -- a sweep of the exit leaves us flat, not short 400."""
     q, ctx = lip_q(lip_offer_lots=400.0)
     _lip_fill(ctx, "yes", 9.0, 0.10)
     lip_step(q, ctx)
     t = ctx.lip_targets[("A", "no")]
-    assert t.size == 409.0 and t.front is True
+    assert t.size == 9.0 and t.front is True
 
 
 def test_lip_exit_one_sided_book_offers_inventory_only():
@@ -1048,7 +1125,7 @@ def test_loss_budget_never_cuts_a_lip_exit():
 
 def test_loss_budget_shrinks_edge_ladder_and_takes():
     q, ctx = Quoter(cfg(order_lots=10.0, quote_levels_behind=1), Model(), FREE, close_time=None), Ctx()
-    q.cfg.risk = P.RiskParams(max_loss_usd=5.0, max_signal_age_s=1.0)
+    q.cfg.risk = risk(max_loss_usd=5.0)
     step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, Book("A", 0.30, 0.70))
     d = ctx.desired[("A", "yes")]
     # Two yes levels near 0.48/0.47 at 10 lots would risk ~$9.5 if A loses.
@@ -1056,18 +1133,23 @@ def test_loss_budget_shrinks_edge_ladder_and_takes():
     assert q.block_counts.get("max_loss_budget", 0) >= 1
 
 
-def test_lips_per_side_band_and_taper_by_yes_price():
-    """Both sides gated by the order's yes price: the bid at p, the offer (no
-    bid at p) at 1 - p."""
+def test_lips_constant_dollars_by_yes_price():
+    """Fixed lots up to the 0.20 cutoff, then the cutoff's $ worst case: bid
+    400 x 0.20 = $80 -> $80 / y; offer 100 x 0.80 = $80 -> $80 / (1 - y). The
+    offer is a no bid at 1 - y. Nothing at a yes price of 0.50 or more."""
     s = P.LipSettings(**dict(LIP_OFF, lip_bid_lots=400.0, lip_offer_lots=100.0))
     assert s.lots_at(0.05, "yes") == 400.0 and s.lots_at(0.20, "yes") == 400.0
     assert s.lots_at(0.95, "no") == 100.0 and s.lots_at(0.80, "no") == 100.0     # yes offer 0.05 / 0.20
-    assert s.lots_at(0.35, "yes") == pytest.approx(200.0)
-    assert s.lots_at(0.65, "no") == pytest.approx(50.0)                          # yes offer 0.35
-    assert s.lots_at(0.49, "yes") == pytest.approx(400.0 * 0.01 / 0.30)
+    assert s.lots_at(0.40, "yes") == pytest.approx(200.0)                        # $80 / 0.40
+    assert s.lots_at(0.60, "no") == pytest.approx(80.0 / 0.60)                   # yes offer 0.40: grows
+    for side, px in (("yes", 0.30), ("yes", 0.45), ("no", 0.70), ("no", 0.55)):
+        worst = px * s.lots_at(px, side)                                         # per-lot loss = own price
+        assert worst == pytest.approx(80.0)
     assert s.lots_at(0.50, "yes") == 0.0 and s.lots_at(0.80, "yes") == 0.0
     assert s.lots_at(0.50, "no") == 0.0 and s.lots_at(0.20, "no") == 0.0          # yes offer 0.50 / 0.80
-    assert s.max_lots() == 400.0
+    assert s.max_lots() == pytest.approx(400.0)
+    s = P.LipSettings(**dict(LIP_OFF, lip_bid_lots=50.0, lip_offer_lots=100.0))
+    assert s.max_lots() == pytest.approx(160.0)                                  # offer peak, $80 / 0.50
 
 
 def test_model_quote_block_pulls_both_ladders_but_still_takes():

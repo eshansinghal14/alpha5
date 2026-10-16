@@ -8,10 +8,9 @@ from __future__ import annotations
 from kalshi_infra.config import APPLY_NEXT_EVENT, param, section  # noqa: F401
 
 # No LIP order (quote or exit) on a market whose yes price -- the order's
-# price in yes terms -- is at or above this; both sizes taper to 0 here from
-# lip_cheap_max_price. Public prints 10-15 17:00 to 10-16 12:00 UTC: yes bids
-# resting at 0.20-0.45 made +0.1 to +3.4c/lot at 10s; 0.45-0.55 was the first
-# adverse bucket (-1.3c).
+# price in yes terms -- is at or above this. Public prints 10-15 17:00 to
+# 10-16 12:00 UTC: 0.45-0.55 was the first adverse maker bucket (-1.3c/lot
+# at 10s).
 LIP_TAPER_END = 0.50
 
 
@@ -118,6 +117,21 @@ class RiskParams:
     max_signal_age_s: float = param(
         "Pull quotes and stop taking when the fair's newest input is older than this; they return "
         "as soon as it's back under.", min=0.01, max=60, step=0.05)
+    # Both checks: S&P decision rows 2026-10-15/16, >=10 min from close, read
+    # band p99.99 <= 23c and outside-touch p99.99 <= 10.5c (wider only at the
+    # 9:30 ET option open); the 10-16 17:41Z chain break read bands to 1.00
+    # and fairs to 57c outside the touch.
+    max_fair_band: float | None = param(
+        "Block a market (no quotes, LIP or takes) while its fair band (prob_hi - prob_lo) is wider "
+        "than this, and leave it out of the max_markets ranking so a broken fair near 0.5 can't pull "
+        "it in. null = off.", min=0.01, max=1.0, step=0.05)
+    max_fair_outside_touch: float | None = param(
+        "Block a market while its fair sits more than this below Kalshi's bid or above its ask. "
+        "null = off.", min=0.01, max=1.0, step=0.01)
+    fair_suspect_hold_s: float = param(
+        "Keep a market blocked this long after its last failed check. The 10-16 break flickered "
+        "between bad and plausible-looking readings for up to 33s, and the plausible ones were up to "
+        "19c from the Kalshi mid.", min=0, max=600, step=5)
 
 
 @section
@@ -142,16 +156,18 @@ class LipSettings:
         "Rest one LIP-farming quote per side, after the edge ladder in priority. Off cancels any "
         "LIP quote. LIP accrual is measured either way.")
     lip_cheap_max_price: float = param(
-        "Full LIP size, both sides, while the order's price in yes terms (the yes bid; 1 - the no "
-        "bid for the offer) is at or below this; above it the size tapers linearly to 0 at 0.50 "
-        "(LIP_TAPER_END), so crossing the cutoff shrinks the order instead of cancelling it. No "
-        "LIP on a market at a yes price of 0.50 or more.", min=0.01, max=0.49, step=0.01)
+        "Fixed LIP lots, both sides, while the order's price in yes terms (the yes bid; 1 - the no "
+        "bid for the offer) is at or below this; above it each side keeps the $ worst case it had "
+        "here (bid lots x this / y; offer lots x (1 - this) / (1 - y)). No LIP on a market at a "
+        "yes price of 0.50 (LIP_TAPER_END) or more.", min=0.01, max=0.49, step=0.01)
     lip_bid_lots: float = param(
-        "LIP yes-bid size (band and taper by the yes bid), less any yes position already held. "
-        "0 = no LIP bid.", min=0, step=10.0)
+        "LIP yes-bid size at or below lip_cheap_max_price, less any yes position already held; "
+        "shrinks above it at constant $ risk. 0 = no LIP bid.", min=0, step=10.0)
     lip_offer_lots: float = param(
-        "LIP yes-offer size, i.e. the no bid at 1 - the yes offer (band and taper by that yes "
-        "offer), less any no position already held. 0 = no LIP offer.", min=0, step=10.0)
+        "LIP yes-offer size (the no bid) at a yes offer at or below lip_cheap_max_price, less any no "
+        "position already held; grows above it at constant $ risk, to x(1 - cutoff)/0.5 just under "
+        "0.50. Worst case per lot is 1 - the yes offer, so this side risks far more per lot than "
+        "the bid. 0 = no LIP offer.", min=0, step=10.0)
     lip_constant_edge: float | None = param(
         "Edge the LIP bid must keep below own-side fair ($): a best bid above fair - this is capped "
         "there. 0 = never above fair. null = no fair check. Live 2026-10-14 22:22-22:55 UTC: 613 of "
@@ -175,18 +191,23 @@ class LipSettings:
 
     def lots_at(self, price: float, side: str) -> float:
         """Order size for a LIP quote on `side` ("yes" = the bid, "no" = the
-        offer) at own-side `price`, by that price in yes terms: full size up to
-        lip_cheap_max_price, linear to 0 at LIP_TAPER_END, 0 at or above it."""
-        lots = self.lip_bid_lots if side == "yes" else self.lip_offer_lots
-        yes_px = lip_yes_price(price, side)
-        if yes_px <= self.lip_cheap_max_price + 1e-9:
-            return lots
-        if yes_px < LIP_TAPER_END - 1e-9:
-            return lots * (LIP_TAPER_END - yes_px) / (LIP_TAPER_END - self.lip_cheap_max_price)
-        return 0.0
+        offer) at own-side `price`, judged by that price in yes terms y: the
+        side's lots up to lip_cheap_max_price, then the same $ worst case as at
+        the cutoff (bid loses y/lot, offer loses 1 - y/lot), 0 at or above
+        LIP_TAPER_END. So the bid shrinks and the offer grows toward 0.50."""
+        edge = self.lip_cheap_max_price
+        y = lip_yes_price(price, side)
+        if y >= LIP_TAPER_END - 1e-9:
+            return 0.0
+        if y <= edge + 1e-9:
+            return self.lip_bid_lots if side == "yes" else self.lip_offer_lots
+        if side == "yes":
+            return self.lip_bid_lots * edge / y
+        return self.lip_offer_lots * (1.0 - edge) / (1.0 - y)
 
     def max_lots(self) -> float:
-        return max(self.lip_bid_lots, self.lip_offer_lots)
+        """Largest LIP order size anywhere: the offer peaks just under 0.50."""
+        return max(self.lip_bid_lots, self.lip_offer_lots * (1.0 - self.lip_cheap_max_price) / (1.0 - LIP_TAPER_END))
 
 
 SHARED_SECTIONS = ("quoting", "trading_time", "risk", "runtime", "lip")

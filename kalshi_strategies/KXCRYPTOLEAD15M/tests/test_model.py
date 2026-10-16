@@ -248,6 +248,22 @@ def test_burst_calibrator_keeps_last_value_when_a_coin_goes_quiet():
     assert cal.threshold("XRP") == 500.0                      # a zero quantile would trip on any print
 
 
+def test_mis_scaled_saved_threshold_goes_record_only():
+    """A saved $91 threshold against ~$1-5k of 1s notional trips ~every
+    sample: ignored (None = no pulls from this source) instead of pulling every
+    quote, and a sane one is kept."""
+    import numpy as np
+    from kalshi_strategies.KXCRYPTOLEAD15M import prints as P
+    cal = P.BurstCalibrator(["ETH"], None)
+    cal.saved = {"ETH": 91.0}
+    assert cal.threshold("ETH") == 91.0                       # no samples yet: can't judge
+    rng = np.random.default_rng(1)
+    cal.seed(rng.uniform(1_000, 5_000, size=(int(P.SANITY_MIN_S / P.SAMPLE_S), 1)))
+    assert cal.threshold("ETH") is None
+    cal.saved = {"ETH": 4_990.0}                              # crossed ~0.25% of samples: fine
+    assert cal.threshold("ETH") == 4_990.0
+
+
 def test_detector_level_decays_without_new_prints():
     from kalshi_strategies.KXCRYPTOLEAD15M.prints import BurstDetector
     d = BurstDetector(["BTC"])
