@@ -46,13 +46,15 @@ def _chart(df: pd.DataFrame, since: pd.Timestamp | None, lip: pd.DataFrame | Non
 
 
 PNL_HELP = "Settled fills at their result; fills on open markets at the latest Kalshi mid."
-MO_HELP = "Per contract vs Kalshi mid 1s after the fill (10s below), fee included. Negative = picked off."
+MO_HELP = ("Per contract vs Kalshi mid 1s after the fill (10s and 60s below), fee included. Negative = "
+           "picked off. 60s catches drift a 10s mark misses; wide books at LIP prices make 1s noisy.")
 SPREAD_HELP = "Mid 1ms before the fill minus our price, fee included: the half-spread we got at the fill."
 
 
 def _common(g: dict):
     """The rows every column shows, so the three line up."""
-    st.metric("1s markout", _c(g["mo1"]), f"10s {_c(g['mo10'])}", delta_color="off", help=MO_HELP)
+    st.metric("1s markout", _c(g["mo1"]), f"10s {_c(g['mo10'])} · 60s {_c(g['mo60'])}", delta_color="off",
+              help=MO_HELP)
     st.metric("Spread at fill", _c(g["mo0"]), delta_color="off", help=SPREAD_HELP)
     st.metric("Lots filled", f"{g['contracts']:,.0f}",
               f"{g['fills']} fills" + (f" · {g['taker']} taker" if g["taker"] else ""), delta_color="off")
@@ -86,11 +88,11 @@ def _lip(g: dict):
     if not g.get("markets") and not g["fills"]:
         st.caption("No LIP payable while armed in this window.")
         return
-    st.metric("Net (reward + fill PnL)", _usd(g["net"]), f"reward {_usd(g['reward'])} · fills {_usd(g['pnl'])}",
-              delta_color="off",
+    st.metric("Net (reward + 10s markout)", _usd(g["net_mo10"]),
+              f"60s {_usd(g['net_mo60'])} · settled {_usd(g['net'])}", delta_color="off",
               help="Estimated LIP reward from the scoring replica while armed (not money received), only "
-                   "markets at or over Kalshi's $1.00 minimum payout, plus the settled/marked PnL of fills "
-                   "on the LIP quote.")
+                   "markets at or over Kalshi's $1.00 minimum payout, plus the LIP fills' markout $ vs Kalshi "
+                   "mid 10s (60s) later. Settled is the same with settlement PnL: far noisier.")
     _common(g)
     st.metric("Reward per lot filled", _c(g["reward_c"]), f"{_usd(g['reward_per_h'])}/h", delta_color="off",
               help="LIP reward over LIP lots filled. Above |markout| means the program pays for the "

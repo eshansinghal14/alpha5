@@ -30,6 +30,7 @@ def test_split_lip_reward_against_lip_fills():
     assert s["fills"] == 1 and s["contracts"] == 10
     assert math.isclose(s["mo1"], -1.0) and math.isclose(s["mo10"], -3.0)
     assert math.isclose(s["reward"], 0.50) and math.isclose(s["pnl"], -0.50) and math.isclose(s["net"], 0.0)
+    assert math.isclose(s["net_mo10"], 0.50 - 0.30) and math.isclose(s["net_mo60"], 0.50 - 0.40)
     assert math.isclose(s["reward_c"], 5.0)
 
 

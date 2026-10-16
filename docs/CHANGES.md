@@ -3,6 +3,17 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-16 — spot_burst pulls LIP at once; LIP judged on markout
+
+- `spot_burst` is now a hard pull for the LIP quote and the LIP exit, like
+  the edge ladder: no `LIP_PULL_DEBOUNCE_S` hold. Over 10-15 17:00 to 10-16
+  07:45 UTC, ~9 of 48 big LIP sweeps landed inside the 2s hold. The hold
+  still covers the other soft pulls (payout floor, max-markets slot, band,
+  fair cap).
+- Dashboard LIP column leads with net = payable reward + 10s markout $ (60s
+  and settled below). Settlement PnL is too noisy to judge LIP on. Every
+  column's markout tile shows 1s, 10s and 60s.
+
 ## 2026-10-15 — LIP scorer aligned with the CFTC filing
 
 Source: Appendix A of the 2026-07-15 LIP amendment (CFTC filing).

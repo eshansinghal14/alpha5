@@ -74,7 +74,9 @@ LIP_MIN_PAYOUT_USD = 1.0
 LIP_START_PAYOUT_USD = 1.2
 # A resting LIP quote is pulled for a soft reason only once it has lasted this
 # long. Live 2026-10-15 16:02-17:08 UTC: 513 LIP creates vs 22 moves, the order
-# up ~20% of its eligible time, mostly from sub-second fair-margin / burst flicker.
+# up ~20% of its eligible time, mostly from sub-second fair-margin flicker.
+# spot_burst is not soft: held 2s, ~9 of 48 big LIP sweeps (10-15 17:00 to
+# 10-16 07:45 UTC) landed inside the hold.
 LIP_PULL_DEBOUNCE_S = 2.0
 # A LIP side (or an exit's band size on top of its inventory) must add more
 # than this $/s of reward to rest; otherwise it is only fill risk.
@@ -432,13 +434,15 @@ class Quoter:
             lips[side] = self._lip_target(ticker, side, book, ladder, net, now, prob) if side_ok else None
         lips = self._lip_select(ctx, ticker, lips, ladder, now)
         lc = self.cfg.lip
-        hard_off = (not lc.enable_lip_quoting or not q.enable_quoting
+        # quote_gate (spot_burst) pulls LIP at once, exit included, same as the
+        # edge ladder: the fair is least reliable exactly when a sweep comes.
+        hard_off = (not lc.enable_lip_quoting or not q.enable_quoting or bool(quote_gate)
                     or (self.close_time is not None
                         and (self.close_time - now).total_seconds() < lc.lip_min_time_left_s))
         for side in ("yes", "no"):
             side_blocked = (block_bid if side == "yes" else block_ask) is not None
             lips[side] = self._lip_debounce(ticker, side, lips[side], now_s, hard_off or side_blocked)
-            exit_t = None if (side_blocked or not lc.enable_lip_quoting or not q.enable_quoting) else \
+            exit_t = None if (side_blocked or quote_gate or not lc.enable_lip_quoting or not q.enable_quoting) else \
                 self._lip_exit(ticker, side, book, ladder, net, prob)
             if exit_t is not None:
                 # One order per side: the exit wins (front of the book), sized to
@@ -671,12 +675,12 @@ class Quoter:
         return math.floor(lo * 100 + 1e-9) / 100
 
     def _lip_debounce(self, ticker, side, target, now_s, hard: bool):
-        """Hold a resting LIP quote through a SOFT pull (spot_burst, payout
-        floor, max-markets slot, out of band) until it has lasted
+        """Hold a resting LIP quote through a SOFT pull (payout floor,
+        max-markets slot, out of band, fair cap) until it has lasted
         LIP_PULL_DEBOUNCE_S: each pull is a cancel, and coming back means a new
-        order at the back of the queue. `hard` pulls (LIP or quoting off, side
-        block, end-of-event cutoff) go through at once; stale signal and no
-        fair never get here (the gate publishes None directly)."""
+        order at the back of the queue. `hard` pulls (LIP or quoting off,
+        spot_burst, side block, end-of-event cutoff) go through at once; stale
+        signal and no fair never get here (the gate publishes None directly)."""
         key = (ticker, side)
         if target is not None:
             self._lip_soft_since.pop(key, None)

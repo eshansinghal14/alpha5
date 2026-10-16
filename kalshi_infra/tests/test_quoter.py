@@ -606,10 +606,15 @@ def _resting_lip(q, ctx, fair=0.10):
     return t
 
 
+def _soft_pull(q, on: bool):
+    """Out of band is a soft pull: cheap band capped below the 0.10 best bid."""
+    q.cfg.lip = dataclasses.replace(q.cfg.lip, lip_cheap_max_price=0.05 if on else 0.20)
+
+
 def test_lip_soft_pull_held_for_debounce():
     q, ctx = lip_q()
     t = _resting_lip(q, ctx)
-    q.model.quote_block = lambda ticker, now_s: "spot_burst"
+    _soft_pull(q, True)
     lip_step(q, ctx, dt=0.5)                                  # pull starts here
     assert ctx.lip_targets[("A", "yes")] == t
     lip_step(q, ctx, dt=1.5)
@@ -621,13 +626,32 @@ def test_lip_soft_pull_held_for_debounce():
 def test_lip_soft_pull_that_clears_resets_the_clock():
     q, ctx = lip_q()
     t = _resting_lip(q, ctx)
-    q.model.quote_block = lambda ticker, now_s: "spot_burst"
+    _soft_pull(q, True)
     lip_step(q, ctx, dt=1.5)
-    q.model.quote_block = lambda ticker, now_s: None
+    _soft_pull(q, False)
     lip_step(q, ctx, dt=0.1)
-    q.model.quote_block = lambda ticker, now_s: "spot_burst"
+    _soft_pull(q, True)
     lip_step(q, ctx, dt=1.5)
     assert ctx.lip_targets[("A", "yes")] == t                # a new 1.5s, not 3.1s
+
+
+def test_lip_spot_burst_pulls_resting_quote_at_once():
+    q, ctx = lip_q()
+    _resting_lip(q, ctx)
+    q.model.quote_block = lambda ticker, now_s: "spot_burst"
+    lip_step(q, ctx, dt=0.1)
+    assert ctx.lip_targets[("A", "yes")] is None
+    assert "lip_pull_held" not in q.block_counts
+
+
+def test_lip_spot_burst_pulls_the_exit_too():
+    q, ctx = lip_q(lip_rich_lots=0.0)
+    _lip_fill(ctx, "yes", 120.0, 0.10)
+    lip_step(q, ctx)
+    assert ctx.lip_targets[("A", "no")] is not None
+    q.model.quote_block = lambda ticker, now_s: "spot_burst"
+    lip_step(q, ctx, dt=0.1)
+    assert ctx.lip_targets[("A", "no")] is None
 
 
 def test_lip_hard_pulls_skip_the_debounce():
@@ -645,7 +669,7 @@ def test_lip_hard_pulls_skip_the_debounce():
 
 def test_lip_soft_pull_with_nothing_resting_is_immediate():
     q, ctx = lip_q()
-    q.model.quote_block = lambda ticker, now_s: "spot_burst"
+    _soft_pull(q, True)
     lip_step(q, ctx)
     assert ctx.lip_targets[("A", "yes")] is None
 
@@ -654,7 +678,7 @@ def test_lip_held_quote_never_grows_after_a_partial_fill():
     q, ctx = lip_q()
     t = _resting_lip(q, ctx)
     ctx.lip_live[("A", "yes")] = (t.price, 150.0)            # 250 of 400 filled
-    q.model.quote_block = lambda ticker, now_s: "spot_burst"
+    _soft_pull(q, True)
     lip_step(q, ctx, dt=0.5)
     assert ctx.lip_targets[("A", "yes")].size == 150.0
 

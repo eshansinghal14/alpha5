@@ -470,10 +470,11 @@ def summarize(df: pd.DataFrame, since: pd.Timestamp | None = None) -> dict:
 def _group(d: pd.DataFrame, hours: float) -> dict:
     if d.empty:
         return {"fills": 0, "contracts": 0.0, "pnl": 0.0, "per_h": 0.0, "taker": 0,
-                **{c: math.nan for c in HORIZONS}}
+                **{c: math.nan for c in HORIZONS}, "mo10_usd": 0.0, "mo60_usd": 0.0}
     usd = float((d.pnl_c * d["size"] / 100).sum())
     return {"fills": len(d), "contracts": float(d["size"].sum()), "pnl": usd, "per_h": usd / hours,
-            "taker": int((d.liquidity == "taker").sum()), **{c: _wavg(d[c], d["size"]) for c in HORIZONS}}
+            "taker": int((d.liquidity == "taker").sum()), **{c: _wavg(d[c], d["size"]) for c in HORIZONS},
+            **{f"{c}_usd": float((d[c].fillna(0) * d["size"] / 100).sum()) for c in ("mo10", "mo60")}}
 
 
 def summarize_split(df: pd.DataFrame, lip: pd.DataFrame | None = None,
@@ -485,7 +486,8 @@ def summarize_split(df: pd.DataFrame, lip: pd.DataFrame | None = None,
     lip = all. Fills from before the role column existed can't be told apart
     and count as regular. With `lip` (accrual frame), "lip" also gets reward
     (an estimate from the scoring replica, not money received), net = reward
-    + LIP-fill PnL and reward_c per LIP lot filled; "all" gets pnl_incl_lip."""
+    + LIP-fill PnL, net_mo10 / net_mo60 = reward + the fills' 10s / 60s
+    markout $, and reward_c per LIP lot filled; "all" gets pnl_incl_lip."""
     now = pd.Timestamp.now(tz="UTC")
     d = window(df, since)
     L = window(lip, since) if lip is not None and len(lip) else None
@@ -498,6 +500,7 @@ def summarize_split(df: pd.DataFrame, lip: pd.DataFrame | None = None,
         reward = float(L.usd.sum()) if L is not None else 0.0
         g = out["lip"]
         g.update(reward=reward, reward_per_h=reward / hours, net=reward + g["pnl"],
+                 net_mo10=reward + g["mo10_usd"], net_mo60=reward + g["mo60_usd"],
                  markets=len(L) if L is not None else 0,
                  reward_c=100 * reward / g["contracts"] if g["contracts"] else math.nan)
         out["all"]["pnl_incl_lip"] = out["all"]["pnl"] + reward
