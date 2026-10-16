@@ -23,10 +23,13 @@ Reverse chronological. One section per material change. Entries before
   (HL ETH $91/s) held every quote pulled for 12 minutes.
 - Crypto params from bid+offer trading 13:18-18:48 UTC (24 LIP fills, 762
   lots): the offer leg lost $107 settled vs the bid's +$31 at similar 10s
-  markout (-3.5c both); its $ risk per lot is ~4x the bid's. `lip_offer_lots`
-  100 -> 30 (cutoff $ risk $27 vs the bid's $15), `lip_bid_lots` 150,
-  `lip_cheap_max_price` 0.10 kept. Payable reward over the same window was
-  $10.08 on 7 of 40 markets.
+  markout (-3.5c both); its $ risk per lot is ~4x the bid's. Markets reaching
+  the $1 payout: 20% at offer 100-150 (avg 74 offer lots resting, $1.40
+  payable/event over 7 events) vs 8% at offer 30 on the linear taper (avg 24
+  lots, $0.50/event over 13 events). `lip_offer_lots` 60: under constant $ it
+  rests ~65-80 lots at yes 0.15-0.30 (the 20% regime's sizes) for $54 worst
+  case per market, 108 just under 0.50. `lip_bid_lots` 150 ($15),
+  `lip_cheap_max_price` 0.10 kept.
 
 ## 2026-10-16 (evening, later) — LIP gate is the yes price; bid and offer on longshots
 

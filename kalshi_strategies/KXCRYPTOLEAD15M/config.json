@@ -25,7 +25,10 @@
   },
   "risk": {
     "max_loss_usd": 80.0,
-    "max_signal_age_s": 0.75
+    "max_signal_age_s": 0.75,
+    "max_fair_band": null,
+    "max_fair_outside_touch": null,
+    "fair_suspect_hold_s": 0.0
   },
   "runtime": {
     "quote_fill_poll_s": 1.0,
@@ -35,7 +38,7 @@
     "enable_lip_quoting": false,
     "lip_cheap_max_price": 0.1,
     "lip_bid_lots": 150.0,
-    "lip_offer_lots": 30.0,
+    "lip_offer_lots": 60.0,
     "lip_constant_edge": 0.01,
     "lip_max_markets": 2,
     "lip_requeue_min_ahead": 200.0,
