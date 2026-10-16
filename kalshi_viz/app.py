@@ -22,6 +22,7 @@ import streamlit as st  # noqa: E402
 import streamlit.components.v1 as components  # noqa: E402
 
 from kalshi_infra.runtime.control import request_trading_mode  # noqa: E402
+from kalshi_infra.trading.lip import payable_usd  # noqa: E402
 from kalshi_strategies.run import registry  # noqa: E402
 from kalshi_viz import config_form, perf_panel  # noqa: E402
 from kalshi_viz.data import (has_lip, latest_summary, load_day, read_summary, read_trading_mode,  # noqa: E402
@@ -149,8 +150,11 @@ def _render_guards(s: dict):
     c[1].metric("PnL (fair / touch)", f"${pnl.get('fair', 0):+.2f}", f"touch ${pnl.get('touch', 0):+.2f}",
                 delta_color="off")
     if lip:
-        c[2].metric("LIP accrued", f"${pnl.get('lip_accrued', 0):.2f}",
-                    help="Expected LIP reward from the scoring replica (program terms from Kalshi).")
+        acc = ((s.get("lip") or {}).get("accrued_usd") or {}).values()
+        c[2].metric("LIP payable", f"${sum(payable_usd(v) for v in acc):.2f}",
+                    f"accrued ${pnl.get('lip_accrued', 0):.2f}", delta_color="off",
+                    help="Estimated LIP reward from the scoring replica this event, counting only markets "
+                         "at or over Kalshi's $1.00 minimum payout (under it pays nothing).")
 
     qb, eb = s.get("quote_block_counts") or {}, s.get("blocked_counts") or {}
     if qb or eb:
@@ -295,8 +299,10 @@ def _render_markets(series: str):
         c[3].metric("Position", f"{m.get('position') or 0:+.4g}")
         if lip_on:
             lip, qf = m.get("lip"), m.get("lip_qualifying")
+            note = [] if lip is None or payable_usd(lip) > 0 else ["under $1: pays $0"]
+            note += [] if qf is None else [f"{qf:.0%} snapshots qualify"]
             c[4].metric("LIP", "no program" if lip is None else f"${lip:.2f}",
-                        None if qf is None else f"{qf:.0%} snapshots qualify", delta_color="off")
+                        " · ".join(note) or None, delta_color="off")
         # Same args -> same html string -> Streamlit keeps the iframe mounted.
         html = _chart_html(series, tk, t0.value // 10**6, q.get("max_position"), quoting, lip_on)
         components.html(html, height=IFRAME_HEIGHT, scrolling=True)

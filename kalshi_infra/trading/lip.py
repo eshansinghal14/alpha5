@@ -235,8 +235,14 @@ def period_payout(user_total_score: float, all_users_total_score: float,
         return 0.0
     gross = (user_total_score / all_users_total_score) * period_reward_usd \
             * (non_excluded / total_snapshots)
+    return payable_usd(gross)
+
+
+def payable_usd(gross_usd: float) -> float:
+    """What Kalshi pays for one market-period's reward: rounded down to the
+    cent, and $0 under $1.00."""
     # The epsilon keeps float error from dropping a cent (16.00 -> 15.99).
-    rounded = math.floor(gross * 100.0 + 1e-6) / 100.0
+    rounded = math.floor(gross_usd * 100.0 + 1e-6) / 100.0
     return rounded if rounded >= 1.00 else 0.0
 
 
@@ -379,7 +385,7 @@ class LipTracker:
 
 __all__ = [
     "LipParams", "LipLevel", "LipSideScore", "LipBookScore",
-    "score_book", "marginal_reward_rate", "period_payout",
+    "score_book", "marginal_reward_rate", "period_payout", "payable_usd",
     "params_from_program", "levels_from_ladder", "levels_with_ours", "others_ladder", "reward_rate",
     "remaining_cap_usd",
     "LipTracker",

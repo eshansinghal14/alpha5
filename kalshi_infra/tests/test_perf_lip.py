@@ -20,15 +20,34 @@ def _fills():
     return d
 
 
-def test_lip_summary_sets_reward_against_lip_fill_markout():
-    lip = pd.DataFrame({"time": [pd.Timestamp("2026-10-15 13:10", tz="UTC")] * 2, "ticker": ["E-BTC", "E-ETH"],
-                        "event": ["E", "E"], "usd": [0.40, 0.10]})
-    s = perf.summarize_lip(_fills(), lip)
-    assert math.isclose(s["reward"], 0.50)
-    assert s["lip_fills"] == 1 and s["lip_contracts"] == 10
-    assert math.isclose(s["adverse_10s"], -0.30) and math.isclose(s["adverse_60s"], -0.40)
-    assert math.isclose(s["lip_fill_pnl"], -0.50) and math.isclose(s["net"], 0.0)
-    assert math.isclose(s["reward_per_contract_c"], 5.0)
+def _lip():
+    return pd.DataFrame({"time": [pd.Timestamp("2026-10-15 13:10", tz="UTC")] * 2, "ticker": ["E-BTC", "E-ETH"],
+                         "event": ["E", "E"], "usd": [0.40, 0.10]})
+
+
+def test_split_lip_reward_against_lip_fills():
+    s = perf.summarize_split(_fills(), _lip())["lip"]
+    assert s["fills"] == 1 and s["contracts"] == 10
+    assert math.isclose(s["mo1"], -1.0) and math.isclose(s["mo10"], -3.0)
+    assert math.isclose(s["reward"], 0.50) and math.isclose(s["pnl"], -0.50) and math.isclose(s["net"], 0.0)
+    assert math.isclose(s["reward_c"], 5.0)
+
+
+def test_split_regular_is_everything_off_the_lip_quote():
+    s = perf.summarize_split(_fills(), _lip())
+    r, a = s["regular"], s["all"]
+    assert r["fills"] == 2 and r["taker"] == 1 and r["contracts"] == 6
+    assert math.isclose(r["mo1"], (4 * 1.0 + 2 * -2.0) / 6)
+    assert a["fills"] == r["fills"] + s["lip"]["fills"]
+    assert math.isclose(a["pnl"], r["pnl"] + s["lip"]["pnl"])
+    assert math.isclose(a["pnl_incl_lip"], a["pnl"] + 0.50)
+
+
+def test_split_without_lip_frame_or_fills():
+    s = perf.summarize_split(_fills())
+    assert "reward" not in s["lip"] and "pnl_incl_lip" not in s["all"]
+    e = perf.summarize_split(_fills().iloc[0:0], _lip())
+    assert e["all"]["fills"] == 0 and math.isnan(e["lip"]["reward_c"]) and math.isclose(e["lip"]["reward"], 0.5)
 
 
 def test_markouts_split_lip_from_edge_quotes():
@@ -60,6 +79,19 @@ def test_fill_carries_order_role():
     o2 = Order(order_id=2, ticker="E-BTC", side="yes", order_type="limit", price=0.4, size=1, decision_time=None)
     assert p.record_fill(o2, 0.4, 1, pd.Timestamp.now(tz="UTC"), "taker").role == "edge"
     assert p.record_fill(o, 0.4, 1, pd.Timestamp.now(tz="UTC"), "maker", seeded=True).role is None
+
+
+def test_lip_frame_drops_markets_under_one_dollar():
+    p = perf.Perf.__new__(perf.Perf)
+    p._lock = __import__("threading").Lock()
+    t = pd.Timestamp("2026-10-15 20:30", tz="UTC")
+    p._lip = {"E1-SOL": (t, 1.512), "E1-BTC": (t, 0.94), "E1-ETH": (t, 0.999999), "E2-XRP": (t, 1.0)}
+    f = p.lip_frame()
+    # 0.999999 rounds down to 0.99 before the $1 test, so it pays nothing.
+    assert dict(zip(f.ticker, f.usd)) == {"E1-SOL": 1.51, "E2-XRP": 1.00}
+    assert set(f.event) == {"E1", "E2"}
+    p._lip = {"E1-BTC": (t, 0.5)}
+    assert p.lip_frame().empty
 
 
 def test_has_lip():

@@ -45,49 +45,56 @@ def _chart(df: pd.DataFrame, since: pd.Timestamp | None, lip: pd.DataFrame | Non
                     use_container_width=True)
 
 
-def _side(s: dict):
-    if not s.get("fills"):
+PNL_HELP = "Settled fills at their result; fills on open markets at the latest Kalshi mid."
+MO_HELP = "Per contract vs Kalshi mid 1s after the fill (10s below), fee included. Negative = picked off."
+SPREAD_HELP = "Mid 1ms before the fill minus our price, fee included: the half-spread we got at the fill."
+
+
+def _common(g: dict):
+    """The rows every column shows, so the three line up."""
+    st.metric("1s markout", _c(g["mo1"]), f"10s {_c(g['mo10'])}", delta_color="off", help=MO_HELP)
+    st.metric("Spread at fill", _c(g["mo0"]), delta_color="off", help=SPREAD_HELP)
+    st.metric("Lots filled", f"{g['contracts']:,.0f}",
+              f"{g['fills']} fills" + (f" · {g['taker']} taker" if g["taker"] else ""), delta_color="off")
+
+
+def _overall(g: dict, lip: bool):
+    st.markdown("**Overall**")
+    if not g["fills"] and not lip:
         st.caption("No real fills in this window.")
         return
-    a, b = st.columns(2)
-    a.metric("PnL", _usd(s["pnl"]), f"{_usd(s['per_h'])}/h", delta_color="off",
-             help="Settled fills at their result; fills on open markets at the latest Kalshi mid.")
-    b.metric("Settled / open", _usd(s["settled_usd"]), f"open {_usd(s['open_usd'])} on {s['unsettled']} fills",
-             delta_color="off")
-    a, b = st.columns(2)
-    m = s["markouts"].get("all", {})
-    a.metric("1s markout", _c(m.get("mo1")), f"10s {_c(m.get('mo10'))}", delta_color="off",
-             help="Per contract vs Kalshi mid, fee included.")
-    a2 = s["markouts"].get("maker", {})
-    b.metric("Spread captured", _c(m.get("mo0")), f"maker 10s {_c(a2.get('mo10'))}", delta_color="off",
-             help="Mid just before the fill minus our price: the half-spread we got at the fill.")
-    a, b = st.columns(2)
-    t = s.get("t_event")
-    a.metric("Lots filled", f"{s['contracts']:,.0f}", f"{s['fills']} fills · {s['taker']} taker", delta_color="off",
-             help="Contracts traded in the window, maker and taker.")
-    b.metric("Max drawdown", _usd(s["max_dd"]), f"fees ${s['fees']:.2f}", delta_color="off")
-    st.caption(f"{s['events']} events · {s['won']:.0%} won"
-               + (f" · t={t:+.2f} (under ~2 is within noise)" if not math.isnan(t) else ""))
+    if lip:
+        st.metric("PnL incl. LIP", _usd(g["pnl_incl_lip"]), f"fills only {_usd(g['pnl'])}", delta_color="off",
+                  help=PNL_HELP + " Plus the estimated LIP reward.")
+    else:
+        st.metric("PnL", _usd(g["pnl"]), f"{_usd(g['per_h'])}/h", delta_color="off", help=PNL_HELP)
+    _common(g)
 
 
-def _lip_side(L: dict):
-    """LIP reward vs what the LIP quote's fills gave back."""
-    st.markdown("**LIP**")
-    if not L.get("markets") and not L.get("lip_fills"):
-        st.caption("No LIP accrued while armed in this window.")
+def _regular(g: dict):
+    st.markdown("**Regular quoting**")
+    if not g["fills"]:
+        st.caption("No regular fills in this window.")
         return
-    st.metric("Net (reward + LIP-fill PnL)", _usd(L["net"]), f"reward {_usd(L['reward'])}", delta_color="off",
-              help="Expected LIP payout from the scoring replica while armed (an estimate, not money "
-                   "received), plus the settled/marked PnL of fills on the LIP quote itself.")
-    st.metric("Reward", _usd(L["reward"]), f"{_usd(L['per_h'])}/h", delta_color="off",
-              help=f"Across {L['markets']} markets in {L['events']} events.")
-    st.metric("LIP fills adverse", _usd(L["adverse_10s"]), f"60s {_usd(L['adverse_60s'])}", delta_color="off",
-              help="$ the LIP quote's own fills were worth vs Kalshi mid 10s / 60s later, fee included. "
-                   "Negative = picked off.")
-    st.metric("LIP fills", f"{L['lip_contracts']:,.0f} lots", f"{L['lip_fills']} fills", delta_color="off")
-    st.metric("Per contract (c)", _c(L["mo10_c"]), f"reward {_c(L['reward_per_contract_c'])}", delta_color="off",
-              help="10s markout per LIP-filled contract vs the LIP reward earned per contract filled. "
-                   "Reward above |markout| = LIP pays for the adverse selection.")
+    st.metric("PnL", _usd(g["pnl"]), f"{_usd(g['per_h'])}/h", delta_color="off",
+              help=PNL_HELP + " Edge quotes and takes; everything not on the LIP quote.")
+    _common(g)
+
+
+def _lip(g: dict):
+    st.markdown("**LIP quoting**")
+    if not g.get("markets") and not g["fills"]:
+        st.caption("No LIP payable while armed in this window.")
+        return
+    st.metric("Net (reward + fill PnL)", _usd(g["net"]), f"reward {_usd(g['reward'])} · fills {_usd(g['pnl'])}",
+              delta_color="off",
+              help="Estimated LIP reward from the scoring replica while armed (not money received), only "
+                   "markets at or over Kalshi's $1.00 minimum payout, plus the settled/marked PnL of fills "
+                   "on the LIP quote.")
+    _common(g)
+    st.metric("Reward per lot filled", _c(g["reward_c"]), f"{_usd(g['reward_per_h'])}/h", delta_color="off",
+              help="LIP reward over LIP lots filled. Above |markout| means the program pays for the "
+                   "adverse selection.")
 
 
 def _pct(v: float) -> str:
@@ -152,17 +159,20 @@ def render(series: str, lip: bool = False):
         since = None if WINDOWS[win] is None else pd.Timestamp.now(tz="UTC") - WINDOWS[win]
         s = perf.summarize(df, since)
         lf = p.lip_frame() if lip else None
+        sp = perf.summarize_split(df, lf, since)
+        cols = st.columns(3 if lip else 2)
+        with cols[0]:
+            _overall(sp["all"], lip)
+        with cols[1]:
+            _regular(sp["regular"])
         if lip:
-            left, right, third = st.columns([3, 2, 1.4])
-            with third:
-                _lip_side(perf.summarize_lip(df, lf, since))
-        else:
-            left, right = st.columns([3, 2])
-        with left:
-            _chart(df, since, lf)
-        with right:
-            _side(s)
+            with cols[2]:
+                _lip(sp["lip"])
+        _chart(df, since, lf)
         _edge_share(perf.summarize_edge(df, p.prints_frame(), since))
+        if s.get("fills"):
+            st.caption(f"Settled {_usd(s['settled_usd'])} · open {_usd(s['open_usd'])} on {s['unsettled']} fills · "
+                       f"fees ${s['fees']:.2f} · max drawdown {_usd(s['max_dd'])} · {s['events']} events")
         with st.expander("Markout by fill type"):
             _table(s)
         if p.updated is not None:

@@ -17,6 +17,12 @@ Source: Appendix A of the 2026-07-15 LIP amendment (CFTC filing).
 - Per-account cap: `reward_rate` is uncapped. The quoter's projection caps
   accrued + future at `max_reward_usd` (`lip.remaining_cap_usd`) instead of
   capping each second's rate at cap/N.
+- Dashboard LIP reward is now payable, not accrued: `perf.lip_frame` drops
+  markets under $1.00 and rounds the rest down to the cent
+  (`lip.payable_usd`), so Net, PnL incl. LIP, reward per lot and the chart
+  line all exclude them. The header shows "LIP payable" with accrued under it;
+  per-market tiles flag "under $1: pays $0". The perf panel is now three
+  columns: overall / regular quoting / LIP quoting.
 
 ## 2026-10-14 (late) — LIP: fair margin, payout floor, max markets, re-queue
 

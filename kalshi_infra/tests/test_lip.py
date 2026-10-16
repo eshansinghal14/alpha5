@@ -13,7 +13,7 @@ import math
 import types
 
 from kalshi_infra.trading.lip import (LipLevel, LipParams, LipTracker, levels_from_ladder, levels_with_ours,
-                                      marginal_reward_rate, params_from_program, period_payout,
+                                      marginal_reward_rate, params_from_program, payable_usd, period_payout,
                                       remaining_cap_usd, reward_rate,
                                       score_book)
 
@@ -35,6 +35,11 @@ def test_payout_under_one_dollar_pays_nothing():
                          non_excluded=100, total_snapshots=100, period_reward_usd=10.0) == 0.0
     assert period_payout(user_total_score=0.1, all_users_total_score=1.0,
                          non_excluded=100, total_snapshots=100, period_reward_usd=10.0) == 1.00
+
+
+def test_payable_usd():
+    assert payable_usd(0.99) == 0.0 and payable_usd(0.0) == 0.0
+    assert payable_usd(1.0) == 1.0 and payable_usd(1.519) == 1.51
 
 
 def test_payout_rounds_down_without_losing_a_cent_to_float_error():

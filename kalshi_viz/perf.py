@@ -26,6 +26,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from kalshi_infra.runtime.persist import LIVE_ROOT
+from kalshi_infra.trading.lip import payable_usd
 
 # Markout horizons, seconds after the fill. "mo0" is the mid 1ms BEFORE the
 # fill: the spread we captured.
@@ -400,10 +401,12 @@ class Perf:
             return self._prints.copy()
 
     def lip_frame(self) -> pd.DataFrame:
-        """(time, ticker, event, usd): LIP accrued per market while armed,
-        stamped at the last armed decision row."""
+        """(time, ticker, event, usd): LIP payable per market while armed,
+        stamped at the last armed decision row. Markets whose accrual is under
+        Kalshi's $1.00 minimum are left out (they pay nothing), including ones
+        still running, which appear once they cross it."""
         with self._lock:
-            rows = [(t, tk, v) for tk, (t, v) in self._lip.items() if v > 0]
+            rows = [(t, tk, payable_usd(v)) for tk, (t, v) in self._lip.items() if payable_usd(v) > 0]
         if not rows:
             return pd.DataFrame(columns=["time", "ticker", "event", "usd"])
         df = pd.DataFrame(rows, columns=["time", "ticker", "usd"]).sort_values("time")
@@ -464,36 +467,40 @@ def summarize(df: pd.DataFrame, since: pd.Timestamp | None = None) -> dict:
     return out
 
 
-def summarize_lip(df: pd.DataFrame, lip: pd.DataFrame, since: pd.Timestamp | None = None) -> dict:
-    """LIP reward against what the LIP quote's own fills cost.
+def _group(d: pd.DataFrame, hours: float) -> dict:
+    if d.empty:
+        return {"fills": 0, "contracts": 0.0, "pnl": 0.0, "per_h": 0.0, "taker": 0,
+                **{c: math.nan for c in HORIZONS}}
+    usd = float((d.pnl_c * d["size"] / 100).sum())
+    return {"fills": len(d), "contracts": float(d["size"].sum()), "pnl": usd, "per_h": usd / hours,
+            "taker": int((d.liquidity == "taker").sum()), **{c: _wavg(d[c], d["size"]) for c in HORIZONS}}
 
-    reward: expected LIP $ accrued while armed (the scoring replica's
-    estimate of Kalshi's payout, not a payment received).
-    adverse: $ the LIP-quote fills lost vs Kalshi mid 10s/60s later; the
-    price of sitting where LIP pays. net = reward + LIP-fill PnL (settled,
-    else marked at mid). Fills before the role column existed are unlabelled
-    and count as edge."""
+
+def summarize_split(df: pd.DataFrame, lip: pd.DataFrame | None = None,
+                    since: pd.Timestamp | None = None) -> dict:
+    """{"all", "regular", "lip"}: fills, contracts, pnl ($, settled else open
+    at mid), per_h, taker and markouts (c/contract, fee incl.) per group.
+
+    regular is every fill not on the LIP quote, takes included, so regular +
+    lip = all. Fills from before the role column existed can't be told apart
+    and count as regular. With `lip` (accrual frame), "lip" also gets reward
+    (an estimate from the scoring replica, not money received), net = reward
+    + LIP-fill PnL and reward_c per LIP lot filled; "all" gets pnl_incl_lip."""
     now = pd.Timestamp.now(tz="UTC")
-    L = window(lip, since)
     d = window(df, since)
-    reward = float(L.usd.sum()) if len(L) else 0.0
-    start = since if since is not None else (min(x.time.min() for x in (L, d) if len(x)) if len(L) or len(d) else now)
+    L = window(lip, since) if lip is not None and len(lip) else None
+    times = [x.time.min() for x in (d, L) if x is not None and len(x)]
+    start = since if since is not None else (min(times) if times else now)
     hours = max((now - start).total_seconds() / 3600, 1e-9)
-    out = {"reward": reward, "per_h": reward / hours, "markets": len(L), "events": int(L.event.nunique()) if len(L) else 0}
-    lf = d[d["role"] == "lip"] if len(d) and "role" in d.columns else d.iloc[0:0]
-    out["lip_fills"], out["lip_contracts"] = len(lf), float(lf["size"].sum()) if len(lf) else 0.0
-    if len(lf):
-        usd = lambda c: float((lf[c].fillna(0) * lf["size"] / 100).sum())  # noqa: E731
-        out.update({"lip_fill_pnl": usd("pnl_c"), "adverse_10s": usd("mo10"), "adverse_60s": usd("mo60"),
-                    "mo10_c": _wavg(lf.mo10, lf["size"]), "mo60_c": _wavg(lf.mo60, lf["size"]),
-                    "spread_c": _wavg(lf.mo0, lf["size"])})
-    else:
-        out.update({"lip_fill_pnl": 0.0, "adverse_10s": 0.0, "adverse_60s": 0.0,
-                    "mo10_c": math.nan, "mo60_c": math.nan, "spread_c": math.nan})
-    out["net"] = reward + out["lip_fill_pnl"]
-    # Reward per contract the LIP quote got filled for: what each fill "earned"
-    # from the program, to set against its markout.
-    out["reward_per_contract_c"] = (100 * reward / out["lip_contracts"]) if out["lip_contracts"] else math.nan
+    is_lip = (d["role"] == "lip") if len(d) and "role" in d.columns else pd.Series(False, index=d.index)
+    out = {"all": _group(d, hours), "regular": _group(d[~is_lip], hours), "lip": _group(d[is_lip], hours)}
+    if lip is not None:
+        reward = float(L.usd.sum()) if L is not None else 0.0
+        g = out["lip"]
+        g.update(reward=reward, reward_per_h=reward / hours, net=reward + g["pnl"],
+                 markets=len(L) if L is not None else 0,
+                 reward_c=100 * reward / g["contracts"] if g["contracts"] else math.nan)
+        out["all"]["pnl_incl_lip"] = out["all"]["pnl"] + reward
     return out
 
 
