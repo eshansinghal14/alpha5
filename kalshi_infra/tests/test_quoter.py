@@ -45,8 +45,8 @@ def cfg(risk_kw=None, **q):
         lip=P.LipSettings(**LIP_OFF))
 
 
-LIP_OFF = dict(enable_lip_quoting=False, lip_cheap_max_price=0.2, lip_bid_lots=0.0, lip_offer_lots=0.0,
-               lip_constant_edge=None, lip_max_markets=None,
+LIP_OFF = dict(enable_lip_quoting=False, lip_cheap_max_price=0.2, lip_max_price=0.5, lip_bid_lots=0.0,
+               lip_offer_lots=0.0, lip_constant_edge=None, lip_max_markets=None,
                lip_requeue_min_ahead=None, lip_min_time_left_s=0.0, lip_hold_s=1.0)
 
 
@@ -613,8 +613,55 @@ def test_lip_capped_inside_far_touch():
     # 0.10 is under target, so our 0.08 still scores. The no side needs the 300
     # target on its own (no expensive-side LIP of ours to make it up).
     q, ctx = lip_q()
+    q._lip_step_back = lambda ticker, side, best, size_at, ladder: best     # the cap alone
     lip_step(q, ctx, yes={0.10: 50.0}, no={0.91: 400.0})
     assert ctx.lip_targets[("A", "yes")].price == 0.08
+
+
+def test_lip_steps_back_when_a_tick_lower_scores_the_same():
+    """Others 3 @0.10, 3 @0.09, 500 @0.07; our 40. The reference (cum >= 60)
+    is 0.07 wherever we sit in 0.07-0.10, so every price there scores in full
+    and our share is the same: rest 3 ticks back, behind others' 6."""
+    q, ctx = lip_q(lip_bid_lots=40.0)
+    lip_step(q, ctx, yes={0.10: 3.0, 0.09: 3.0, 0.07: 500.0}, no={0.89: 400.0})
+    assert ctx.lip_targets[("A", "yes")].price == 0.07
+    assert q.block_counts.get("lip_stepped_back", 0) >= 1
+
+
+def test_lip_does_not_step_back_into_a_lower_share():
+    """Our size sets the reference at our level: stepping back moves it down
+    onto a wall and dilutes us, so the quote stays at the best bid."""
+    q, ctx = lip_q(lip_bid_lots=100.0)
+    lip_step(q, ctx, yes={0.10: 3.0, 0.09: 100.0, 0.08: 500.0}, no={0.89: 400.0})
+    assert ctx.lip_targets[("A", "yes")].price == 0.10
+
+
+def test_lip_stays_at_best_when_a_tick_back_loses_reward():
+    """Others 500 @0.10: the reference is at 0.10 without us, so 0.09 is a
+    tick below it and earns half (DF 0.5) -- stay at the best bid."""
+    q, ctx = lip_q()
+    lip_step(q, ctx, yes={0.10: 500.0, 0.09: 300.0}, no={0.89: 400.0})
+    assert ctx.lip_targets[("A", "yes")].price == 0.10
+    assert q.block_counts.get("lip_stepped_back", 0) == 0
+
+
+def test_lip_exit_never_steps_back():
+    """The exit wants the fill: a tick in front of others' best, not behind."""
+    q, ctx = lip_q()
+    _lip_fill(ctx, "yes", 50.0, 0.10)
+    lip_step(q, ctx, yes={0.06: 500.0}, no={0.89: 50.0, 0.88: 300.0})
+    assert ctx.lip_targets[("A", "no")].price == 0.90 and ctx.lip_targets[("A", "no")].front
+
+
+def test_lip_max_price_param_moves_the_hard_cap():
+    q, ctx = lip_q(lip_max_price=0.25)
+    lip_step(q, ctx, yes={0.30: 500.0, 0.29: 300.0}, no={0.65: 500.0}, fair=0.32)
+    assert ctx.lip_targets[("A", "yes")] is None
+    s = P.LipSettings(**dict(LIP_OFF, lip_bid_lots=150.0, lip_offer_lots=60.0, lip_cheap_max_price=0.10,
+                             lip_max_price=0.35))
+    assert s.lots_at(0.34, "yes") > 0 and s.lots_at(0.35, "yes") == 0.0
+    assert s.max_lots() == pytest.approx(150.0)
+    assert s.lots_at(0.66, "no") == pytest.approx(60.0 * 0.9 / 0.66)               # yes offer 0.34
 
 
 # Others under target at the best bid, so a quote capped one or two ticks back
@@ -1026,7 +1073,7 @@ def test_lip_exit_never_rests_at_or_over_half():
     _lip_fill(ctx, "no", 120.0, 0.38)
     lip_step(q, ctx, yes={0.60: 300.0}, no={0.38: 300.0}, fair=0.61)
     assert ctx.lip_targets[("A", "yes")] is None
-    assert q.block_counts.get("lip_exit_over_half", 0) >= 1
+    assert q.block_counts.get("lip_exit_over_max", 0) >= 1
 
 
 def test_lip_never_quotes_at_or_over_half_whatever_the_sizes():

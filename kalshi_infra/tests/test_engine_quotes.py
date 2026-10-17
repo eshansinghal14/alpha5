@@ -493,6 +493,34 @@ def test_loss_limit_is_per_event_not_run():
     assert "event PnL" in eng.halt_reason
 
 
+def test_matched_yes_no_pairs_mark_at_one_dollar():
+    """80 yes @0.81 and 80 no @0.16 (an exited LIP round trip) pay $80 whatever
+    the result: worth $80 - $77.60 = +$2.40, not bid + (1 - ask) per pair.
+    Touch-marking both legs with a 0.40/0.60 book read -$17.60."""
+    eng, _, _ = setup(real=True)
+    p = eng.portfolio.position("A")
+    p.yes_qty, p.yes_cost, p.no_qty, p.no_cost = 80.0, 80 * 0.81, 80.0, 80 * 0.16
+    assert eng.current_pnl(mark="touch") == pytest.approx(80.0 - 80 * 0.97)
+    p.yes_qty, p.yes_cost = 86.0, 80 * 0.81 + 6 * 0.50       # 6 unpaired yes, marked at the 0.40 bid
+    assert eng.current_pnl(mark="touch") == pytest.approx(80.0 - 80 * 0.97 + 6 * (0.40 - 0.50))
+
+
+def test_emptied_book_side_marks_at_its_last_price_not_zero():
+    """In the last seconds every yes bid can be pulled: 60 yes bought at 0.80
+    marked at $0 read -$48 and could trip the loss limit (26OCT162015 read
+    -$172.81, settled -$13.75). The last bid seen is used instead."""
+    eng, _, _ = setup(real=True)
+    eng.update_book(book(bid=0.78, ask=0.82))
+    p = eng.portfolio.position("A")
+    p.yes_qty, p.yes_cost = 60.0, 60 * 0.80
+    lb = L2Book("A")
+    lb.apply_snapshot("yes", [], time=pd.Timestamp.now(tz="UTC"))
+    lb.apply_snapshot("no", [(0.18, 100.0)], time=pd.Timestamp.now(tz="UTC"))
+    eng.update_book(BookView.from_quote(lb.to_quote(pd.Timestamp.now(tz="UTC")), ladder=lb))
+    assert eng.books["A"].bid is None
+    assert eng.current_pnl(mark="touch") == pytest.approx(60 * (0.78 - 0.80))
+
+
 def test_real_lock_refuses_arm():
     eng, _, _ = setup(real=False)
     eng.order_client = FakeClient()

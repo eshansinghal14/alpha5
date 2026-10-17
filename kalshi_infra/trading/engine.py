@@ -199,6 +199,9 @@ class LiveEngine:
         self.unresolved_reasons: dict[str, int] = {}
         self.portfolio = Portfolio(fee_multiplier=fees.taker_rate, maker_fee_multiplier=fees.maker_rate)
         self.books: dict[str, BookView] = {}
+        # Last non-empty yes bid / ask per ticker, for touch marking when one
+        # side of the book empties (see pnl_by_ticker).
+        self._last_touch: dict[str, list] = {}
         self.queue_trackers: list[QueueTracker] = []
         self.trackers_by_id: dict[int, QueueTracker] = {}
         self.cancelled_ids: set[int] = set()
@@ -761,6 +764,11 @@ class LiveEngine:
 
     def update_book(self, book: BookView):
         self.books[book.ticker] = book
+        last = self._last_touch.setdefault(book.ticker, [None, None])
+        if book.bid is not None:
+            last[0] = book.bid
+        if book.ask is not None:
+            last[1] = book.ask
 
     def current_pnl(self, mark: str = "touch") -> float:
         """Mark-to-market PnL across every ticker this engine has touched.
@@ -792,6 +800,14 @@ class LiveEngine:
             book = self.books.get(ticker)
             yes_bid = book.bid if book is not None else None
             yes_ask = book.ask if book is not None else None
+            # An emptied side marks at its last price, not 0: in the last
+            # seconds every bid on a side can be pulled, and marking the
+            # inventory there at $0 read 26OCT162015 at -$172.81 (it settled
+            # -$13.75) and tripped the -$120 loss limit.
+            last = self._last_touch.get(ticker)
+            if last is not None:
+                yes_bid = last[0] if yes_bid is None else yes_bid
+                yes_ask = last[1] if yes_ask is None else yes_ask
             p = fair_probs.get(ticker)
             if p is not None:
                 out[ticker] = pos.unrealized_pnl(p, p)   # both legs marked at the model's fair value

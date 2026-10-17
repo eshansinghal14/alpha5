@@ -47,7 +47,7 @@ from kalshi_infra.kalshi.venue import MAX_PRICE, MIN_PRICE, TICK
 from kalshi_infra.trading.fair import Fair, FairUpdate
 from kalshi_infra.trading.lip import LipTracker, levels_with_ours, others_ladder, remaining_cap_usd, reward_rate
 from kalshi_infra.trading.order_manager import Desired, LipTarget
-from kalshi_infra.trading.params import LIP_TAPER_END, lip_yes_price
+from kalshi_infra.trading.params import lip_yes_price
 
 # Fair is clipped to [eps, 1-eps] before quoting (logged unclipped). Well
 # inside Kalshi's 1c minimum price, so it only guards against a 0/1 fair.
@@ -79,6 +79,10 @@ LIP_PULL_DEBOUNCE_S = 2.0
 # A LIP side (or an exit's band size on top of its inventory) must add more
 # than this $/s of reward to rest; otherwise it is only fill risk.
 LIP_MIN_RATE_USD_S = 1e-9
+# A LIP quote rests up to this many ticks behind the best bid if it keeps
+# LIP_STEP_BACK_KEEP of the best bid's reward rate (see _lip_step_back).
+LIP_STEP_BACK_TICKS = 3
+LIP_STEP_BACK_KEEP = 0.98
 
 
 class Quoter:
@@ -578,17 +582,58 @@ class Quoter:
             return None
         # Hard cap before sizing: the sizing below adds back a position held
         # the other way, which with a 0 band would still rest an order on a
-        # market at a yes price over 0.50.
-        if lip_yes_price(price, side) >= LIP_TAPER_END - 1e-9:
+        # market at a yes price over the cap.
+        if lip_yes_price(price, side) >= lc.lip_max_price - 1e-9:
             return None
         # The band size is the most position we want on this side: quote up to
         # it, net of the signed position held there (a position the other way
         # adds to it).
         held = net if side == "yes" else -net
-        size = math.floor(lc.lots_at(price, side) - held - self._resting(ticker, side) + 1e-9)
+
+        def size_at(px):
+            return math.floor(lc.lots_at(px, side) - held - self._resting(ticker, side) + 1e-9)
+
+        size = size_at(price)
         if size < 1:
             return None
-        return LipTarget(price, float(size))
+        price = self._lip_step_back(ticker, side, price, size_at, ladder)
+        return LipTarget(price, float(size_at(price)))
+
+    def _lip_step_back(self, ticker, side, best, size_at, ladder) -> float:
+        """Lowest price within LIP_STEP_BACK_TICKS of `best` that still earns
+        LIP_STEP_BACK_KEEP of the reward rate at `best`, the other side as it
+        stands. Kalshi scores every bid at or above the reference price in
+        full, so a tick or two back often earns the same while a sweep has to
+        clear the levels in front first. Live books 10-17 00:30 UTC: one tick
+        back kept >=95% of the reward on 55% of sides, two ticks on 21%.
+        Prefers the price already resting, so a quote doesn't hop."""
+        if self.lip is None or ticker not in self.lip.params:
+            return best
+        here = {side: LipTarget(best, float(size_at(best)))}
+        base = self._lip_rate(ticker, here, ladder)
+        if base <= LIP_MIN_RATE_USD_S:
+            return best
+        live = self._lip_live.get((ticker, side))
+        resting_px = None if live is None else round(live[0], 2)
+        chosen = best
+        for k in range(1, LIP_STEP_BACK_TICKS + 1):
+            px = round(best - k * TICK, 2)
+            if px < MIN_PRICE:
+                break
+            z = size_at(px)
+            if z < 1:
+                break
+            if self._lip_rate(ticker, {side: LipTarget(px, float(z))}, ladder) < LIP_STEP_BACK_KEEP * base:
+                break
+            chosen = px
+        if resting_px is not None and chosen <= resting_px <= best:
+            z = size_at(resting_px)
+            if z >= 1 and self._lip_rate(ticker, {side: LipTarget(resting_px, float(z))}, ladder) \
+                    >= LIP_STEP_BACK_KEEP * base:
+                chosen = resting_px
+        if chosen < best - 1e-9:
+            self._block("lip_stepped_back")
+        return chosen
 
     def _lip_exit(self, ticker, side, book, ladder, net, prob) -> LipTarget | None:
         """Offer back what LIP orders bought: inventory long yes from LIP fills
@@ -599,7 +644,8 @@ class Quoter:
         of the book) and is marked `front`, so it is never re-queued. Bypasses
         the bands, lots, payout floor, max-markets and the LIP time cutoff;
         keeps the far-touch and lip_constant_edge price caps, and like every
-        LIP order never rests at a yes price of LIP_TAPER_END or more."""
+        LIP order never rests at a yes price of lip_max_price or more. Never
+        stepped back: it wants the fill."""
         inv = self._lip_inv.get(ticker, 0.0)
         qty = min(max(inv, 0.0), max(net, 0.0)) if side == "no" else min(max(-inv, 0.0), max(-net, 0.0))
         qty = math.floor(qty * 100 + 1e-9) / 100
@@ -625,8 +671,8 @@ class Quoter:
             price = min(price, self._lip_fair_cap(side, prob))
         if not (MIN_PRICE <= price <= MAX_PRICE):
             return None
-        if lip_yes_price(price, side) >= LIP_TAPER_END - 1e-9:
-            self._block("lip_exit_over_half")
+        if lip_yes_price(price, side) >= lc.lip_max_price - 1e-9:
+            self._block("lip_exit_over_max")
             return None
         self._block("lip_exit")
         # The inventory alone. Band size on top flipped the position at the

@@ -7,10 +7,8 @@ from __future__ import annotations
 
 from kalshi_infra.config import APPLY_NEXT_EVENT, param, section  # noqa: F401
 
-# No LIP order (quote or exit) on a market whose yes price -- the order's
-# price in yes terms -- is at or above this. Public prints 10-15 17:00 to
-# 10-16 12:00 UTC: 0.45-0.55 was the first adverse maker bucket (-1.3c/lot
-# at 10s).
+# Upper bound for lip_max_price. Public prints 10-15 17:00 to 10-16 12:00
+# UTC: 0.45-0.55 was the first adverse maker bucket (-1.3c/lot at 10s).
 LIP_TAPER_END = 0.50
 
 
@@ -147,27 +145,31 @@ class LipSettings:
     """Program parameters (target, discount, reward, period) come from Kalshi's
     /incentive_programs per market; these only shape our own LIP quote.
 
-    One LIP order per side, at others' best bid on that side, on longshot
-    markets only: both the yes bid (lip_bid_lots) and the yes offer, a no bid
-    (lip_offer_lots), while the order's price in yes terms is under 0.50
-    (LIP_TAPER_END). Our fair caps the price (lip_constant_edge). Rationale and
-    backtest: kalshi_strategies/KXCRYPTOLEAD15M/research/LIP_REPORT.md."""
+    One LIP order per side, at (or a few ticks behind) others' best bid on
+    that side, on longshot markets only: both the yes bid (lip_bid_lots) and
+    the yes offer, a no bid (lip_offer_lots), while the order's price in yes
+    terms is under lip_max_price. Our fair caps the price (lip_constant_edge).
+    Rationale and backtest: kalshi_strategies/KXCRYPTOLEAD15M/research/LIP_REPORT.md."""
     enable_lip_quoting: bool = param(
         "Rest one LIP-farming quote per side, after the edge ladder in priority. Off cancels any "
         "LIP quote. LIP accrual is measured either way.")
     lip_cheap_max_price: float = param(
         "Fixed LIP lots, both sides, while the order's price in yes terms (the yes bid; 1 - the no "
         "bid for the offer) is at or below this; above it each side keeps the $ worst case it had "
-        "here (bid lots x this / y; offer lots x (1 - this) / (1 - y)). No LIP on a market at a "
-        "yes price of 0.50 (LIP_TAPER_END) or more.", min=0.01, max=0.49, step=0.01)
+        "here (bid lots x this / y; offer lots x (1 - this) / (1 - y)), up to lip_max_price.",
+        min=0.01, max=0.49, step=0.01)
+    lip_max_price: float = param(
+        "No LIP order (quote or exit) at a yes price -- the yes bid, or 1 - the no bid for the "
+        "offer -- at or above this. Lower it to keep LIP off contested markets, where both sides "
+        "were picked off 10-16 23:00-00:15 UTC.", min=0.05, max=LIP_TAPER_END, step=0.01)
     lip_bid_lots: float = param(
         "LIP yes-bid size at or below lip_cheap_max_price, less any yes position already held; "
         "shrinks above it at constant $ risk. 0 = no LIP bid.", min=0, step=10.0)
     lip_offer_lots: float = param(
         "LIP yes-offer size (the no bid) at a yes offer at or below lip_cheap_max_price, less any no "
-        "position already held; grows above it at constant $ risk, to x(1 - cutoff)/0.5 just under "
-        "0.50. Worst case per lot is 1 - the yes offer, so this side risks far more per lot than "
-        "the bid. 0 = no LIP offer.", min=0, step=10.0)
+        "position already held; grows above it at constant $ risk, to x(1 - cutoff)/(1 - "
+        "lip_max_price) at the cap. Worst case per lot is 1 - the yes offer, so this side risks far "
+        "more per lot than the bid. 0 = no LIP offer.", min=0, step=10.0)
     lip_constant_edge: float | None = param(
         "Edge the LIP bid must keep below own-side fair ($): a best bid above fair - this is capped "
         "there. 0 = never above fair. null = no fair check. Live 2026-10-14 22:22-22:55 UTC: 613 of "
@@ -194,10 +196,10 @@ class LipSettings:
         offer) at own-side `price`, judged by that price in yes terms y: the
         side's lots up to lip_cheap_max_price, then the same $ worst case as at
         the cutoff (bid loses y/lot, offer loses 1 - y/lot), 0 at or above
-        LIP_TAPER_END. So the bid shrinks and the offer grows toward 0.50."""
+        lip_max_price. So the bid shrinks and the offer grows toward the cap."""
         edge = self.lip_cheap_max_price
         y = lip_yes_price(price, side)
-        if y >= LIP_TAPER_END - 1e-9:
+        if y >= self.lip_max_price - 1e-9:
             return 0.0
         if y <= edge + 1e-9:
             return self.lip_bid_lots if side == "yes" else self.lip_offer_lots
@@ -206,8 +208,9 @@ class LipSettings:
         return self.lip_offer_lots * (1.0 - edge) / (1.0 - y)
 
     def max_lots(self) -> float:
-        """Largest LIP order size anywhere: the offer peaks just under 0.50."""
-        return max(self.lip_bid_lots, self.lip_offer_lots * (1.0 - self.lip_cheap_max_price) / (1.0 - LIP_TAPER_END))
+        """Largest LIP order size anywhere: the offer peaks just under lip_max_price."""
+        peak = max(self.lip_max_price, self.lip_cheap_max_price)
+        return max(self.lip_bid_lots, self.lip_offer_lots * (1.0 - self.lip_cheap_max_price) / (1.0 - peak))
 
 
 SHARED_SECTIONS = ("quoting", "trading_time", "risk", "runtime", "lip")

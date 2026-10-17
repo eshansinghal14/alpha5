@@ -50,6 +50,7 @@
     "lip": {
       "enable_lip_quoting": false,
       "lip_cheap_max_price": 0.2,
+      "lip_max_price": 0.5,
       "lip_bid_lots": 0.0,
       "lip_offer_lots": 0.0,
       "lip_constant_edge": null,
@@ -112,6 +113,7 @@
     "lip": {
       "enable_lip_quoting": false,
       "lip_cheap_max_price": 0.2,
+      "lip_max_price": 0.5,
       "lip_bid_lots": 0.0,
       "lip_offer_lots": 0.0,
       "lip_constant_edge": null,
@@ -174,6 +176,7 @@
     "lip": {
       "enable_lip_quoting": false,
       "lip_cheap_max_price": 0.2,
+      "lip_max_price": 0.5,
       "lip_bid_lots": 0.0,
       "lip_offer_lots": 0.0,
       "lip_constant_edge": null,

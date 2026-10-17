@@ -152,9 +152,11 @@ Per market and side (`trading/quoter.py` docstring has the formula):
   gated by its price in yes terms y (the yes bid; 1 − the no bid): fixed
   lots at y ≤ `lip_cheap_max_price`, then the same $ worst case as at the
   cutoff (bid loses y per lot, offer loses 1 − y), so the bid shrinks and the
-  offer grows toward 0.50. No LIP order, exit included, ever rests at a yes
-  price of 0.50 (`params.LIP_TAPER_END`) or more, so a favourite gets no LIP.
-  Needs at least
+  offer grows toward the cap. No LIP order, exit included, ever rests at a
+  yes price of `lip_max_price` (at most 0.50) or more, so a favourite gets no
+  LIP. The quote rests up to 3 ticks behind others' best bid when that keeps
+  98% of the reward rate (Kalshi scores everything at or above the reference
+  price in full). Needs at least
   `lip_min_time_left_s` to close. Size is net of the position already held
   on that side and our resting edge size there. Capped at own-side fair minus
   `lip_constant_edge`. Pulled with the edge quotes on no fair, a stale

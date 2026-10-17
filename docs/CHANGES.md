@@ -3,6 +3,22 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-17 — LIP steps back behind the best bid; `lip_max_price`; loss-limit marking
+
+- A LIP quote rests at the lowest price within 3 ticks of others' best bid
+  that keeps 98% of the reward rate it would earn at the best bid
+  (`quoter._lip_step_back`; prefers the price already resting). Kalshi scores
+  every bid at or above the reference price in full, so behind a thin best
+  level a sweep must clear others first for the same reward. Live books
+  10-17 00:30 UTC: one tick back kept >=95% of the reward on 55% of sides,
+  two ticks on 21%. Exits never step back.
+- `lip.lip_max_price` (dashboard; was the hardcoded 0.50 `LIP_TAPER_END`, now
+  its upper bound): no LIP quote or exit at a yes price at or above it.
+- Loss-limit PnL: matched yes/no pairs are valued at $1 (they pay exactly
+  that), and a book side that has emptied marks at its last price, not $0.
+  26OCT162015 read -$172.81 just after the 60s cutoff, as the books thinned,
+  and tripped the -$120 limit; it settled -$13.75.
+
 ## 2026-10-16 (night) — constant-$ LIP sizing; exit = inventory; one LIP order per side; burst-threshold check
 
 - LIP size above `lip_cheap_max_price` keeps the cutoff's $ worst case

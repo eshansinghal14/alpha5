@@ -164,13 +164,16 @@ class Position:
         price isn't currently known rather than guessing."""
         if self.settled:
             return 0.0
-        pnl = -self.fees_paid
-        if self.yes_qty:
-            exit_px = yes_bid if yes_bid is not None else 0.0
-            pnl += self.yes_qty * exit_px - self.yes_cost
-        if self.no_qty:
-            no_bid = (1.0 - yes_ask) if yes_ask is not None else 0.0
-            pnl += self.no_qty * no_bid - self.no_cost
+        # A yes and a no in the same market pay exactly $1 together whatever
+        # the result, so matched pairs are worth $1 each, not bid + (1 - ask):
+        # touch-marking both legs booked the full spread as a loss on every
+        # exited LIP round trip.
+        pair = min(self.yes_qty, self.no_qty)
+        pnl = -self.fees_paid - self.yes_cost - self.no_cost + pair
+        if self.yes_qty - pair > 1e-12:
+            pnl += (self.yes_qty - pair) * (yes_bid if yes_bid is not None else 0.0)
+        if self.no_qty - pair > 1e-12:
+            pnl += (self.no_qty - pair) * ((1.0 - yes_ask) if yes_ask is not None else 0.0)
         return pnl
 
 
