@@ -103,6 +103,8 @@ def _coerce(value, tp, where: str):
         expected = origin
         if not isinstance(value, expected):
             raise ConfigError(f"{where}: expected {expected.__name__}, got {value!r}")
+        if origin is list and typing.get_args(inner) == (str,) and not all(isinstance(v, str) for v in value):
+            raise ConfigError(f"{where}: expected a list of strings, got {value!r}")
         return value
     raise ConfigError(f"{where}: unsupported field type {tp}")
 

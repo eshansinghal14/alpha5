@@ -154,7 +154,8 @@ Per market and side (`trading/quoter.py` docstring has the formula):
   cutoff (bid loses y per lot, offer loses 1 − y), so the bid shrinks and the
   offer grows toward the cap. No LIP order, exit included, ever rests at a
   yes price of `lip_max_price` (at most 0.50) or more, so a favourite gets no
-  LIP; the offer has its own tighter cap, `lip_offer_max_price`. The quote rests up to 3 ticks behind others' best bid when that keeps
+  LIP; the offer has its own tighter cap, `lip_offer_max_price`. Only the
+  markets ticked in `lip_markets` quote LIP (null = all). The quote rests up to 3 ticks behind others' best bid when that keeps
   98% of the reward rate (Kalshi scores everything at or above the reference
   price in full). Needs at least
   `lip_min_time_left_s` to close. Size is net of the position already held

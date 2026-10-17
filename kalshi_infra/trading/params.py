@@ -167,6 +167,10 @@ class LipSettings:
         "offer at or above this; the bid keeps lip_max_price. 10-17 05:15-13:30 UTC: the offer at "
         "a yes offer <= 0.20 accrued $15 for +$10.65 net of 10s markout, above 0.20 $21 for "
         "-$123 (88% of its fill lots).", min=0.05, max=LIP_TAPER_END, step=0.01)
+    lip_markets: list[str] | None = param(
+        "Markets that may LIP-quote, by the last part of the ticker (XRP for "
+        "KXCRYPTOLEAD15M-26OCT171745-XRP). null = every market. A market left out quotes no LIP "
+        "but still offers back LIP inventory it already holds (the exit).")
     lip_bid_lots: float = param(
         "LIP yes-bid size at or below lip_cheap_max_price, less any yes position already held; "
         "shrinks above it at constant $ risk. 0 = no LIP bid.", min=0, step=10.0)
@@ -197,6 +201,9 @@ class LipSettings:
     lip_hold_s: float = param(
         "A resting LIP quote is moved to a new price or size at most this often (one amend). "
         "Safety cancels (stale, band, time, LIP off) are never held.", min=0, max=60, step=0.5)
+
+    def market_allowed(self, ticker: str) -> bool:
+        return self.lip_markets is None or ticker.rsplit("-", 1)[-1] in self.lip_markets
 
     def max_price(self, side: str) -> float:
         """The yes price at or above which `side` ("yes" = bid, "no" = offer)

@@ -561,6 +561,9 @@ class Quoter:
         params = self.lip.params.get(ticker) if self.lip is not None else None
         if not lc.enable_lip_quoting or params is None or ladder is None or book is None:
             return None
+        if not lc.market_allowed(ticker):
+            self._block("lip_market_off")
+            return None
         if self.close_time is not None and (self.close_time - now).total_seconds() < lc.lip_min_time_left_s:
             return None
         bids = ladder.yes_bids if side == "yes" else ladder.no_bids

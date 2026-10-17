@@ -310,6 +310,15 @@ def _render_markets(series: str):
         st.dataframe(day.fills_df, use_container_width=True)
 
 
+def _market_names(series: str) -> list[str]:
+    """The running event's market names (BTC, ETH, ...), in the event's own
+    order, for the per-market config checkboxes; [] with no live summary."""
+    got = latest_summary(series)
+    s = got[1] if got else {}
+    tickers = s.get("tickers") or list((s.get("markets") or {}))
+    return list(dict.fromkeys(_market_label(t, s.get("event_ticker")) for t in tickers))
+
+
 def main():
     reg = _registry()
     with st.sidebar:
@@ -318,7 +327,7 @@ def main():
         series = st.radio("Series", sorted(reg), label_visibility="collapsed", key=SERIES_KEY,
                           format_func=lambda t: t + ("  ●" if t in live else ""))
         st.header("Config")
-        config_form.render(reg[series])
+        config_form.render(reg[series], _market_names(series))
     _render_series(series, reg[series])
 
 

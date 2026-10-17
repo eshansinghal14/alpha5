@@ -45,7 +45,7 @@ def cfg(risk_kw=None, **q):
         lip=P.LipSettings(**LIP_OFF))
 
 
-LIP_OFF = dict(enable_lip_quoting=False, lip_cheap_max_price=0.2, lip_max_price=0.5, lip_offer_max_price=0.5, lip_bid_lots=0.0,
+LIP_OFF = dict(enable_lip_quoting=False, lip_cheap_max_price=0.2, lip_max_price=0.5, lip_offer_max_price=0.5, lip_markets=None, lip_bid_lots=0.0,
                lip_offer_lots=0.0, lip_constant_edge=None, lip_max_markets=None,
                lip_requeue_min_ahead=None, lip_min_time_left_s=0.0, lip_hold_s=1.0)
 
@@ -651,6 +651,41 @@ def test_lip_exit_never_steps_back():
     _lip_fill(ctx, "yes", 50.0, 0.10)
     lip_step(q, ctx, yes={0.06: 500.0}, no={0.89: 50.0, 0.88: 300.0})
     assert ctx.lip_targets[("A", "no")].price == 0.90 and ctx.lip_targets[("A", "no")].front
+
+
+def test_lip_markets_selects_which_markets_quote_lip():
+    """lip_markets ["XRP"]: market A (ticker "A") is not on the list, so no
+    LIP bid or offer; null = every market."""
+    q, ctx = lip_q(lip_markets=["XRP"], lip_offer_lots=60.0)
+    lip_step(q, ctx, fair=0.105)
+    assert ctx.lip_targets[("A", "yes")] is None and ctx.lip_targets[("A", "no")] is None
+    assert q.block_counts.get("lip_market_off", 0) >= 1
+    q, ctx = lip_q(lip_markets=["A"], lip_offer_lots=60.0)
+    lip_step(q, ctx, fair=0.105)
+    assert ctx.lip_targets[("A", "yes")] is not None and ctx.lip_targets[("A", "no")] is not None
+    s = P.LipSettings(**dict(LIP_OFF, lip_markets=["XRP", "HYPE"]))
+    assert s.market_allowed("KXCRYPTOLEAD15M-26OCT171745-XRP")
+    assert not s.market_allowed("KXCRYPTOLEAD15M-26OCT171745-BTC")
+    assert P.LipSettings(**dict(LIP_OFF, lip_markets=None)).market_allowed("X-BTC")
+
+
+def test_lip_market_off_still_offers_back_held_inventory():
+    """Unticking a market stops new LIP there, but LIP inventory it already
+    holds is still offered back (the exit), so it isn't stranded."""
+    q, ctx = lip_q(lip_markets=["XRP"])
+    _lip_fill(ctx, "yes", 120.0, 0.10)
+    lip_step(q, ctx)
+    t = ctx.lip_targets[("A", "no")]
+    assert t is not None and t.front and t.size == 120.0
+    assert ctx.lip_targets[("A", "yes")] is None
+
+
+def test_lip_markets_config_must_be_a_list_of_names():
+    from kalshi_infra.config import ConfigError, build
+    raw = dict(LIP_OFF, lip_markets=["XRP", 3])
+    with pytest.raises(ConfigError):
+        build(P.LipSettings, raw)
+    assert build(P.LipSettings, dict(LIP_OFF, lip_markets=["XRP"])).lip_markets == ["XRP"]
 
 
 def test_lip_offer_has_its_own_tighter_cap():

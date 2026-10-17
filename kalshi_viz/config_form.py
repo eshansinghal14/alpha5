@@ -32,11 +32,25 @@ def _nullable_number(d: dict, value, label: str, key: str, help_: str):
     return v
 
 
-def _widget(d: dict, value, key: str):
+def _market_checkboxes(d: dict, value, key: str, label: str, help_: str, markets: list[str]):
+    """One checkbox per market for a list-of-market-names field. All ticked
+    is saved as null (= every market, including any added later)."""
+    st.markdown(f"**{label}**", help=help_)
+    on = set(markets) if value is None else set(value)
+    cols = st.columns(len(markets))
+    picked = [m for c, m in zip(cols, markets) if c.checkbox(m, value=m in on, key=f"{key}_{m}")]
+    if len(picked) == len(markets):
+        return None
+    return picked
+
+
+def _widget(d: dict, value, key: str, markets: list[str] | None = None):
     """One input for one field. Returns the new value."""
     name = d["name"].split(".")[-1]
     label = name + ("  ⏭" if d["apply"] == APPLY_NEXT_EVENT else "")
     help_ = d["help"] + ("\n\n⏭ applies at the next event." if d["apply"] == APPLY_NEXT_EVENT else "")
+    if d["type"] == "list" and name.endswith("_markets") and markets:
+        return _market_checkboxes(d, value, key, label, help_, markets)
     if d["type"] == "bool":
         return st.checkbox(label, value=bool(value), key=key, help=help_)
     if d["type"] == "str":
@@ -56,8 +70,9 @@ def _widget(d: dict, value, key: str):
                                  key=key, help=help_))
 
 
-def render(series) -> None:
-    """Sidebar form for `series` (a runtime.series.Series)."""
+def render(series, markets: list[str] | None = None) -> None:
+    """Sidebar form for `series` (a runtime.series.Series). `markets`: the
+    series' market names (XRP, BTC, ...), for per-market checkbox fields."""
     try:
         cfg = load(series.config_cls, series.config_path, series.config_key)
     except (ConfigError, OSError, ValueError) as e:
@@ -74,8 +89,10 @@ def render(series) -> None:
             with st.expander(sec, expanded=sec == "quoting"):
                 for d in ds:
                     cur = get_dotted(cfg, d["name"])
+                    if d["type"] == "list" and not markets:
+                        continue            # no market list to draw checkboxes from: leave as is
                     try:
-                        new = _widget(d, cur, f"cfg_{series.ticker}_{d['name']}")
+                        new = _widget(d, cur, f"cfg_{series.ticker}_{d['name']}", markets)
                     except _BadInput as e:
                         bad.append(str(e))
                         continue

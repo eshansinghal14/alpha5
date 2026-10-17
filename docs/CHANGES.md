@@ -21,6 +21,16 @@ Reverse chronological. One section per material change. Entries before
   bid HYPE 0.48 x77 with 83s left, 9c over the edge ladder's threshold; it
   filled and fair fell to 0.09 within 17s (-48c/lot at 60s).
 
+## 2026-10-17 (night) — pick which markets quote LIP
+
+- `lip.lip_markets` (dashboard: one checkbox per market): only the ticked
+  markets quote LIP; all ticked is saved as null (= every market). A
+  market left out quotes no LIP, holds no `lip_max_markets` slot, but still
+  offers back LIP inventory it already holds. Config lists of strings are now
+  type-checked.
+- 10-17 by coin (01:30-21:50 UTC): XRP earned $24.13 of the $44.59 payable
+  (19 of 35 markets that reached $1) and its LIP fills lost $102.81 at 10s.
+
 ## 2026-10-17 (afternoon) — separate price cap for the LIP offer
 
 - `lip.lip_offer_max_price` (dashboard): no LIP offer (the no bid), exit
