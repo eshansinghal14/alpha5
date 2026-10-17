@@ -3,6 +3,17 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-17 — A LIP fill clears that side's LIP target
+
+- `OrderManager.on_fill`: a LIP fill drops the side's published target (the
+  order's remainder keeps resting) until the quoter re-sizes it against the
+  new position. The pump used to re-create a fully filled LIP order at the
+  old size, or amend a partial back up to filled + target, in the gap.
+  26OCT170115 SOL (05:02:26 UTC): a 97-lot no bid @0.54 filled, a second 97
+  went up 76ms later and filled 70; 0 -> -170 in 0.1s and the position halt
+  tripped. Fills arrive during stale_signal pulls, when the quoter isn't
+  publishing, so the stale target could sit there for the whole pull.
+
 ## 2026-10-17 — LIP exit stops at the LIP time cutoff
 
 - The LIP exit no longer bypasses `lip_min_time_left_s`: inside it no LIP

@@ -239,6 +239,20 @@ def _lip_engine():
     return eng, client, q
 
 
+def test_real_lip_fill_does_not_put_the_same_size_back_up():
+    """26OCT170115 SOL: a filled 97-lot LIP order was re-created at 97 by the
+    pump 76ms later and filled again (0 -> -170)."""
+    eng, client, q = _lip_engine()
+    n = len([c for c in client.creates if c[3] == 100.0])
+    eng.on_real_fill({"ticker": "A", "side": "yes", "price": 0.10, "size": 100.0, "fee": 0.0,
+                      "time": pd.Timestamp.now(tz="UTC"), "liquidity": "maker",
+                      "order_id": q.exchange_id, "trade_id": "t1"})
+    for _ in range(5):
+        eng.pump_quotes()
+    assert len([c for c in client.creates if c[3] == 100.0]) == n
+    assert eng.om.lip_quote("A", "yes") is None
+
+
 def test_requeue_lip_moves_front_of_queue_to_back():
     eng, client, q = _lip_engine()
     # 30 ahead at 0.10, 500 displayed: 370 behind us.

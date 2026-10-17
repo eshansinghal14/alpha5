@@ -927,6 +927,15 @@ class OrderManager:
         if q is None:
             return
         q.filled += size
+        if q.role == LIP:
+            # The target was sized for the position before this fill. Left in
+            # place, the pump re-creates a fully filled LIP order at full size,
+            # or amends a partial back up to filled + target, before the quoter
+            # re-sizes it. 26OCT170115 SOL: a 97-lot no @0.54 filled, a second
+            # 97 went up 76ms later and filled 70 (0 -> -170 in 0.1s, position
+            # halt). Dropping the target without cancelling leaves any
+            # remainder resting until the quoter publishes a fresh one.
+            self.lip[(q.ticker, q.side)] = None
         if q.remaining <= 1e-9:
             self.quotes.pop(order_id, None)
             self._cancel_q.pop(order_id, None)

@@ -597,6 +597,32 @@ def test_lip_exit_target_is_never_requeued():
     assert ex.cancels == []
 
 
+def test_filled_lip_order_is_not_recreated_on_its_stale_target():
+    """26OCT170115 SOL: the LIP order filled in full and the pump put the same
+    97 lots straight back up before the quoter re-sized it."""
+    m, ex, c = mk()
+    q = _resting_lip(m, ex)
+    m.on_fill(q.order_id, 20.0)
+    c.t += 1.0
+    m.pump()
+    assert [x for x in ex.creates if x.role == "lip"] == [ex.creates[0]]
+    assert m.lip.get(("A", "yes")) is None
+    # The next decision publishes a fresh target: that one is placed.
+    m.set_lip("A", "yes", LipTarget(0.30, 5.0))
+    m.pump()
+    assert [x.size for x in ex.creates if x.role == "lip"] == [20.0, 5.0]
+
+
+def test_partial_lip_fill_is_not_amended_back_up():
+    m, ex, c = mk()
+    q = _resting_lip(m, ex)
+    m.on_fill(q.order_id, 12.0)
+    c.t += 5.0
+    m.pump()
+    assert ex.amends == [] and ex.cancels == []
+    assert m.lip_quote("A", "yes").remaining == pytest.approx(8.0)
+
+
 def test_on_book_includes_lip():
     m, ex, _ = mk()
     m.set_lip("A", "yes", LipTarget(0.30, 20.0))
