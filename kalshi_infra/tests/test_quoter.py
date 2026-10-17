@@ -45,7 +45,7 @@ def cfg(risk_kw=None, **q):
         lip=P.LipSettings(**LIP_OFF))
 
 
-LIP_OFF = dict(enable_lip_quoting=False, lip_cheap_max_price=0.2, lip_max_price=0.5, lip_bid_lots=0.0,
+LIP_OFF = dict(enable_lip_quoting=False, lip_cheap_max_price=0.2, lip_max_price=0.5, lip_offer_max_price=0.5, lip_bid_lots=0.0,
                lip_offer_lots=0.0, lip_constant_edge=None, lip_max_markets=None,
                lip_requeue_min_ahead=None, lip_min_time_left_s=0.0, lip_hold_s=1.0)
 
@@ -651,6 +651,38 @@ def test_lip_exit_never_steps_back():
     _lip_fill(ctx, "yes", 50.0, 0.10)
     lip_step(q, ctx, yes={0.06: 500.0}, no={0.89: 50.0, 0.88: 300.0})
     assert ctx.lip_targets[("A", "no")].price == 0.90 and ctx.lip_targets[("A", "no")].front
+
+
+def test_lip_offer_has_its_own_tighter_cap():
+    """lip_offer_max_price 0.20: a yes offer of 0.24 (no bid 0.76) gets no LIP
+    while the 0.22 bid (under lip_max_price 0.35) still does; at a 0.11 offer
+    (no bid 0.89) the offer quotes again."""
+    q, ctx = lip_q(lip_max_price=0.35, lip_offer_max_price=0.20, lip_offer_lots=60.0)
+    lip_step(q, ctx, yes={0.22: 500.0, 0.21: 300.0}, no={0.76: 500.0, 0.75: 300.0}, fair=0.23)
+    assert ctx.lip_targets[("A", "yes")] is not None
+    assert ctx.lip_targets[("A", "no")] is None
+    q, ctx = lip_q(lip_max_price=0.35, lip_offer_max_price=0.20, lip_offer_lots=60.0)
+    lip_step(q, ctx, fair=0.105)
+    assert ctx.lip_targets[("A", "no")] is not None
+    s = P.LipSettings(**dict(LIP_OFF, lip_bid_lots=150.0, lip_offer_lots=60.0, lip_cheap_max_price=0.10,
+                             lip_max_price=0.35, lip_offer_max_price=0.20))
+    assert s.max_price("yes") == 0.35 and s.max_price("no") == 0.20
+    assert s.lots_at(0.81, "no") > 0 and s.lots_at(0.80, "no") == 0.0          # yes offer 0.19 / 0.20
+    assert s.lots_at(0.30, "yes") > 0
+    assert s.max_lots() == pytest.approx(150.0)                                # offer peak 60*0.9/0.8 = 67.5
+    s = P.LipSettings(**dict(LIP_OFF, lip_bid_lots=10.0, lip_offer_lots=60.0, lip_cheap_max_price=0.10,
+                             lip_max_price=0.35, lip_offer_max_price=0.40))
+    assert s.max_price("no") == 0.35                                           # never looser than lip_max_price
+
+
+def test_lip_exit_follows_the_offer_cap():
+    """120 yes bought at 0.10 is offered back as a no bid at 0.89 (yes 0.11):
+    with the offer capped at 0.10 that exit is not placed."""
+    q, ctx = lip_q(lip_offer_max_price=0.10)
+    _lip_fill(ctx, "yes", 120.0, 0.10)
+    lip_step(q, ctx)
+    assert ctx.lip_targets[("A", "no")] is None
+    assert q.block_counts.get("lip_exit_over_max", 0) >= 1
 
 
 def test_lip_max_price_param_moves_the_hard_cap():

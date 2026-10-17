@@ -553,7 +553,7 @@ class Quoter:
         minus lip_constant_edge. Quoted only if that price is in a band
         (lip.lots_at) and at least lip_min_time_left_s remain. The full edge
         reservation is NOT used: it left the quote almost never at the best
-        bid, where nearly all the LIP is (LIP_REPORT.md §6).
+        bid, where nearly all the LIP is (LIP_REPORT.md Â§6).
 
         Size: lots_at(price) minus the position already held on this side and
         our resting edge size there."""
@@ -586,7 +586,7 @@ class Quoter:
         # Hard cap before sizing: the sizing below adds back a position held
         # the other way, which with a 0 band would still rest an order on a
         # market at a yes price over the cap.
-        if lip_yes_price(price, side) >= lc.lip_max_price - 1e-9:
+        if lip_yes_price(price, side) >= lc.max_price(side) - 1e-9:
             return None
         # The band size is the most position we want on this side: quote up to
         # it, net of the signed position held there (a position the other way
@@ -648,7 +648,7 @@ class Quoter:
         the bands, lots, payout floor and max-markets, but not the LIP time
         cutoff (the caller holds the inventory inside it);
         keeps the far-touch and lip_constant_edge price caps, and like every
-        LIP order never rests at a yes price of lip_max_price or more. Never
+        LIP order never rests at a yes price of its side's cap (lc.max_price) or more. Never
         stepped back: it wants the fill."""
         inv = self._lip_inv.get(ticker, 0.0)
         qty = min(max(inv, 0.0), max(net, 0.0)) if side == "no" else min(max(-inv, 0.0), max(-net, 0.0))
@@ -675,7 +675,7 @@ class Quoter:
             price = min(price, self._lip_fair_cap(side, prob))
         if not (MIN_PRICE <= price <= MAX_PRICE):
             return None
-        if lip_yes_price(price, side) >= lc.lip_max_price - 1e-9:
+        if lip_yes_price(price, side) >= lc.max_price(side) - 1e-9:
             self._block("lip_exit_over_max")
             return None
         self._block("lip_exit")

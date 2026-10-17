@@ -38,6 +38,7 @@
     "enable_lip_quoting": false,
     "lip_cheap_max_price": 0.1,
     "lip_max_price": 0.5,
+    "lip_offer_max_price": 0.2,
     "lip_bid_lots": 150.0,
     "lip_offer_lots": 60.0,
     "lip_constant_edge": 0.01,

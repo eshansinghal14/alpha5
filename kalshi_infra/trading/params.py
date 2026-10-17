@@ -162,14 +162,20 @@ class LipSettings:
         "No LIP order (quote or exit) at a yes price -- the yes bid, or 1 - the no bid for the "
         "offer -- at or above this. Lower it to keep LIP off contested markets, where both sides "
         "were picked off 10-16 23:00-00:15 UTC.", min=0.05, max=LIP_TAPER_END, step=0.01)
+    lip_offer_max_price: float = param(
+        "Tighter cap for the LIP offer (the no bid) alone: no LIP offer, exit included, at a yes "
+        "offer at or above this; the bid keeps lip_max_price. 10-17 05:15-13:30 UTC: the offer at "
+        "a yes offer <= 0.20 accrued $15 for +$10.65 net of 10s markout, above 0.20 $21 for "
+        "-$123 (88% of its fill lots).", min=0.05, max=LIP_TAPER_END, step=0.01)
     lip_bid_lots: float = param(
         "LIP yes-bid size at or below lip_cheap_max_price, less any yes position already held; "
         "shrinks above it at constant $ risk. 0 = no LIP bid.", min=0, step=10.0)
     lip_offer_lots: float = param(
         "LIP yes-offer size (the no bid) at a yes offer at or below lip_cheap_max_price, less any no "
-        "position already held; grows above it at constant $ risk, to x(1 - cutoff)/(1 - "
-        "lip_max_price) at the cap. Worst case per lot is 1 - the yes offer, so this side risks far "
-        "more per lot than the bid. 0 = no LIP offer.", min=0, step=10.0)
+        "position already held; grows above it at constant $ risk, to x(1 - cutoff)/(1 - cap) at "
+        "the offer's cap (the lower of lip_max_price and lip_offer_max_price). Worst case per lot is "
+        "1 - the yes offer, so this side risks far more per lot than the bid. 0 = no LIP offer.",
+        min=0, step=10.0)
     lip_constant_edge: float | None = param(
         "Edge the LIP bid must keep below own-side fair ($): a best bid above fair - this is capped "
         "there. 0 = never above fair. null = no fair check. Live 2026-10-14 22:22-22:55 UTC: 613 of "
@@ -192,15 +198,21 @@ class LipSettings:
         "A resting LIP quote is moved to a new price or size at most this often (one amend). "
         "Safety cancels (stale, band, time, LIP off) are never held.", min=0, max=60, step=0.5)
 
+    def max_price(self, side: str) -> float:
+        """The yes price at or above which `side` ("yes" = bid, "no" = offer)
+        rests no LIP order: lip_max_price, tightened by lip_offer_max_price
+        for the offer."""
+        return self.lip_max_price if side == "yes" else min(self.lip_max_price, self.lip_offer_max_price)
+
     def lots_at(self, price: float, side: str) -> float:
         """Order size for a LIP quote on `side` ("yes" = the bid, "no" = the
         offer) at own-side `price`, judged by that price in yes terms y: the
         side's lots up to lip_cheap_max_price, then the same $ worst case as at
         the cutoff (bid loses y/lot, offer loses 1 - y/lot), 0 at or above
-        lip_max_price. So the bid shrinks and the offer grows toward the cap."""
+        max_price(side). So the bid shrinks and the offer grows toward its cap."""
         edge = self.lip_cheap_max_price
         y = lip_yes_price(price, side)
-        if y >= self.lip_max_price - 1e-9:
+        if y >= self.max_price(side) - 1e-9:
             return 0.0
         if y <= edge + 1e-9:
             return self.lip_bid_lots if side == "yes" else self.lip_offer_lots
@@ -209,8 +221,8 @@ class LipSettings:
         return self.lip_offer_lots * (1.0 - edge) / (1.0 - y)
 
     def max_lots(self) -> float:
-        """Largest LIP order size anywhere: the offer peaks just under lip_max_price."""
-        peak = max(self.lip_max_price, self.lip_cheap_max_price)
+        """Largest LIP order size anywhere: the offer peaks just under its cap."""
+        peak = max(self.max_price("no"), self.lip_cheap_max_price)
         return max(self.lip_bid_lots, self.lip_offer_lots * (1.0 - self.lip_cheap_max_price) / (1.0 - peak))
 
 

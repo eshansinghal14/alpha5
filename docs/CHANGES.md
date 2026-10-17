@@ -21,6 +21,16 @@ Reverse chronological. One section per material change. Entries before
   bid HYPE 0.48 x77 with 83s left, 9c over the edge ladder's threshold; it
   filled and fair fell to 0.09 within 17s (-48c/lot at 60s).
 
+## 2026-10-17 (afternoon) — separate price cap for the LIP offer
+
+- `lip.lip_offer_max_price` (dashboard): no LIP offer (the no bid), exit
+  included, at a yes offer at or above it; the bid keeps `lip_max_price`. It
+  can only tighten, never loosen, the offer's cap. Crypto: 0.20 (bid 0.35).
+  10-17 05:15-13:30 UTC, splitting accrual by which side was resting: the
+  offer at a yes offer <= 0.20 accrued $15 for +$10.65 net of 10s markout;
+  above 0.20, $21 for -$123, on 88% of its fill lots. Reward per minute was
+  flat ($0.04-0.08) at every price on both sides.
+
 ## 2026-10-17 — LIP steps back behind the best bid; `lip_max_price`; loss-limit marking
 
 - A LIP quote rests at the lowest price within 3 ticks of others' best bid
