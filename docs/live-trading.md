@@ -163,7 +163,9 @@ Per market and side (`trading/quoter.py` docstring has the formula):
   signal, `enable_quoting` off, a model side block or `spot_burst`. Moved at
   most once per `lip_hold_s`. The LIP exit (inventory offered back on the
   other side, at the front of the book) is sized to the inventory alone and
-  only runs where its yes price is under 0.50. A new LIP order on a side
+  only runs where its yes price is under 0.50. It stops at
+  `lip_min_time_left_s` like every LIP order: inside it the inventory is
+  held to settlement (or worked by the edge ladder). A new LIP order on a side
   waits until the previous one's cancel has landed.
   - **$1 payout floor** (hardcoded, `quoter.LIP_MIN_PAYOUT_USD`): a market is
     LIP-quoted only if LIP accrued so far plus our current $/s (book as it is,

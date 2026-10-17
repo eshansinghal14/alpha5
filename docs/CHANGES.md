@@ -3,6 +3,13 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-17 — LIP exit stops at the LIP time cutoff
+
+- The LIP exit no longer bypasses `lip_min_time_left_s`: inside it no LIP
+  order rests and LIP inventory is held. 26OCT162045 (00:43 UTC): the exit
+  bid HYPE 0.48 x77 with 83s left, 9c over the edge ladder's threshold; it
+  filled and fair fell to 0.09 within 17s (-48c/lot at 60s).
+
 ## 2026-10-17 — LIP steps back behind the best bid; `lip_max_price`; loss-limit marking
 
 - A LIP quote rests at the lowest price within 3 ticks of others' best bid

@@ -470,13 +470,16 @@ class Quoter:
         lc = self.cfg.lip
         # quote_gate (spot_burst) pulls LIP at once, exit included, same as the
         # edge ladder: the fair is least reliable exactly when a sweep comes.
+        # The time cutoff stops the exit too: inside it LIP inventory is held.
+        # 26OCT162045: an exit bid HYPE 0.48 x77 at 83s left, 9c over the edge
+        # threshold, and fair fell to 0.09 within 17s.
         hard_off = (not lc.enable_lip_quoting or not q.enable_quoting or bool(quote_gate)
                     or (self.close_time is not None
                         and (self.close_time - now).total_seconds() < lc.lip_min_time_left_s))
         for side in ("yes", "no"):
             side_blocked = (block_bid if side == "yes" else block_ask) is not None
             lips[side] = self._lip_debounce(ticker, side, lips[side], now_s, hard_off or side_blocked)
-            exit_t = None if (side_blocked or quote_gate or not lc.enable_lip_quoting or not q.enable_quoting) else \
+            exit_t = None if (side_blocked or hard_off) else \
                 self._lip_exit(ticker, side, book, ladder, net, prob)
             if exit_t is not None:
                 # One order per side: the exit (inventory only, front of the
@@ -642,7 +645,8 @@ class Quoter:
         fill flattens rather than flips. Unlike a LIP quote it WANTS the
         fill: it steps a tick in front of others' best bid (alone at the front
         of the book) and is marked `front`, so it is never re-queued. Bypasses
-        the bands, lots, payout floor, max-markets and the LIP time cutoff;
+        the bands, lots, payout floor and max-markets, but not the LIP time
+        cutoff (the caller holds the inventory inside it);
         keeps the far-touch and lip_constant_edge price caps, and like every
         LIP order never rests at a yes price of lip_max_price or more. Never
         stepped back: it wants the fill."""

@@ -185,8 +185,9 @@ class LipSettings:
         "cancelled and re-placed at the back -- fewest-ahead first, only with write tokens to "
         "spare above cancels_token. null = never.", min=0, step=10.0)
     lip_min_time_left_s: float = param(
-        "No LIP quote with fewer than this many seconds to close. The last 3 min lost money net "
-        "in every cut of the 2026-10-11..14 backtest.", min=0, step=30)
+        "No LIP order with fewer than this many seconds to close, the LIP exit included: inside it "
+        "LIP inventory is held. The last 3 min lost money net in every cut of the 2026-10-11..14 "
+        "backtest.", min=0, step=30)
     lip_hold_s: float = param(
         "A resting LIP quote is moved to a new price or size at most this often (one amend). "
         "Safety cancels (stale, band, time, LIP off) are never held.", min=0, max=60, step=0.5)

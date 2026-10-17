@@ -1125,12 +1125,22 @@ def test_lip_exit_shrinks_as_it_fills_and_ignores_edge_fills():
     assert ctx.lip_targets[("A", "no")].size == 70.0
 
 
-def test_lip_exit_continues_past_the_lip_time_cutoff():
+def test_lip_exit_stops_at_the_lip_time_cutoff():
+    """Inside lip_min_time_left_s the LIP inventory is held: no exit."""
     q, ctx = lip_q(close=T0 + pd.Timedelta(seconds=100))
     _lip_fill(ctx, "yes", 120.0, 0.10)
     lip_step(q, ctx)
     assert ctx.lip_targets[("A", "yes")] is None
-    assert ctx.lip_targets[("A", "no")].size == 120.0
+    assert ctx.lip_targets[("A", "no")] is None
+
+
+def test_lip_exit_resting_is_pulled_when_the_cutoff_passes():
+    q, ctx = lip_q(close=T0 + pd.Timedelta(seconds=185))
+    _lip_fill(ctx, "yes", 120.0, 0.10)
+    lip_step(q, ctx)
+    assert ctx.lip_targets[("A", "no")] is not None    # 185s left: exit rests
+    lip_step(q, ctx, dt=10.0)                           # 175s left
+    assert ctx.lip_targets[("A", "no")] is None
 
 
 def test_loss_budget_shrinks_lip_entry_to_fit():
