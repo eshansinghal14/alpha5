@@ -56,7 +56,6 @@
       "basis_sd_bp": 0.3,
       "ci_vol_multiplier": 1.5,
       "reaction_latency_s": 2.0,
-      "min_rv_seconds": 900,
       "min_trade_tau_s": 15.0,
       "tradeable_min": 0.1,
       "tradeable_max": 0.9,
@@ -117,7 +116,21 @@
       "hard_stale_s": 15.0,
       "recovery_s": 5.0,
       "warmup_s": 14400.0,
-      "composite_flush_s": 30.0
+      "composite_flush_s": 30.0,
+      "vol_source": "realized",
+      "implied_ema_s": 900.0,
+      "implied_min_obs": 20.0,
+      "implied_mid_min": 0.15,
+      "implied_mid_max": 0.85,
+      "implied_max_spread": 0.02,
+      "implied_mid_noise": 0.005,
+      "implied_spot_err_bp": 1.0,
+      "implied_lag_s": 5.0,
+      "implied_max_obs_se": 0.5,
+      "implied_max_curvature": 1.0,
+      "implied_vol_min_bp": 0.1,
+      "implied_vol_max_bp": 5.0,
+      "min_rv_seconds": 900
     }
   },
   "KXETH15M": {
@@ -177,7 +190,6 @@
       "basis_sd_bp": 0.3,
       "ci_vol_multiplier": 1.5,
       "reaction_latency_s": 2.0,
-      "min_rv_seconds": 900,
       "min_trade_tau_s": 15.0,
       "tradeable_min": 0.1,
       "tradeable_max": 0.9,
@@ -238,7 +250,21 @@
       "hard_stale_s": 15.0,
       "recovery_s": 5.0,
       "warmup_s": 14400.0,
-      "composite_flush_s": 30.0
+      "composite_flush_s": 30.0,
+      "vol_source": "implied",
+      "implied_ema_s": 900.0,
+      "implied_min_obs": 20.0,
+      "implied_mid_min": 0.15,
+      "implied_mid_max": 0.85,
+      "implied_max_spread": 0.02,
+      "implied_mid_noise": 0.005,
+      "implied_spot_err_bp": 1.0,
+      "implied_lag_s": 5.0,
+      "implied_max_obs_se": 0.5,
+      "implied_max_curvature": 1.0,
+      "implied_vol_min_bp": 0.1,
+      "implied_vol_max_bp": 5.0,
+      "min_rv_seconds": 900
     }
   },
   "KXSOL15M": {
@@ -298,7 +324,6 @@
       "basis_sd_bp": 0.3,
       "ci_vol_multiplier": 1.5,
       "reaction_latency_s": 2.0,
-      "min_rv_seconds": 900,
       "min_trade_tau_s": 15.0,
       "tradeable_min": 0.1,
       "tradeable_max": 0.9,
@@ -359,7 +384,21 @@
       "hard_stale_s": 15.0,
       "recovery_s": 5.0,
       "warmup_s": 14400.0,
-      "composite_flush_s": 30.0
+      "composite_flush_s": 30.0,
+      "vol_source": "realized",
+      "implied_ema_s": 900.0,
+      "implied_min_obs": 20.0,
+      "implied_mid_min": 0.15,
+      "implied_mid_max": 0.85,
+      "implied_max_spread": 0.02,
+      "implied_mid_noise": 0.005,
+      "implied_spot_err_bp": 1.0,
+      "implied_lag_s": 5.0,
+      "implied_max_obs_se": 0.5,
+      "implied_max_curvature": 1.0,
+      "implied_vol_min_bp": 0.1,
+      "implied_vol_max_bp": 5.0,
+      "min_rv_seconds": 900
     }
   },
   "KXXRP15M": {
@@ -419,7 +458,6 @@
       "basis_sd_bp": 0.3,
       "ci_vol_multiplier": 1.5,
       "reaction_latency_s": 2.0,
-      "min_rv_seconds": 900,
       "min_trade_tau_s": 15.0,
       "tradeable_min": 0.1,
       "tradeable_max": 0.9,
@@ -480,7 +518,21 @@
       "hard_stale_s": 15.0,
       "recovery_s": 5.0,
       "warmup_s": 14400.0,
-      "composite_flush_s": 30.0
+      "composite_flush_s": 30.0,
+      "vol_source": "realized",
+      "implied_ema_s": 900.0,
+      "implied_min_obs": 20.0,
+      "implied_mid_min": 0.15,
+      "implied_mid_max": 0.85,
+      "implied_max_spread": 0.02,
+      "implied_mid_noise": 0.005,
+      "implied_spot_err_bp": 1.0,
+      "implied_lag_s": 5.0,
+      "implied_max_obs_se": 0.5,
+      "implied_max_curvature": 1.0,
+      "implied_vol_min_bp": 0.1,
+      "implied_vol_max_bp": 5.0,
+      "min_rv_seconds": 900
     }
   },
   "KXHYPE15M": {
@@ -540,7 +592,6 @@
       "basis_sd_bp": 0.3,
       "ci_vol_multiplier": 1.5,
       "reaction_latency_s": 2.0,
-      "min_rv_seconds": 900,
       "min_trade_tau_s": 15.0,
       "tradeable_min": 0.1,
       "tradeable_max": 0.9,
@@ -601,7 +652,21 @@
       "hard_stale_s": 15.0,
       "recovery_s": 5.0,
       "warmup_s": 14400.0,
-      "composite_flush_s": 30.0
+      "composite_flush_s": 30.0,
+      "vol_source": "realized",
+      "implied_ema_s": 900.0,
+      "implied_min_obs": 20.0,
+      "implied_mid_min": 0.15,
+      "implied_mid_max": 0.85,
+      "implied_max_spread": 0.02,
+      "implied_mid_noise": 0.005,
+      "implied_spot_err_bp": 1.0,
+      "implied_lag_s": 5.0,
+      "implied_max_obs_se": 0.5,
+      "implied_max_curvature": 1.0,
+      "implied_vol_min_bp": 0.1,
+      "implied_vol_max_bp": 5.0,
+      "min_rv_seconds": 900
     }
   }
 }

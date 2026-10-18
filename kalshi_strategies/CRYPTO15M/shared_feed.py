@@ -7,6 +7,7 @@ only that coin's model.
 """
 from __future__ import annotations
 
+from kalshi_strategies.CRYPTO15M.implied_vol import ImpliedVolEMA
 from kalshi_strategies.KXCRYPTOLEAD15M.live_feed import SpotFeed
 
 
@@ -16,6 +17,13 @@ class SharedSpotFeed(SpotFeed):
         self.models: list = []
         # Monotonic time until which each coin's own bursts pull its quotes.
         self.burst_until_by_coin: dict[str, float] = {}
+        # Per coin, outliving events: each event starts from the last one's implied vol.
+        self._implied: dict[str, ImpliedVolEMA] = {}
+
+    def implied_ema(self, coin: str) -> ImpliedVolEMA:
+        if coin not in self._implied:
+            self._implied[coin] = ImpliedVolEMA()
+        return self._implied[coin]
 
     def attach(self, model):
         p = model.cfg.pricing

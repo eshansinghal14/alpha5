@@ -104,6 +104,41 @@ def test_burst_pulls_own_coin_only():
     assert m.quote_block(m.ticker, now) == "spot_burst"
 
 
+def test_implied_without_observations_withholds():
+    now = time.time()
+    m, spot = _setup(now, vol_source="implied")
+    _feed(spot, "BTC")
+    assert m.reprice(now)[m.ticker] is None and m.withheld_reason == "no_implied_vol"
+
+
+def test_implied_prices_once_ema_has_data():
+    now = time.time()
+    # implied_lag_s 0: the 10bp move below is set up in one go, not a live jump.
+    # Wide SE / curvature gates: at 1bp/sqrt(s) and 600s left a 0.70 mid is a
+    # weak vol read (SE ~1.0); this checks the plumbing, not the gates.
+    m, spot = _setup(now, vol_source="implied", implied_min_obs=2.5, implied_lag_s=0.0,
+                     implied_max_obs_se=2.0, implied_max_curvature=5.0)
+    _feed(spot, "BTC", 1.0010)
+    m.reprice(now)
+    # Kalshi priced 10bp up at 0.70: implies some vol; three seconds of it fill the EMA.
+    for k in range(3):
+        m.on_book(_Book(m.ticker, 0.69, 0.71))
+        m._iv_last_sec = None
+        m._dirty = True
+        f = m.reprice(now + k)[m.ticker]
+    assert f is not None and m.vol_src == "implied" and abs(f.prob - 0.70) < 0.02
+
+
+def test_spot_jump_downweights_implied():
+    now = time.time()
+    m, spot = _setup(now, vol_source="implied", implied_min_obs=1.0, implied_lag_s=5.0)
+    _feed(spot, "BTC", 1.0010)     # 10bp since the last bars: Kalshi may lag it
+    m.on_book(_Book(m.ticker, 0.69, 0.71))
+    m.reprice(now)
+    o = spot.implied_ema("BTC").last
+    assert o is not None and (o.reason is not None or o.se_log > 0.5)
+
+
 def test_withheld_before_start():
     now = time.time()
     m, spot = _setup(now)

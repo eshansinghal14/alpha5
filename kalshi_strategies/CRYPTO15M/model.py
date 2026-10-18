@@ -18,6 +18,7 @@ import time
 
 from kalshi_infra.kalshi.markets import EventInfo
 from kalshi_infra.trading.fair import Fair
+from kalshi_strategies.CRYPTO15M.implied_vol import observe
 from kalshi_strategies.CRYPTO15M.pricer import implied_mu, prob_up
 from kalshi_strategies.KXCRYPTOLEAD15M.cf_index import STALE_S as CF_STALE_S
 from kalshi_strategies.KXCRYPTOLEAD15M.model import BASIS_MIN_S, BASIS_WINDOW_S
@@ -60,6 +61,8 @@ class UpDownModel:
         self._shift_raw = 0.0
         self._shift_t: float | None = None
         self._shift_fit_t = -math.inf
+        self._iv_last_sec: int | None = None
+        self.vol_src: str | None = None
 
     # --- inputs -------------------------------------------------------------
 
@@ -127,9 +130,48 @@ class UpDownModel:
         self.withheld_reason = reason
         return {self.ticker: None}
 
-    def _rate(self, h: float) -> float:
+    def _realized_rate(self, h: float) -> float:
         f = self.spot.forecaster
         return float(f.rate_per_s(h, time.time())[f.coin_order.index(self.coin)]) * self.cfg.pricing.vol_mult
+
+    def _spot_move(self, now_s: float) -> float:
+        """|ln(mid now / mid lag_s ago)| from the 1s bars: how far Kalshi may
+        still be behind spot."""
+        lag = self.cfg.pricing.implied_lag_s
+        bars = self.bus.feeds[self.coin].tail(int(lag) + 3)
+        old = [b.mid for b in bars if b.ts_s <= now_s - lag]
+        cur = self.bus.mid_nowcast(self.coin)
+        if not old or not cur:
+            return 0.0
+        return abs(math.log(cur / old[-1]))
+
+    def _observe_implied(self, now_s: float, x: float, tau: float, bsd: float):
+        """One second's implied-vol observation into the shared EMA."""
+        p = self.cfg.pricing
+        km = self._kmid()
+        if km is None or self._kask - self._kbid > p.implied_max_spread + 1e-9:
+            return
+        if not (p.implied_mid_min <= km <= p.implied_mid_max):
+            return
+        sec = int(now_s)
+        if sec == self._iv_last_sec:
+            return
+        self._iv_last_sec = sec
+        spot_err = math.hypot(p.implied_spot_err_bp * 1e-4, self._spot_move(now_s))
+        obs = observe(km, (self._kask - self._kbid) / 2, x, 1.0, tau, bsd, p.t_nu,
+                      mid_noise_floor=p.implied_mid_noise, spot_err=spot_err, max_obs_se=p.implied_max_obs_se,
+                      max_curvature=p.implied_max_curvature,
+                      s_bounds=(p.implied_vol_min_bp * 1e-4, p.implied_vol_max_bp * 1e-4))
+        self.spot.implied_ema(self.coin).add(now_s, obs, p.implied_ema_s)
+
+    def _rate(self, now_s: float, h: float) -> tuple[float | None, str]:
+        """(per-second variance, source). Implied has no fallback: None until
+        the EMA holds implied_min_obs, and the fair is withheld."""
+        p = self.cfg.pricing
+        if p.vol_source != "implied":
+            return self._realized_rate(h), "realized"
+        s = self.spot.implied_ema(self.coin).value(now_s, p.implied_ema_s, p.implied_min_obs)
+        return (None, "implied") if s is None else (s * s, "implied")
 
     def _market_shift(self, now_s: float, x: float, I: float, tau: float, rate: float, basis: float):
         """EMA toward the shift in x that would put our fair on the Kalshi mid.
@@ -159,7 +201,7 @@ class UpDownModel:
         f = self.spot.forecaster
         if self.coin in f.alarms():
             return self._withhold("vol_alarm")
-        if f.rv[self.coin].n < p.min_rv_seconds:
+        if p.vol_source != "implied" and f.rv[self.coin].n < p.min_rv_seconds:
             return self._withhold("vol_warming")
         if now_s < self.window.S:
             return self._withhold("before_start")
@@ -183,8 +225,13 @@ class UpDownModel:
             n_end = len(vals)
             n_eff = min(L, max(float(n_end), L - tau))
             I = (sum(math.log(v / start) for v in vals) + x * (n_eff - n_end)) / L
-        rate = self._rate(max(tau, 1.0))
         bsd = p.basis_sd_bp * 1e-4
+        if p.vol_source == "implied":
+            self._observe_implied(now_s, x, tau, bsd)
+        rate, vol_src = self._rate(now_s, max(tau, 1.0))
+        self.vol_src = vol_src
+        if rate is None:
+            return self._withhold("no_implied_vol")
         self._market_shift(now_s, x, I, tau, rate, bsd)
         sh = p.market_shift_alpha * self._shift
         r = prob_up(x + sh, I, tau, rate, nu=p.t_nu, basis_sd=bsd, reaction_s=p.reaction_latency_s)
@@ -198,7 +245,10 @@ class UpDownModel:
                                           "x_bp": x * 1e4, "mu_bp": r.mu * 1e4, "sd_bp": r.sd * 1e4,
                                           "shift_bp": sh * 1e4, "shift_ema_bp": self._shift * 1e4,
                                           "start": start, "start_src": self.start_src, "cf_basis_bp": b * 1e4,
-                                          "cf_end_n": n_end, "spot_mid": mid, "kmid": self._kmid()})}
+                                          "cf_end_n": n_end, "spot_mid": mid, "kmid": self._kmid(),
+                                          "vol_bp": math.sqrt(rate) * 1e4, "vol_src": vol_src,
+                                          "realized_vol_bp": math.sqrt(self._realized_rate(max(tau, 1.0))) * 1e4,
+                                          "iv_n_eff": self.spot.implied_ema(self.coin).n_eff()})}
 
     # --- FairModel ----------------------------------------------------------------
 
@@ -266,6 +316,7 @@ class UpDownModel:
             "kalshi_strike": self.kalshi_strike, "start": self.start, "start_src": self.start_src,
             "cf_basis_bp": None if self.basis is None else self.basis * 1e4, "cf_age_s": self._cf_age(),
             "kalshi_mid": self._kmid(), "market_shift_bp": self.cfg.pricing.market_shift_alpha * self._shift * 1e4,
+            "vol_source": self.vol_src, "implied_vol": self.spot.implied_ema(self.coin).snapshot(),
             "spot_burst": {"active": time.monotonic() < self.spot.burst_until_by_coin.get(self.coin, 0.0),
                            "n": self.spot.n_bursts},
             "feed_health": self.health.snapshot(),

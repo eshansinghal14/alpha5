@@ -28,6 +28,36 @@ class UpDownPricingParams:
     ci_vol_multiplier: float = param("Fair band half-width = this x theo_vol.", min=0, max=10, step=0.1)
     reaction_latency_s: float = param("Horizon for theo_vol (the fair move we charge for).",
                                       min=0.001, step=0.1)
+    vol_source: str = param(
+        "\"implied\": vol is a precision-weighted EMA of the vol the Kalshi mid implies (implied_vol.py); "
+        "the fair is withheld (quotes pulled) until it has implied_min_obs, no realized fallback. "
+        "\"realized\": the HAR model x vol_mult.")
+    implied_ema_s: float = param(
+        "Time constant of the implied-vol EMA (s). 900: an estimate over the last 15 min forecast the next "
+        "15 min best of 1/5/15/60 min (spot 10-11..18, vol_dynamics.py: ETH 19% median error at 15 min).",
+        min=30, step=60)
+    implied_min_obs: float = param("Decayed count of accepted observations before the EMA is used.",
+                                   min=1, step=5)
+    implied_mid_min: float = param("Use the mid for implied vol only inside [this, implied_mid_max].",
+                                   min=0.01, max=0.5, step=0.01)
+    implied_mid_max: float = param("Upper bound of the mid used for implied vol.", min=0.5, max=0.99, step=0.01)
+    implied_max_spread: float = param("Use the mid only while the Kalshi spread is at most this ($).",
+                                      min=0.01, step=0.01)
+    implied_mid_noise: float = param(
+        "Floor on the mid's own error ($) in an observation's weight; the half-spread when wider.",
+        min=0.001, step=0.001)
+    implied_spot_err_bp: float = param(
+        "Error in our spot level vs what the market prices off (bp), the delta term of the weight. ~1bp: "
+        "the 30s mid->CF basis noise per coin (KXCRYPTOLEAD15M/model.py).", min=0, step=0.1)
+    implied_lag_s: float = param(
+        "Spot move over this many seconds is added to the spot error: Kalshi may not have caught up to "
+        "it yet, and a lagging mid reads as high vol.", min=0, step=1)
+    implied_max_obs_se: float = param("Drop an observation whose SE of ln(vol) exceeds this.", min=0.05, step=0.05)
+    implied_max_curvature: float = param(
+        "Drop an observation where |volga| x SE(vol) / |vega| exceeds this: the vol error is too lopsided "
+        "for a first-order weight.", min=0.05, step=0.05)
+    implied_vol_min_bp: float = param("Reject implied vols below this (bp/sqrt(s)).", min=0.01, step=0.05)
+    implied_vol_max_bp: float = param("Reject implied vols above this (bp/sqrt(s)).", min=0.5, step=0.5)
     min_rv_seconds: int = param(
         "Withhold until the coin's RV has this many 1s samples (cold start without persisted bars).",
         min=0, step=60)
