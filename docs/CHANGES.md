@@ -3,6 +3,16 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-18 — Edge top quote holds its place when others join it
+
+- Real mode: if our best edge quote was alone at its price on an earlier
+  decision and others have since joined it there, the top stays at that
+  price instead of stepping a tick over them (we're first in that queue, so
+  the step only paid 1c/lot more). Someone bidding above us is still
+  overtaken as before. 10-17 00:00 to 10-18 06:00 UTC: 5.7% of the ~9,800
+  book-driven step-ups/h were this case; edge fills alone at the top ran
+  +2.1 to +2.7c/lot at 10s vs +0.25c when sharing the top price.
+
 ## 2026-10-18 — LIP-only signal-age limit
 
 - `lip.lip_max_signal_age_s` (dashboard; null = off): every LIP order, exit

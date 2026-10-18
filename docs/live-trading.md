@@ -144,7 +144,9 @@ Per market and side (`trading/quoter.py` docstring has the formula):
   clears the touch.
 - **Edge quote** (`quoting.order_lots`): first tick outside fair minus
   (quoting edge + band + lean + maker fee), capped `max_improve_ticks`
-  inside the near touch and a tick inside the far one.
+  inside the near touch and a tick inside the far one. A top quote that was
+  alone at its price stays there when others join it (we keep first place in
+  that queue) rather than stepping over them.
 - **LIP quote** (`lip.*`): exists only to earn LIP. One order per side at
   others' best bid on that side (our own orders netted out), capped a tick
   inside the far touch. Longshot markets only, both sides: `lip_bid_lots`

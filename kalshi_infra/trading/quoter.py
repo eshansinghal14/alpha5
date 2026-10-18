@@ -133,6 +133,9 @@ class Quoter:
         self._lip_last: dict[tuple[str, str], LipTarget] = {}
         # Per ticker: epoch seconds until which its fair is held as suspect.
         self._suspect_until: dict[str, float] = {}
+        # Per (ticker, side): own-side price our top edge quote was alone at
+        # (see _front_hold).
+        self._front: dict[tuple[str, str], float] = {}
         self._now_s = 0.0
 
     # ------------------------------------------------------------------
@@ -990,6 +993,31 @@ class Quoter:
         near_own = near if side == "yes" else round(1.0 - near, 2)
         return round(near_own + self.cfg.quoting.max_improve_ticks * TICK, 2)
 
+    def _front_hold(self, ticker, side, ladder) -> float | None:
+        """Own-side price to hold the top quote at, or None. If our best
+        resting quote was alone at its price on an earlier decision and others
+        have since joined it there, we're still first in that queue, so it
+        isn't stepped up a tick over them. 10-17/18: 5.7% of book-driven
+        step-ups were this case. Someone bidding above us is not held."""
+        key = (ticker, side)
+        shown = self._shown.get(key) or []
+        others = self._others_bids(ticker, side, ladder)
+        if not shown or others is None:
+            self._front.pop(key, None)
+            return None
+        mine = round(max(p for p, _ in shown), 2)
+        best = round(max(others), 2) if others else None
+        if best is None or best < mine - 1e-9:
+            self._front[key] = mine
+            return None
+        if self._front.get(key) != mine:
+            self._front.pop(key, None)
+            return None
+        if abs(best - mine) < 1e-9:
+            self._block("front_hold")
+            return mine
+        return None
+
     def _top_price(self, ticker, side, res, market_bid, market_ask, ladder) -> float | None:
         """Best level in own-side terms: first tick outside the reservation
         (rounding to nearest would put half our quotes inside the edge), at
@@ -1000,14 +1028,19 @@ class Quoter:
         top = _first_outside(side, res)
         yes = top if side == "yes" else round(1.0 - top, 2)
         near = self._others_touch(ticker, side, market_bid, market_ask, ladder)
+        hold = self._front_hold(ticker, side, ladder)
         if side == "yes":
             if near is not None:
                 yes = min(yes, near + n * TICK)
+            if hold is not None:
+                yes = min(yes, hold)
             if market_ask is not None:
                 yes = min(yes, market_ask - TICK)
         else:
             if near is not None:
                 yes = max(yes, near - n * TICK)
+            if hold is not None:
+                yes = max(yes, round(1.0 - hold, 2))
             if market_bid is not None:
                 yes = max(yes, market_bid + TICK)
         yes = round(yes, 2)

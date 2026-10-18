@@ -227,6 +227,42 @@ def test_no_self_chase_when_we_are_alone_at_the_touch():
     assert ladder(ctx, "yes")[0] == 0.41
 
 
+def test_front_of_queue_holds_when_others_join_our_price():
+    """Real mode: our 1 lot alone at 0.41, then 5 lots join at 0.41. We're
+    first in that queue: the top stays 0.41 instead of stepping to 0.42.
+    Someone bidding 0.42 above us is still overtaken (0.43)."""
+    q, ctx = Quoter(cfg(), Model(), FREE, close_time=None), Ctx(own_in_book=True)
+    fair = {"A": Fair(0.50, 0.49, 0.51)}
+    ctx.ours[("A", "yes")] = [(0.41, 1.0)]
+    step(q, ctx, fair, lb({0.41: 1.0, 0.40: 100.0}, {0.40: 100.0}, 0.41, 0.60))
+    assert ladder(ctx, "yes")[0] == 0.41
+    step(q, ctx, fair, lb({0.41: 6.0, 0.40: 100.0}, {0.40: 100.0}, 0.41, 0.60), dt=0.1)
+    assert ladder(ctx, "yes")[0] == 0.41
+    assert q.block_counts.get("front_hold", 0) >= 1
+    step(q, ctx, fair, lb({0.42: 5.0, 0.41: 1.0, 0.40: 100.0}, {0.40: 100.0}, 0.42, 0.60), dt=0.1)
+    assert ladder(ctx, "yes")[0] == 0.43
+
+
+def test_front_hold_on_the_no_side():
+    """Same on the no side (own-side no prices): alone at no 0.41, joined."""
+    q, ctx = Quoter(cfg(), Model(), FREE, close_time=None), Ctx(own_in_book=True)
+    fair = {"A": Fair(0.50, 0.49, 0.51)}
+    ctx.ours[("A", "no")] = [(0.41, 1.0)]
+    step(q, ctx, fair, lb({0.40: 100.0}, {0.41: 1.0, 0.40: 100.0}, 0.40, 0.59))
+    assert ladder(ctx, "no")[0] == 0.41
+    step(q, ctx, fair, lb({0.40: 100.0}, {0.41: 6.0, 0.40: 100.0}, 0.40, 0.59), dt=0.1)
+    assert ladder(ctx, "no")[0] == 0.41
+
+
+def test_no_front_hold_when_we_joined_others():
+    """Our 1 lot lands at 0.41 where 5 others already were: we're behind
+    them, so the top still steps over to 0.42."""
+    q, ctx = Quoter(cfg(), Model(), FREE, close_time=None), Ctx(own_in_book=True)
+    ctx.ours[("A", "yes")] = [(0.41, 1.0)]
+    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, lb({0.41: 6.0, 0.40: 100.0}, {0.40: 100.0}, 0.41, 0.60))
+    assert ladder(ctx, "yes")[0] == 0.42
+
+
 def test_shadow_does_not_net_our_size_out_of_the_book():
     """Shadow quotes aren't in Kalshi's book, so the displayed touch is
     everyone else's: 0.41 shown -> top 0.42 (still outside the 0.48 edge)."""
