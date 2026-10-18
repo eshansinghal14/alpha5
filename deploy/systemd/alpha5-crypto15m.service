@@ -1,0 +1,25 @@
+[Unit]
+Description=alpha5 single-coin 15M crypto (CRYPTO15M, ETH only) -- shadow, never resumes armed
+After=network-online.target chrony.service
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/opt/alpha5
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+# Below alpha5-crypto: the race is the one trading real money on this box.
+Environment=ALPHA5_PRIORITY=normal
+# alpha5-crypto writes the shared spot files (composite bars, CF index, prints); read them only.
+Environment=CRYPTO15M_PERSIST=0
+# No --resume-arm-h: a restart always comes back in shadow.
+ExecStart=/opt/alpha5/.venv/bin/python -u -m kalshi_strategies.run --only KXETH15M
+KillSignal=SIGINT
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/opt/alpha5/data/live/crypto15m.out.log
+StandardError=append:/opt/alpha5/data/live/crypto15m.err.log
+
+[Install]
+WantedBy=multi-user.target

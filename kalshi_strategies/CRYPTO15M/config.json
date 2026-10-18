@@ -1,0 +1,607 @@
+{
+  "KXBTC15M": {
+    "quoting": {
+      "max_position": 20.0,
+      "constant_edge": 0.03,
+      "constant_edge_ref_s": null,
+      "edge_fraction": 0.8,
+      "lean_dollars": 0.035,
+      "max_markets": null,
+      "atm_hysteresis": 0,
+      "enable_taking": false,
+      "enable_quoting": true,
+      "quoting_edge": 0.0,
+      "max_improve_ticks": 1,
+      "quote_levels_behind": 1,
+      "skip_quote_depth_ahead": null,
+      "quote_keep_inside": 0.01,
+      "quote_ahead_grace_s": 1.0,
+      "cancels_token": 20.0,
+      "requote_delay_s": 0.5,
+      "order_lots": 2.0
+    },
+    "trading_time": {
+      "real_trading_delay_s": 10.0,
+      "real_trading_cutoff_s": 60.0
+    },
+    "risk": {
+      "max_loss_usd": 80.0,
+      "max_signal_age_s": 0.75,
+      "max_fair_band": null,
+      "max_fair_outside_touch": null,
+      "fair_suspect_hold_s": 0.0
+    },
+    "runtime": {
+      "quote_fill_poll_s": 1.0,
+      "control_poll_s": 1.0
+    },
+    "lip": {
+      "enable_lip_quoting": false,
+      "lip_cheap_max_price": 0.1,
+      "lip_max_price": 0.5,
+      "lip_offer_max_price": 0.2,
+      "lip_markets": null,
+      "lip_bid_lots": 150.0,
+      "lip_offer_lots": 60.0,
+      "lip_constant_edge": 0.01,
+      "lip_max_markets": 2,
+      "lip_requeue_min_ahead": 200.0,
+      "lip_max_signal_age_s": 0.03,
+      "lip_min_time_left_s": 180.0,
+      "lip_hold_s": 0.5
+    },
+    "pricing": {
+      "t_nu": 5.0,
+      "vol_mult": 2.0,
+      "basis_sd_bp": 0.3,
+      "ci_vol_multiplier": 1.5,
+      "reaction_latency_s": 2.0,
+      "min_rv_seconds": 900,
+      "min_trade_tau_s": 15.0,
+      "tradeable_min": 0.1,
+      "tradeable_max": 0.9,
+      "burst_own_coin_only": true,
+      "market_shift_alpha": 0.0,
+      "market_shift_half_life_s": 60.0,
+      "market_shift_fit_s": 5.0,
+      "market_shift_max_bp": 10.0,
+      "burst_usd_1s": {
+        "BTC": 69300,
+        "ETH": 30000,
+        "SOL": 11100,
+        "XRP": 17200,
+        "HYPE": 3650
+      },
+      "burst_hold_s": 0.5,
+      "burst_pull_coins": {
+        "coinbase": [
+          "BTC",
+          "ETH",
+          "SOL",
+          "XRP",
+          "HYPE"
+        ],
+        "hyperliquid": [
+          "HYPE"
+        ],
+        "binance_perp": [
+          "BTC",
+          "ETH",
+          "SOL",
+          "XRP",
+          "HYPE"
+        ],
+        "bybit_perp": [
+          "BTC",
+          "ETH",
+          "SOL",
+          "XRP",
+          "HYPE"
+        ],
+        "okx_perp": [
+          "BTC",
+          "ETH",
+          "SOL",
+          "XRP",
+          "HYPE"
+        ],
+        "perp_move": [
+          "BTC",
+          "ETH",
+          "SOL",
+          "XRP",
+          "HYPE"
+        ]
+      },
+      "soft_stale_s": 3.0,
+      "hard_stale_s": 15.0,
+      "recovery_s": 5.0,
+      "warmup_s": 14400.0,
+      "composite_flush_s": 30.0
+    }
+  },
+  "KXETH15M": {
+    "quoting": {
+      "max_position": 5.0,
+      "constant_edge": 0.005,
+      "constant_edge_ref_s": null,
+      "edge_fraction": 0.1,
+      "lean_dollars": 0.01,
+      "max_markets": null,
+      "atm_hysteresis": 0,
+      "enable_taking": false,
+      "enable_quoting": true,
+      "quoting_edge": 0.0,
+      "max_improve_ticks": 1,
+      "quote_levels_behind": 1,
+      "skip_quote_depth_ahead": null,
+      "quote_keep_inside": 0.0,
+      "quote_ahead_grace_s": 1.0,
+      "cancels_token": 20.0,
+      "requote_delay_s": 0.5,
+      "order_lots": 0.5
+    },
+    "trading_time": {
+      "real_trading_delay_s": 10.0,
+      "real_trading_cutoff_s": 60.0
+    },
+    "risk": {
+      "max_loss_usd": 80.0,
+      "max_signal_age_s": 0.75,
+      "max_fair_band": null,
+      "max_fair_outside_touch": null,
+      "fair_suspect_hold_s": 0.0
+    },
+    "runtime": {
+      "quote_fill_poll_s": 1.0,
+      "control_poll_s": 1.0
+    },
+    "lip": {
+      "enable_lip_quoting": false,
+      "lip_cheap_max_price": 0.1,
+      "lip_max_price": 0.5,
+      "lip_offer_max_price": 0.2,
+      "lip_markets": null,
+      "lip_bid_lots": 150.0,
+      "lip_offer_lots": 60.0,
+      "lip_constant_edge": 0.01,
+      "lip_max_markets": 2,
+      "lip_requeue_min_ahead": 200.0,
+      "lip_max_signal_age_s": 0.03,
+      "lip_min_time_left_s": 180.0,
+      "lip_hold_s": 0.5
+    },
+    "pricing": {
+      "t_nu": 5.0,
+      "vol_mult": 2.0,
+      "basis_sd_bp": 0.3,
+      "ci_vol_multiplier": 1.5,
+      "reaction_latency_s": 2.0,
+      "min_rv_seconds": 900,
+      "min_trade_tau_s": 15.0,
+      "tradeable_min": 0.1,
+      "tradeable_max": 0.9,
+      "burst_own_coin_only": true,
+      "market_shift_alpha": 0.0,
+      "market_shift_half_life_s": 60.0,
+      "market_shift_fit_s": 5.0,
+      "market_shift_max_bp": 10.0,
+      "burst_usd_1s": {
+        "BTC": 69300,
+        "ETH": 30000,
+        "SOL": 11100,
+        "XRP": 17200,
+        "HYPE": 3650
+      },
+      "burst_hold_s": 0.5,
+      "burst_pull_coins": {
+        "coinbase": [
+          "BTC",
+          "ETH",
+          "SOL",
+          "XRP",
+          "HYPE"
+        ],
+        "hyperliquid": [
+          "HYPE"
+        ],
+        "binance_perp": [
+          "BTC",
+          "ETH",
+          "SOL",
+          "XRP",
+          "HYPE"
+        ],
+        "bybit_perp": [
+          "BTC",
+          "ETH",
+          "SOL",
+          "XRP",
+          "HYPE"
+        ],
+        "okx_perp": [
+          "BTC",
+          "ETH",
+          "SOL",
+          "XRP",
+          "HYPE"
+        ],
+        "perp_move": [
+          "BTC",
+          "ETH",
+          "SOL",
+          "XRP",
+          "HYPE"
+        ]
+      },
+      "soft_stale_s": 3.0,
+      "hard_stale_s": 15.0,
+      "recovery_s": 5.0,
+      "warmup_s": 14400.0,
+      "composite_flush_s": 30.0
+    }
+  },
+  "KXSOL15M": {
+    "quoting": {
+      "max_position": 20.0,
+      "constant_edge": 0.03,
+      "constant_edge_ref_s": null,
+      "edge_fraction": 0.8,
+      "lean_dollars": 0.035,
+      "max_markets": null,
+      "atm_hysteresis": 0,
+      "enable_taking": false,
+      "enable_quoting": true,
+      "quoting_edge": 0.0,
+      "max_improve_ticks": 1,
+      "quote_levels_behind": 1,
+      "skip_quote_depth_ahead": null,
+      "quote_keep_inside": 0.01,
+      "quote_ahead_grace_s": 1.0,
+      "cancels_token": 20.0,
+      "requote_delay_s": 0.5,
+      "order_lots": 2.0
+    },
+    "trading_time": {
+      "real_trading_delay_s": 10.0,
+      "real_trading_cutoff_s": 60.0
+    },
+    "risk": {
+      "max_loss_usd": 80.0,
+      "max_signal_age_s": 0.75,
+      "max_fair_band": null,
+      "max_fair_outside_touch": null,
+      "fair_suspect_hold_s": 0.0
+    },
+    "runtime": {
+      "quote_fill_poll_s": 1.0,
+      "control_poll_s": 1.0
+    },
+    "lip": {
+      "enable_lip_quoting": false,
+      "lip_cheap_max_price": 0.1,
+      "lip_max_price": 0.5,
+      "lip_offer_max_price": 0.2,
+      "lip_markets": null,
+      "lip_bid_lots": 150.0,
+      "lip_offer_lots": 60.0,
+      "lip_constant_edge": 0.01,
+      "lip_max_markets": 2,
+      "lip_requeue_min_ahead": 200.0,
+      "lip_max_signal_age_s": 0.03,
+      "lip_min_time_left_s": 180.0,
+      "lip_hold_s": 0.5
+    },
+    "pricing": {
+      "t_nu": 5.0,
+      "vol_mult": 2.0,
+      "basis_sd_bp": 0.3,
+      "ci_vol_multiplier": 1.5,
+      "reaction_latency_s": 2.0,
+      "min_rv_seconds": 900,
+      "min_trade_tau_s": 15.0,
+      "tradeable_min": 0.1,
+      "tradeable_max": 0.9,
+      "burst_own_coin_only": true,
+      "market_shift_alpha": 0.0,
+      "market_shift_half_life_s": 60.0,
+      "market_shift_fit_s": 5.0,
+      "market_shift_max_bp": 10.0,
+      "burst_usd_1s": {
+        "BTC": 69300,
+        "ETH": 30000,
+        "SOL": 11100,
+        "XRP": 17200,
+        "HYPE": 3650
+      },
+      "burst_hold_s": 0.5,
+      "burst_pull_coins": {
+        "coinbase": [
+          "BTC",
+          "ETH",
+          "SOL",
+          "XRP",
+          "HYPE"
+        ],
+        "hyperliquid": [
+          "HYPE"
+        ],
+        "binance_perp": [
+          "BTC",
+          "ETH",
+          "SOL",
+          "XRP",
+          "HYPE"
+        ],
+        "bybit_perp": [
+          "BTC",
+          "ETH",
+          "SOL",
+          "XRP",
+          "HYPE"
+        ],
+        "okx_perp": [
+          "BTC",
+          "ETH",
+          "SOL",
+          "XRP",
+          "HYPE"
+        ],
+        "perp_move": [
+          "BTC",
+          "ETH",
+          "SOL",
+          "XRP",
+          "HYPE"
+        ]
+      },
+      "soft_stale_s": 3.0,
+      "hard_stale_s": 15.0,
+      "recovery_s": 5.0,
+      "warmup_s": 14400.0,
+      "composite_flush_s": 30.0
+    }
+  },
+  "KXXRP15M": {
+    "quoting": {
+      "max_position": 20.0,
+      "constant_edge": 0.03,
+      "constant_edge_ref_s": null,
+      "edge_fraction": 0.8,
+      "lean_dollars": 0.035,
+      "max_markets": null,
+      "atm_hysteresis": 0,
+      "enable_taking": false,
+      "enable_quoting": true,
+      "quoting_edge": 0.0,
+      "max_improve_ticks": 1,
+      "quote_levels_behind": 1,
+      "skip_quote_depth_ahead": null,
+      "quote_keep_inside": 0.01,
+      "quote_ahead_grace_s": 1.0,
+      "cancels_token": 20.0,
+      "requote_delay_s": 0.5,
+      "order_lots": 2.0
+    },
+    "trading_time": {
+      "real_trading_delay_s": 10.0,
+      "real_trading_cutoff_s": 60.0
+    },
+    "risk": {
+      "max_loss_usd": 80.0,
+      "max_signal_age_s": 0.75,
+      "max_fair_band": null,
+      "max_fair_outside_touch": null,
+      "fair_suspect_hold_s": 0.0
+    },
+    "runtime": {
+      "quote_fill_poll_s": 1.0,
+      "control_poll_s": 1.0
+    },
+    "lip": {
+      "enable_lip_quoting": false,
+      "lip_cheap_max_price": 0.1,
+      "lip_max_price": 0.5,
+      "lip_offer_max_price": 0.2,
+      "lip_markets": null,
+      "lip_bid_lots": 150.0,
+      "lip_offer_lots": 60.0,
+      "lip_constant_edge": 0.01,
+      "lip_max_markets": 2,
+      "lip_requeue_min_ahead": 200.0,
+      "lip_max_signal_age_s": 0.03,
+      "lip_min_time_left_s": 180.0,
+      "lip_hold_s": 0.5
+    },
+    "pricing": {
+      "t_nu": 5.0,
+      "vol_mult": 2.0,
+      "basis_sd_bp": 0.3,
+      "ci_vol_multiplier": 1.5,
+      "reaction_latency_s": 2.0,
+      "min_rv_seconds": 900,
+      "min_trade_tau_s": 15.0,
+      "tradeable_min": 0.1,
+      "tradeable_max": 0.9,
+      "burst_own_coin_only": true,
+      "market_shift_alpha": 0.0,
+      "market_shift_half_life_s": 60.0,
+      "market_shift_fit_s": 5.0,
+      "market_shift_max_bp": 10.0,
+      "burst_usd_1s": {
+        "BTC": 69300,
+        "ETH": 30000,
+        "SOL": 11100,
+        "XRP": 17200,
+        "HYPE": 3650
+      },
+      "burst_hold_s": 0.5,
+      "burst_pull_coins": {
+        "coinbase": [
+          "BTC",
+          "ETH",
+          "SOL",
+          "XRP",
+          "HYPE"
+        ],
+        "hyperliquid": [
+          "HYPE"
+        ],
+        "binance_perp": [
+          "BTC",
+          "ETH",
+          "SOL",
+          "XRP",
+          "HYPE"
+        ],
+        "bybit_perp": [
+          "BTC",
+          "ETH",
+          "SOL",
+          "XRP",
+          "HYPE"
+        ],
+        "okx_perp": [
+          "BTC",
+          "ETH",
+          "SOL",
+          "XRP",
+          "HYPE"
+        ],
+        "perp_move": [
+          "BTC",
+          "ETH",
+          "SOL",
+          "XRP",
+          "HYPE"
+        ]
+      },
+      "soft_stale_s": 3.0,
+      "hard_stale_s": 15.0,
+      "recovery_s": 5.0,
+      "warmup_s": 14400.0,
+      "composite_flush_s": 30.0
+    }
+  },
+  "KXHYPE15M": {
+    "quoting": {
+      "max_position": 20.0,
+      "constant_edge": 0.03,
+      "constant_edge_ref_s": null,
+      "edge_fraction": 0.8,
+      "lean_dollars": 0.035,
+      "max_markets": null,
+      "atm_hysteresis": 0,
+      "enable_taking": false,
+      "enable_quoting": true,
+      "quoting_edge": 0.0,
+      "max_improve_ticks": 1,
+      "quote_levels_behind": 1,
+      "skip_quote_depth_ahead": null,
+      "quote_keep_inside": 0.01,
+      "quote_ahead_grace_s": 1.0,
+      "cancels_token": 20.0,
+      "requote_delay_s": 0.5,
+      "order_lots": 2.0
+    },
+    "trading_time": {
+      "real_trading_delay_s": 10.0,
+      "real_trading_cutoff_s": 60.0
+    },
+    "risk": {
+      "max_loss_usd": 80.0,
+      "max_signal_age_s": 0.75,
+      "max_fair_band": null,
+      "max_fair_outside_touch": null,
+      "fair_suspect_hold_s": 0.0
+    },
+    "runtime": {
+      "quote_fill_poll_s": 1.0,
+      "control_poll_s": 1.0
+    },
+    "lip": {
+      "enable_lip_quoting": false,
+      "lip_cheap_max_price": 0.1,
+      "lip_max_price": 0.5,
+      "lip_offer_max_price": 0.2,
+      "lip_markets": null,
+      "lip_bid_lots": 150.0,
+      "lip_offer_lots": 60.0,
+      "lip_constant_edge": 0.01,
+      "lip_max_markets": 2,
+      "lip_requeue_min_ahead": 200.0,
+      "lip_max_signal_age_s": 0.03,
+      "lip_min_time_left_s": 180.0,
+      "lip_hold_s": 0.5
+    },
+    "pricing": {
+      "t_nu": 5.0,
+      "vol_mult": 2.0,
+      "basis_sd_bp": 0.3,
+      "ci_vol_multiplier": 1.5,
+      "reaction_latency_s": 2.0,
+      "min_rv_seconds": 900,
+      "min_trade_tau_s": 15.0,
+      "tradeable_min": 0.1,
+      "tradeable_max": 0.9,
+      "burst_own_coin_only": true,
+      "market_shift_alpha": 0.0,
+      "market_shift_half_life_s": 60.0,
+      "market_shift_fit_s": 5.0,
+      "market_shift_max_bp": 10.0,
+      "burst_usd_1s": {
+        "BTC": 69300,
+        "ETH": 30000,
+        "SOL": 11100,
+        "XRP": 17200,
+        "HYPE": 3650
+      },
+      "burst_hold_s": 0.5,
+      "burst_pull_coins": {
+        "coinbase": [
+          "BTC",
+          "ETH",
+          "SOL",
+          "XRP",
+          "HYPE"
+        ],
+        "hyperliquid": [
+          "HYPE"
+        ],
+        "binance_perp": [
+          "BTC",
+          "ETH",
+          "SOL",
+          "XRP",
+          "HYPE"
+        ],
+        "bybit_perp": [
+          "BTC",
+          "ETH",
+          "SOL",
+          "XRP",
+          "HYPE"
+        ],
+        "okx_perp": [
+          "BTC",
+          "ETH",
+          "SOL",
+          "XRP",
+          "HYPE"
+        ],
+        "perp_move": [
+          "BTC",
+          "ETH",
+          "SOL",
+          "XRP",
+          "HYPE"
+        ]
+      },
+      "soft_stale_s": 3.0,
+      "hard_stale_s": 15.0,
+      "recovery_s": 5.0,
+      "warmup_s": 14400.0,
+      "composite_flush_s": 30.0
+    }
+  }
+}
