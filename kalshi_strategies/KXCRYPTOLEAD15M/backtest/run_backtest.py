@@ -95,7 +95,7 @@ class _ReplayCf:
 
     def __init__(self, values: dict[str, dict[int, float]]):
         self._all = values
-        self.now_s = -math.inf
+        self.now_s = 0.0
         self.version = 0
 
     def advance(self, now_s: float):
