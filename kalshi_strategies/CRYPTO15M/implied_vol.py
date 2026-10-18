@@ -101,53 +101,83 @@ def observe(m: float, half_spread: float, mu: float, g: float, tau: float, b: fl
     return Observation(s, se_log, vega, delta, None)
 
 
-class ImpliedVolEMA:
-    """Precision-weighted, time-decayed mean of ln s. Session-lifetime: it is
-    carried across events, so each event starts from the last one's estimate."""
+class _Decayed:
+    """Time-decayed sums of weight, weight * ln s, and count."""
+    __slots__ = ("sw", "swx", "n", "t")
 
     def __init__(self):
-        self._sw = 0.0      # decayed sum of weights
-        self._swx = 0.0     # decayed sum of weight * ln s
-        self._n = 0.0       # decayed count of accepted observations
-        self._t: float | None = None
+        self.sw = self.swx = self.n = 0.0
+        self.t: float | None = None
+
+    def decay(self, now_s: float, tau_s: float):
+        if self.t is not None and now_s > self.t:
+            k = math.exp(-(now_s - self.t) / tau_s)
+            self.sw *= k
+            self.swx *= k
+            self.n *= k
+        self.t = now_s if self.t is None else max(self.t, now_s)
+
+    def add(self, w: float, lx: float):
+        self.sw += w
+        self.swx += w * lx
+        self.n += 1.0
+
+
+class ImpliedVolEMA:
+    """Precision-weighted, time-decayed mean of ln s, slow (the pricing vol) and
+    fast (the check on it). Session-lifetime: carried across events, so each
+    event starts from the last one's estimate."""
+
+    def __init__(self):
+        self.slow, self.fast = _Decayed(), _Decayed()
         self.last: Observation | None = None
         self.n_seen = 0
+        self.n_recal = 0
         self.rejects: dict[str, int] = {}
 
-    def _decay(self, now_s: float, tau_s: float):
-        if self._t is not None and now_s > self._t:
-            k = math.exp(-(now_s - self._t) / tau_s)
-            self._sw *= k
-            self._swx *= k
-            self._n *= k
-        self._t = now_s if self._t is None else max(self._t, now_s)
-
-    def add(self, now_s: float, obs: Observation, tau_s: float):
-        self._decay(now_s, tau_s)
+    def add(self, now_s: float, obs: Observation, tau_s: float, fast_tau_s: float = 60.0):
+        self.slow.decay(now_s, tau_s)
+        self.fast.decay(now_s, fast_tau_s)
         self.last = obs
         self.n_seen += 1
         if obs.reason is not None:
             self.rejects[obs.reason] = self.rejects.get(obs.reason, 0) + 1
             return
-        w = 1.0 / (obs.se_log * obs.se_log)
-        self._sw += w
-        self._swx += w * math.log(obs.s)
-        self._n += 1.0
+        w, lx = 1.0 / (obs.se_log * obs.se_log), math.log(obs.s)
+        self.slow.add(w, lx)
+        self.fast.add(w, lx)
 
     def value(self, now_s: float, tau_s: float, min_obs: float) -> float | None:
         """Implied per-sqrt-second vol (log units), or None with too few
-        accepted observations inside the EMA."""
-        self._decay(now_s, tau_s)
-        if self._n < min_obs or self._sw <= 0:
+        accepted observations inside the slow EMA."""
+        self.slow.decay(now_s, tau_s)
+        if self.slow.n < min_obs or self.slow.sw <= 0:
             return None
-        return math.exp(self._swx / self._sw)
+        return math.exp(self.slow.swx / self.slow.sw)
+
+    def fast_stats(self, now_s: float, fast_tau_s: float) -> tuple[float | None, float, float]:
+        """(mean ln s, its SE, decayed count) of the fast EMA. The SE treats
+        readings as independent; seconds share a spot-level error, so it is
+        optimistic."""
+        self.fast.decay(now_s, fast_tau_s)
+        if self.fast.sw <= 0:
+            return None, math.inf, self.fast.n
+        return self.fast.swx / self.fast.sw, 1.0 / math.sqrt(self.fast.sw), self.fast.n
+
+    def recalibrate(self, now_s: float, tau_s: float, fast_tau_s: float):
+        """Restart the slow EMA from the fast one: its mean, weight and count."""
+        self.slow.decay(now_s, tau_s)
+        self.fast.decay(now_s, fast_tau_s)
+        self.slow.sw, self.slow.swx, self.slow.n = self.fast.sw, self.fast.swx, self.fast.n
+        self.n_recal += 1
 
     def n_eff(self) -> float:
-        return self._n
+        return self.slow.n
 
     def snapshot(self) -> dict:
         o = self.last
-        return {"n_eff": round(self._n, 1), "n_seen": self.n_seen, "rejects": dict(self.rejects),
+        return {"n_eff": round(self.slow.n, 1), "n_fast": round(self.fast.n, 1), "n_seen": self.n_seen,
+                "n_recal": self.n_recal, "rejects": dict(self.rejects),
                 "last_s_bp": None if o is None or not np.isfinite(o.s) else round(o.s * 1e4, 4),
                 "last_se_log": None if o is None or not np.isfinite(o.se_log) else round(o.se_log, 3),
                 "last_reason": None if o is None else o.reason}

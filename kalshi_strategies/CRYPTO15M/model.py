@@ -16,6 +16,8 @@ from __future__ import annotations
 import math
 import time
 
+import numpy as np
+
 from kalshi_infra.kalshi.markets import EventInfo
 from kalshi_infra.trading.fair import Fair
 from kalshi_strategies.CRYPTO15M.implied_vol import observe
@@ -63,6 +65,9 @@ class UpDownModel:
         self._shift_fit_t = -math.inf
         self._iv_last_sec: int | None = None
         self.vol_src: str | None = None
+        self.vol_check: dict | None = None
+        self.burst_ratio: float | None = None
+        self._burst_last_sec: int | None = None
 
     # --- inputs -------------------------------------------------------------
 
@@ -162,7 +167,63 @@ class UpDownModel:
                       mid_noise_floor=p.implied_mid_noise, spot_err=spot_err, max_obs_se=p.implied_max_obs_se,
                       max_curvature=p.implied_max_curvature,
                       s_bounds=(p.implied_vol_min_bp * 1e-4, p.implied_vol_max_bp * 1e-4))
-        self.spot.implied_ema(self.coin).add(now_s, obs, p.implied_ema_s)
+        self.spot.implied_ema(self.coin).add(now_s, obs, p.implied_ema_s, p.vol_off_fast_s)
+
+    def _vol_off_check(self, now_s: float):
+        """Pull 1: the fast implied EMA has left the slow one (|ln ratio| over
+        ln(vol_off_ratio) at z >= vol_off_z). Held vol_off_hold_s; once the fast
+        EMA is itself well measured, the slow one restarts from it."""
+        p = self.cfg.pricing
+        ema = self.spot.implied_ema(self.coin)
+        slow = ema.value(now_s, p.implied_ema_s, p.implied_min_obs)
+        lf, se, nf = ema.fast_stats(now_s, p.vol_off_fast_s)
+        self.vol_check = None
+        if slow is None or lf is None or nf < p.vol_off_min_obs:
+            return
+        d = lf - math.log(slow)
+        z = d / se
+        self.vol_check = {"fast_bp": math.exp(lf) * 1e4, "slow_bp": slow * 1e4, "z": z, "n_fast": nf}
+        if abs(d) >= math.log(p.vol_off_ratio) and abs(z) >= p.vol_off_z:
+            mono = time.monotonic()
+            self.spot.vol_off_until[self.coin] = max(self.spot.vol_off_until.get(self.coin, 0.0),
+                                                     mono + p.vol_off_hold_s)
+            if se <= p.vol_off_recal_se:
+                ema.recalibrate(now_s, p.implied_ema_s, p.vol_off_fast_s)
+                print(f"[{self.event_ticker}] vol off: implied {math.exp(lf) * 1e4:.3f} vs {slow * 1e4:.3f}bp "
+                      f"(z {z:+.1f}); recalibrated", flush=True)
+
+    def _burst_ratio(self) -> float | None:
+        """Realized vol over the last vol_burst_short_s / over vol_burst_long_s,
+        from 10s returns on the 1s bars (the vol_dynamics.py estimator). A ratio
+        of our own spot vol, so its level needn't be right."""
+        p = self.cfg.pricing
+        bars = self.bus.feeds[self.coin].tail(int(p.vol_burst_long_s) + 10)
+        if len(bars) < p.vol_burst_long_s * 0.8:
+            return None
+        t = np.array([b.ts_s for b in bars])
+        lp = np.log(np.array([b.mid for b in bars]))
+        idx = {int(s): i for i, s in enumerate(t)}
+        r = [lp[i] - lp[idx[int(s) - 10]] for i, s in enumerate(t) if int(s) - 10 in idx]
+        r = np.array(r)
+        n_short = int(p.vol_burst_short_s)
+        if len(r) < n_short + 30:
+            return None
+        long_v, short_v = float(np.mean(r * r)), float(np.mean(r[-n_short:] ** 2))
+        return math.sqrt(short_v / long_v) if long_v > 0 else None
+
+    def _burst_check(self):
+        """Pull 2: our own spot vol is in a burst the 15-min implied can't see
+        (implied readings are downweighted right after spot moves)."""
+        p = self.cfg.pricing
+        sec = int(time.time())
+        if sec == self._burst_last_sec:
+            return
+        self._burst_last_sec = sec
+        self.burst_ratio = self._burst_ratio()
+        if self.burst_ratio is not None and self.burst_ratio >= p.vol_burst_ratio:
+            mono = time.monotonic()
+            self.spot.vol_burst_until[self.coin] = max(self.spot.vol_burst_until.get(self.coin, 0.0),
+                                                       mono + p.vol_burst_hold_s)
 
     def _rate(self, now_s: float, h: float) -> tuple[float | None, str]:
         """(per-second variance, source). Implied has no fallback: None until
@@ -228,6 +289,8 @@ class UpDownModel:
         bsd = p.basis_sd_bp * 1e-4
         if p.vol_source == "implied":
             self._observe_implied(now_s, x, tau, bsd)
+            self._vol_off_check(now_s)
+        self._burst_check()
         rate, vol_src = self._rate(now_s, max(tau, 1.0))
         self.vol_src = vol_src
         if rate is None:
@@ -248,7 +311,10 @@ class UpDownModel:
                                           "cf_end_n": n_end, "spot_mid": mid, "kmid": self._kmid(),
                                           "vol_bp": math.sqrt(rate) * 1e4, "vol_src": vol_src,
                                           "realized_vol_bp": math.sqrt(self._realized_rate(max(tau, 1.0))) * 1e4,
-                                          "iv_n_eff": self.spot.implied_ema(self.coin).n_eff()})}
+                                          "iv_n_eff": self.spot.implied_ema(self.coin).n_eff(),
+                                          "iv_fast_bp": None if not self.vol_check else self.vol_check["fast_bp"],
+                                          "iv_z": None if not self.vol_check else self.vol_check["z"],
+                                          "burst_ratio": self.burst_ratio})}
 
     # --- FairModel ----------------------------------------------------------------
 
@@ -300,8 +366,13 @@ class UpDownModel:
     def quote_block(self, ticker, now_s):
         until = (self.spot.burst_until_by_coin.get(self.coin, 0.0) if self.cfg.pricing.burst_own_coin_only
                  else self.spot.burst_until)
-        if time.monotonic() < until:
+        mono = time.monotonic()
+        if mono < until:
             return "spot_burst"
+        if mono < self.spot.vol_burst_until.get(self.coin, 0.0):
+            return "vol_burst"
+        if mono < self.spot.vol_off_until.get(self.coin, 0.0):
+            return "vol_off"
         return None
 
     def summary_extras(self) -> dict:
@@ -317,6 +388,7 @@ class UpDownModel:
             "cf_basis_bp": None if self.basis is None else self.basis * 1e4, "cf_age_s": self._cf_age(),
             "kalshi_mid": self._kmid(), "market_shift_bp": self.cfg.pricing.market_shift_alpha * self._shift * 1e4,
             "vol_source": self.vol_src, "implied_vol": self.spot.implied_ema(self.coin).snapshot(),
+            "vol_check": self.vol_check, "burst_ratio": self.burst_ratio,
             "spot_burst": {"active": time.monotonic() < self.spot.burst_until_by_coin.get(self.coin, 0.0),
                            "n": self.spot.n_bursts},
             "feed_health": self.health.snapshot(),

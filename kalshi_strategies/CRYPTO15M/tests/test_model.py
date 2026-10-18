@@ -1,4 +1,5 @@
 """UpDownModel gates and Fair shape, offline (no network, nothing persisted)."""
+import math
 import time
 
 import pandas as pd
@@ -8,6 +9,7 @@ from kalshi_infra.kalshi.markets import EventInfo
 from kalshi_strategies.CRYPTO15M.config import CONFIG_PATH, UpDownConfig
 from kalshi_strategies.CRYPTO15M.model import UpDownModel
 from kalshi_strategies.CRYPTO15M.shared_feed import SharedSpotFeed
+from kalshi_strategies.KXCRYPTOLEAD15M.composite import CompositeBar
 from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed.base import OrderBookLevel, VenueBook
 
 PX = {"BTC": 80000.0, "ETH": 2500.0, "SOL": 110.0, "XRP": 1.4, "HYPE": 84.0}
@@ -137,6 +139,34 @@ def test_spot_jump_downweights_implied():
     m.reprice(now)
     o = spot.implied_ema("BTC").last
     assert o is not None and (o.reason is not None or o.se_log > 0.5)
+
+
+def test_vol_off_and_burst_pull_quotes():
+    now = time.time()
+    m, spot = _setup(now, vol_source="implied")
+    assert m.quote_block(m.ticker, now) is None
+    spot.vol_off_until["BTC"] = time.monotonic() + 30
+    assert m.quote_block(m.ticker, now) == "vol_off"
+    spot.vol_burst_until["BTC"] = time.monotonic() + 30
+    assert m.quote_block(m.ticker, now) == "vol_burst"
+    spot.vol_off_until["ETH"] = spot.vol_burst_until["ETH"] = 0.0
+    spot.vol_off_until["BTC"] = spot.vol_burst_until["BTC"] = 0.0
+    assert m.quote_block(m.ticker, now) is None
+
+
+def test_burst_ratio_trips_on_last_minute_vol():
+    now = int(time.time())
+    m, spot = _setup(now, vol_burst_long_s=300.0)
+    feed = spot.bus.feeds["BTC"]
+    feed._bars.clear()
+    rng = __import__("numpy").random.default_rng(1)
+    px = PX["BTC"]
+    for i, t in enumerate(range(now - 400, now)):
+        px *= math.exp(rng.normal(0, (4e-4 if i >= 340 else 0.5e-4)))
+        feed._bars.append(CompositeBar("BTC", float(t), px, 1.0, 1, 0, False, px, 1))
+    m._burst_check()
+    assert m.burst_ratio is not None and m.burst_ratio > 2.0
+    assert m.quote_block(m.ticker, now) == "vol_burst"
 
 
 def test_withheld_before_start():

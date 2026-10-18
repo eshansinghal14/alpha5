@@ -58,6 +58,28 @@ class UpDownPricingParams:
         "for a first-order weight.", min=0.05, step=0.05)
     implied_vol_min_bp: float = param("Reject implied vols below this (bp/sqrt(s)).", min=0.01, step=0.05)
     implied_vol_max_bp: float = param("Reject implied vols above this (bp/sqrt(s)).", min=0.5, step=0.5)
+    vol_off_fast_s: float = param(
+        "Time constant (s) of the fast implied EMA that checks the slow one.", min=10, step=10)
+    vol_off_ratio: float = param(
+        "Pull quotes (vol_off) when fast and slow implied differ by more than this factor...", min=1.0, step=0.05)
+    vol_off_z: float = param(
+        "...and by at least this many SEs of the fast EMA (ATM readings carry ~no weight, so they can't trip it).",
+        min=0, step=0.5)
+    vol_off_min_obs: float = param("Decayed accepted readings the fast EMA needs before it can pull.",
+                                   min=1, step=1)
+    vol_off_hold_s: float = param("A vol_off pull lasts this long after the last disagreeing second.",
+                                  min=0, step=5)
+    vol_off_recal_se: float = param(
+        "Restart the slow EMA from the fast one once the fast one's SE of ln(vol) is under this.",
+        min=0.01, step=0.01)
+    vol_burst_ratio: float = param(
+        "Pull quotes (vol_burst) while realized spot vol over vol_burst_short_s is this many x that over "
+        "vol_burst_long_s. 2: ETH 10-11..18 had a >=2x minute 3.4% of the time, back to ~1.2x within 2 min "
+        "(vol_dynamics.py).", min=1.0, step=0.1)
+    vol_burst_short_s: float = param("Short window of the burst ratio (s).", min=20, step=10)
+    vol_burst_long_s: float = param("Long window of the burst ratio (s).", min=120, step=60)
+    vol_burst_hold_s: float = param("A vol_burst pull lasts this long after the last tripping second.",
+                                    min=0, step=5)
     min_rv_seconds: int = param(
         "Withhold until the coin's RV has this many 1s samples (cold start without persisted bars).",
         min=0, step=60)

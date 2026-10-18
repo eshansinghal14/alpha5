@@ -49,6 +49,22 @@ def test_ema_needs_min_obs_and_decays():
     assert e.value(40.0 + 3600, 900.0, min_obs=20) is None
 
 
+def test_fast_ema_tracks_a_step_and_recalibrates_slow():
+    e = ImpliedVolEMA()
+    a = observe(_mid(15e-4), 0.005, 15e-4, 1.0, TAU, 0.0, 5.0, spot_err=1e-4, **KW)
+    for t in range(600):
+        e.add(float(t), a, 900.0, 60.0)
+    s2 = 1.6 * S
+    b = observe(_mid(15e-4, s=s2), 0.005, 15e-4, 1.0, TAU, 0.0, 5.0, spot_err=1e-4, **KW)
+    for t in range(600, 720):
+        e.add(float(t), b, 900.0, 60.0)
+    lf, se, n = e.fast_stats(720.0, 60.0)
+    slow = e.value(720.0, 900.0, 1)
+    assert abs(math.exp(lf) / s2 - 1) < 0.15 and slow < 1.25 * S and se < 0.05
+    e.recalibrate(720.0, 900.0, 60.0)
+    assert abs(e.value(720.0, 900.0, 1) / math.exp(lf) - 1) < 1e-9 and e.n_recal == 1
+
+
 def test_precision_weighting_favours_informative_obs():
     e = ImpliedVolEMA()
     sharp = observe(_mid(15e-4), 0.005, 15e-4, 1.0, TAU, 0.0, 5.0, spot_err=1e-4, **KW)

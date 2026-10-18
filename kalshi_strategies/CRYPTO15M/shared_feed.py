@@ -19,6 +19,10 @@ class SharedSpotFeed(SpotFeed):
         self.burst_until_by_coin: dict[str, float] = {}
         # Per coin, outliving events: each event starts from the last one's implied vol.
         self._implied: dict[str, ImpliedVolEMA] = {}
+        # Monotonic time until which each coin's vol pulls hold (model.quote_block);
+        # here so a pull started near a close carries into the next event.
+        self.vol_off_until: dict[str, float] = {}
+        self.vol_burst_until: dict[str, float] = {}
 
     def implied_ema(self, coin: str) -> ImpliedVolEMA:
         if coin not in self._implied:
