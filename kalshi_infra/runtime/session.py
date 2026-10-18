@@ -250,6 +250,7 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
                         order_client=order_client, event_ticker=ev.event_ticker, close_time=ev.close_time)
     engine.set_clocks(signal_age_fn=model.signal_age_s, feed_age_fn=model.feed_age_s,
                       applied_age_fn=model.applied_age_s)
+    engine.order_events = []
     attach = getattr(model, "attach_engine", None)   # optional: models that read our positions
     if attach is not None:
         attach(engine)
@@ -481,7 +482,8 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
                                         quoter=quoter, store=store, model=model, now=now,
                                         timings={k: _stat(v) for k, v in timings.items()},
                                         arm_requested=arm["want"])
-        writer.flush(summary, engine.portfolio.fills, engine.live_trading)
+        orders, engine.order_events = engine.order_events, []
+        writer.flush(summary, engine.portfolio.fills, engine.live_trading, orders=orders)
 
     async def flush_loop():
         while True:

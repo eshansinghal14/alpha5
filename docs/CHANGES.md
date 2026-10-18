@@ -13,6 +13,23 @@ Reverse chronological. One section per material change. Entries before
   hurt 1-3 min (-0.004) and the last minute (-0.008), where it is frozen at a
   stale value; halves disagree in sign. It moved the fair 0.46c on average.
 
+## 2026-10-18 — Order lifecycle journal (`orders` stream)
+
+- New journal stream `data/live/{series}/{date}/journal/orders/`: one row per
+  real create / amend / cancel sent and answered, with the round trip timed
+  on the worker thread (`rtt_s`), `queued_s` on a cancel (decided -> sent),
+  and every real fill with `state` and, if we had already decided to cancel
+  that order, `cancel_decided_t` + `cancel_reason` (a fill that raced our
+  cancel). Before this, cancel timing wasn't recorded anywhere: of 78
+  pick-offs 10-18 09:00-17:40 UTC, 6 lost the race to a cancel, but how
+  much of that is our send vs Kalshi's answer couldn't be told apart.
+- Not changed, from the same review: holding a step toward the touch. Over
+  1,974 edge fills (10-16 19:05 -> 10-18 17:40 UTC) fills within 0.25s of a
+  book-driven step-up were picked off 30% of the time vs 20% after none,
+  but still made +$6.34 at 10s; holding them 0.1-2s removed fills worth
+  -$2 to +$22. Fair-driven step-ups within 1s: -$9.30 on 357 fills, about
+  half of it HYPE, and not consistent per 0.25s bucket.
+
 ## 2026-10-18 — Crypto prices and settles on the CF index
 
 - New `cf_index.py`: the CF Benchmarks settlement index for all five coins

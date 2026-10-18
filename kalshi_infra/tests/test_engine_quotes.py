@@ -210,6 +210,35 @@ def test_fill_after_cancel_still_books():
     assert eng.portfolio.position("A").no_qty == 1.0
 
 
+def test_order_events_time_the_round_trips_and_flag_a_fill_that_raced_its_cancel():
+    """Real mode logs create/cancel sent + answered with RTTs; a fill reported
+    after we decided to cancel carries that decision's time and reason."""
+    eng, quoter, client = setup(real=True)
+    eng.order_events = []
+    fair(eng)
+    ev = eng.order_events
+    assert sum(r["event"] == "create_sent" for r in ev) == 6
+    acks = [r for r in ev if r["event"] == "create_ack"]
+    assert len(acks) == 6 and all(r["status"] == "ok" and r["rtt_s"] >= 0 for r in acks)
+    x = xid(eng, "no", 0.41)
+    quoter.model.age = 5.0
+    fair(eng)                                # stale: everything cancelled
+    sent = [r for r in ev if r["event"] == "cancel_sent"]
+    ca = [r for r in ev if r["event"] == "cancel_ack"]
+    assert len(sent) == 6 and len(ca) == 6 and all(r["queued_s"] is not None for r in sent)
+    assert all(r["rtt_s"] >= 0 and r["status"] == "ok" for r in ca)
+    fill(eng, x, "no", trade="t9")
+    (f,) = [r for r in ev if r["event"] == "fill"]
+    assert f["state"] == "gone" and f["cancel_decided_t"] is not None and f["cancel_reason"]
+    assert f["cancel_decided_t"] <= f["t"]
+
+
+def test_order_events_off_by_default():
+    eng, _, _ = setup(real=True)
+    fair(eng)
+    assert eng.order_events is None
+
+
 def test_fill_wakes_requote_delay_and_ladder_refills_after_it():
     eng, quoter, client = setup(real=True, requote_delay_s=0.0)
     fair(eng)

@@ -46,6 +46,7 @@ state here:
     event for anything still resting (cancel_resting).
 """
 import asyncio
+import collections
 import dataclasses
 import itertools
 import time
@@ -302,6 +303,26 @@ class LiveEngine:
         # the fill feed has not yet reported. Not cleared on reset, like
         # _exchange_to_quote: the feed's copy can arrive after one.
         self._ack_booked: dict[str, float] = {}
+        # Order lifecycle events (journal stream "orders"): one row per
+        # send/answer, wall time at the event on this process. The session
+        # drains it into the writer each flush; None = not recorded.
+        self.order_events: list[dict] | None = None
+        # order_id -> (wall time we first decided to cancel it, reason). Kept
+        # past the cancel ack: a fill that raced the cancel usually reports
+        # after it, when the manager has already dropped the quote.
+        self._cancel_decided: collections.OrderedDict = collections.OrderedDict()
+
+    def _oev(self, event: str, q=None, order_id=None, **kw):
+        if self.order_events is None:
+            return
+        row = {"t": time.time(), "event": event, "live": self.live_trading}
+        if q is not None:
+            row.update(order_id=q.order_id, ticker=q.ticker, side=q.side, price=q.price, role=q.role,
+                       exchange_id=q.exchange_id)
+        elif order_id is not None:
+            row["order_id"] = order_id
+        row.update(kw)
+        self.order_events.append(row)
 
     def next_order_id(self) -> int:
         return next(self._order_id_seq)
@@ -1030,8 +1051,9 @@ class LiveEngine:
             self.n_real_orders += 1
             self.n_real_quotes += 1
             self.n_real_in_flight += 1
-            self._run_blocking(lambda: self._rest_blocking(order),
-                               lambda res: self._on_real_quote_result(order, res))
+            self._oev("create_sent", q, size=q.size)
+            self._run_blocking(lambda: self._timed(lambda: self._rest_blocking(order)),
+                               lambda res: self._on_real_quote_timed(order, res))
             return True
         # Shadow: lands after the modelled send latency, against the book then.
         self._schedule_shadow(order)
@@ -1054,8 +1076,14 @@ class LiveEngine:
         tag = f"{reason}/{q.role}"
         self.order_client.allow_now("cancel", force=True, reason=tag)
         exchange_id, ticker = q.exchange_id, (order.ticker if order is not None else q.ticker)
-        self._run_blocking(lambda: self._cancel_send(exchange_id, ticker),
-                           lambda res: self._on_cancel_result(q.order_id, res, reason))
+        if q.cancel_at is not None:
+            self._cancel_decided[q.order_id] = (q.cancel_at, q.cancel_reason)
+            while len(self._cancel_decided) > 5000:
+                self._cancel_decided.popitem(last=False)
+        self._oev("cancel_sent", q, reason=reason,
+                  queued_s=None if q.cancel_at is None else time.time() - q.cancel_at)
+        self._run_blocking(lambda: self._timed(lambda: self._cancel_send(exchange_id, ticker)),
+                           lambda res: self._on_cancel_result(q.order_id, res[0], reason, rtt=res[1]))
 
     def _om_amend(self, q, price: float, remaining: float) -> bool:
         """Move a resting quote to `price` (own-side) and `remaining` resting
@@ -1093,15 +1121,20 @@ class LiveEngine:
             return False
         filled = q.filled
         self.n_real_amends += 1
+        self._oev("amend_sent", q, new_price=price, size=remaining)
 
         def work():
+            t0 = time.perf_counter()
             try:
-                return self.order_client.amend(q.exchange_id, order, remaining, filled, price=price), None
+                return self.order_client.amend(q.exchange_id, order, remaining, filled, price=price), None, \
+                    time.perf_counter() - t0
             except Exception as exc:
-                return None, exc
+                return None, exc, time.perf_counter() - t0
 
         def done(res):
-            resp, exc = res
+            resp, exc, rtt = res
+            self._oev("amend_ack", q, new_price=price, rtt_s=rtt,
+                      status="ok" if exc is None else f"err:{http_status(exc)}")
             if exc is None:
                 order.price = price
                 order.size = filled + remaining
@@ -1120,6 +1153,14 @@ class LiveEngine:
 
         self._run_blocking(work, done)
         return True
+
+    @staticmethod
+    def _timed(work):
+        """(work(), seconds it took) -- on the worker thread, so the RTT excludes
+        the loop's wait to run the done callback."""
+        t0 = time.perf_counter()
+        r = work()
+        return r, time.perf_counter() - t0
 
     def _run_blocking(self, work, done):
         """Run `work` on the default executor and `done(result)` back on the
@@ -1176,6 +1217,15 @@ class LiveEngine:
             return self.order_client.place_resting(order), None
         except Exception as exc:
             return None, exc
+
+    def _on_real_quote_timed(self, order: Order, res: tuple):
+        result, rtt = res
+        ack, exc = result
+        self._oev("create_ack", order_id=order.order_id, ticker=order.ticker, side=order.side, price=order.price,
+                  role=getattr(order, "role", None), rtt_s=rtt,
+                  exchange_id=None if ack is None else ack.exchange_order_id,
+                  status="ok" if exc is None else f"err:{http_status(exc)}")
+        self._on_real_quote_result(order, result)
 
     def _on_real_quote_result(self, order: Order, result: tuple):
         """Back on the event loop: register what is now resting, and book
@@ -1315,8 +1365,11 @@ class LiveEngine:
         self.order_client.allow_now("cancel", force=True, reason=reason)
         return self._cancel_send(exchange_id, ticker)
 
-    def _on_cancel_result(self, order_id: int, result: tuple, reason: str = "retry"):
+    def _on_cancel_result(self, order_id: int, result: tuple, reason: str = "retry", rtt: float | None = None):
         ok, exc = result
+        q = self.om.quotes.get(order_id)
+        self._oev("cancel_ack", q, order_id=order_id, reason=reason, rtt_s=rtt,
+                  status=("ok" if ok else "gone") if exc is None else f"err:{http_status(exc)}")
         if exc is not None:
             if http_status(exc) == 429:
                 # Throttled, not refused: re-queue; it goes again as the
@@ -1369,6 +1422,17 @@ class LiveEngine:
         self.n_real_fills += 1
         self.portfolio.record_fill(order, price, size, when, liquidity, fee=fee,
                                    exchange_order_id=exchange_id, trade_id=trade_id)
+        q = self.om.quotes.get(order.order_id)
+        dec = self._cancel_decided.get(order.order_id)
+        if dec is None and q is not None and q.cancel_at is not None:
+            dec = (q.cancel_at, q.cancel_reason)
+        self._oev("fill", order_id=order.order_id, ticker=order.ticker, side=order.side, price=price, size=size,
+                  role=getattr(order, "role", None), exchange_id=exchange_id, trade_id=trade_id,
+                  exch_t=when.timestamp() if when is not None else None,
+                  state="gone" if q is None else q.state,
+                  # Set when we had already decided to pull it: the fill raced our cancel.
+                  cancel_reason=None if dec is None else dec[1],
+                  cancel_decided_t=None if dec is None else dec[0])
         self.om.on_fill(order.order_id, size)
         print(f"[live] REAL QUOTE FILL {order.ticker} {order.side} {size:g} @ {price:.4f} "
               f"({liquidity}, fee ${fee:.4f})")

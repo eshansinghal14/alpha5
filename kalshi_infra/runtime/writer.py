@@ -72,6 +72,7 @@ class _Event:
         for r in d["bbo"]:
             self.journal._buf["bbo"].append(r)
         self.journal.record_trades(d.get("trades") or [])
+        self.journal.record_orders(d.get("orders") or [])
         self.bbo.extend(d["bbo"])
         _thin(self.bbo, MAX_HISTORY_ROWS)
         self.fair.extend(d["fair"])
@@ -325,14 +326,16 @@ class SnapshotWriter:
     def pnl_ticker(self, ticker: str, now, value: float):
         self._pnl_by_ticker.setdefault(ticker, []).append((now, value))
 
-    def flush(self, summary: dict, fills: list, live_trading: bool):
+    def flush(self, summary: dict, fills: list, live_trading: bool, orders: list | None = None):
+        """`orders`: order-event rows since the last flush (handed over, not copied)."""
         if len(fills) < self._fills_sent:
             self._fills_sent = 0
         new_fills = list(fills[self._fills_sent:])
         self._fills_sent = len(fills)
         self._put(("data", {"summary": summary, "decisions": self._decisions, "bbo": self._bbo,
                             "fair": self._fair, "pnl": self._pnl, "pnl_by_ticker": self._pnl_by_ticker,
-                            "fills": new_fills, "live_trading": live_trading, "trades": self._trades}))
+                            "fills": new_fills, "live_trading": live_trading, "trades": self._trades,
+                            "orders": orders or []}))
         self._clear_buffers()
 
 

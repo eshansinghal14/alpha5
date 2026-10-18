@@ -21,7 +21,9 @@ import pandas as pd
 
 from kalshi_infra.runtime.persist import LIVE_ROOT
 
-STREAMS = ("bbo", "decisions", "fills", "trades")
+# "orders": our order lifecycle (create/amend/cancel sent and answered, with
+# round-trip times, and every fill with the cancel it raced if any).
+STREAMS = ("bbo", "decisions", "fills", "trades", "orders")
 
 
 def journal_dir(series: str, date: str, out_root: str = None) -> str:
@@ -101,6 +103,9 @@ class DayJournal:
 
     def record_decision(self, row: dict) -> None:
         self._buf["decisions"].append(row)
+
+    def record_orders(self, rows) -> None:
+        self._buf["orders"].extend(rows)
 
     def record_trades(self, rows) -> None:
         """Public prints, once per trade_id within this process."""
@@ -190,6 +195,11 @@ def write(captured: dict | None) -> None:
         out_dir = os.path.join(captured["dir"], stream)
         os.makedirs(out_dir, exist_ok=True)
         df = pd.DataFrame(rows)
+        if stream == "orders" and "t" in df.columns:
+            df.insert(0, "time", pd.to_datetime(df.pop("t"), unit="s", utc=True))
+            for c in df.columns:
+                if df[c].dtype == object:
+                    df[c] = df[c].astype("string")
         path = os.path.join(out_dir, f"part-{captured['seq']:06d}.parquet")
         df.to_parquet(path)
 

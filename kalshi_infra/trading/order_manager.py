@@ -112,6 +112,8 @@ class Quote:
     prev_price: float | None = None   # set while an amend is in flight
     prev_size: float | None = None
     ahead_since: float | None = None  # clock() since it's been above Desired.max_ahead_price
+    cancel_at: float | None = None    # wall time we first decided to cancel it (order event log)
+    cancel_reason: str | None = None
 
     @property
     def remaining(self) -> float:
@@ -226,6 +228,7 @@ class OrderManager:
         when the executor has none (shadow, backtest)."""
         self.ex = executor
         self.clock = clock
+        self.clock_wall = time.time
         self.sim_bucket = (TokenBucket(sim_bucket_tokens_per_s, clock)
                            if sim_bucket_tokens_per_s is not None else None)
         # Set by WriteGroup.attach: the group then owns the reserve, the
@@ -475,6 +478,8 @@ class OrderManager:
         """Queue a cancel (or mark an unacked create to be cancelled on ack)."""
         if q.state == CANCELLING or q.order_id in self._cancel_q:
             return
+        q.cancel_at = q.cancel_at or self.clock_wall()
+        q.cancel_reason = q.cancel_reason or reason
         if q.state == CREATING and q.exchange_id is None:
             q.state = CANCELLING
             self._bump(f"cancel_pending_ack:{reason}")
