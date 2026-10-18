@@ -1,8 +1,8 @@
 """
 CoinRacePricer: fair-value computation for one event's 5 markets.
 
-Section 4 of the spec. Given the current composite prices, the locked
-(or partially-locked) start TWAP, the partial end-TWAP running sum, and
+Section 4 of the spec. Given log returns vs the locked CF start average
+(x), the partial CF end-average sum (I), and
 a covariance forecast, return `p_i = P(coin i wins)` for each coin.
 
 Ranking on log returns is equivalent to ranking on arithmetic returns,
@@ -82,23 +82,15 @@ class FairResult:
 
 class CoinRacePricer:
 
-    def __init__(self, forecaster: CovarianceForecaster, config,
-                 base_rate: np.ndarray | None = None, basis_sd: np.ndarray | None = None):
+    def __init__(self, forecaster: CovarianceForecaster, config, base_rate: np.ndarray | None = None):
         """`config`: the series' CryptoPricingParams section (mc_n, mc_seed,
-        t_nu, vol_mult, shrinkage_lambda, reaction_latency_s). `basis_sd`:
-        per-coin sd (log units) of our final 15-min return vs the one Kalshi
-        settles on, added as independent noise to every draw; None = treat
-        our spot as exact."""
+        t_nu, vol_mult, shrinkage_lambda, reaction_latency_s)."""
         self.forecaster = forecaster
         self.config = config
         # Common random numbers: pre-generate ONCE at construction and
         # reuse on every tick so theo doesn't jitter on sampling noise.
         rng = np.random.default_rng(self.config.mc_seed)
         self._Z = rng.standard_normal((self.config.mc_n, N_COINS))
-        # Own stream, so adding it leaves the diffusion draws unchanged.
-        self._B = (None if basis_sd is None else
-                   np.random.default_rng(self.config.mc_seed + 1).standard_normal((self.config.mc_n, N_COINS))
-                   * np.asarray(basis_sd, dtype=float))
         if self.config.t_nu is not None:
             # Unit-variance multivariate t: scale by sqrt(nu/chi2 * (nu-2)/nu)
             # so the t mixture changes the TAILS, not the variance. The old
@@ -183,7 +175,7 @@ class CoinRacePricer:
                  compute_delta: bool = True,
                  prev_result: "FairResult | None" = None) -> FairResult:
         """Fair win probabilities. `x`, `I` are 5-vectors of log returns
-        (x vs the start TWAP; I = partial end-average, last minute only);
+        (x vs the start average; I = (1/60) x sum over end seconds elapsed, 0 before the last minute);
         `tau = T - now_s` in seconds.
 
         Y = mu + sqrt(tau_eff) * E, with E drawn once per covariance (see
@@ -216,16 +208,13 @@ class CoinRacePricer:
 
         if te <= 0 or not np.any(sd > 0):
             E = None
-            probs = self._argmax_probs(mu[None, :] if self._B is None else mu + self._B)
+            probs = self._argmax_probs(mu[None, :])
         else:
             # Re-draw only when the covariance itself changes: forecaster
             # state (new 1s data) or horizon bucket (whole seconds of h).
             key = (getattr(self.forecaster, "version", None), round(h))
             E = self._draws(rate, R, key if key[0] is not None else None)
-            Y = mu + math.sqrt(te) * E
-            if self._B is not None:
-                Y = Y + self._B
-            probs = self._argmax_probs(Y)
+            probs = self._argmax_probs(mu + math.sqrt(te) * E)
 
         lam = self.config.shrinkage_lambda
         if lam > 0:
@@ -233,7 +222,7 @@ class CoinRacePricer:
             probs = probs / probs.sum()
 
         if compute_delta and E is not None:
-            scaled = math.sqrt(te) * E if self._B is None else math.sqrt(te) * E + self._B
+            scaled = math.sqrt(te) * E
             delta = self._bump_deltas(mu, scaled, sd, probs)
             lat = self.config.reaction_latency_s
             n_reval = int(getattr(self.config, "theo_vol_reval_draws", 0) or 0)

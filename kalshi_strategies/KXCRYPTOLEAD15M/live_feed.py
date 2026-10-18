@@ -15,6 +15,7 @@ import asyncio
 import atexit
 import time
 
+from kalshi_strategies.KXCRYPTOLEAD15M.cf_index import CfIndex
 from kalshi_strategies.KXCRYPTOLEAD15M.composite import CompositeBus
 from kalshi_strategies.KXCRYPTOLEAD15M.prints import (AUTO_SOURCES, HL_BURST_USD_1S, MOVE_SOURCE, PERP_BURST_USD_1S,
                                                        PERP_SOURCES, REFRESH_S, load_thresholds, save_thresholds,
@@ -73,9 +74,11 @@ class SpotFeed:
         # No deep_book_fn: rebuilding a 1000-level view and the CF replica
         # over it every second was 200-300ms on the trading loop per pass
         # (2026-10-09 live profile), the cause of the remaining stale
-        # windows. The replica `price` is diagnostics only -- pricing and the
-        # TWAPs use the mid (CompositeBar.mid) -- so bars are sampled from the
-        # 25-level per-message view instead (~1.5-7ms per coin).
+        # windows. The replica `price` is diagnostics only (the race settles
+        # on `cf`, the real index), so bars are sampled from the 25-level
+        # per-message view instead (~1.5-7ms per coin).
+        self.cf = CfIndex(persist=persist)
+        self.cf.on_tick = self._on_cf_tick
         self.forecaster = RobustHarForecaster()
         self.health = FeedHealthMonitor(soft_stale_s=p.soft_stale_s, hard_stale_s=p.hard_stale_s,
                                         recovery_s=p.recovery_s)
@@ -283,7 +286,7 @@ class SpotFeed:
             if t.done() and not t.cancelled() and t.exception() is not None:
                 print(f"[KXCRYPTOLEAD15M] spot feed task died ({t.exception()!r}); restarting", flush=True)
             t.cancel()
-        coros = [self.coinbase.run(self._on_book), self._sample_loop(), self._flush_loop(),
+        coros = [self.coinbase.run(self._on_book), self.cf.run(), self._sample_loop(), self._flush_loop(),
                  self._calib_sample_loop(), self._calib_refresh_loop()]
         if self.venues is not None:
             coros.append(self._venue_loop())
@@ -295,10 +298,12 @@ class SpotFeed:
         p = model.cfg.pricing
         self.health.soft_stale_s, self.health.hard_stale_s = p.soft_stale_s, p.hard_stale_s
         self.health.recovery_s = p.recovery_s
-        # Bars sampled while the model was being built went nowhere; the
-        # tracker dedupes on ts_s.
-        model.tracker.backfill(self.recent_bars(model.start_window_since()))
         self.model = model
+
+    def _on_cf_tick(self, coin: str, ts_s: int):
+        m = self.model
+        if m is not None:
+            m.cf_ticked()
 
     def detach(self, model):
         if self.model is model:
@@ -312,15 +317,10 @@ class SpotFeed:
             m._mid_moved()
 
     def sample(self, now_s: float):
-        """Pin this second's bars into the forecaster and the attached
-        event's tracker. Idempotent per second."""
+        """Pin this second's bars into the forecaster. Idempotent per second."""
         sampled = self.bus.sample_all(now_s)
         if not sampled:
             return
-        m = self.model
-        if m is not None:
-            for bar in sampled.values():
-                m.tracker.ingest(bar)
         try:
             self.forecaster.update(max(b.ts_s for b in sampled.values()), {c: b.mid for c, b in sampled.items()})
         except NotImplementedError:
@@ -369,3 +369,8 @@ class SpotFeed:
                 await asyncio.get_running_loop().run_in_executor(None, self.trips.write, self.trips.drain())
             except Exception as e:
                 print(f"[KXCRYPTOLEAD15M] burst trip flush failed: {e!r}")
+            rows = self.cf.drain()
+            try:
+                await asyncio.get_running_loop().run_in_executor(None, self.cf.write, rows)
+            except Exception as e:
+                print(f"[KXCRYPTOLEAD15M] cf_index flush failed: {e!r}")

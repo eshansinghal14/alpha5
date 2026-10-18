@@ -27,6 +27,13 @@ async def _build(ev, cfg):
     loop = asyncio.get_running_loop()
     if _SPOT is None:
         _SPOT = SpotFeed(cfg)
+        # Disk + REST before the socket's first tick, so an event adopted
+        # mid-window has its start average at once.
+        now = time.time()
+        try:
+            await loop.run_in_executor(None, _SPOT.cf.seed, now - 2 * 3600, now)
+        except Exception as e:
+            print(f"[{TICKER}] CF index seed failed ({e!r}); waiting on the live feed")
     _SPOT.ensure_running()
     if not _SPOT.forecaster_warmed:
         # Off the loop: replaying 4h of bars takes seconds, and the spot feed
@@ -36,14 +43,7 @@ async def _build(ev, cfg):
         except Exception as e:
             print(f"[{TICKER}] forecaster warmup failed ({e!r}); it warms from live data instead")
             _SPOT.forecaster_warmed = True
-    model = CoinRaceModel(ev, cfg, spot=_SPOT)
-    try:
-        mem = _SPOT.recent_bars(model.start_window_since())
-        sq = await loop.run_in_executor(None, model.backfill_start, mem)
-        print(f"[{TICKER}] start-TWAP backfill: {sq}")
-    except Exception as e:
-        print(f"[{TICKER}] start-TWAP backfill failed ({e!r}); pricing withheld until S is re-reached")
-    return model
+    return CoinRaceModel(ev, cfg, cf=_SPOT.cf, spot=_SPOT)
 
 
 SERIES = {TICKER: Series(ticker=TICKER, config_cls=CryptoConfig, config_path=CONFIG_PATH, config_key=None,

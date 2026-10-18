@@ -1,9 +1,11 @@
 ﻿"""CoinRaceModel gates and Fair shape, offline (no network)."""
+import math
 import time
 
 import pandas as pd
 
 from kalshi_infra.kalshi.markets import EventInfo
+from kalshi_strategies.KXCRYPTOLEAD15M.cf_index import STALE_S, CfIndex
 from kalshi_strategies.KXCRYPTOLEAD15M.composite import CompositeBar, CompositeBus
 from kalshi_strategies.KXCRYPTOLEAD15M.cov_forecaster import ConstantCovForecaster
 from kalshi_strategies.KXCRYPTOLEAD15M.model import CoinRaceModel
@@ -27,14 +29,31 @@ def _book(coin, mono, mult=1.0):
                      receive_ts=mono)
 
 
+def _cf_at(S, now, px=None, mono=None):
+    """CF at `px` (default PX) for every second over [S-60, now), live as of `mono`."""
+    cf = CfIndex(persist=False)
+    mono = time.monotonic() if mono is None else mono
+    for c in COINS:
+        for t in range(int(S) - 60, int(now)):
+            cf.add(c, t, (px or PX)[c], mono=mono)
+    return cf
+
+
+def _bars(m, now, mults=None):
+    """Mid bars matching CF's level over the basis window, so basis = 0."""
+    for c in COINS:
+        f = m.bus.feeds[c]
+        for t in range(int(now) - 40, int(now)):
+            p = PX[c] * (mults or {}).get(c, 1.0)
+            f._bars.append(CompositeBar(c, float(t), p, 1.0, 1, 0, False, p, 1))
+
+
 def _model(now, **pricing):
     cfg = config(**pricing)
-    m = CoinRaceModel(_event(now - 300, now + 600), cfg, bus=CompositeBus(coins=COINS, persist=False),
-                      coinbase=None, forecaster=ConstantCovForecaster())
-    # Lock the start TWAP at today's prices: 60 bars over [S-60, S).
-    S = m.window.S
-    m.tracker.backfill({c: [CompositeBar(c, S - 60 + i, PX[c], 1.0, 1, 0, False, PX[c], 1) for i in range(61)]
-                        for c in COINS})
+    S = int(now) - 300
+    m = CoinRaceModel(_event(S, S + 900), cfg, cf=_cf_at(S, now), bus=CompositeBus(coins=COINS, persist=False),
+                      forecaster=ConstantCovForecaster())
+    _bars(m, now)
     return m
 
 
@@ -119,7 +138,7 @@ def test_spot_feed_carries_state_across_events():
     spot = SpotFeed(cfg, persist=False, venues=False)
     spot.forecaster = ConstantCovForecaster()
     spot.forecaster_warmed = True
-    a = CoinRaceModel(_event(now - 300, now + 600), cfg, spot=spot)
+    a = CoinRaceModel(_event(now - 300, now + 600), cfg, cf=spot.cf, spot=spot)
     spot.attach(a)
     woke = []
     a.set_wakeup(lambda: woke.append("a"))
@@ -128,66 +147,133 @@ def test_spot_feed_carries_state_across_events():
         spot._on_book(_book(c, mono))
     assert woke and a.forecaster is spot.forecaster and a.health is spot.health
     spot.detach(a)
-    b = CoinRaceModel(_event(now - 60, now + 840), cfg, spot=spot)
-    spot.sample(now - 30)      # lands in b's start window while b is unattached
+    b = CoinRaceModel(_event(now - 60, now + 840), cfg, cf=spot.cf, spot=spot)
     spot.attach(b)
     b.set_wakeup(lambda: woke.append("b"))
     spot._on_book(_book("BTC", mono, 1.01))
     assert woke[-1] == "b"
-    assert any(bar.ts_s == int(now - 30) for bar in b.tracker._bars["BTC"])
+    spot._on_cf_tick("BTC", int(now))          # a CF second wakes the attached event
+    assert woke[-1] == "b" and b.tracker.cf is spot.cf
 
 
-def _last_minute_model(now, mid_ret, cf_ret, **pricing):
-    """Model 30s from close whose end-average bars give each coin `mid_ret`
-    on the mid and `cf_ret` on the CF replica."""
+def _last_minute_model(now, mid_mult, cf_mult, **pricing):
+    """30s from close. CF start at PX; CF over the 30 elapsed end seconds at
+    PX * cf_mult; the mid at PX * mid_mult, with the same offset to CF over the
+    basis window as now (so basis = ln(mid_mult / cf_mult))."""
     cfg = config(recovery_s=0.0, **pricing)
-    m = CoinRaceModel(_event(now - 870, now + 30), cfg, bus=CompositeBus(coins=COINS, persist=False),
-                      coinbase=None, forecaster=ConstantCovForecaster())
-    S, T = m.window.S, m.window.T
-    bars = {}
+    T = int(now) + 30
+    S = T - 900
+    cf = CfIndex(persist=False)
+    mono = time.monotonic()
     for c in COINS:
-        p = PX[c]
-        start = [CompositeBar(c, S - 60 + i, p, 1.0, 1, 0, False, p, 1) for i in range(60)]
-        end = [CompositeBar(c, T - 60 + i, p * (1 + cf_ret[c]), 1.0, 1, 0, False, p * (1 + mid_ret[c]), 1)
-               for i in range(30)]
-        bars[c] = start + end
-    m.tracker.backfill(bars)
+        for t in range(S - 60, int(now)):
+            v = PX[c] * (cf_mult.get(c, 1.0) if t >= T - 60 else 1.0)
+            cf.add(c, t, v, mono=mono)
+    m = CoinRaceModel(_event(S, T), cfg, cf=cf, bus=CompositeBus(coins=COINS, persist=False),
+                      forecaster=ConstantCovForecaster())
+    for c in COINS:
+        f = m.bus.feeds[c]
+        # The basis window [now-30, now) is inside the end average, where CF
+        # sits at cf_mult; the mid sits at mid_mult throughout.
+        for t in range(int(now) - 40, int(now)):
+            p = PX[c] * mid_mult.get(c, 1.0)
+            f._bars.append(CompositeBar(c, float(t), p, 1.0, 1, 0, False, p, 1))
+    _feed(m, mono, mid_mult)
     return m
 
 
-def test_basis_tie_blocks_both_sides_of_contenders_only():
+def test_last_minute_prices_the_cf_leader_not_the_mid_leader():
+    """Mid says HYPE by 1bp; CF (what settles) says BTC by 1bp; the basis
+    puts the mid on CF's level, so the fair follows CF: 26OCT092330's shape."""
     now = time.time()
-    flat = {c: 0.0 for c in COINS}
-    # Mid says HYPE by 1bp, CF says BTC by 1bp: KXCRYPTOLEAD15M-26OCT092330's shape.
-    mid = {**flat, "HYPE": 0.0011, "BTC": 0.0010}
-    cf = {**flat, "HYPE": 0.0010, "BTC": 0.0011}
+    mid = {"HYPE": 1.0011, "BTC": 1.0010}
+    cf = {"HYPE": 1.0010, "BTC": 1.0011}
     m = _last_minute_model(now, mid, cf)
-    _feed(m, time.monotonic(), {"HYPE": 1.0011, "BTC": 1.0010})
     fairs = m.reprice(now)
-    assert m.basis_tie == {"HYPE", "BTC"}
-    for c in COINS:
-        t = m.ticker_of[c]
-        want = "basis_tie" if c in ("HYPE", "BTC") else None
-        assert m.side_block(t, "yes", fairs[t], now) == want
-        assert m.side_block(t, "no", fairs[t], now) == want
+    p = {c: fairs[m.ticker_of[c]].prob for c in COINS}
+    assert p["BTC"] > p["HYPE"] and p["BTC"] > 0.5
+    assert fairs[m.ticker_of["BTC"]].extras["cf_end_n"] == 30
 
 
-def test_clear_leader_on_both_sources_is_not_a_basis_tie():
+def test_end_seconds_not_yet_in_are_filled_with_x():
+    """An elapsed end second whose CF tick hasn't landed counts at x, so the
+    fair doesn't jump when it lands (a leader stays the leader)."""
     now = time.time()
-    lead = {**{c: 0.0 for c in COINS}, "SOL": 0.003}
-    m = _last_minute_model(now, lead, lead)
-    _feed(m, time.monotonic(), {"SOL": 1.003})
+    lead = {"SOL": 1.003}
+    a = _last_minute_model(now, lead, lead)
+    pa = a.reprice(now)[a.ticker_of["SOL"]].prob
+    # Same state but the newest 3 end seconds haven't landed yet.
+    b = _last_minute_model(now, lead, lead)
+    for c in COINS:
+        for t in range(int(now) - 3, int(now)):
+            b.cf._v[c].pop(t)
+        b.cf._newest[c] = int(now) - 4
+    pb = b.reprice(now)[b.ticker_of["SOL"]].prob
+    assert pa > 0.95 and abs(pa - pb) < 0.02
+
+
+def test_basis_moves_mid_onto_cf_level():
+    """Mid 2bp above CF all window with no real move: x = 0, not +2bp."""
+    now = time.time()
+    S = int(now) - 300
+    cfg = config(recovery_s=0.0)
+    m = CoinRaceModel(_event(S, S + 900), cfg, cf=_cf_at(S, now), bus=CompositeBus(coins=COINS, persist=False),
+                      forecaster=ConstantCovForecaster())
+    _bars(m, now, {"XRP": 1.0002})
+    _feed(m, time.monotonic(), {"XRP": 1.0002})
     fairs = m.reprice(now)
-    assert m.basis_tie == frozenset()
-    assert all(m.side_block(t, "yes", f, now) is None for t, f in fairs.items())
+    assert abs(m.basis_bp["XRP"] - 2.0) < 1e-3
+    flat = _model(now, recovery_s=0.0)
+    _feed(flat, time.monotonic())
+    ff = flat.reprice(now)
+    assert all(abs(fairs[m.ticker_of[c]].prob - ff[flat.ticker_of[c]].prob) < 1e-9 for c in COINS)
 
 
-def test_basis_tie_off_outside_last_minute():
+def test_no_cf_start_withholds():
+    now = time.time()
+    S = int(now) - 300
+    cf = _cf_at(S, now)
+    for t in range(S - 60, S):
+        cf._v["ETH"].pop(t, None)
+    m = CoinRaceModel(_event(S, S + 900), config(recovery_s=0.0), cf=cf,
+                      bus=CompositeBus(coins=COINS, persist=False), forecaster=ConstantCovForecaster())
+    _bars(m, now)
+    _feed(m, time.monotonic())
+    assert all(f is None for f in m.reprice(now).values()) and m.withheld_reason == "no_cf_start"
+
+
+def test_stale_cf_is_a_stale_signal():
+    """A CF feed past STALE_S reads as signal age over any sane
+    max_signal_age_s, so the quoter pulls everything (stale_signal)."""
+    now = time.time()
+    m = _model(now, recovery_s=0.0)
+    mono = time.monotonic()
+    _feed(m, mono)
+    m.reprice(now)
+    assert m.signal_age_s() < 0.5
+    for c in COINS:
+        m.cf._last_rx_mono[c] = mono - (STALE_S + 1.0)
+    assert m.signal_age_s() >= STALE_S + 1.0 - 1e-6
+    assert m.signal_age_s() > m.cfg.risk.max_signal_age_s
+
+
+def test_cf_age_under_threshold_does_not_add_to_signal_age():
+    now = time.time()
+    m = _model(now, recovery_s=0.0)
+    mono = time.monotonic()
+    _feed(m, mono)
+    m.reprice(now)
+    for c in COINS:
+        m.cf._last_rx_mono[c] = mono - 0.9            # between ticks: healthy
+    assert m.signal_age_s() < 0.5
+
+
+def test_no_side_blocks():
     now = time.time()
     m = _model(now, recovery_s=0.0)
     _feed(m, time.monotonic())
-    m.reprice(now)
-    assert m.basis_tie == frozenset()
+    fairs = m.reprice(now)
+    assert all(m.side_block(t, s, f, now) is None for t, f in fairs.items() for s in ("yes", "no"))
 
 
 def test_spot_burst_pulls_quotes_for_every_market_then_expires():
@@ -196,7 +282,7 @@ def test_spot_burst_pulls_quotes_for_every_market_then_expires():
     cfg = config(recovery_s=0.0, burst_usd_1s={c: 1000.0 for c in COINS}, burst_hold_s=1.5)
     spot = SpotFeed(cfg, persist=False, venues=False)
     spot.forecaster = ConstantCovForecaster()
-    m = CoinRaceModel(_event(now - 300, now + 600), cfg, spot=spot)
+    m = CoinRaceModel(_event(now - 300, now + 600), cfg, cf=spot.cf, spot=spot)
     spot.attach(m)
     woke = []
     m.set_wakeup(lambda: woke.append(1))

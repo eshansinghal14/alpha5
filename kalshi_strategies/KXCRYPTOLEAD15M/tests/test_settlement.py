@@ -1,150 +1,135 @@
-"""
-SettlementTracker tests.
-"""
+"""SettlementTracker and CfIndex tests."""
 import math
-import os
-import sys
+import time
 
-import pytest
-
-
-from kalshi_strategies.KXCRYPTOLEAD15M.composite import CompositeBar
-from kalshi_strategies.KXCRYPTOLEAD15M.settlement_tracker import EventWindow, SettlementTracker
+from kalshi_strategies.KXCRYPTOLEAD15M.cf_index import STALE_S, CfIndex, load_cf
 from kalshi_strategies.KXCRYPTOLEAD15M.series import COINS
+from kalshi_strategies.KXCRYPTOLEAD15M.settlement_tracker import EventWindow, SettlementTracker
+
+S, T = 1_000_200, 1_001_100
 
 
-def _bar(coin, ts_s, price):
-    return CompositeBar(coin=coin, ts_s=ts_s, price=price,
-                        utilized_depth=1.0, n_venues_in=1,
-                        n_venues_dropped=0, is_fallback=False,
-                        fallback_mid=price, nowcast_count=1)
+def _cf(start=100.0, end=None, end_secs=60):
+    """CF holding [S-60, S) at `start` and the first `end_secs` end seconds at `end`."""
+    cf = CfIndex(persist=False)
+    end = end or {}
+    for c in COINS:
+        for t in range(S - 60, S):
+            cf.add(c, t, start, live=False)
+        for t in range(T - 60, T - 60 + end_secs):
+            cf.add(c, t, end.get(c, start), live=False)
+    return cf
 
 
-def test_projected_returns_fill_unformed_end_with_last_bar_per_source():
-    S, T = 1_000_000.0, 1_000_900.0
-    tr = SettlementTracker(EventWindow(event_ticker="E", S=S, T=T))
-    for ts in range(int(S - 60), int(S)):
-        for c in COINS:
-            tr.ingest(_bar(c, float(ts), 100.0))
-    # 30s into the end average: mid at 101, replica at 102.
-    for ts in range(int(T - 60), int(T - 30)):
-        for c in COINS:
-            tr.ingest(CompositeBar(c, float(ts), 102.0, 1.0, 1, 0, False, 101.0, 1))
-    now = T - 30
-    assert math.isclose(tr.projected_returns(now, "mid")["BTC"], 0.01, abs_tol=1e-12)
-    assert math.isclose(tr.projected_returns(now, "cf")["BTC"], 0.02, abs_tol=1e-12)
+def test_start_is_mean_of_the_60_seconds_before_S():
+    cf = CfIndex(persist=False)
+    for c in COINS:
+        for i, t in enumerate(range(S - 60, S)):
+            cf.add(c, t, 100.0 + i, live=False)
+        cf.add(c, S, 1e6, live=False)            # S itself is not in the window
+        cf.add(c, S - 61, 1e6, live=False)
+    tr = SettlementTracker(EventWindow("E", S, T), cf)
+    assert math.isclose(tr.start("BTC"), 100.0 + 29.5)
 
 
-def test_kalshi_start_override_replaces_mid_start_only():
-    S, T = 1_000_000.0, 1_000_900.0
-    tr = SettlementTracker(EventWindow(event_ticker="E", S=S, T=T))
-    for ts in range(int(S - 60), int(S)):
-        for c in COINS:
-            tr.ingest(_bar(c, float(ts), 100.0))
-    for ts in range(int(T - 60), int(T - 30)):
-        for c in COINS:
-            tr.ingest(_bar(c, float(ts), 101.0))
-    tr.set_start_override({"BTC": 99.0})              # partial: ignored
-    assert tr.snapshot(T - 30).start_quality["BTC"] == "ok"
-    tr.set_start_override({c: 100.5 for c in COINS})
-    snap = tr.snapshot(T - 30)
-    assert snap.start_quality["BTC"] == "kalshi" and snap.start_twap["BTC"] == 100.5
-    assert math.isclose(tr.projected_returns(T - 30, "mid")["BTC"], 101.0 / 100.5 - 1, abs_tol=1e-12)
-    # The CF cross-check keeps its own start.
-    assert math.isclose(tr.projected_returns(T - 30, "cf")["BTC"], 0.01, abs_tol=1e-12)
+def test_start_waits_for_all_60_seconds():
+    cf = CfIndex(persist=False)
+    for t in range(S - 60, S - 1):
+        cf.add("BTC", t, 100.0, live=False)
+    tr = SettlementTracker(EventWindow("E", S, T), cf)
+    assert tr.start("BTC") is None
+    cf.add("BTC", S - 1, 100.0, live=False)
+    assert tr.start("BTC") == 100.0
 
 
 def test_basic_winner():
-    """BTC up 0.1%, others flat -> BTC wins."""
-    S, T = 1_000_000.0, 1_000_900.0
-    w = EventWindow(event_ticker="E", S=S, T=T)
-    tr = SettlementTracker(w)
-    # Start TWAPs: 60 flat samples each for all coins.
-    for ts in range(int(S - 60), int(S)):
-        for c in COINS:
-            tr.ingest(_bar(c, float(ts), 100.0))
-    # End TWAPs: BTC at 100.1 (0.1% up), others at 100.0.
-    for ts in range(int(T - 60), int(T)):
-        tr.ingest(_bar("BTC", float(ts), 100.1))
-        for c in COINS[1:]:
-            tr.ingest(_bar(c, float(ts), 100.0))
-    outcome = tr.finalize(T + 1)
-    assert outcome is not None
-    assert outcome.winners == ["BTC"]
-    assert math.isclose(outcome.returns_pct["BTC"], 0.1, abs_tol=1e-6)
+    tr = SettlementTracker(EventWindow("E", S, T), _cf(end={"BTC": 100.1}))
+    out = tr.finalize()
+    assert out.winners == ["BTC"] and math.isclose(out.returns_pct["BTC"], 0.1, abs_tol=1e-9)
 
 
 def test_tie_payout_split():
-    """Two coins tie at the top -> payout_cents_each = 50."""
-    S, T = 1_000_000.0, 1_000_900.0
-    w = EventWindow(event_ticker="E", S=S, T=T)
-    tr = SettlementTracker(w)
-    for ts in range(int(S - 60), int(S)):
-        for c in COINS:
-            tr.ingest(_bar(c, float(ts), 100.0))
-    # BTC and ETH both at +0.1%; others flat.
-    for ts in range(int(T - 60), int(T)):
-        for c in ("BTC", "ETH"):
-            tr.ingest(_bar(c, float(ts), 100.1))
-        for c in ("SOL", "XRP", "HYPE"):
-            tr.ingest(_bar(c, float(ts), 100.0))
-    outcome = tr.finalize(T + 1)
-    assert outcome is not None
-    assert set(outcome.winners) == {"BTC", "ETH"}
-    assert outcome.payout_cents_each == 50
-
-
-def test_partial_start_quality_flag():
-    """Only 30 of 60 start samples -> start_quality=='partial'."""
-    S, T = 1_000_000.0, 1_000_900.0
-    w = EventWindow(event_ticker="E", S=S, T=T)
-    tr = SettlementTracker(w)
-    for ts in range(int(S - 30), int(S)):  # only 30 samples
-        for c in COINS:
-            tr.ingest(_bar(c, float(ts), 100.0))
-    snap = tr.snapshot(S + 0.1)   # just after S
-    assert snap.start_quality["BTC"] == "partial"
-
-
-def test_backfill_resolves_start_quality():
-    """Backfilling the start window from persisted bars (what the live
-    runner does on adopting an event mid-window) must make start_quality
-    resolve to 'ok' -- without it, start_locked stays False and the pricer
-    gets x=0, collapsing the fair to a variance prior that sits far from
-    the Kalshi mid (observed 2026-10-07: BTC theo 0.17 vs market 0.035)."""
-    S, T = 1_000_000.0, 1_000_900.0
-    w = EventWindow(event_ticker="E", S=S, T=T)
-    tr = SettlementTracker(w)
-    # No live ingest at all -- start_quality is 'missing' for every coin.
-    snap0 = tr.snapshot(S + 300.0)
-    assert all(q == "missing" for q in snap0.start_quality.values())
-    # Now backfill a full 60-sample start window from "persisted" bars.
-    bars = {c: [_bar(c, float(ts), 100.0) for ts in range(int(S - 60), int(S))]
-            for c in COINS}
-    tr.backfill(bars)
-    snap1 = tr.snapshot(S + 300.0)
-    assert all(q == "ok" for q in snap1.start_quality.values())
-    # And backfill is idempotent (dedup on ts_s): re-applying doesn't
-    # double-count or change quality.
-    tr.backfill(bars)
-    assert tr.snapshot(S + 300.0).start_quality["BTC"] == "ok"
+    tr = SettlementTracker(EventWindow("E", S, T), _cf(end={"BTC": 100.1, "ETH": 100.1}))
+    out = tr.finalize()
+    assert set(out.winners) == {"BTC", "ETH"} and out.payout_cents_each == 50
 
 
 def test_rounding_at_boundary():
-    """Returns are rounded to 1e-5 (3 decimals in percent)."""
-    S, T = 1_000_000.0, 1_000_900.0
-    w = EventWindow(event_ticker="E", S=S, T=T)
-    tr = SettlementTracker(w)
-    for ts in range(int(S - 60), int(S)):
-        for c in COINS:
-            tr.ingest(_bar(c, float(ts), 100.0))
-    # BTC: tiny positive, within rounding -> should still round to a
-    # multiple of 0.001 (percent) == 1e-5 in return units.
-    for ts in range(int(T - 60), int(T)):
-        tr.ingest(_bar("BTC", float(ts), 100.0004))  # +0.0004%, rounds to 0.0
-        for c in COINS[1:]:
-            tr.ingest(_bar(c, float(ts), 100.0))
-    outcome = tr.finalize(T + 1)
-    # +0.0004% rounds to +0.000% -- a 5-way tie.
-    assert len(outcome.winners) == 5
-    assert outcome.payout_cents_each == 20
+    """+0.0004% rounds to 0.000%: a five-way tie at 20c each."""
+    out = SettlementTracker(EventWindow("E", S, T), _cf(end={"BTC": 100.0004})).finalize()
+    assert len(out.winners) == 5 and out.payout_cents_each == 20
+
+
+def test_finalize_needs_the_whole_end_window():
+    assert SettlementTracker(EventWindow("E", S, T), _cf(end_secs=59)).finalize() is None
+
+
+def test_snapshot_end_sum_counts_only_seconds_in():
+    cf = _cf(end={"SOL": 101.0}, end_secs=20)
+    snap = SettlementTracker(EventWindow("E", S, T), cf).snapshot(T - 40 + 0.5)
+    assert snap.end_n["SOL"] == 20
+    assert math.isclose(snap.end_log_sum["SOL"], 20 * math.log(1.01))
+    assert snap.end_n["BTC"] == 20 and snap.end_log_sum["BTC"] == 0.0
+    assert SettlementTracker(EventWindow("E", S, T), cf).snapshot(T - 100).end_n["SOL"] == 0
+
+
+def test_snapshot_sees_a_late_tick():
+    cf = _cf(end_secs=10)
+    tr = SettlementTracker(EventWindow("E", S, T), cf)
+    assert tr.snapshot(T - 45.5).end_n["BTC"] == 10
+    for c in COINS:
+        cf.add(c, T - 50, 100.0, live=False)
+    assert tr.snapshot(T - 45.5).end_n["BTC"] == 11
+
+
+def test_cf_age_and_stale():
+    cf = CfIndex(persist=False)
+    now = time.monotonic()
+    for c in COINS[:-1]:
+        cf.add(c, S, 1.0, mono=now)
+    assert cf.age_s(now) is None and cf.stale(now)          # one coin never ticked
+    cf.add("HYPE", S, 1.0, mono=now - 1.0)
+    assert math.isclose(cf.age_s(now), 1.0) and not cf.stale(now)
+    assert cf.stale(now + STALE_S)
+    cf.add("HYPE", S - 5, 1.0, live=False)                  # a REST fill isn't a live tick
+    assert cf.stale(now + STALE_S)
+
+
+def test_cf_history_trims_and_ignores_old_fills():
+    from kalshi_strategies.KXCRYPTOLEAD15M import cf_index
+    cf = CfIndex(persist=False)
+    cf.add("BTC", 10_000, 1.0, live=False)
+    cf.add("BTC", 10_000 + cf_index.HISTORY_S + 1, 2.0, live=False)
+    assert cf.value("BTC", 10_000) is None
+    assert not cf.add("BTC", 10_000, 1.0, live=False)
+    assert cf.latest("BTC") == (10_000 + cf_index.HISTORY_S + 1, 2.0)
+
+
+def test_cf_ws_message_parsing():
+    import asyncio
+    import json
+    cf = CfIndex(persist=False)
+    msg = {"type": "cfbenchmarks_value", "msg": {"index_id": "XRPUSD_RTI", "data": json.dumps(
+        {"type": "value", "time": S * 1000, "id": "XRPUSD_RTI", "value": "1.2913"})}}
+
+    async def handle(m):
+        return cf._handle(m)
+    assert asyncio.run(handle(msg)) == ("XRP", S)
+    assert cf.value("XRP", S) == 1.2913
+    assert asyncio.run(handle(msg)) is None                 # duplicate second
+    off_second = {"type": "cfbenchmarks_value", "msg": {"index_id": "BRTI", "data": json.dumps(
+        {"time": S * 1000 + 200, "value": "1"})}}
+    assert asyncio.run(handle(off_second)) is None
+
+
+def test_cf_write_load_roundtrip(tmp_path):
+    cf = CfIndex(persist=True, root=tmp_path)
+    for t in range(S - 5, S + 5):
+        cf.add("ETH", t, float(t), live=False)
+    assert cf.write(cf.drain()) == 10
+    cf2 = CfIndex(persist=True, root=tmp_path)
+    cf2.add("ETH", S, -1.0, live=False)        # rejected: not > 0
+    cf2.add("ETH", S + 100, float(S + 100), live=False)
+    cf2.write(cf2.drain())
+    got = load_cf("ETH", S - 10, S + 200, tmp_path)
+    assert got[S - 5] == float(S - 5) and got[S + 100] == float(S + 100) and len(got) == 11

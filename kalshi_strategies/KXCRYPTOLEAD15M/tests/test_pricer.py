@@ -188,15 +188,3 @@ def test_mc_vs_analytic_two_coin_sanity():
     analytic = norm.cdf(0.5 / math.sqrt(2.0))
     assert abs(probs[0] - analytic) < 0.01, f"{probs[0]:.4f} vs analytic {analytic:.4f}"
 
-
-def test_basis_noise_softens_a_tiny_last_second_lead():
-    import numpy as np
-    from kalshi_strategies.KXCRYPTOLEAD15M.cov_forecaster import ConstantCovForecaster
-    cfg = CoinRaceConfig()
-    lead = np.array([1e-5, 0.0, -1e-3, -1e-3, -1e-3])          # BTC leads ETH by 0.1bp, 1s left
-    args = dict(x=lead, I=lead * 59 / 60, tau=1.0, now_s=0.0, S=-899.0, T=1.0, start_locked=True,
-                compute_delta=False)
-    exact = CoinRacePricer(ConstantCovForecaster(), cfg).fairs_at(**args).probs
-    noisy = CoinRacePricer(ConstantCovForecaster(), cfg, basis_sd=np.full(5, 0.5e-4)).fairs_at(**args).probs
-    assert exact[0] > 0.99
-    assert 0.5 < noisy[0] < 0.9 and abs(noisy.sum() - 1.0) < 1e-9

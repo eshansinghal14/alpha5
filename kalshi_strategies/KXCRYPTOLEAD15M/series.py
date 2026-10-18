@@ -39,7 +39,7 @@ CF_CONSTITUENTS = {
     "XRP":  ("coinbase", "kraken", "bitstamp", "crypto_com", "lmax"),
     "HYPE": ("coinbase", "kraken", "bitstamp"),
 }
-# Venues medianed into each coin's pricing mid (and so its settlement replica).
+# Venues medianed into each coin's pricing mid.
 # 15-min return RMS error vs Kalshi's 15M settlement values, 16 settlements per
 # coin (recorder 2026-10-11 00:47-05:21 UTC), Coinbase alone vs median of the
 # constituents we see: ETH 0.68 -> 0.32bp, XRP 0.59 -> 0.46, BTC 0.49 -> 0.41,
@@ -52,19 +52,6 @@ SPOT_VENUES = {
     "XRP":  ("coinbase", "kraken", "bitstamp", "crypto_com"),
     "HYPE": ("coinbase",),
 }
-# Sd of our final 15-min return vs Kalshi's, in bp, with each coin priced off
-# its SPOT_VENUES source: RMS over 24 settlements, recorder 2026-10-11
-# 01:00-08:00 UTC (mean errors all within +-0.14bp, so no bias term). The pricer
-# adds this as independent per-coin noise; without it a 1bp lead in the last
-# minute priced at 0.99 while our replica's BTC-ETH gap was off by ~0.5bp
-# (26OCT110400: ours +1.05 vs Kalshi +0.58). Errors correlate 0.3-0.55 among
-# ETH/HYPE/XRP; ignored at n=24. Re-fit once the recorder has a few days.
-BASIS_SD_BP = {"BTC": 0.38, "ETH": 0.34, "SOL": 0.56, "XRP": 0.52, "HYPE": 0.92}
-# Off: on 28 settled events (2026-10-11 01:00-08:00 UTC) it raised the winner's
-# last-minute log loss at every tau <= 45 s (tau 5: 0.0001 -> 0.074; tau 30:
-# 0.065 -> 0.098). Independent noise overstates ranking error -- these errors
-# partly cancel across coins. Re-test on a sample with more close finishes.
-APPLY_BASIS_SD = False
 # Per-index parameters from the methodology tables: deviation-from-mid D,
 # potentially-erroneous threshold, and retrieval lag threshold (s). CME CF RTI
 # methodology v16.8 table 6.2 for the four majors (D 0.5% BTC / 1% others,
@@ -108,7 +95,7 @@ def coin_from_market_ticker(ticker: str) -> str | None:
 
 __all__ = [
     "SERIES_TICKER", "COINS", "COINBASE_PRODUCTS", "CF_CONSTITUENTS", "SETTLEMENT_INDEX", "INDEX_PARAMS",
-    "SPOT_VENUES", "BASIS_SD_BP", "APPLY_BASIS_SD",
+    "SPOT_VENUES",
     "EVENT_WINDOW_S", "START_END_AVG_S", "RETURN_ROUNDING_PCT",
     "TICK", "MIN_QUOTE_PRICE", "MAX_QUOTE_PRICE",
     "market_ticker", "coin_from_market_ticker",

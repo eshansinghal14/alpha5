@@ -5,8 +5,9 @@ Kalshi books in kalshi_backtest.engine.
 
     python -m kalshi_strategies.KXCRYPTOLEAD15M.backtest.run_backtest [event_ticker ...]
 
-Needs data/kalshi_crypto/composite/{coin}_*.parquet over [S-120, T] and a
-cached Kalshi source for the event.
+Needs data/kalshi_crypto/composite/{coin}_*.parquet over [S-120, T], the CF
+index under data/kalshi_crypto/cf_index/, and a cached Kalshi source for the
+event.
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ from kalshi_infra.kalshi import markets as km
 from kalshi_infra.trading.lip import LipTracker, params_from_program
 from kalshi_infra.trading.fair import FairUpdate
 from kalshi_infra.trading.quoter import Quoter
+from kalshi_strategies.KXCRYPTOLEAD15M.cf_index import CF_ROOT, load_cf
 from kalshi_strategies.KXCRYPTOLEAD15M.composite import CompositeBar
 from kalshi_strategies.KXCRYPTOLEAD15M.config import CONFIG_PATH, CryptoConfig
 from kalshi_strategies.KXCRYPTOLEAD15M.model import CoinRaceModel, load_composite_bars
@@ -56,6 +58,26 @@ class _ReplayBus:
         b = self._last.get(coin)
         return None if b is None else b.mid
 
+    @property
+    def feeds(self):
+        """Per coin, the replayed bars up to the clock (CompositeFeed.tail/newest_ts)."""
+        bus = self
+
+        class _F:
+            def __init__(self, c):
+                self.c = c
+
+            def tail(self, n):
+                return bus._bars[self.c][max(0, bus._i[self.c] - n):bus._i[self.c]]
+
+            def newest_ts(self):
+                b = bus._last[self.c]
+                return None if b is None else b.ts_s
+
+            def _live_books(self, _):
+                return []
+        return {c: _F(c) for c in self._bars}
+
     def venue_books_per_coin(self):
         # Fresh as of the replay clock -> feed health OK, skew = bar spacing.
         return {c: ([types.SimpleNamespace(receive_ts=b.ts_s, is_resyncing=False, is_one_sided=lambda: False,
@@ -66,12 +88,53 @@ class _ReplayBus:
         return 0
 
 
+class _ReplayCf:
+    """Persisted CF seconds revealed up to the replay clock, each one second
+    after its stamp (live ticks land ~70ms after the second; a 1s reveal is
+    the conservative whole-second version)."""
+
+    def __init__(self, values: dict[str, dict[int, float]]):
+        self._all = values
+        self.now_s = -math.inf
+        self.version = 0
+
+    def advance(self, now_s: float):
+        if int(now_s) != int(self.now_s):
+            self.version += 1
+        self.now_s = now_s
+
+    def _visible(self, t: int) -> bool:
+        return t + 1 <= self.now_s
+
+    def value(self, coin, ts_s):
+        ts_s = int(ts_s)
+        return self._all[coin].get(ts_s) if self._visible(ts_s) else None
+
+    def window(self, coin, lo, hi):
+        return [v for t in range(int(lo), int(hi)) if (v := self.value(coin, t)) is not None]
+
+    def latest(self, coin):
+        t = int(self.now_s) - 1
+        for k in range(t, t - 10, -1):
+            v = self._all[coin].get(k)
+            if v is not None:
+                return k, v
+        return None
+
+    def age_s(self, now_mono=None):
+        return 0.0
+
+    def request_fill(self, coin):
+        pass
+
+
 class _ReplayModel(CoinRaceModel):
     """Monotonic-clock checks (feed health, skew, signal age) run on the
     replay clock instead of wall time."""
 
     def _price(self, now_s, compute_delta):
         import kalshi_strategies.KXCRYPTOLEAD15M.model as m
+        self.cf.advance(now_s)
         real = m.time.monotonic
         m.time.monotonic = lambda: now_s
         try:
@@ -102,7 +165,10 @@ def run_one(event_ticker: str, cfg=None, verbose: bool = True):
     for ts in sorted(by_s):
         fc.update(float(ts), by_s[ts])
 
-    model = _ReplayModel(ev, cfg, bus=_ReplayBus(live), coinbase=None, forecaster=fc)
+    cf = _ReplayCf({c: load_cf(c, S - 300, T + 1) for c in COINS})
+    if any(len(cf._all[c]) < 900 for c in COINS):
+        raise RuntimeError(f"CF index missing for {event_ticker} under {CF_ROOT}")
+    model = _ReplayModel(ev, cfg, cf=cf, bus=_ReplayBus(live), forecaster=fc)
     # Freshness is a wall-clock concept: the replay clock would read every fair as stale.
     cfg = types.SimpleNamespace(**{**vars(cfg), "risk": types.SimpleNamespace(
         **{**vars(cfg.risk), "max_signal_age_s": math.inf})})
@@ -144,7 +210,8 @@ def run_one(event_ticker: str, cfg=None, verbose: bool = True):
 
 def theo_calibration(quoter, model) -> pd.DataFrame:
     """Log loss / Brier of the fair at tau checkpoints, against the settled winner."""
-    out = model.tracker.finalize(model.window.T + 1)
+    model.cf.advance(model.window.T + 1)
+    out = model.tracker.finalize()
     if out is None:
         return pd.DataFrame()
     winners = set(out.winners)

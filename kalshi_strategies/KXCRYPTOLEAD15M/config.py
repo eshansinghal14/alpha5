@@ -43,12 +43,6 @@ class CryptoPricingParams:
         "Withhold fairs when the newest and oldest coin books are further apart than this -- one coin "
         "resuming before the others makes a false leader (2026-10-08 16:34: four 26c lifts).",
         min=0.05, step=0.1)
-    basis_tie_gap: float = param(
-        "Last minute: block both sides of every coin within this projected-return gap (fraction, not %) "
-        "of the leader on EITHER the Coinbase mid or the CF replica. Coinbase-only prices miss the "
-        "settlement index on near-ties: on 97 events 2026-10-06..10, 7.5e-5 flagged ~20% of last "
-        "minutes and caught every wrong mid leader from tau<=15s (8/10 at 30s). 0 disables.",
-        min=0, step=0.00001)
     burst_usd_1s: dict[str, float] | None = param(
         "Pull every quote in the event when one coin's trailing-1s Coinbase print notional (USD) reaches "
         "this. Per coin: each coin's p99.5 over 10/09 21:00-10/10 04:50 UTC. Pulling there 5.4% of the "
@@ -68,8 +62,6 @@ class CryptoPricingParams:
         "but exposed worse flow (+$1,880 to +$2,040). Key \"perp_move\" is the price-move trigger "
         "(prints.MOVE_*): 2 of 3 perp venues moving >= their own p99.5 of |0.5s move| one way.",
         editable=False)
-    quote_before_start: bool = param(
-        "Quote before the start TWAP is locked (pre-open / forming start average).")
     soft_stale_s: float = param("Feed health: a coin older than this is DEGRADED (priced off last value).",
                                 min=0.1, step=0.5)
     hard_stale_s: float = param("A coin older than this is DOWN: the joint is unknowable, all fairs withheld.",
@@ -94,11 +86,6 @@ class CryptoPricingParams:
         min=0.5, step=0.5)
     market_shift_max_bp: float = param(
         "Cap on any one coin's estimated shift, per estimate, in bp of return.", min=0, step=0.5)
-    kalshi_start_offset_events: int = param(
-        "Once Kalshi publishes the start value (single-coin 15M expiration_value), price off it, "
-        "shifted onto our mid's level by the mean offset over this many previous boundaries. "
-        "8 on 59 events 2026-10-11: BTC-HYPE gap error 0.89 -> 0.73bp. 0 = our own start TWAP.",
-        min=0, step=1, apply=APPLY_NEXT_EVENT)
 
 
 @section

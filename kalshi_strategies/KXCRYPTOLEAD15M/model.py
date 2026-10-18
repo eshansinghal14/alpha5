@@ -1,16 +1,24 @@
 """
-Live Coin Race model for one KXCRYPTOLEAD15M event: Coinbase books ->
-per-coin composite mid -> settlement tracker + HAR vol forecaster -> MC
-winner probabilities -> per-market Fair.
+Live Coin Race model for one KXCRYPTOLEAD15M event: venue books -> per-coin
+composite mid; CF settlement index -> start and end averages; HAR vol
+forecaster -> MC winner probabilities -> per-market Fair.
+
+The race settles on the CF index (settlement_tracker). The mid is only the
+fast signal between CF ticks, so it is put on CF's level first:
+
+    x_i = ln(mid_i / start_i) - basis_i,  basis_i = mean ln(mid/CF) over the
+                                           last BASIS_WINDOW_S CF seconds
+    I_i = (1/60) * sum of ln(CF_s / start_i) over end seconds already in
+
+Replay 10-12 17:00..10-18 05:00 UTC (516 events): last-minute winner log loss
+0.238 -> 0.115 on the held-out half (mid-only start and end), no change
+before the last minute (+0.0002, CI +-0.006).
 
 Band = prob +/- ci_vol_multiplier * theo_vol, where theo_vol is the
-sigma-equivalent fair move over reaction_latency_s: full revaluation under
-joint coin moves (theo_vol_reval_draws > 0), else the bump deltas x 1-sigma. The pricer works in
-log returns; only the SettlementTracker works in Kalshi's arithmetic returns.
+sigma-equivalent fair move over reaction_latency_s.
 """
 from __future__ import annotations
 
-import asyncio
 import math
 import time
 from pathlib import Path
@@ -21,20 +29,17 @@ import pandas as pd
 from kalshi_infra.kalshi.markets import EventInfo
 from kalshi_infra.trading.fair import Fair
 from kalshi_strategies.KXCRYPTOLEAD15M.composite import DATA_ROOT, CompositeBar, CompositeBus, bar_files
-from kalshi_strategies.KXCRYPTOLEAD15M.kalshi_start import kalshi_values, level_offsets
 from kalshi_strategies.KXCRYPTOLEAD15M.pricer import BaseRateTracker, CoinRacePricer, FairResult
 from kalshi_strategies.KXCRYPTOLEAD15M.robust_har import RobustHarForecaster
-from kalshi_strategies.KXCRYPTOLEAD15M.series import (APPLY_BASIS_SD, BASIS_SD_BP, COINS, START_END_AVG_S,
-                                                       coin_from_market_ticker)
+from kalshi_strategies.KXCRYPTOLEAD15M.series import COINS, START_END_AVG_S, coin_from_market_ticker
 from kalshi_strategies.KXCRYPTOLEAD15M.settlement_tracker import EventWindow, SettlementTracker
 from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed import FeedHealthMonitor
-from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed.coinbase import CoinbaseAdapter
 
-
-# Kalshi published 21:45 values within seconds of the boundary (2026-10-11
-# check); poll every few seconds and give up after 2 min.
-KALSHI_START_POLL_S = 3.0
-KALSHI_START_GIVE_UP_S = 120.0
+# Seconds of (mid, CF) pairs the basis averages. 30 in the replay above; the
+# basis is a slow level offset (HYPE -1.9bp, XRP -1.8bp mean, 10-12..18) plus
+# ~1bp of noise per coin that a shorter window would chase.
+BASIS_WINDOW_S = 30
+BASIS_MIN_S = 10
 
 
 def load_composite_bars(coin: str, start_s: float, end_s: float, root: Path = DATA_ROOT) -> list[CompositeBar]:
@@ -65,10 +70,9 @@ def load_composite_bars(coin: str, start_s: float, end_s: float, root: Path = DA
 
 
 class CoinRaceModel:
-    def __init__(self, ev: EventInfo, cfg, *, bus: CompositeBus | None = None,
-                 coinbase: CoinbaseAdapter | None = None, forecaster=None, spot=None):
-        """Live: pass `spot` (a session-lifetime live_feed.SpotFeed), which
-        supplies the bus, Coinbase feed, forecaster and health monitor.
+    def __init__(self, ev: EventInfo, cfg, *, cf, bus: CompositeBus | None = None, forecaster=None, spot=None):
+        """`cf`: the session's CfIndex. Live: pass `spot` (a session-lifetime
+        live_feed.SpotFeed), which supplies the bus, forecaster and health.
         Tests/backtest: pass `bus` (and optionally `forecaster`) instead."""
         self.cfg = cfg
         self.event_ticker = ev.event_ticker
@@ -80,22 +84,19 @@ class CoinRaceModel:
         self.tickers = [self.ticker_of[c] for c in COINS]
         self.window = EventWindow(event_ticker=ev.event_ticker, S=ev.open_time.timestamp(),
                                   T=ev.close_time.timestamp())
-        self.tracker = SettlementTracker(self.window)
+        self.cf = cf
+        self.tracker = SettlementTracker(self.window, cf)
         p = cfg.pricing
         self.spot = spot
         if spot is not None:
-            bus, coinbase, forecaster = spot.bus, spot.coinbase, spot.forecaster
+            bus, forecaster = spot.bus, spot.forecaster
             self.health = spot.health
         else:
             self.health = FeedHealthMonitor(soft_stale_s=p.soft_stale_s, hard_stale_s=p.hard_stale_s,
                                             recovery_s=p.recovery_s)
         self.forecaster = forecaster or RobustHarForecaster()
-        self.pricer = CoinRacePricer(self.forecaster, p,
-                                     base_rate=BaseRateTracker(p.base_rate_window).rate(),
-                                     basis_sd=(np.array([BASIS_SD_BP[c] for c in COINS]) * 1e-4
-                                               if APPLY_BASIS_SD else None))
+        self.pricer = CoinRacePricer(self.forecaster, p, base_rate=BaseRateTracker(p.base_rate_window).rate())
         self.bus = bus
-        self.coinbase = coinbase
         self.result: FairResult | None = None
         self.withheld_reason: str | None = "warming"
         self._last_delta_s = 0.0
@@ -104,7 +105,8 @@ class CoinRaceModel:
         self._wake = None
         # A mid has moved since the last _price, so the fair lags its inputs.
         self._dirty = True
-        self.basis_tie: frozenset[str] = frozenset()
+        self.basis_bp: dict[str, float] = {}
+        self._basis_cache: dict[str, tuple] = {}
         # Market-implied relative return shift (see _update_market_shift).
         self._kmid: dict[str, float] = {}
         self._shift = np.zeros(len(COINS))      # EMA, applied as alpha * _shift
@@ -125,7 +127,7 @@ class CoinRaceModel:
         elif ask > bid:
             self._kmid[c] = (bid + ask) / 2.0
 
-    def _update_market_shift(self, now_s: float, x: np.ndarray, I: np.ndarray, start_locked: bool):
+    def _update_market_shift(self, now_s: float, x: np.ndarray, I: np.ndarray):
         """Advance the EMA toward the latest market-implied shift and, every
         market_shift_fit_s, re-estimate it: the mean-zero return shift dx that
         moves our five fairs onto the Kalshi mids to first order, dp = D dx,
@@ -142,8 +144,7 @@ class CoinRaceModel:
         if now_s - self._shift_fit_t < p.market_shift_fit_s or len(self._kmid) < len(COINS):
             return
         base = self.pricer.fairs_at(x=x, I=I, tau=max(0.0, self.window.T - now_s), now_s=now_s,
-                                    S=self.window.S, T=self.window.T, start_locked=start_locked,
-                                    compute_delta=True)
+                                    S=self.window.S, T=self.window.T, start_locked=True, compute_delta=True)
         Dm = base.delta
         if not np.any(Dm):
             return
@@ -160,10 +161,9 @@ class CoinRaceModel:
         self._wake = fn
 
     def _on_book(self, vb):
-        """Coinbase callback. Wakes the reprice only when the coin's mid
-        moves: level2 sends ~64 msg/s across the five coins but the mid
-        changes ~4.6/s (2026-10-09), and the mid is the only per-message
-        input to pricing."""
+        """Venue book (without a SpotFeed). Wakes the reprice only when the
+        coin's mid moves: level2 sends ~64 msg/s across the five coins but the
+        mid changes ~4.6/s (2026-10-09)."""
         before = self.bus.mid_nowcast(vb.coin) if vb.coin in self.bus.feeds else None
         self.bus.observe(vb)
         if self.bus.mid_nowcast(vb.coin) != before:
@@ -174,131 +174,38 @@ class CoinRaceModel:
         if self._wake is not None:
             self._wake()
 
-    # --- warmup -----------------------------------------------------------
-
-    def backfill(self) -> dict[str, str]:
-        """Seed the start TWAP and forecaster from persisted bars, so an event
-        adopted mid-window prices off real returns. Without it x = 0 and the
-        fair is a pure variance prior (2026-10-07: BTC theo 0.17 vs a 0.035
-        market). Returns per-coin start_quality. Live sessions use
-        backfill_start instead (the session's SpotFeed owns the forecaster)."""
-        now_s = time.time()
-        since = self.window.S - 2 * START_END_AVG_S
-        bars = {c: load_composite_bars(c, now_s - self.cfg.pricing.warmup_s, self.window.T) for c in COINS}
-        self.tracker.backfill({c: [b for b in bl if b.ts_s >= since] for c, bl in bars.items()})
-        by_s: dict[int, dict[str, float]] = {}
-        for c, bl in bars.items():
-            for b in bl:
-                by_s.setdefault(int(b.ts_s), {})[c] = b.mid
-        for ts in sorted(by_s):
-            try:
-                self.forecaster.update(float(ts), by_s[ts])
-            except NotImplementedError:
-                break
-        return dict(self.tracker.snapshot(time.time()).start_quality)
-
-    def start_window_since(self) -> float:
-        return self.window.S - 2 * START_END_AVG_S
-
-    @staticmethod
-    def _mids(coin: str, lo: float, hi: float) -> dict[float, float]:
-        """Persisted 1s mids over [lo, hi). Disk only: bars older than the
-        session's memory are what the offset needs, and the composite flush
-        (composite_flush_s) has written everything before S long since."""
-        return {b.ts_s: b.mid for b in load_composite_bars(coin, lo, hi) if b.ts_s < hi}
-
-    def fetch_kalshi_start(self) -> dict[str, float] | None:
-        """Kalshi-published start, moved onto our mid's level (kalshi_start).
-        Blocking network + disk: call off the loop. None until Kalshi has
-        published all five values or when there's too little history for the
-        offset; the TWAP start stays in force then."""
-        n = self.cfg.pricing.kalshi_start_offset_events
-        if n <= 0:
-            return None
-        S = self.window.S
-        anchors = {}
-        # Recomputed while any coin lacks history: the previous boundary's
-        # bars may not have been flushed yet (level_offsets caches the rest).
-        offs = getattr(self, "_kalshi_offs", None)
-        if offs is None or any(v is None for v in offs.values()):
-            self._kalshi_offs = level_offsets(S, n, self._mids)
-        offs = self._kalshi_offs
-        for c in COINS:
-            vals = kalshi_values(c, S, S)
-            if S not in vals or offs.get(c) is None:
-                return None
-            anchors[c] = vals[S] * math.exp(offs[c])
-        return anchors
-
-    async def kalshi_start_loop(self):
-        """Poll for Kalshi's start value after S; adopt it once, then stop."""
-        loop = asyncio.get_running_loop()
-        if self.cfg.pricing.kalshi_start_offset_events <= 0:
-            return
-        if time.time() < self.window.S:
-            # A cold start reads ~12h of bars (~20s); do it before S so the
-            # anchor lands seconds after Kalshi publishes, not 20s later.
-            try:
-                await loop.run_in_executor(None, self.fetch_kalshi_start)
-            except Exception as e:
-                print(f"[KXCRYPTOLEAD15M] kalshi start offsets failed ({e!r}); retrying after S", flush=True)
-                self._kalshi_offs = None
-        while time.time() < self.window.S + 2:
-            await asyncio.sleep(1.0)
-        deadline = self.window.S + KALSHI_START_GIVE_UP_S
-        while time.time() < min(deadline, self.window.T - START_END_AVG_S):
-            try:
-                anchors = await loop.run_in_executor(None, self.fetch_kalshi_start)
-            except Exception as e:
-                print(f"[KXCRYPTOLEAD15M] kalshi start fetch failed ({e!r}); retrying", flush=True)
-                anchors = None
-            if anchors:
-                old = self.tracker.snapshot(time.time()).start_twap
-                self.tracker.set_start_override(anchors)
-                moved = {c: round((anchors[c] / old[c] - 1) * 1e4, 2) for c in COINS if old.get(c)}
-                print(f"[KXCRYPTOLEAD15M] start anchored on Kalshi values (bp vs our TWAP): {moved}", flush=True)
-                self._mid_moved()
-                return
-            await asyncio.sleep(KALSHI_START_POLL_S)
-        print(f"[KXCRYPTOLEAD15M] Kalshi start not available for {self.event_ticker}; pricing on our TWAP",
-              flush=True)
-
-    def backfill_start(self, mem_bars: dict[str, list[CompositeBar]]) -> dict[str, str]:
-        """Seed only the settlement tracker. `mem_bars` are the session's
-        in-memory bars from start_window_since(); disk fills in only when
-        the session started after that (the next event's start average is
-        the previous event's last minute, already in memory). Safe off the
-        loop: nothing else touches this model's tracker until feed_tasks()."""
-        since = self.start_window_since()
-        if any(not bl or bl[0].ts_s > since + 1 for bl in mem_bars.values()):
-            disk = {c: load_composite_bars(c, since, self.window.T) for c in COINS}
-        else:
-            disk = {}
-        self.tracker.backfill({c: disk.get(c, []) + mem_bars.get(c, []) for c in COINS})
-        return dict(self.tracker.snapshot(time.time()).start_quality)
+    def cf_ticked(self):
+        """A new CF second arrived: in the last minute it moves I directly."""
+        self._mid_moved()
 
     # --- pricing ----------------------------------------------------------
 
-    def _basis_tie_coins(self, now_s: float) -> frozenset[str]:
-        """Coins still in contention for the win once the CF replica is
-        considered alongside the mid: each source's leader plus anything within
-        basis_tie_gap of it. Empty outside the last minute or when one coin
-        clearly leads on both."""
-        gap = self.cfg.pricing.basis_tie_gap
-        if gap <= 0 or now_s < self.window.end_avg_begin:
-            return frozenset()
-        out: set[str] = set()
-        for source in ("mid", "cf"):
-            r = self.tracker.projected_returns(now_s, source)
-            if any(v is None for v in r.values()):
-                return frozenset()
-            best = max(r.values())
-            out |= {c for c, v in r.items() if best - v < gap}
-        return frozenset(out) if len(out) > 1 else frozenset()
+    def _basis(self, coin: str) -> float | None:
+        """mean ln(mid / CF) over the last BASIS_WINDOW_S seconds both hold.
+        Changes only when a bar or a CF second lands, so cached on those."""
+        feed = self.bus.feeds[coin]
+        key = (feed.newest_ts(), getattr(self.cf, "version", None))
+        hit = self._basis_cache.get(coin)
+        if hit is not None and hit[0] == key and key[1] is not None:
+            return hit[1]
+        b = self._basis_calc(coin, feed)
+        self._basis_cache[coin] = (key, b)
+        return b
+
+    def _basis_calc(self, coin: str, feed) -> float | None:
+        bars = {int(b.ts_s): b.mid for b in feed.tail(BASIS_WINDOW_S + 5)}
+        latest = self.cf.latest(coin)
+        if latest is None:
+            return None
+        diffs = []
+        for t in range(latest[0] - BASIS_WINDOW_S + 1, latest[0] + 1):
+            v, m = self.cf.value(coin, t), bars.get(t)
+            if v is not None and m is not None and m > 0:
+                diffs.append(math.log(m / v))
+        return float(np.mean(diffs)) if len(diffs) >= BASIS_MIN_S else None
 
     def _withhold(self, reason: str):
         self.result = None
-        self.basis_tie = frozenset()
         self.withheld_reason = reason
         return {t: None for t in self.tickers}
 
@@ -307,8 +214,6 @@ class CoinRaceModel:
             self.spot.sample(now_s)
             return
         sampled = self.bus.sample_all(now_s)
-        for bar in sampled.values():
-            self.tracker.ingest(bar)
         if sampled:
             try:
                 self.forecaster.update(max(b.ts_s for b in sampled.values()),
@@ -329,14 +234,15 @@ class CoinRaceModel:
         alarms = self.forecaster.alarms() if hasattr(self.forecaster, "alarms") else []
         if alarms:
             return self._withhold(f"vol_alarm:{','.join(alarms)}")
-
-        snap = self.tracker.snapshot(now_s)
-        in_window = now_s >= self.window.S
-        start_locked = in_window and all(snap.start_quality.get(c) in ("ok", "partial", "kalshi") for c in COINS)
-        if in_window and not start_locked:
-            return self._withhold("no_start_twap")
-        if not in_window and not p.quote_before_start:
+        if now_s < self.window.S:
             return self._withhold("before_start")
+        snap = self.tracker.snapshot(now_s)
+        missing = [c for c, v in snap.start.items() if v is None]
+        if missing:
+            if now_s > self.window.S + 2:
+                for c in missing:
+                    self.cf.request_fill(c)
+            return self._withhold("no_cf_start")
 
         books = self.bus.venue_books_per_coin()
         newest = []
@@ -346,37 +252,38 @@ class CoinRaceModel:
         if min(newest) <= 0 or max(newest) - min(newest) > p.max_cross_coin_skew_s:
             return self._withhold("cross_coin_skew")
 
-        x, I = np.zeros(len(COINS)), np.zeros(len(COINS))
-        if start_locked:
-            for i, c in enumerate(COINS):
-                m, s = self.bus.mid_nowcast(c), snap.start_twap.get(c)
-                if m is None or s is None or s <= 0:
-                    return self._withhold("no_mid")
-                x[i] = math.log(m / s)
-                if snap.projected_return_log.get(c) is not None and now_s >= self.window.end_avg_begin:
-                    # Pricer wants a partial SUM over the end average, not the
-                    # partial average (passing the average double-counted it).
-                    I[i] = snap.projected_return_log[c] * snap.end_sample_count.get(c, 0) / float(START_END_AVG_S)
-        if start_locked:
-            # Estimated off the unshifted fair, so the shift can't feed on itself.
-            self._update_market_shift(now_s, x, I, start_locked)
-            sh = p.market_shift_alpha * self._shift
-            x = x + sh
-            if now_s >= self.window.end_avg_begin:
-                # The shift moves every end-average sample already taken too.
-                n = min(START_END_AVG_S, max(0.0, now_s - self.window.end_avg_begin))
-                I = I + sh * n / float(START_END_AVG_S)
+        tau = max(0.0, self.window.T - now_s)
+        L = float(START_END_AVG_S)
+        x, I, n_eff = np.zeros(len(COINS)), np.zeros(len(COINS)), np.zeros(len(COINS))
+        for i, c in enumerate(COINS):
+            m, b = self.bus.mid_nowcast(c), self._basis(c)
+            if m is None or m <= 0:
+                return self._withhold("no_mid")
+            if b is None:
+                return self._withhold("no_cf_basis")
+            self.basis_bp[c] = b * 1e4
+            x[i] = math.log(m / snap.start[c]) - b
+            # The pricer takes the end average as elapsed (L - tau) + remaining
+            # tau. An elapsed second whose CF tick hasn't landed yet (~70ms
+            # after it) is filled with x, the best guess for it, so I and the
+            # pricer's remaining-time term never both leave it out.
+            n_eff[i] = min(L, max(float(snap.end_n[c]), L - tau)) if tau < L else 0.0
+            I[i] = (snap.end_log_sum[c] + x[i] * (n_eff[i] - snap.end_n[c])) / L
+        self._update_market_shift(now_s, x, I)
+        sh = p.market_shift_alpha * self._shift
+        x = x + sh
+        # The shift moves every end-average second already counted too.
+        I = I + sh * n_eff / L
         if compute_delta is None:
             compute_delta = self.result is None or now_s - self._last_delta_s >= p.delta_refresh_s
-        self.result = self.pricer.fairs_at(x=x, I=I, tau=max(0.0, self.window.T - now_s), now_s=now_s,
-                                           S=self.window.S, T=self.window.T, start_locked=start_locked,
+        self.result = self.pricer.fairs_at(x=x, I=I, tau=tau, now_s=now_s,
+                                           S=self.window.S, T=self.window.T, start_locked=True,
                                            compute_delta=compute_delta, prev_result=self.result)
         if compute_delta:
             self._last_delta_s = now_s
         self._newest_mono = min(newest)
         self._dirty = False
         self.withheld_reason = None
-        self.basis_tie = self._basis_tie_coins(now_s)
         k = p.ci_vol_multiplier
         out = {}
         for i, c in enumerate(COINS):
@@ -385,8 +292,8 @@ class CoinRaceModel:
             # would erase the edge on tail coins (fair 0.002, band 0.015).
             out[self.ticker_of[c]] = Fair(prob=prob, lo=prob - k * tv, hi=prob + k * tv,
                                           extras={"coin": c, "theo_vol": tv, "tau": self.result.tau,
-                                                  "phase": self.result.phase,
-                                                  "basis_tie": c in self.basis_tie})
+                                                  "phase": self.result.phase, "cf_basis_bp": self.basis_bp[c],
+                                                  "cf_end_n": snap.end_n[c]})
         return out
 
     # --- FairModel ----------------------------------------------------------
@@ -405,19 +312,31 @@ class CoinRaceModel:
         return self._price(now_s, False)
 
     def signal_age_s(self):
-        """Age of the oldest coin's data under the current fair. While no mid
-        has moved since the fair was computed, the fair is still exact, so
-        the age follows the books' live freshness (advanced by every message
-        on the connection) instead of freezing at the last reprice."""
+        """Age of the oldest input under the current fair: the oldest coin's
+        venue book, or the CF feed if it has gone quiet (pricing on a frozen
+        start/basis/end average is exactly the stale case). While no mid has
+        moved since the fair was computed, the fair is still exact, so the
+        book age follows the books' live freshness instead of the last reprice."""
         if self.result is None or self._newest_mono <= 0:
+            return None
+        cf_age = self.cf.age_s()
+        if cf_age is None:
             return None
         if not self._dirty:
             books = self.bus.venue_books_per_coin()
             live = [max((vb.receive_ts for vb in books.get(c, []) if not vb.is_resyncing), default=0.0)
                     for c in COINS]
             if min(live) > 0:
-                return time.monotonic() - min(live)
-        return time.monotonic() - self._newest_mono
+                return max(time.monotonic() - min(live), self._cf_excess(cf_age))
+        return max(time.monotonic() - self._newest_mono, self._cf_excess(cf_age))
+
+    @staticmethod
+    def _cf_excess(cf_age: float) -> float:
+        """CF ticks once a second, so its age alone runs 0-1s on a healthy
+        feed. Only age past cf_index.STALE_S counts, and then in full, so it
+        trips max_signal_age_s at once."""
+        from kalshi_strategies.KXCRYPTOLEAD15M.cf_index import STALE_S
+        return cf_age if cf_age > STALE_S else 0.0
 
     def feed_age_s(self):
         books = [vb.receive_ts for vbs in self.bus.venue_books_per_coin().values() for vb in vbs]
@@ -427,10 +346,6 @@ class CoinRaceModel:
         return self.signal_age_s()
 
     def side_block(self, ticker, side, fair, now_s):
-        # Both sides: our fair on a contender is confidently wrong either way
-        # (KXCRYPTOLEAD15M-26OCT092330: bought HYPE at a 0.97 fair; BTC won on CF).
-        if fair is not None and fair.extras.get("basis_tie"):
-            return "basis_tie"
         return None
 
     def quote_block(self, ticker, now_s):
@@ -447,14 +362,15 @@ class CoinRaceModel:
             "feed_problem": (None if self.withheld_reason in (None, "before_start")
                              else f"fair withheld: {self.withheld_reason}"),
             "phase": None if r is None else r.phase, "tau_s": snap.tau, "tau_eff": None if r is None else r.tau_eff,
-            "start_quality": dict(snap.start_quality), "withheld_reason": self.withheld_reason,
-            "basis_tie": sorted(self.basis_tie),
+            "cf_start": dict(snap.start), "cf_start_n": dict(snap.start_n), "cf_end_n": dict(snap.end_n),
+            "cf_age_s": self.cf.age_s(), "cf_basis_bp": {c: round(v, 3) for c, v in self.basis_bp.items()},
+            "withheld_reason": self.withheld_reason,
             "market_shift_bp": {c: round(float(self.cfg.pricing.market_shift_alpha * self._shift[i]) * 1e4, 3)
                                 for i, c in enumerate(COINS)},
             "spot_burst": (None if self.spot is None else
-                            {"active": time.monotonic() < self.spot.burst_until,
-                             "coin": self.spot.burst_coin, "n": self.spot.n_bursts,
-                             "thresholds": self.spot.burst_thresholds()}),
+                           {"active": time.monotonic() < self.spot.burst_until,
+                            "coin": self.spot.burst_coin, "n": self.spot.n_bursts,
+                            "thresholds": self.spot.burst_thresholds()}),
             "fairs": None if r is None else {c: float(r.probs[i]) for i, c in enumerate(COINS)},
             "theo_vol": None if r is None else {c: float(r.theo_vol[i]) for i, c in enumerate(COINS)},
             "feed_health": self.health.snapshot(),
@@ -468,35 +384,11 @@ class CoinRaceModel:
     # --- lifecycle -----------------------------------------------------------
 
     def feed_tasks(self):
-        if self.spot is not None:
-            # The session's feed keeps running across events; attach() routes
-            # its bars and wakeups here.
-            self.spot.ensure_running()
-            self.spot.attach(self)
-            return [self.kalshi_start_loop()]
-        tasks = [self._sample_loop(), self._flush_loop()]
-        if self.coinbase is not None:
-            tasks.append(self.coinbase.run(self._on_book))
-        return tasks
-
-    async def _sample_loop(self):
-        """Pin per-second bars aligned to second boundaries (Kalshi's own
-        snapshots are second-aligned)."""
-        while True:
-            now = time.time()
-            try:
-                self._ingest_bars(now)
-            except Exception as e:
-                print(f"[KXCRYPTOLEAD15M] composite sampling error: {e!r}")
-            await asyncio.sleep(max(0.0, int(now) + 1 - now + 0.02))
-
-    async def _flush_loop(self):
-        while True:
-            await asyncio.sleep(self.cfg.pricing.composite_flush_s)
-            try:
-                await asyncio.get_running_loop().run_in_executor(None, self.bus.flush_all)
-            except Exception as e:
-                print(f"[KXCRYPTOLEAD15M] composite flush failed: {e!r}")
+        # The session's feeds keep running across events; attach() routes
+        # their bars and wakeups here.
+        self.spot.ensure_running()
+        self.spot.attach(self)
+        return []
 
     async def close(self):
         if self.spot is not None:

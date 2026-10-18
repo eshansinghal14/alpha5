@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import itertools
 import os
 import time
 from pathlib import Path
@@ -220,6 +221,13 @@ class CompositeFeed:
         if since_s is None:
             return list(self._bars)
         return [b for b in self._bars if b.ts_s >= since_s]
+
+    def tail(self, n: int) -> list[CompositeBar]:
+        """The newest `n` bars, oldest first, without scanning the whole hour."""
+        return list(itertools.islice(reversed(self._bars), n))[::-1]
+
+    def newest_ts(self) -> float | None:
+        return self._bars[-1].ts_s if self._bars else None
 
     def flush(self) -> int:
         """Append any pending bars to parquet. Returns the number of
