@@ -757,7 +757,8 @@ loss limit (-$84 vs -$80). Same pickoff as #5, at 120-300 lots per order.
   than we do (17.8c vs our 16.9c, realized 13.4%): likely sample luck across
   five coins tested. Recheck in a week.
 - Kalshi mid vs live fair: log loss 1.245 vs 1.262 on common states (CI -0.037
-  to +0.003); supports market_shift_alpha 0.25, not more.
+  to +0.003); supported the market shift at 0.25 then. Removed 10-18 once the
+  fair priced on the CF index (see CHANGES).
 Scripts: `%TEMP%/opencode/{all_cal,start_bias,xrp_vol,scale_test,btc_cal}.py`.
 
 ### #8 — Open

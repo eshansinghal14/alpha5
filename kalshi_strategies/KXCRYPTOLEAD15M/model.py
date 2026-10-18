@@ -107,55 +107,6 @@ class CoinRaceModel:
         self._dirty = True
         self.basis_bp: dict[str, float] = {}
         self._basis_cache: dict[str, tuple] = {}
-        # Market-implied relative return shift (see _update_market_shift).
-        self._kmid: dict[str, float] = {}
-        self._shift = np.zeros(len(COINS))      # EMA, applied as alpha * _shift
-        self._shift_raw = np.zeros(len(COINS))  # latest estimate the EMA chases
-        self._shift_t: float | None = None
-        self._shift_fit_t = -math.inf
-
-    def on_book(self, book):
-        """Kalshi BBO for one leg. An empty side is still a price (no bid = 0,
-        no ask = 1); both empty means no market, so the leg's mid is dropped."""
-        c = coin_from_market_ticker(book.ticker)
-        if c is None:
-            return
-        bid = 0.0 if book.bid is None else float(book.bid)
-        ask = 1.0 if book.ask is None else float(book.ask)
-        if bid <= 0.0 and ask >= 1.0:
-            self._kmid.pop(c, None)
-        elif ask > bid:
-            self._kmid[c] = (bid + ask) / 2.0
-
-    def _update_market_shift(self, now_s: float, x: np.ndarray, I: np.ndarray):
-        """Advance the EMA toward the latest market-implied shift and, every
-        market_shift_fit_s, re-estimate it: the mean-zero return shift dx that
-        moves our five fairs onto the Kalshi mids to first order, dp = D dx,
-        with D the bump deltas. Only relative shifts are identified (the five
-        probabilities sum to 1). Frozen once the end average starts: a stale
-        shift there overshoots near-ties (backtest 2026-10-12)."""
-        p = self.cfg.pricing
-        if p.market_shift_alpha <= 0 or now_s >= self.window.end_avg_begin:
-            return
-        if self._shift_t is not None:
-            lam = 1.0 - 0.5 ** (max(0.0, now_s - self._shift_t) / p.market_shift_half_life_s)
-            self._shift += lam * (self._shift_raw - self._shift)
-        self._shift_t = now_s
-        if now_s - self._shift_fit_t < p.market_shift_fit_s or len(self._kmid) < len(COINS):
-            return
-        base = self.pricer.fairs_at(x=x, I=I, tau=max(0.0, self.window.T - now_s), now_s=now_s,
-                                    S=self.window.S, T=self.window.T, start_locked=True, compute_delta=True)
-        Dm = base.delta
-        if not np.any(Dm):
-            return
-        m = np.array([self._kmid[c] for c in COINS])
-        m = m / m.sum()
-        A = Dm.T @ Dm
-        A = A + 1e-2 * np.eye(len(COINS)) * np.trace(A) / len(COINS)
-        dx = np.linalg.solve(A, Dm.T @ (m - base.probs))
-        cap = p.market_shift_max_bp * 1e-4
-        self._shift_raw = np.clip(dx - dx.mean(), -cap, cap)
-        self._shift_fit_t = now_s
 
     def set_wakeup(self, fn):
         self._wake = fn
@@ -254,7 +205,7 @@ class CoinRaceModel:
 
         tau = max(0.0, self.window.T - now_s)
         L = float(START_END_AVG_S)
-        x, I, n_eff = np.zeros(len(COINS)), np.zeros(len(COINS)), np.zeros(len(COINS))
+        x, I = np.zeros(len(COINS)), np.zeros(len(COINS))
         for i, c in enumerate(COINS):
             m, b = self.bus.mid_nowcast(c), self._basis(c)
             if m is None or m <= 0:
@@ -267,13 +218,8 @@ class CoinRaceModel:
             # tau. An elapsed second whose CF tick hasn't landed yet (~70ms
             # after it) is filled with x, the best guess for it, so I and the
             # pricer's remaining-time term never both leave it out.
-            n_eff[i] = min(L, max(float(snap.end_n[c]), L - tau)) if tau < L else 0.0
-            I[i] = (snap.end_log_sum[c] + x[i] * (n_eff[i] - snap.end_n[c])) / L
-        self._update_market_shift(now_s, x, I)
-        sh = p.market_shift_alpha * self._shift
-        x = x + sh
-        # The shift moves every end-average second already counted too.
-        I = I + sh * n_eff / L
+            n_eff = min(L, max(float(snap.end_n[c]), L - tau)) if tau < L else 0.0
+            I[i] = (snap.end_log_sum[c] + x[i] * (n_eff - snap.end_n[c])) / L
         if compute_delta is None:
             compute_delta = self.result is None or now_s - self._last_delta_s >= p.delta_refresh_s
         self.result = self.pricer.fairs_at(x=x, I=I, tau=tau, now_s=now_s,
@@ -365,8 +311,6 @@ class CoinRaceModel:
             "cf_start": dict(snap.start), "cf_start_n": dict(snap.start_n), "cf_end_n": dict(snap.end_n),
             "cf_age_s": self.cf.age_s(), "cf_basis_bp": {c: round(v, 3) for c, v in self.basis_bp.items()},
             "withheld_reason": self.withheld_reason,
-            "market_shift_bp": {c: round(float(self.cfg.pricing.market_shift_alpha * self._shift[i]) * 1e4, 3)
-                                for i, c in enumerate(COINS)},
             "spot_burst": (None if self.spot is None else
                            {"active": time.monotonic() < self.spot.burst_until,
                             "coin": self.spot.burst_coin, "n": self.spot.n_bursts,

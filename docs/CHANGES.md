@@ -3,6 +3,16 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-18 — Crypto: market-implied shift removed
+
+- The fair no longer leans toward the Kalshi mids (`market_shift_alpha`,
+  `_half_life_s`, `_fit_s`, `_max_bp` and the model's Kalshi-book input are
+  gone). Replay of the CF-index model, alpha 0 vs the live 0.25, every 5s of
+  568 events 10-12 17:00..10-18 17:00 UTC: winner log loss 0.9707 vs 0.9707
+  (diff -0.0000, 90% CI +-0.0022). The shift helped 7-15 min out (+0.003) and
+  hurt 1-3 min (-0.004) and the last minute (-0.008), where it is frozen at a
+  stale value; halves disagree in sign. It moved the fair 0.46c on average.
+
 ## 2026-10-18 — Crypto prices and settles on the CF index
 
 - New `cf_index.py`: the CF Benchmarks settlement index for all five coins
