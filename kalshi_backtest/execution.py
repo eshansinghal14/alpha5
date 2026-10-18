@@ -169,6 +169,11 @@ class QueueTracker:
             return None
         if abs(trade.price - self.price) > 1e-9:
             return None
+        # A taker on our own side emptied the OTHER side's queue. Near 0.50 the
+        # two sides' prices overlap (yes bid 0.47, no bid 0.47), so matching on
+        # price alone booked 35-50% phantom maker fills (CRYPTO15M shadow 2026-10-18).
+        if trade.taker_side is not None and trade.taker_side == self.order.side:
+            return None
         available = trade.size
         consume_ahead = min(self.depth_ahead, available)
         self.depth_ahead -= consume_ahead

@@ -258,6 +258,16 @@ def test_shadow_quote_fills_off_trades_behind_the_queue():
     assert 0.41 not in live_prices(eng, "yes")
 
 
+def test_shadow_quote_ignores_print_on_the_other_sides_queue():
+    eng, _, _ = setup()
+    fair(eng)
+    now = pd.Timestamp.now(tz="UTC")
+    # A yes taker at no 0.41 hit the NO queue there, not our yes bid at 0.41.
+    eng.on_trade("A", Trade(ticker="A", time=now, price=0.41, size=1.0, taker_side="yes"), now)
+    assert eng.portfolio.position("A").yes_qty == 0.0
+    assert 0.41 in live_prices(eng, "yes")
+
+
 def _lip_engine():
     eng, _, client = setup(real=True)
     eng.update_book(book(bid=0.10, ask=0.60, depth=500.0))
