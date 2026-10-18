@@ -8,7 +8,8 @@ from kalshi_infra.config import load
 from kalshi_infra.kalshi.markets import EventInfo
 from kalshi_strategies.CRYPTO15M.config import CONFIG_PATH, UpDownConfig
 from kalshi_strategies.CRYPTO15M.model import UpDownModel
-from kalshi_strategies.CRYPTO15M.shared_feed import SharedSpotFeed
+from kalshi_strategies.CRYPTO15M.shared_feed import extend, implied_ema
+from kalshi_strategies.KXCRYPTOLEAD15M.live_feed import SpotFeed
 from kalshi_strategies.KXCRYPTOLEAD15M.composite import CompositeBar
 from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed.base import OrderBookLevel, VenueBook
 
@@ -31,7 +32,7 @@ def _setup(now, coin="BTC", strike=None, cf_mult=1.0, **pricing):
     """Event opened 300s ago; CF and 1s bars at PX * cf_mult for the last 400s,
     so the start average and the basis are both in."""
     cfg = _cfg(**pricing)
-    spot = SharedSpotFeed(cfg, persist=False, venues=False)
+    spot = SpotFeed(cfg, persist=False, venues=False)
     S, T = int(now) - 300, int(now) + 600
     m = {"ticker": f"KX{coin}15M-EV-00", "floor_strike": strike}
     ev = EventInfo("EV", pd.Timestamp(S, unit="s", tz="UTC"), pd.Timestamp(T, unit="s", tz="UTC"), [m])
@@ -41,7 +42,7 @@ def _setup(now, coin="BTC", strike=None, cf_mult=1.0, **pricing):
         spot.cf.add(coin, t, PX[coin] * cf_mult, mono=mono)
         _feed(spot, coin, ts=mono)
         spot.bus.feeds[coin].sample(t)
-    spot.attach(model)
+    spot.attach(model, coins=(coin,))
     return model, spot
 
 
@@ -137,7 +138,7 @@ def test_spot_jump_downweights_implied():
     _feed(spot, "BTC", 1.0010)     # 10bp since the last bars: Kalshi may lag it
     m.on_book(_Book(m.ticker, 0.69, 0.71))
     m.reprice(now)
-    o = spot.implied_ema("BTC").last
+    o = implied_ema(spot, "BTC").last
     assert o is not None and (o.reason is not None or o.se_log > 0.5)
 
 
@@ -145,12 +146,12 @@ def test_vol_off_and_burst_pull_quotes():
     now = time.time()
     m, spot = _setup(now, vol_source="implied")
     assert m.quote_block(m.ticker, now) is None
-    spot.vol_off_until["BTC"] = time.monotonic() + 30
+    extend(spot, "BTC", "vol_off", time.monotonic() + 30)
     assert m.quote_block(m.ticker, now) == "vol_off"
-    spot.vol_burst_until["BTC"] = time.monotonic() + 30
+    extend(spot, "BTC", "vol_burst", time.monotonic() + 30)
     assert m.quote_block(m.ticker, now) == "vol_burst"
-    spot.vol_off_until["ETH"] = spot.vol_burst_until["ETH"] = 0.0
-    spot.vol_off_until["BTC"] = spot.vol_burst_until["BTC"] = 0.0
+    extend(spot, "ETH", "vol_off", time.monotonic() + 30)       # another coin's pull
+    spot.coin_state["BTC"].clear()
     assert m.quote_block(m.ticker, now) is None
 
 
@@ -167,6 +168,47 @@ def test_burst_ratio_trips_on_last_minute_vol():
     m._burst_check()
     assert m.burst_ratio is not None and m.burst_ratio > 2.0
     assert m.quote_block(m.ticker, now) == "vol_burst"
+
+
+def test_one_feed_serves_race_and_single_coin_models():
+    """In the shared process an ETH book wakes the race and the ETH model, a
+    BTC book only the race; a burst pull reaches both; health keeps the
+    first-attached model's thresholds."""
+    from kalshi_strategies.KXCRYPTOLEAD15M.model import CoinRaceModel
+    from kalshi_strategies.KXCRYPTOLEAD15M.tests.conftest import config as race_config
+    from kalshi_strategies.KXCRYPTOLEAD15M.tests.test_model import _event as race_event
+    now = time.time()
+    rcfg = race_config(recovery_s=0.0)
+    spot = SpotFeed(rcfg, persist=False, venues=False)
+    race = CoinRaceModel(race_event(now - 300, now + 600), rcfg, cf=spot.cf, spot=spot)
+    spot.attach(race)
+    cfg = _cfg(soft_stale_s=99.0)
+    S, T = int(now) - 300, int(now) + 600
+    ev = EventInfo("EV", pd.Timestamp(S, unit="s", tz="UTC"), pd.Timestamp(T, unit="s", tz="UTC"),
+                   [{"ticker": "KXETH15M-EV-00", "floor_strike": None}])
+    eth = UpDownModel(ev, cfg, "ETH", spot)
+    spot.attach(eth, coins=("ETH",))
+    assert spot.health.soft_stale_s == rcfg.pricing.soft_stale_s
+    woke = []
+    race.set_wakeup(lambda: woke.append("race"))
+    eth.set_wakeup(lambda: woke.append("eth"))
+    _feed(spot, "ETH", 1.001)
+    assert sorted(woke) == ["eth", "race"]
+    woke.clear()
+    _feed(spot, "BTC", 1.001)
+    assert woke == ["race"]
+    woke.clear()
+    spot._on_cf_tick("ETH", int(now))
+    assert sorted(woke) == ["eth", "race"]
+    woke.clear()
+    spot._pull("BTC", "coinbase", time.monotonic())
+    assert sorted(woke) == ["eth", "race"]                     # every model hears a pull
+    assert race.quote_block(race.tickers[0], now) == "spot_burst"
+    assert eth.quote_block(eth.ticker, now) is None            # but ETH pulls on ETH bursts only
+    spot.detach(eth)
+    woke.clear()
+    _feed(spot, "ETH", 1.002)
+    assert woke == ["race"] and spot.model is race
 
 
 def test_withheld_before_start():

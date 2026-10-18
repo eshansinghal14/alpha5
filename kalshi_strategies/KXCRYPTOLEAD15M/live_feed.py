@@ -83,7 +83,11 @@ class SpotFeed:
         self.health = FeedHealthMonitor(soft_stale_s=p.soft_stale_s, hard_stale_s=p.hard_stale_s,
                                         recovery_s=p.recovery_s)
         self.forecaster_warmed = False
-        self.model = None
+        # Every attached model, and the coins whose books/CF ticks wake it. The
+        # race attaches all five; a single-coin model (CRYPTO15M) attaches one,
+        # so in a shared process a coin's update wakes only the models that price it.
+        self.models: list = []
+        self._wakes: dict[str, list] = {c: [] for c in COINS}
         self._tasks: list[asyncio.Task] = []
         self.bursts = BurstDetector(COINS)
         self.prints = PrintLog(persist=persist)
@@ -93,6 +97,11 @@ class SpotFeed:
         self.burst_until = 0.0
         self.burst_coin: str | None = None
         self.n_bursts = 0
+        # Per coin, for models that pull only on their own coin's bursts.
+        self.burst_until_by_coin: dict[str, float] = {}
+        # Per-coin state single-coin models keep across events (CRYPTO15M:
+        # implied-vol EMA, vol pull holds); opaque here.
+        self.coin_state: dict[str, dict] = {c: {} for c in COINS}
         # Coinbase falls back to config.json's burst_usd_1s until calibrated.
         self.calib = {"coinbase": BurstCalibrator(COINS, p.burst_usd_1s),
                       "hyperliquid": BurstCalibrator(COINS, HL_BURST_USD_1S),
@@ -146,9 +155,11 @@ class SpotFeed:
             self.n_bursts += 1
         self.burst_until = max(self.burst_until, as_of + self.cfg.pricing.burst_hold_s)
         self.burst_coin = coin if src == "coinbase" else f"{coin}@{src}"
-        m = self.model
-        if m is not None:
-            # A pull must reach the quoter now, not at the next mid move.
+        self.burst_until_by_coin[coin] = max(self.burst_until_by_coin.get(coin, 0.0),
+                                             as_of + self.cfg.pricing.burst_hold_s)
+        # A pull must reach the quoter now, not at the next mid move. Every
+        # model: the race pulls the whole event on any coin's burst.
+        for m in self.models:
             m._mid_moved()
 
     def _on_trip(self, kind, src, coin, level, thr, onset, as_of, exch_ts):
@@ -294,27 +305,45 @@ class SpotFeed:
             self._calib_tasks = [asyncio.create_task(self._calib_seed())]
         self._tasks = [asyncio.create_task(c) for c in coros]
 
-    def attach(self, model):
-        p = model.cfg.pricing
-        self.health.soft_stale_s, self.health.hard_stale_s = p.soft_stale_s, p.hard_stale_s
-        self.health.recovery_s = p.recovery_s
-        self.model = model
+    def attach(self, model, coins=None):
+        """`coins`: whose updates wake `model` (default every coin). Feed health
+        thresholds come from the first model attached -- the race's when it
+        shares the process -- so a later model can't loosen them."""
+        if not self.models:
+            p = model.cfg.pricing
+            self.health.soft_stale_s, self.health.hard_stale_s = p.soft_stale_s, p.hard_stale_s
+            self.health.recovery_s = p.recovery_s
+        self.detach(model)
+        self.models.append(model)
+        for c in (COINS if coins is None else coins):
+            self._wakes[c].append(model)
+
+    @property
+    def model(self):
+        """The first attached model (back-compat for single-model callers)."""
+        return self.models[0] if self.models else None
 
     def _on_cf_tick(self, coin: str, ts_s: int):
-        m = self.model
-        if m is not None:
+        for m in self._wakes.get(coin, ()):
             m.cf_ticked()
 
     def detach(self, model):
-        if self.model is model:
-            self.model = None
+        if model in self.models:
+            self.models.remove(model)
+            for ms in self._wakes.values():
+                if model in ms:
+                    ms.remove(model)
 
     def _on_book(self, vb):
-        before = self.bus.mid_nowcast(vb.coin) if vb.coin in self.bus.feeds else None
+        ms = self._wakes.get(vb.coin)
+        if not ms:
+            self.bus.observe(vb)
+            return
+        before = self.bus.mid_nowcast(vb.coin)
         self.bus.observe(vb)
-        m = self.model
-        if m is not None and self.bus.mid_nowcast(vb.coin) != before:
-            m._mid_moved()
+        if self.bus.mid_nowcast(vb.coin) != before:
+            for m in ms:
+                m._mid_moved()
 
     def sample(self, now_s: float):
         """Pin this second's bars into the forecaster. Idempotent per second."""
