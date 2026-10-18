@@ -194,6 +194,10 @@ class LipSettings:
         "fewer than this many contracts ahead at its price, and others queued behind it, is "
         "cancelled and re-placed at the back -- fewest-ahead first, only with write tokens to "
         "spare above cancels_token. null = never.", min=0, step=10.0)
+    lip_max_signal_age_s: float | None = param(
+        "Pull every LIP order (quote and exit) while the fair's newest input is older than this; "
+        "tighter than risk.max_signal_age_s, which still pulls everything. They return as soon as "
+        "it's back under. null = only risk.max_signal_age_s.", min=0.001, max=60, step=0.005)
     lip_min_time_left_s: float = param(
         "No LIP order with fewer than this many seconds to close, the LIP exit included: inside it "
         "LIP inventory is held. The last 3 min lost money net in every cut of the 2026-10-11..14 "

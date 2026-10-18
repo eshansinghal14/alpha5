@@ -444,6 +444,12 @@ class Quoter:
         res_b = qres_bid if (quoting and block_bid is None) else None
         res_a = qres_ask if (quoting and block_ask is None) else None
         ladder = getattr(book, "ladder", None) if book is not None else None
+        lc = self.cfg.lip
+        # The age signal_stale() just read; not None here (None is stale).
+        lip_stale = (lc.lip_max_signal_age_s is not None and self._last_signal_age is not None
+                     and self._last_signal_age > lc.lip_max_signal_age_s)
+        if lip_stale:
+            self._block("lip_stale_signal")
         out, lips = {}, {}
         for side, res in (("yes", res_b), ("no", res_a)):
             d = self._ladder(ticker, side, res, market_bid, market_ask, ladder, net, now)
@@ -463,17 +469,16 @@ class Quoter:
             # LIP obeys enable_quoting, the model's side blocks and quote_block
             # (spot_burst): a big-trade burst is when a 300-lot LIP order gets
             # swept, and the fair it's priced off is momentarily least reliable.
-            side_ok = (q.enable_quoting and not quote_gate
+            side_ok = (q.enable_quoting and not quote_gate and not lip_stale
                        and (block_bid if side == "yes" else block_ask) is None)
             lips[side] = self._lip_target(ticker, side, book, ladder, net, now, prob) if side_ok else None
         lips = self._lip_select(ctx, ticker, lips, ladder, now)
-        lc = self.cfg.lip
         # quote_gate (spot_burst) pulls LIP at once, exit included, same as the
         # edge ladder: the fair is least reliable exactly when a sweep comes.
         # The time cutoff stops the exit too: inside it LIP inventory is held.
         # 26OCT162045: an exit bid HYPE 0.48 x77 at 83s left, 9c over the edge
         # threshold, and fair fell to 0.09 within 17s.
-        hard_off = (not lc.enable_lip_quoting or not q.enable_quoting or bool(quote_gate)
+        hard_off = (not lc.enable_lip_quoting or not q.enable_quoting or bool(quote_gate) or lip_stale
                     or (self.close_time is not None
                         and (self.close_time - now).total_seconds() < lc.lip_min_time_left_s))
         for side in ("yes", "no"):

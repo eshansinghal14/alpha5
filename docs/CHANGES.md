@@ -3,6 +3,23 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-18 — LIP-only signal-age limit
+
+- `lip.lip_max_signal_age_s` (dashboard; null = off): every LIP order, exit
+  included, is pulled while the fair's signal age is over it and returns on
+  the next decision under it; edge quotes keep `risk.max_signal_age_s`.
+  Crypto 0.03. Replayed on decision rows (age, 10-17 00:00 to 10-18 02:50
+  UTC, LIP quote up) and every LIP fill since 10-15 17:00, a fill counted as
+  avoided if the gate was already off 30ms before it:
+  10ms: 63% of LIP time off. 20ms: 32% off, avoids 7.1k lots at -2.7c/lot
+  10s. 30ms: 15% off (15% of accrual), avoids 3.9k lots at -3.1c (-$120 of
+  -$361); kept fills -1.6c. ~3,800 off-spells per LIP side-hour at 30ms, a
+  cancel + create each: ~13 write tokens/s per resting LIP side. Holding LIP
+  off for 0.1-1s after the age recovers took more time without picking out
+  worse fills (avoided markout drifts back to the -1.9c average), so there
+  is no hold. On ETH/BTC alone the avoided fills were about flat: the gate
+  mainly protects SOL/XRP/HYPE.
+
 ## 2026-10-17 — A LIP fill clears that side's LIP target
 
 - `OrderManager.on_fill`: a LIP fill drops the side's published target (the

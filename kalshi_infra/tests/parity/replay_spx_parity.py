@@ -112,7 +112,7 @@ def new_cfg(oc):
         lip=P.LipSettings(enable_lip_quoting=False, lip_cheap_max_price=0.2, lip_max_price=0.5, lip_offer_max_price=0.5, lip_markets=None,
                           lip_bid_lots=0.0, lip_offer_lots=0.0,
                           lip_constant_edge=None,
-                          lip_max_markets=None, lip_requeue_min_ahead=None,
+                          lip_max_markets=None, lip_requeue_min_ahead=None, lip_max_signal_age_s=None,
                           lip_min_time_left_s=0.0, lip_hold_s=1.0))
 
 

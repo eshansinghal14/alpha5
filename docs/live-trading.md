@@ -161,7 +161,9 @@ Per market and side (`trading/quoter.py` docstring has the formula):
   `lip_min_time_left_s` to close. Size is net of the position already held
   on that side and our resting edge size there. Capped at own-side fair minus
   `lip_constant_edge`. Pulled with the edge quotes on no fair, a stale
-  signal, `enable_quoting` off, a model side block or `spot_burst`. Moved at
+  signal, `enable_quoting` off, a model side block or `spot_burst`; LIP
+  alone (quote and exit) is also pulled while the signal age is over
+  `lip_max_signal_age_s` (null = off). Moved at
   most once per `lip_hold_s`. The LIP exit (inventory offered back on the
   other side, at the front of the book) is sized to the inventory alone and
   only runs where its yes price is under 0.50. It stops at

@@ -47,7 +47,7 @@ def cfg(risk_kw=None, **q):
 
 LIP_OFF = dict(enable_lip_quoting=False, lip_cheap_max_price=0.2, lip_max_price=0.5, lip_offer_max_price=0.5, lip_markets=None, lip_bid_lots=0.0,
                lip_offer_lots=0.0, lip_constant_edge=None, lip_max_markets=None,
-               lip_requeue_min_ahead=None, lip_min_time_left_s=0.0, lip_hold_s=1.0)
+               lip_requeue_min_ahead=None, lip_max_signal_age_s=None, lip_min_time_left_s=0.0, lip_hold_s=1.0)
 
 
 class Model:
@@ -583,6 +583,29 @@ def test_lip_pulled_on_stale_signal():
     q.model.age = 5.0
     step(q, ctx, dt=0.1)
     assert ctx.lip_targets[("A", "yes")] is None and ctx.lip_targets[("A", "no")] is None
+
+
+def test_lip_max_signal_age_pulls_lip_only():
+    """Age 0.02 against lip_max_signal_age_s 0.01 (risk limit 1.0): LIP quote
+    and exit are pulled, the edge ladder stays; back under, LIP returns."""
+    q, ctx = lip_q(lip_max_signal_age_s=0.01, lip_offer_lots=60.0)
+    _lip_fill(ctx, "yes", 50.0, 0.10)
+    q.model.age = 0.02
+    lip_step(q, ctx, fair=0.105)
+    assert ctx.lip_targets[("A", "yes")] is None and ctx.lip_targets[("A", "no")] is None
+    assert q.block_counts.get("lip_stale_signal", 0) >= 1
+    assert ctx.desired[("A", "yes")] is not None and q.block_counts.get("stale_signal", 0) == 0
+    q.model.age = 0.005
+    lip_step(q, ctx, fair=0.105, dt=0.1)
+    assert ctx.lip_targets[("A", "yes")] is not None
+    assert ctx.lip_targets[("A", "no")] is not None and ctx.lip_targets[("A", "no")].front
+
+
+def test_lip_max_signal_age_null_is_off():
+    q, ctx = lip_q(lip_max_signal_age_s=None)
+    q.model.age = 0.5
+    lip_step(q, ctx, fair=0.105)
+    assert ctx.lip_targets[("A", "yes")] is not None
 
 
 def test_lip_size_net_of_position_on_that_side():
