@@ -13,28 +13,28 @@
   },
   "KXINXU": {
     "quoting": {
-      "max_position": 5.0,
+      "max_position": 30.0,
       "constant_edge": 0.01,
-      "constant_edge_ref_s": null,
       "edge_fraction": 0.6,
-      "lean_dollars": 0.02,
-      "max_markets": 5,
+      "lean_dollars": 0.01,
+      "max_markets": 8,
       "atm_hysteresis": 2,
       "enable_taking": false,
       "enable_quoting": true,
       "quoting_edge": 0.0,
       "max_improve_ticks": 1,
-      "quote_levels_behind": 2,
+      "quote_levels_behind": 0,
       "skip_quote_depth_ahead": null,
-      "quote_keep_inside": 0.0,
+      "quote_keep_inside": 0.01,
       "quote_ahead_grace_s": 1.0,
-      "cancels_token": 20.0,
+      "cancels_token": 30.0,
       "requote_delay_s": 1.0,
-      "order_lots": 0.5
+      "order_lots": 5.0,
+      "constant_edge_ref_s": null
     },
     "trading_time": {
       "real_trading_delay_s": 0.0,
-      "real_trading_cutoff_s": 0.0
+      "real_trading_cutoff_s": 600.0
     },
     "risk": {
       "max_loss_usd": 80.0,
@@ -55,12 +55,12 @@
       "lip_markets": null,
       "lip_bid_lots": 0.0,
       "lip_offer_lots": 0.0,
+      "lip_min_time_left_s": 0.0,
+      "lip_hold_s": 1.0,
       "lip_constant_edge": null,
       "lip_max_markets": null,
       "lip_requeue_min_ahead": null,
-      "lip_max_signal_age_s": null,
-      "lip_min_time_left_s": 0.0,
-      "lip_hold_s": 1.0
+      "lip_max_signal_age_s": null
     },
     "pricing": {
       "event_suffix": "H1600",
@@ -79,31 +79,31 @@
   },
   "KXINXDUD": {
     "quoting": {
-      "max_position": 5.0,
+      "max_position": 60.0,
       "constant_edge": 0.01,
-      "constant_edge_ref_s": null,
-      "edge_fraction": 1.0,
-      "lean_dollars": 0.02,
+      "edge_fraction": 0.6,
+      "lean_dollars": 0.01,
       "max_markets": null,
       "atm_hysteresis": 0,
       "enable_taking": false,
       "enable_quoting": true,
-      "quoting_edge": 0.005,
+      "quoting_edge": 0.0,
       "max_improve_ticks": 1,
-      "quote_levels_behind": 2,
+      "quote_levels_behind": 0,
       "skip_quote_depth_ahead": null,
-      "quote_keep_inside": 0.0,
+      "quote_keep_inside": 0.01,
       "quote_ahead_grace_s": 1.0,
-      "cancels_token": 20.0,
+      "cancels_token": 40.0,
       "requote_delay_s": 1.0,
-      "order_lots": 0.5
+      "order_lots": 15.0,
+      "constant_edge_ref_s": null
     },
     "trading_time": {
       "real_trading_delay_s": 0.0,
-      "real_trading_cutoff_s": 0.0
+      "real_trading_cutoff_s": 600.0
     },
     "risk": {
-      "max_loss_usd": 80.0,
+      "max_loss_usd": 200.0,
       "max_signal_age_s": 0.2,
       "max_fair_band": 0.3,
       "max_fair_outside_touch": 0.15,
@@ -121,12 +121,12 @@
       "lip_markets": null,
       "lip_bid_lots": 0.0,
       "lip_offer_lots": 0.0,
+      "lip_min_time_left_s": 0.0,
+      "lip_hold_s": 1.0,
       "lip_constant_edge": null,
       "lip_max_markets": null,
       "lip_requeue_min_ahead": null,
-      "lip_max_signal_age_s": null,
-      "lip_min_time_left_s": 0.0,
-      "lip_hold_s": 1.0
+      "lip_max_signal_age_s": null
     },
     "pricing": {
       "event_suffix": "H1600",
