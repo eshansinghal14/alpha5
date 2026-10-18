@@ -23,7 +23,7 @@ def _pick_event(events, cfg):
 async def _build(ev, cfg):
     from kalshi_strategies.KXCRYPTOLEAD15M.model import CoinRaceModel
     from kalshi_strategies.KXCRYPTOLEAD15M.shared import get_spot
-    spot = await get_spot(cfg, persist=True, tag=TICKER)
+    spot = await get_spot(cfg, persist=True, tag=TICKER, owner=True)
     return CoinRaceModel(ev, cfg, cf=spot.cf, spot=spot)
 
 

@@ -69,9 +69,16 @@ class Observation:
 
 def observe(m: float, half_spread: float, mu: float, g: float, tau: float, b: float, nu: float | None, *,
             mid_noise_floor: float, spot_err: float, max_obs_se: float, max_curvature: float,
-            s_bounds: tuple[float, float]) -> Observation:
+            s_bounds: tuple[float, float], ref_s: float | None = None) -> Observation:
     """One implied-vol observation from the Kalshi mid `m`. `mu`, `b`, `spot_err`
-    in log units; `spot_err` already includes any recent-move (lag) term."""
+    in log units; `spot_err` already includes any recent-move (lag) term.
+
+    `ref_s`: the vol the weight (vega, SE, curvature) is evaluated at -- the
+    EMA's current value. Evaluated at the reading's own vol instead, a high
+    reading got more weight than an equally noisy low one, biasing the mean
+    up (KXETH15M 10-18 22:39-23:10: fast EMA 1.01bp vs ~0.93bp the mid implied
+    at our spot level, theo above the ask 61% of seconds). None = the reading's
+    own vol (no estimate yet)."""
     te, _, phase = variance_clock(tau)
     if phase != "in_window" or te <= 0:
         return Observation(float("nan"), float("inf"), 0.0, 0.0, "not_in_window")
@@ -85,15 +92,16 @@ def observe(m: float, half_spread: float, mu: float, g: float, tau: float, b: fl
     s = math.sqrt(sd2 / te)
     if not (s_bounds[0] <= s <= s_bounds[1]):
         return Observation(s, float("inf"), 0.0, 0.0, "out_of_bounds")
-    _, delta, vega = greeks(mu, g, s, te, b, nu)
+    w = s if ref_s is None or not (ref_s > 0) else ref_s
+    _, delta, vega = greeks(mu, g, w, te, b, nu)
     if vega == 0:
         return Observation(s, float("inf"), vega, delta, "no_vega")
     dm = max(half_spread, mid_noise_floor)
     se_s = math.sqrt(dm * dm + (delta * spot_err) ** 2) / abs(vega)
-    se_log = se_s / s
+    se_log = se_s / w
     # Second order: volga from a central difference of vega.
-    h = 0.05 * s
-    volga = (greeks(mu, g, s + h, te, b, nu)[2] - greeks(mu, g, s - h, te, b, nu)[2]) / (2 * h)
+    h = 0.05 * w
+    volga = (greeks(mu, g, w + h, te, b, nu)[2] - greeks(mu, g, w - h, te, b, nu)[2]) / (2 * h)
     if abs(volga) * se_s / abs(vega) > max_curvature:
         return Observation(s, se_log, vega, delta, "curvature")
     if se_log > max_obs_se:

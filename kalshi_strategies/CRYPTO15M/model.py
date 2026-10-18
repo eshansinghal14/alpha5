@@ -173,11 +173,13 @@ class UpDownModel:
             return
         self._iv_last_sec = sec
         spot_err = math.hypot(p.implied_spot_err_bp * 1e-4, self._spot_move(now_s))
+        ema = implied_ema(self.spot, self.coin)
         obs = observe(km, (self._kask - self._kbid) / 2, x, 1.0, tau, bsd, p.t_nu,
                       mid_noise_floor=p.implied_mid_noise, spot_err=spot_err, max_obs_se=p.implied_max_obs_se,
                       max_curvature=p.implied_max_curvature,
-                      s_bounds=(p.implied_vol_min_bp * 1e-4, p.implied_vol_max_bp * 1e-4))
-        implied_ema(self.spot, self.coin).add(now_s, obs, p.implied_ema_s, p.vol_off_fast_s)
+                      s_bounds=(p.implied_vol_min_bp * 1e-4, p.implied_vol_max_bp * 1e-4),
+                      ref_s=ema.value(now_s, p.implied_ema_s, 1.0))
+        ema.add(now_s, obs, p.implied_ema_s, p.vol_off_fast_s)
 
     def _vol_off_check(self, now_s: float):
         """Pull 1: the fast implied EMA has left the slow one (|ln ratio| over

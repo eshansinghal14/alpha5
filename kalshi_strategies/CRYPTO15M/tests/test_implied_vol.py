@@ -65,6 +65,30 @@ def test_fast_ema_tracks_a_step_and_recalibrates_slow():
     assert abs(e.value(720.0, 900.0, 1) / math.exp(lf) - 1) < 1e-9 and e.n_recal == 1
 
 
+def test_weights_at_reference_vol_are_unbiased():
+    """Readings at 0.8x and 1.25x the true vol, same spot. Weighted at their own
+    vol the two get different weights (which one wins depends on the point), so
+    the mean is off the true vol; at the EMA's vol they weigh the same and the
+    mean is exact."""
+    x = 12e-4
+    lo, hi = 0.8 * S, 1.25 * S
+    own = [observe(_mid(x, s=v), 0.005, x, 1.0, TAU, 0.0, 5.0, spot_err=1e-4, **KW) for v in (lo, hi)]
+    ref = [observe(_mid(x, s=v), 0.005, x, 1.0, TAU, 0.0, 5.0, spot_err=1e-4, ref_s=S, **KW) for v in (lo, hi)]
+    assert all(o.reason is None for o in own + ref)
+    assert abs(own[0].se_log - own[1].se_log) > 1e-4
+    assert abs(ref[0].se_log - ref[1].se_log) < 1e-12
+
+    def mean(obs):
+        e = ImpliedVolEMA()
+        for t in range(50):
+            for o in obs:
+                e.add(float(t), o, 900.0)
+        return e.value(50.0, 900.0, 1)
+
+    assert abs(mean(ref) / S - 1) < 1e-9
+    assert abs(mean(own) / S - 1) > 1e-4
+
+
 def test_precision_weighting_favours_informative_obs():
     e = ImpliedVolEMA()
     sharp = observe(_mid(15e-4), 0.005, 15e-4, 1.0, TAU, 0.0, 5.0, spot_err=1e-4, **KW)

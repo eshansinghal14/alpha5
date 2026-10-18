@@ -17,8 +17,19 @@ _SPOT = None
 _LOCK: asyncio.Lock | None = None
 
 
-async def get_spot(cfg, *, persist: bool = True, tag: str = "crypto"):
-    """The process's SpotFeed, started, seeded and with its forecaster warmed."""
+def adopt_owner(spot, cfg):
+    """Make `cfg` the feed's config: burst pulls (burst_pull_coins,
+    burst_hold_s) and feed health are read from spot.cfg at run time. The race
+    owns it, so its settings hold whichever series happened to build the feed."""
+    spot.cfg = cfg
+    p = cfg.pricing
+    spot.health.soft_stale_s, spot.health.hard_stale_s = p.soft_stale_s, p.hard_stale_s
+    spot.health.recovery_s = p.recovery_s
+
+
+async def get_spot(cfg, *, persist: bool = True, tag: str = "crypto", owner: bool = False):
+    """The process's SpotFeed, started, seeded and with its forecaster warmed.
+    `owner`: this series' config becomes the feed's (the race passes True)."""
     global _SPOT, _LOCK
     from kalshi_strategies.KXCRYPTOLEAD15M.live_feed import SpotFeed
     from kalshi_strategies.KXCRYPTOLEAD15M.model import warm_forecaster
@@ -36,6 +47,8 @@ async def get_spot(cfg, *, persist: bool = True, tag: str = "crypto"):
                 await loop.run_in_executor(None, _SPOT.cf.seed, now - 2 * 3600, now)
             except Exception as e:
                 print(f"[{tag}] CF index seed failed ({e!r}); waiting on the live feed", flush=True)
+        if owner and _SPOT.cfg is not cfg:
+            adopt_owner(_SPOT, cfg)
         _SPOT.ensure_running()
         if not _SPOT.forecaster_warmed:
             # Off the loop: replaying 4h of bars takes seconds, and the spot
@@ -54,4 +67,4 @@ def reset():
     _SPOT, _LOCK = None, None
 
 
-__all__ = ["get_spot", "reset"]
+__all__ = ["get_spot", "adopt_owner", "reset"]

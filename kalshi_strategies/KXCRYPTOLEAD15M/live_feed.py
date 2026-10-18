@@ -307,9 +307,9 @@ class SpotFeed:
 
     def attach(self, model, coins=None):
         """`coins`: whose updates wake `model` (default every coin). Feed health
-        thresholds come from the first model attached -- the race's when it
-        shares the process -- so a later model can't loosen them."""
-        if not self.models:
+        thresholds follow only the model whose config is the feed's (the race's
+        in a shared process, see shared.adopt_owner), so another can't loosen them."""
+        if model.cfg is self.cfg:
             p = model.cfg.pricing
             self.health.soft_stale_s, self.health.hard_stale_s = p.soft_stale_s, p.hard_stale_s
             self.health.recovery_s = p.recovery_s
