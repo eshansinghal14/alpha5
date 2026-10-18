@@ -3,6 +3,33 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-18 — Crypto prices and settles on the CF index
+
+- New `cf_index.py`: the CF Benchmarks settlement index for all five coins
+  from Kalshi's relay (`cfbenchmarks_value` websocket, one whole-second tick
+  per index; REST `/cfbenchmarks/values` fills gaps and seeds a restart).
+  Persisted to `data/kalshi_crypto/cf_index/{coin}_{day}_{HH}.parquet`.
+- Start and end = mean of the index's seconds over [S-60, S) and [T-60, T).
+  On 10-12..18 that matched Kalshi's published expiration_value to <=0.02bp
+  (XRP's is rounded to 4 dp); the race paid the exact-average winner where
+  the rounded values disagreed (26OCT130400, 26OCT161015). Kalshi's WS
+  quarter-hour average uses (S-60, S] and is 0.003-0.03bp off; not used.
+- Pricing: x = ln(mid / CF start) - basis, basis = mean ln(mid / CF) over the
+  last 30 CF seconds; last-minute I from CF seconds (an elapsed second whose
+  tick hasn't landed counts at x). Replay 10-12 17:00..10-18 05:00 (516
+  events): last-minute winner log loss 0.238 -> 0.115 on the held-out half,
+  in-window unchanged (+0.0002, CI +-0.006). Shadow beside live 10-18
+  08:39-10:15 UTC (6 settled events): last minute 0.284 -> 0.121, all
+  0.987 -> 0.955; stale_signal share 7.1% vs live 7.9%; every start/end within
+  0.02bp of expiration_value (XRP 0.33, its 4-dp rounding), 6/6 winners.
+- CF ticks older than 2.5s count in full toward signal age, so a dead CF feed
+  is `stale_signal` (every quote pulled). No start yet: fair withheld
+  (`no_cf_start`) and a REST fill requested.
+- Removed: the mid start TWAP and its backfill, the Kalshi-start anchor
+  (`kalshi_start.py`, `kalshi_start_offset_events`), `basis_tie` and
+  `basis_tie_gap`, the independent basis noise (`BASIS_SD_BP`,
+  `APPLY_BASIS_SD`), `quote_before_start`.
+
 ## 2026-10-18 — Edge top quote holds its place when others join it
 
 - Real mode: if our best edge quote was alone at its price on an earlier
