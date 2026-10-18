@@ -52,6 +52,49 @@ NO_EVENT_RETRY_S = 300.0    # nothing listed yet (e.g. KXINX lists the next day'
 RETRY_S = 30.0              # failed lookup or failed event
 
 
+SETTLE_POLL_S = (15, 30, 60, 120, 300, 600)
+_SETTLE_TASKS: set = set()
+
+
+def settled_pnl(positions: dict, results: dict) -> float | None:
+    """Settlement PnL from {ticker: (yes_qty, no_qty, yes_cost, no_cost, fees)}
+    and {ticker: "yes" | "no"}; None until every ticker has a result."""
+    total = 0.0
+    for t, (yq, nq, yc, nc, fee) in positions.items():
+        r = results.get(t)
+        if r not in ("yes", "no"):
+            return None
+        total += (yq if r == "yes" else 0.0) + (nq if r == "no" else 0.0) - yc - nc - fee
+    return total
+
+
+async def _log_settled(series: str, event_ticker: str, positions: dict, marked: float):
+    """Log the event's settled real PnL once Kalshi publishes every result.
+    Off the trading path: a few REST reads, retried for ~19 min, then dropped."""
+    from kalshi_infra.api_functions import kalshi_get
+    loop = asyncio.get_running_loop()
+    results: dict[str, str] = {}
+    for wait in SETTLE_POLL_S:
+        await asyncio.sleep(wait)
+        for t in positions:
+            if t in results:
+                continue
+            try:
+                m = (await loop.run_in_executor(None, functools.partial(
+                    kalshi_get, f"/trade-api/v2/markets/{t}", max_retries=2))).get("market", {})
+            except Exception:
+                continue
+            if m.get("status") in ("finalized", "settled", "determined") and m.get("result") in ("yes", "no"):
+                results[t] = m["result"]
+        pnl = settled_pnl(positions, results)
+        if pnl is not None:
+            _log(series, f"{event_ticker} real PnL settled {pnl:+.2f} (marked at disarm {marked:+.2f}, "
+                         f"diff {pnl - marked:+.2f})")
+            return
+    _log(series, f"{event_ticker} real PnL settled: results not published after "
+                 f"{sum(SETTLE_POLL_S)}s ({len(results)}/{len(positions)} markets)")
+
+
 def _log(series: str, msg: str):
     print(f"[{series}] {msg}", flush=True)
 
@@ -265,7 +308,14 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
     engine.real_lock = run_state.get("lock")
     # This event's real PnL, worse of touch/fair, as of the last moment it
     # was armed -- after a cutoff disarm the ledger keeps taking paper fills.
-    event_real = {"pnl": None}
+    event_real = {"pnl": None, "positions": None}
+
+    def _snap_real():
+        """Mark and position snapshot at the last armed moment. The position is
+        what settles; paper fills after a cutoff disarm are not real."""
+        event_real["pnl"] = min(engine.current_pnl(mark="touch"), engine.current_pnl(mark="prob"))
+        event_real["positions"] = {t: (p.yes_qty, p.no_qty, p.yes_cost, p.no_cost, p.fees_paid)
+                                   for t, p in engine.portfolio.positions.items() if p.yes_qty or p.no_qty}
     stop = {"reason": None}
     stop_evt = asyncio.Event()
 
@@ -309,6 +359,7 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
             elif arm["want"]:
                 _log(S, f"real trading OFF: within {cfg.trading_time.real_trading_delay_s:g}s of open; "
                         f"paper continues, arms once the delay passes")
+            _snap_real()
             engine.set_live_trading(False)
         elif (arm["want"] and not engine.live_trading and not outside_trading_time()
               and not engine.halted and engine.real_lock is None and time.monotonic() >= arm["retry_at"]):
@@ -491,7 +542,7 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
             try:
                 engine.check_failsafe()
                 if engine.live_trading:
-                    event_real["pnl"] = min(engine.current_pnl(mark="touch"), engine.current_pnl(mark="prob"))
+                    _snap_real()
                 if engine.halt_kind == "loss" and run_state["lock"] is None:
                     # This series only, and the process stays up in shadow: a
                     # restart is what re-enables real trading.
@@ -499,6 +550,7 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
                     engine.real_lock = run_state["lock"]
                     _log(S, f"LOSS LIMIT: {engine.halt_reason} -- real trading OFF for {S} until restart; "
                             f"shadow resumes next event, other series unaffected")
+                    _snap_real()
                     engine.set_live_trading(False)
                 elif stopper is not None and (reason := stopper.poll()) is not None:
                     _stop(reason)
@@ -578,7 +630,7 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
                 if engine.has_quote_history():
                     engine.apply_real_fills(engine.order_client.fills(
                         ev.event_ticker, min_ts=engine.fill_poll_min_ts()))
-                event_real["pnl"] = min(engine.current_pnl(mark="touch"), engine.current_pnl(mark="prob"))
+                _snap_real()
                 engine.live_trading = False
             except Exception:
                 _log(S, f"WARN: shutdown cleanup failed -- CHECK KALSHI BY HAND for resting "
@@ -599,13 +651,19 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
         except Exception:
             _log(S, "WARN: final snapshot failed:")
             traceback.print_exc()
-        # Marked at the last armed moment (worse of touch/fair), not at
-        # settlement, so it can differ from the account by the move after.
-        # The run total is informational; the loss limit is per event.
+        # Marked at the last armed moment (worse of touch/fair), so it misses
+        # the last minute: 26OCT181930 logged +13.76 and settled -33.62 when the
+        # race flipped at 23:29 UTC. The settled line follows once Kalshi
+        # publishes. The run total is informational; the loss limit is per event.
         if event_real["pnl"] is not None:
             run_state["real_pnl"] += event_real["pnl"]
-            _log(S, f"{ev.event_ticker} real PnL {event_real['pnl']:+.2f} (halt at -{cfg.risk.max_loss_usd:g} "
-                    f"per event); this run {run_state['real_pnl']:+.2f}")
+            _log(S, f"{ev.event_ticker} real PnL marked at disarm {event_real['pnl']:+.2f} (worse of touch/fair; "
+                    f"halt at -{cfg.risk.max_loss_usd:g} per event); this run {run_state['real_pnl']:+.2f}")
+            if event_real["positions"]:
+                t = asyncio.get_running_loop().create_task(
+                    _log_settled(S, ev.event_ticker, event_real["positions"], event_real["pnl"]))
+                _SETTLE_TASKS.add(t)       # the loop only holds weak refs to tasks
+                t.add_done_callback(_SETTLE_TASKS.discard)
     if stop["reason"] is not None:
         raise StopAll(stop["reason"])
     return arm["want"]
