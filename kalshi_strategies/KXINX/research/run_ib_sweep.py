@@ -5,8 +5,8 @@ assumption.
 
 Usage:
     python -m kalshi_strategies.KXINX.research.run_ib_sweep                  # both series
-    python -m kalshi_strategies.KXINX.research.run_ib_sweep KXINX            # one series
-    python -m kalshi_strategies.KXINX.research.run_ib_sweep KXINX EVENT...   # specific events
+    python -m kalshi_strategies.KXINX.research.run_ib_sweep KXINXU           # one series
+    python -m kalshi_strategies.KXINX.research.run_ib_sweep KXINXU EVENT...  # specific events
 """
 import sys
 import traceback
@@ -44,6 +44,6 @@ def main(series_list, only_events=None):
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    series = [a for a in args if a in ("KXINX", "KXINXU")]
+    series = [a for a in args if a in ("KXINXU", "KXINXDUD")]
     events = [a for a in args if "-" in a]
-    main(series or ["KXINX", "KXINXU"], only_events=events or None)
+    main(series or ["KXINXU", "KXINXDUD"], only_events=events or None)

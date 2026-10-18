@@ -3,6 +3,18 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-18 — S&P: KXINX range buckets no longer traded; one KXINX+ page
+
+- `kalshi_strategies/KXINX` registers only KXINXU and KXINXDUD; the KXINX
+  section of config.json is gone. It never ran armed: 10-14..10-16 shadow
+  was 212 of 223 fills taker at -1.3c/contract 10s markout. Bucket pricing
+  (`bucket_fairs`, grid/backtest) is kept for research.
+- Dashboard: the folder's series share one sidebar page, "KXINX+"
+  (`DASHBOARD_NAME`). The performance panel pools both series' real fills
+  (with a per-series split under "Markout by fill type"). Each series'
+  status and theo/NBBO charts sit under its own header. A ticker slider in
+  the sidebar picks which section the config form edits.
+
 ## 2026-10-18 — Crypto: market-implied shift removed
 
 - The fair no longer leans toward the Kalshi mids (`market_shift_alpha`,

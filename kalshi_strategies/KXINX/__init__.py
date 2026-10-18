@@ -1,6 +1,7 @@
-"""S&P 500 daily close, priced off SPXW 0DTE options: KXINX (range buckets),
-KXINXU (above/below ladder) and KXINXDUD (one "above prior close" market).
-Pricing only -- the runtime does the rest.
+"""S&P 500 daily close, priced off SPXW 0DTE options: KXINXU (above/below
+ladder) and KXINXDUD (one "above prior close" market). Pricing only -- the
+runtime does the rest. KXINX itself (range buckets) is not traded; the
+pricing still handles bucket markets for the backtests and research.
 
 `python -m kalshi_strategies.run --series KXINX` runs every series here plus
 the shared pricing hub (SERVICES); `--only KXINXU` runs one series."""
@@ -14,13 +15,15 @@ from kalshi_infra.runtime.series import Series, Service
 from kalshi_strategies.KXINX.config import CONFIG_PATH, HUB_KEY, SpxConfig
 
 _ET = "America/New_York"
-# All three series run in one process on one write bucket, cancel reserve
-# and quote priority queue (they are all on shard 0).
+# Both series run in one process on one write bucket, cancel reserve and
+# quote priority queue (both are on shard 0).
 WRITE_GROUP = "spx-daily"
 # Who gets the shared bucket first (lower first). KXINXDUD is one market and
-# needs few writes; KXINXU's 5-market ladder takes whatever it is given (88%
-# of the 240 tokens/s on 2026-10-15), so it goes after DUD.
-WRITE_PRIORITY = {"KXINXDUD": 0, "KXINX": 1, "KXINXU": 2}
+# needs few writes; KXINXU's ladder takes whatever it is given (88% of the
+# 240 tokens/s on 2026-10-15), so it goes after DUD.
+WRITE_PRIORITY = {"KXINXDUD": 0, "KXINXU": 1}
+# One dashboard page for both series (kalshi_viz.app).
+DASHBOARD_NAME = "KXINX+"
 
 
 def _pick_event(events, cfg):
@@ -58,5 +61,5 @@ def _hub_port() -> int:
     return load(HubConfig, CONFIG_PATH, HUB_KEY).port
 
 
-SERIES = {t: _make(t) for t in ("KXINX", "KXINXU", "KXINXDUD")}
+SERIES = {t: _make(t) for t in ("KXINXU", "KXINXDUD")}
 SERVICES = [Service(name="spx-hub", module="kalshi_strategies.KXINX.hub", port=_hub_port)]

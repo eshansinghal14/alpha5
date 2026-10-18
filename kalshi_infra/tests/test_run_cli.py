@@ -16,8 +16,14 @@ def _resolve(fmap, series=None, only=None):
 
 def test_folder_expands_to_all_its_series_and_hub(fmap):
     s, svc = _resolve(fmap, ["KXINX"])
-    assert s == ["KXINX", "KXINXU", "KXINXDUD"]
+    assert s == ["KXINXU", "KXINXDUD"]
     assert [x.name for x in svc] == ["spx-hub"]
+
+
+def test_kxinx_buckets_not_traded(fmap):
+    assert "KXINX" not in run.registry()
+    with pytest.raises(SystemExit):
+        _resolve(fmap, only=["KXINX"])
 
 
 def test_only_runs_one_series_but_keeps_its_hub(fmap):
@@ -37,11 +43,11 @@ def test_series_ticker_is_not_a_folder(fmap):
 
 def test_dedup_and_case(fmap):
     s, _ = _resolve(fmap, ["kxinx", "KXINX"], ["KXINXDUD"])
-    assert s == ["KXINX", "KXINXU", "KXINXDUD"]
+    assert s == ["KXINXU", "KXINXDUD"]
 
 
 def test_write_group_runs_as_one_process(fmap):
     reg = run.registry()
     s, _ = _resolve(fmap, ["KXINX", "KXCRYPTOLEAD15M"])
-    assert run.units_of(s, reg) == [["KXINX", "KXINXU", "KXINXDUD"], ["KXCRYPTOLEAD15M"]]
+    assert run.units_of(s, reg) == [["KXINXU", "KXINXDUD"], ["KXCRYPTOLEAD15M"]]
     assert run.units_of(["KXINXU"], reg) == [["KXINXU"]]

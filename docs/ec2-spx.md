@@ -1,6 +1,6 @@
 # S&P on the EC2 box
 
-How to run the S&P strategy (KXINX + KXINXU + KXINXDUD + pricing hub) on
+How to run the S&P strategy (KXINXU + KXINXDUD + pricing hub) on
 `alpha5-live` (us-east-1; c7g.xlarge since 2026-10-14). The public IP changes on every stop/start (no Elastic IP); get it with `aws ec2 describe-instances --filters Name=tag:Name,Values=alpha5-live --query "Reservations[0].Instances[0].PublicIpAddress" --output text`, written `<ip>` below, next to KXCRYPTOLEAD15M, with IB
 Gateway on the same box and one dashboard for both.
 
@@ -8,15 +8,15 @@ Gateway on the same box and one dashboard for both.
 
 ```
 alpha5-ibgateway  docker: IB Gateway + IBC + Xvfb   127.0.0.1:4001 (API), :5900 (VNC)
-alpha5-spx        run --series KXINX   -> hub (only IB client) + one process for the 3 series
+alpha5-spx        run --series KXINX   -> hub (only IB client) + one process for KXINXU + KXINXDUD
 alpha5-crypto     unchanged (nice -5, real money)
 alpha5-dashboard  one Streamlit for every series (sidebar), 127.0.0.1:8502
 alpha5-watchdog   unchanged; already covers every series under data/live
 ```
 
 The dashboard needs no change: its series list comes from the registry,
-so the S&P series appear in the same sidebar as crypto as soon as their
-`data/live/<SERIES>/` folders exist on the box.
+so the S&P series appear in the same sidebar as crypto (as one "KXINX+"
+page) as soon as their `data/live/<SERIES>/` folders exist on the box.
 
 ## What has to be true first
 
@@ -82,7 +82,7 @@ series and write budget from two machines.
 ## Operating
 
 - Dashboard: `ssh -i ... -N -L 8502:127.0.0.1:8502 ubuntu@<ip>`,
-  then http://localhost:8502. Crypto and the three S&P series are in one sidebar.
+  then http://localhost:8502. Crypto and the S&P page (KXINX+) are in one sidebar.
 - Gateway screen (2FA, stuck dialog):
   `ssh -i ... -N -L 5900:127.0.0.1:5900 ubuntu@<ip>`, then any VNC
   client on localhost:5900 with `VNC_SERVER_PASSWORD`.

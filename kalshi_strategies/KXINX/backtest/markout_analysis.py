@@ -46,7 +46,7 @@ want those specifically instead of the combined PDF.
 
 Usage:
     python -m kalshi_strategies.KXINX.backtest.markout_analysis [event_ticker ...] [n]
-Defaults to KXINX-26AUG18H1600, n=5. One or more event tickers may be
+Defaults to KXINXU-26AUG28H1600, n=5. One or more event tickers may be
 passed (one full run per ticker); a trailing all-digit argument is read as
 n instead of a ticker.
 """
@@ -667,6 +667,6 @@ if __name__ == "__main__":
     if _args and _args[-1].isdigit():
         _n = int(_args[-1])
         _args = _args[:-1]
-    _event_tickers = _args or ["KXINX-26AUG18H1600"]
+    _event_tickers = _args or ["KXINXU-26AUG28H1600"]
     for _et in _event_tickers:
         main(_et, n=_n)

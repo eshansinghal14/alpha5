@@ -1,9 +1,10 @@
 """
-Backtest the generic Quoter on a KXINX / KXINXU event: cached Kalshi quotes
-+ Databento SPXW options, through kalshi_backtest.engine with the same
-config.json section the live session uses.
+Backtest the generic Quoter on a KXINXU / KXINXDUD event: cached Kalshi
+quotes + Databento SPXW options, through kalshi_backtest.engine with the
+same config.json section the live session uses. KXINX (range buckets) has
+no config section since it stopped trading; pass `cfg` to run_one for it.
 
-    python -m kalshi_strategies.KXINX.backtest.run_backtest KXINX [event_ticker ...]
+    python -m kalshi_strategies.KXINX.backtest.run_backtest KXINXU [event_ticker ...]
 
 With no event tickers, runs every event of the series that has both a cached
 Kalshi source and an unscoped (full-chain) SPXW cache.

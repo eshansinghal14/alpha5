@@ -1,5 +1,5 @@
-"""S&P daily config schema. config.json holds one complete section per series
-ticker (KXINX, KXINXU, KXINXDUD) plus "hub", the shared pricing process's
+"""S&P daily config schema. config.json holds one complete section per traded
+series ticker (KXINXU, KXINXDUD) plus "hub", the shared pricing process's
 own settings."""
 from __future__ import annotations
 

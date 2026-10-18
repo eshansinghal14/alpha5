@@ -8,7 +8,7 @@ F = K + C - P per strike, which should agree across strikes if the
 option book is coherent.
 
 Usage:
-    python -m kalshi_strategies.KXINX.research.check_fair_value --series KXINX [--seconds 60]
+    python -m kalshi_strategies.KXINX.research.check_fair_value --series KXINXU [--seconds 60]
 """
 import argparse
 import asyncio
@@ -125,7 +125,7 @@ async def main(series: str, seconds: float, interval_s: float):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--series", choices=("KXINX", "KXINXU", "KXINXDUD"), required=True)
+    ap.add_argument("--series", choices=("KXINXU", "KXINXDUD"), required=True)
     ap.add_argument("--seconds", type=float, default=60.0)
     ap.add_argument("--interval-s", type=float, default=5.0)
     args = ap.parse_args()

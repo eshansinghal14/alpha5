@@ -1,7 +1,7 @@
 """
 Combined settlement risk across every S&P series priced off one expiry.
 
-KXINX, KXINXU and KXINXDUD all settle on the same 16:00 close, so their
+KXINXU and KXINXDUD settle on the same 16:00 close, so their
 positions are one bet on where the index lands. Each series' own
 max_loss_usd marks only its own book; this adds up what every position
 would pay at each possible close and finds the worst one.

@@ -1,5 +1,5 @@
 [Unit]
-Description=alpha5 S&P daily (KXINX, KXINXU, KXINXDUD + pricing hub), shadow unless armed
+Description=alpha5 S&P daily (KXINXU, KXINXDUD + pricing hub), shadow unless armed
 After=network-online.target chrony.service alpha5-ibgateway.service
 Wants=network-online.target alpha5-ibgateway.service
 

@@ -1,7 +1,7 @@
 """
 Scheduled health checks of the S&P shadow session while nobody is watching:
 at each time in --at (ET), run a headless opencode agent that reviews the
-running KXINX / KXINXU / KXINXDUD session and appends a short report to
+running KXINXU / KXINXDUD session and appends a short report to
 data/live/KXINX/check_<date>.md. Read-only: the agent never edits code,
 config or control files and never touches processes.
 
@@ -25,7 +25,7 @@ ET = "America/New_York"
 LOG = os.path.join(LIVE_ROOT, "spx_check.log")
 
 PROMPT = """READ-ONLY health check of the live S&P SHADOW session (no real orders) on this machine, at {now} ET.
-Series KXINX, KXINXU, KXINXDUD run in one process (write group spx-daily) with the shared pricing hub
+Series KXINXU, KXINXDUD run in one process (write group spx-daily) with the shared pricing hub
 (kalshi_strategies/KXINX/hub.py). Do NOT edit any file except the report below, do NOT touch config.json,
 trading_mode.json, STOP.json or any process, do not place or cancel orders, and do not start long jobs
 (nothing over ~2 minutes; read journals with a column subset and a time filter).

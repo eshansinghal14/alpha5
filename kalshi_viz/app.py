@@ -23,7 +23,7 @@ import streamlit.components.v1 as components  # noqa: E402
 
 from kalshi_infra.runtime.control import request_trading_mode  # noqa: E402
 from kalshi_infra.trading.lip import payable_usd  # noqa: E402
-from kalshi_strategies.run import registry  # noqa: E402
+from kalshi_strategies.run import folders, registry  # noqa: E402
 from kalshi_viz import config_form, perf_panel  # noqa: E402
 from kalshi_viz.data import (has_lip, latest_summary, load_day, read_summary, read_trading_mode,  # noqa: E402
                              stream_url, summary_age_s)
@@ -54,12 +54,27 @@ def _registry():
     return registry()
 
 
-def _stale(series: str) -> bool:
-    """True if a timed fragment is drawing a series that is no longer
+@st.cache_resource
+def _pages() -> dict[str, list[str]]:
+    """Sidebar page -> the series it shows. A folder with DASHBOARD_NAME
+    (KXINX: "KXINX+") is one page for all its series; every other series is
+    its own page."""
+    reg, out, grouped = _registry(), {}, set()
+    for mod in folders().values():
+        name = getattr(mod, "DASHBOARD_NAME", None)
+        if name and len(mod.SERIES) > 1:
+            out[name] = list(mod.SERIES)
+            grouped |= set(mod.SERIES)
+    out.update({t: [t] for t in reg if t not in grouped})
+    return dict(sorted(out.items()))
+
+
+def _stale(page: str) -> bool:
+    """True if a timed fragment is drawing a page that is no longer
     selected. Fragment ids hash the function and page position, not its
-    args, so every series' fragments share ids; a 2s rerun in flight when
+    args, so every page's fragments share ids; a 2s rerun in flight when
     the sidebar changed drew KXINX's charts into the KXINXDUD page."""
-    if st.session_state.get(SERIES_KEY, series) != series:
+    if st.session_state.get(SERIES_KEY, page) != page:
         st.rerun(scope="app")
         return True
     return False
@@ -190,14 +205,26 @@ def _markets(day, show_all: bool = False) -> list[str]:
     return sorted(listed, key=lambda t: (t not in probs.index, t in excluded, abs(probs.get(t, 0.5) - 0.5), t))
 
 
-def _render_series(series: str, spec):
-    st.title(series)
-    last = read_summary(series) or ((latest_summary(series) or (None, None))[1])
-    perf_panel.render(series, lip=has_lip(last))
+def _last_summary(series: str) -> dict | None:
+    return read_summary(series) or ((latest_summary(series) or (None, None))[1])
 
+
+def _render_page(page: str, members: list[str]):
+    """One series: its page as before. Several: one combined performance
+    panel, then each series' status and theo/NBBO charts under its own header."""
+    st.title(page)
+    perf_panel.render(members, page=page, lip=any(has_lip(_last_summary(s)) for s in members))
+    for s in members:
+        if len(members) > 1:
+            st.divider()
+            st.header(s)
+        _render_series(s, page)
+
+
+def _render_series(series: str, page: str):
     @st.fragment(run_every="2s")
     def status():
-        if _stale(series):
+        if _stale(page):
             return
         s = read_summary(series)
         if s is None:
@@ -227,7 +254,7 @@ def _render_series(series: str, spec):
         st.session_state[k] = ident
 
     status()
-    _render_markets(series)
+    _render_markets(series, page)
 
 
 def _market_stats(day, ticker: str) -> dict:
@@ -265,8 +292,8 @@ def _stable_order(series: str, day, markets: list[str]) -> list[str]:
 
 
 @st.fragment(run_every="2s")
-def _render_markets(series: str):
-    if _stale(series):
+def _render_markets(series: str, page: str):
+    if _stale(page):
         return
     day = load_day(series)
     if day is None:
@@ -306,7 +333,7 @@ def _render_markets(series: str):
         # Same args -> same html string -> Streamlit keeps the iframe mounted.
         html = _chart_html(series, tk, t0.value // 10**6, q.get("max_position"), quoting, lip_on)
         components.html(html, height=IFRAME_HEIGHT, scrolling=True)
-    with st.expander("Fills"):
+    with st.expander(f"{series} fills"):
         st.dataframe(day.fills_df, use_container_width=True)
 
 
@@ -320,15 +347,24 @@ def _market_names(series: str) -> list[str]:
 
 
 def main():
-    reg = _registry()
+    reg, pages = _registry(), _pages()
+    # A session from before the KXINX+ page can still hold "KXINXU" etc.
+    if st.session_state.get(SERIES_KEY) not in (None, *pages):
+        del st.session_state[SERIES_KEY]
     with st.sidebar:
         st.header("Series")
-        live = [t for t in sorted(reg) if read_summary(t) is not None]
-        series = st.radio("Series", sorted(reg), label_visibility="collapsed", key=SERIES_KEY,
-                          format_func=lambda t: t + ("  ●" if t in live else ""))
+        live = {s for s in reg if read_summary(s) is not None}
+        page = st.radio("Series", list(pages), label_visibility="collapsed", key=SERIES_KEY,
+                        format_func=lambda p: p + ("  ●" if live & set(pages[p]) else ""))
+        members = pages[page]
         st.header("Config")
+        series = members[0]
+        if len(members) > 1:
+            series = st.select_slider("Ticker", options=members, key=f"cfg_pick_{page}",
+                                      format_func=lambda s: s + ("  ●" if s in live else ""),
+                                      help="Which series' config.json section the form below edits.")
         config_form.render(reg[series], _market_names(series))
-    _render_series(series, reg[series])
+    _render_page(page, members)
 
 
 main()

@@ -40,7 +40,7 @@ GIL long enough to stall the loop past `max_signal_age_s`.
 ```
 python -m kalshi_strategies.run --series KXINX KXCRYPTOLEAD15M                    # folders: all their series
 python -m kalshi_strategies.run --series KXINX --only KXINXU                      # one series (+ its hub)
-python -m kalshi_strategies.run --only KXINX --event-ticker KXINX-26OCT09H1600    # one event, no rollover
+python -m kalshi_strategies.run --only KXINXU --event-ticker KXINXU-26OCT09H1600  # one event, no rollover
 python -m kalshi_strategies.run --series KXINX --live-trading                     # REAL orders from start
 streamlit run kalshi_viz/app.py
 ```
@@ -52,7 +52,7 @@ run together in one process.
 
 ### Write groups
 
-KXINX, KXINXU and KXINXDUD are write group `spx-daily`: one process, one
+KXINXU and KXINXDUD are write group `spx-daily`: one process, one
 write bucket (`orders.WriteBudget`, the process's whole shard share), one
 `cancels_token` reserve (the largest member's setting) and one quote
 priority queue (`order_manager.WriteGroup`). Each pump pass goes through
@@ -60,11 +60,11 @@ every member's cancels (touch first across all of them), then fixes, then
 every member's touch levels, then LIP, then deeper levels, then trims.
 Splitting the budget per series instead left 26.7 tokens each with three
 series on shard 0, below `cancels_token` 20 + one create (10), so nothing
-quoted (2026-10-13). The trade-off: one crash takes down all three.
+quoted (2026-10-13). The trade-off: one crash takes down every member.
 
 ### S&P pricing hub
 
-`--series KXINX` runs KXINX, KXINXU and KXINXDUD plus one shared pricing
+`--series KXINX` runs KXINXU and KXINXDUD plus one shared pricing
 process (`kalshi_strategies/KXINX/hub.py`, the folder's `SERVICES`). The hub
 holds the only IB connection: it subscribes the union of every series'
 scope, fits the option curve once per tick batch, and streams each series

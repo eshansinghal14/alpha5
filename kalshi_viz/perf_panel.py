@@ -138,29 +138,42 @@ def _table(s: dict):
                "PnL is settled (or open at mid).")
 
 
-def render(series: str, lip: bool = False):
-    """`lip`: the series' events carry LIP programs; adds the LIP column."""
-    p = perf.get(series)
-    p.ensure_background()
+def _concat(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    frames = [f for f in frames if f is not None and len(f)]
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True).sort_values("time", ignore_index=True)
+
+
+def render(series: str | list[str], page: str | None = None, lip: bool = False):
+    """One panel over every series in `series`, their fills pooled as one
+    strategy. `page`: the dashboard page drawing it (defaults to the one
+    series). `lip`: the events carry LIP programs; adds the LIP column."""
+    members = [series] if isinstance(series, str) else list(series)
+    page = page or members[0]
+    ps = [perf.get(s) for s in members]
+    for p in ps:
+        p.ensure_background()
 
     @st.fragment(run_every="15s")
     def body():
-        # Same shared-fragment-id race as app._stale: don't draw a series
+        # Same shared-fragment-id race as app._stale: don't draw a page
         # that is no longer selected.
-        if st.session_state.get("dash_series", series) != series:
+        if st.session_state.get("dash_series", page) != page:
             st.rerun(scope="app")
             return
-        df = p.latest
-        if df is None:
+        if any(p.latest is None for p in ps):
             st.caption("Loading performance from the day journals… (first pass takes ~30s)")
             return
-        if p.error:
-            st.caption(f"Last performance refresh failed: {p.error}")
-        win = st.radio("Window", list(WINDOWS), index=2, horizontal=True, key=f"perf_win_{series}",
+        df = _concat([p.latest for p in ps])
+        errs = [f"{s}: {p.error}" for s, p in zip(members, ps) if p.error]
+        if errs:
+            st.caption("Last performance refresh failed: " + "; ".join(errs))
+        win = st.radio("Window", list(WINDOWS), index=2, horizontal=True, key=f"perf_win_{page}",
                        label_visibility="collapsed")
         since = None if WINDOWS[win] is None else pd.Timestamp.now(tz="UTC") - WINDOWS[win]
         s = perf.summarize(df, since)
-        lf = p.lip_frame() if lip else None
+        lf = _concat([p.lip_frame() for p in ps]) if lip else None
         sp = perf.summarize_split(df, lf, since)
         cols = st.columns(3 if lip else 2)
         with cols[0]:
@@ -171,15 +184,37 @@ def render(series: str, lip: bool = False):
             with cols[2]:
                 _lip(sp["lip"])
         _chart(df, since, lf)
-        _edge_share(perf.summarize_edge(df, p.prints_frame(), since))
+        _edge_share(perf.summarize_edge(df, _concat([p.prints_frame() for p in ps]), since))
         if s.get("fills"):
             st.caption(f"Settled {_usd(s['settled_usd'])} · open {_usd(s['open_usd'])} on {s['unsettled']} fills · "
                        f"fees ${s['fees']:.2f} · max drawdown {_usd(s['max_dd'])} · {s['events']} events")
         with st.expander("Markout by fill type"):
             _table(s)
-        if p.updated is not None:
-            st.caption(f"Updated {p.updated:%H:%M:%S} UTC. Fills are marked once 60s of book follows them.")
+            if len(members) > 1 and len(df):
+                _by_series(df, since)
+        updated = [p.updated for p in ps if p.updated is not None]
+        if updated:
+            st.caption(f"Updated {min(updated):%H:%M:%S} UTC. Fills are marked once 60s of book follows them.")
 
     with st.container(border=True):
-        st.markdown("##### Strategy performance (real fills)")
+        st.markdown("##### Strategy performance (real fills)"
+                    + (f" -- {' + '.join(members)} combined" if len(members) > 1 else ""))
         body()
+
+
+def _by_series(df: pd.DataFrame, since):
+    """The pooled numbers split back out per series."""
+    d = perf.window(df, since)
+    if d.empty:
+        return
+    rows = {}
+    for s, g in d.groupby(d.ticker.str.split("-").str[0]):
+        x = perf.summarize(g)
+        rows[s] = {"fills": x["fills"], "lots": x["contracts"], "PnL $": x["pnl"],
+                   **{k: x["markouts"]["all"][k] for k in ("mo0", "mo1", "mo10", "mo60")}}
+    t = pd.DataFrame(rows).T
+    t.columns = ["fills", "lots", "PnL $", "at fill", "+1s", "+10s", "+60s"]
+    t["fills"] = t["fills"].astype(int)
+    st.dataframe(t.style.format({c: "{:+.2f}" for c in t.columns if c not in ("fills", "lots")} | {"lots": "{:,.0f}"}),
+                 use_container_width=True)
+    st.caption("Per series, same units as above.")

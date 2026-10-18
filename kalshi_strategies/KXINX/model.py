@@ -1,5 +1,5 @@
 """
-Live S&P model for one KXINX / KXINXU / KXINXDUD event. Pricing runs in the
+Live S&P model for one KXINXU / KXINXDUD event. Pricing runs in the
 shared hub (hub.py): one IB feed and one curve fit for every S&P series.
 This side registers the event, keeps the subscribed scope centred, turns
 the hub's (lo, mid, hi) into Fairs through the noise filter, and reports

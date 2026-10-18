@@ -15,7 +15,7 @@ print(s["last_update"], s["event_ticker"], "live:", s["live_trading"], "signal_a
 print("venues_in_mid:", e.get("venues_in_mid"))
 print("venue_process:", e.get("venue_process"))
 print("quote blocks:", s.get("quote_block_counts"), "| loop lag:", s.get("timings", {}).get("loop_lag"))
-for series in ("KXINX", "KXINXU", "KXINXDUD"):
+for series in ("KXINXU", "KXINXDUD"):
     ps = glob.glob(f"data/live/{series}/*/summary.json")
     if not ps:
         print(series, "no summary yet")

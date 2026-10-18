@@ -1,6 +1,6 @@
 """
 S&P pricing hub: one IB connection, one option book and one curve fit per
-SPXW expiry, shared by every S&P series (KXINX, KXINXU, KXINXDUD).
+SPXW expiry, shared by every S&P series (KXINXU, KXINXDUD).
 
     python -m kalshi_strategies.KXINX.hub
 
