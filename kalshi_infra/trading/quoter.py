@@ -524,6 +524,7 @@ class Quoter:
                           cap_yes=cap_yes, cap_no=cap_no, mfee_bid=mfee_bid, mfee_ask=mfee_ask,
                           qres_bid=qres_bid, qres_ask=qres_ask, quote_bid=quote_bid, quote_ask=quote_ask,
                           lip_bid=lip_bid, lip_ask=lip_ask, block_bid=block_bid, block_ask=block_ask,
+                          quote_block=quote_gate,
                           lip_size_bid=None if lips["yes"] is None else lips["yes"].size,
                           lip_size_ask=None if lips["no"] is None else lips["no"].size,
                           lip_proj_usd=self._lip_proj.get(ticker),
@@ -1089,6 +1090,9 @@ class Quoter:
             "lip_proj_usd": v.get("lip_proj_usd"),
             "lip_ahead_bid": v.get("lip_ahead_bid"), "lip_ahead_ask": v.get("lip_ahead_ask"),
             "block_bid": block or v.get("block_bid"), "block_ask": block or v.get("block_ask"),
+            # The model's event-wide pull (spot_burst). Not in block_*: those are
+            # per-side, and the takes stay live under it.
+            "quote_block": v.get("quote_block"),
             "atm_tradeable": ticker in self._atm_set if self.cfg.quoting.max_markets else True,
         }
         if fair is not None:

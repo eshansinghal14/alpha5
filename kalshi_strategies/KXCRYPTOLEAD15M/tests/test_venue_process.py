@@ -69,6 +69,49 @@ def test_books_prints_and_keepalive_reach_the_parent(monkeypatch):
         p.stop()
 
 
+TRIP_STUB = r"""
+import sys, time, threading
+sys.path.insert(0, {root!r})
+from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed import venue_process as vp
+out = sys.stdout.buffer
+got = []
+def rd():
+    while True:
+        m = vp._read_frame(sys.stdin.buffer)
+        if m is None:
+            return
+        got.append(m)
+threading.Thread(target=rd, daemon=True).start()
+deadline = time.time() + 20
+while not got and time.time() < deadline:
+    time.sleep(0.01)
+now = time.time()
+thr = got[0]["vol"]["binance_perp"]["BTC"] if got else -1
+vp._write_frame(out, ([], [], [], {{"trips": [("volume", "binance_perp", "BTC", 2.0 * thr, thr, True, now, now)]}}))
+sys.stdin.buffer.read()
+"""
+
+
+def test_control_reaches_child_and_trip_frame_wakes_parent(monkeypatch):
+    from kalshi_infra import REPO_ROOT
+    code = TRIP_STUB.format(root=str(REPO_ROOT))
+    real_popen = vp.subprocess.Popen
+    monkeypatch.setattr(vp.subprocess, "Popen", lambda args, **kw: real_popen([sys.executable, "-c", code], **kw))
+    p = vp.VenueProcess({"binance_perp": ["BTC"]})
+    woke = []
+    p.on_urgent = lambda: woke.append(time.monotonic())
+    p.send_control({"vol": {"binance_perp": {"BTC": 1234.0}}})     # held, sent on start
+    p.ensure_running()
+    try:
+        trips = []
+        assert _wait(lambda: woke)
+        p.drain(lambda vb: None, on_trip=lambda *a: trips.append(a))
+        assert trips and trips[0][:6] == ("volume", "binance_perp", "BTC", 2468.0, 1234.0, True)
+        assert abs(time.monotonic() - trips[0][6]) < 5.0
+    finally:
+        p.stop()
+
+
 def test_dead_child_is_restarted_with_backoff(monkeypatch):
     _stubbed(monkeypatch, n=1, tail="")          # exits right after one frame
     clock = [0.0]

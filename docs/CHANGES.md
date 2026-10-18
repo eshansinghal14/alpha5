@@ -13,6 +13,53 @@ Reverse chronological. One section per material change. Entries before
   book-driven step-ups/h were this case; edge fills alone at the top ran
   +2.1 to +2.7c/lot at 10s vs +0.25c when sharing the top price.
 
+## 2026-10-18 — spot_burst: leading-venue trips sent at once; perp price-move trigger
+
+- Volume trips on Hyperliquid and the perps are detected in the venue process
+  on every print (`prints.LeadTrigger`) and sent on their own frame, which
+  wakes the trading loop's drain. They used to wait for the 50ms batch and
+  the 50ms drain tick. The trading process still owns the thresholds
+  (calibrators) and sends them down as control frames on stdin, and still
+  decides whether a trip pulls (`burst_pull_coins`). Coinbase is unchanged
+  (in-process). Replay 10-16 19:05 to 10-18 06:35 UTC, 50ms grid, perp trips
+  seen 100ms late vs at once: same 10.5% pulled, maker $ on unpulled public
+  prints +$918 -> +$2,560, big-move coverage 68% -> 80%, pick-offs within
+  0.5s of a trip avoided 12 -> 37 of 159. Local smoke test: child receipt ->
+  applied in parent p50 9ms.
+- Perp price-move trigger, source `perp_move`: 2 of Binance/Bybit/OKX with a
+  last-trade move over 0.5s at or over that venue's own p99.5 (2h rolling,
+  60s refresh, seeded from perp_prints/, calibrated in the venue process),
+  same direction. Same pull/hold as a volume trip. Same replay on top of the
+  above: pulled 10.5% -> 11.6%, maker $ on unpulled prints +$2,560 ->
+  +$3,222, the extra pulled time ran -6.5c/lot to makers, big moves covered
+  80% -> 88%. Every window 0.4-0.75s x p99-p99.7 tried was positive; one
+  venue alone fired on the 10-17 22:15:37 all-venue glitch on every coin,
+  2-of-3 on two.
+- Trip log rows carry `kind` (volume / move) and `level` (USD or bp);
+  `seen_delay_s` is now receipt -> applied on the trading loop.
+- `ALPHA5_DATA_ROOT` moves `data/` (for a shadow run beside live).
+
+## 2026-10-18 — spot_burst trip log; Hyperliquid pulls on HYPE only
+
+- Every (source, coin) crossing of its burst threshold is a row under
+  `data/kalshi_crypto/burst_trips/{day}/` (onsets only): trailing-1s $,
+  threshold, ratio, threshold source (live/saved/fallback), whether it
+  pulled, exchange and receipt time, and `seen_delay_s` (receipt to the
+  handler: the venue process's batching for non-Coinbase sources).
+  Decision rows carry `quote_block` (`spot_burst` while pulled); it was
+  invisible before (priced rows with 0 levels).
+- `pricing.burst_pull_coins`: per source, the coins whose trips pull quotes;
+  the rest are logged only. Crypto: Hyperliquid on HYPE only, every other
+  source on all five. Replay 10-16 19:05 to 10-18 06:35 UTC (live rule, 0.1s
+  grid, 16,446 public Kalshi prints, 1,570 edge fills): time pulled only by
+  a Hyperliquid trip (2.8%) had flow favouring makers, +1.96c/lot at 10s
+  (BTC +9.6, XRP +4.8, ETH +2.5, SOL -0.6, HYPE -1.1). HL prints reach us
+  ~0.38s after exchange time vs ~0.08s for Binance. Maker $ on unpulled
+  prints +$2,627 -> +$2,895, pulled 12.8% -> ~10.5%, big-move coverage
+  83% -> 81.5%; better in all four quarters. Requiring 2+ keys or 2-4x the
+  threshold pulled less (3-6%) but every variant exposed worse flow
+  (+$1,880 to +$2,040), so those were not taken.
+
 ## 2026-10-18 — LIP-only signal-age limit
 
 - `lip.lip_max_signal_age_s` (dashboard; null = off): every LIP order, exit

@@ -4,4 +4,6 @@ the older data/pricing helpers (flat modules). Import from the repo root."""
 import os
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-DATA_ROOT = os.path.join(REPO_ROOT, "data")
+# ALPHA5_DATA_ROOT: a shadow run next to live writes its prints, thresholds and
+# composite bars elsewhere instead of appending to live's files.
+DATA_ROOT = os.environ.get("ALPHA5_DATA_ROOT") or os.path.join(REPO_ROOT, "data")

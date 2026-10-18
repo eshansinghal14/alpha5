@@ -16,10 +16,10 @@ import atexit
 import time
 
 from kalshi_strategies.KXCRYPTOLEAD15M.composite import CompositeBus
-from kalshi_strategies.KXCRYPTOLEAD15M.prints import (AUTO_SOURCES, HL_BURST_USD_1S, PERP_BURST_USD_1S, PERP_SOURCES,
-                                                       REFRESH_S, load_thresholds, save_thresholds,
+from kalshi_strategies.KXCRYPTOLEAD15M.prints import (AUTO_SOURCES, HL_BURST_USD_1S, MOVE_SOURCE, PERP_BURST_USD_1S,
+                                                       PERP_SOURCES, REFRESH_S, load_thresholds, save_thresholds,
                                                        SAMPLE_S, BurstCalibrator, BurstDetector, PrintLog,
-                                                       seed_rows)
+                                                       TripLog, seed_rows)
 from kalshi_strategies.KXCRYPTOLEAD15M.robust_har import RobustHarForecaster
 from kalshi_strategies.KXCRYPTOLEAD15M.series import COINS, SPOT_VENUES
 from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed import FeedHealthMonitor
@@ -84,6 +84,7 @@ class SpotFeed:
         self._tasks: list[asyncio.Task] = []
         self.bursts = BurstDetector(COINS)
         self.prints = PrintLog(persist=persist)
+        self.trips = TripLog(persist=persist)
         self.coinbase.on_print = self._on_print
         # Monotonic time until which quotes stay pulled, and the coin that set it.
         self.burst_until = 0.0
@@ -96,6 +97,9 @@ class SpotFeed:
         self._calib_seeded = not persist        # tests: nothing on disk to seed from
         self._calib_tasks: list[asyncio.Task] = []
         self._persist = persist
+        self._drain_now: asyncio.Event | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._sent_thr: dict | None = None
         if persist:
             saved = load_thresholds()
             for src, th in saved.items():
@@ -111,9 +115,56 @@ class SpotFeed:
         return None
 
     def burst_thresholds(self) -> dict:
-        return {s: {"calibrated": c.ready, "source": c.source,
-                    "usd_1s": {k: round(c.threshold(k) or 0) for k in COINS}}
-                for s, c in self.calib.items()}
+        pull = self.cfg.pricing.burst_pull_coins
+        out = {s: {"calibrated": c.ready, "source": c.source,
+                   "usd_1s": {k: round(c.threshold(k) or 0) for k in COINS},
+                   "pulls": list(pull.get(s) or [])}
+               for s, c in self.calib.items()}
+        if self.venues is not None:
+            out[MOVE_SOURCE] = {"bp": self.venues.status.get("move_thr"), "pulls": list(pull.get(MOVE_SOURCE) or [])}
+        return out
+
+    def _venue_thresholds(self) -> dict:
+        """What the venue process trips on: every non-Coinbase source's current
+        threshold, too_hot (None) left out. Pull or not is decided here."""
+        return {s: {c: v for c in COINS if (v := self._threshold(s, c)) is not None}
+                for s in self.calib if s != "coinbase"}
+
+    def _push_venue_thresholds(self):
+        if self.venues is None:
+            return
+        thr = self._venue_thresholds()
+        if thr != self._sent_thr:
+            self._sent_thr = thr
+            self.venues.send_control({"vol": thr})
+
+    def _pull(self, coin: str, src: str, as_of: float):
+        if as_of >= self.burst_until:
+            self.n_bursts += 1
+        self.burst_until = max(self.burst_until, as_of + self.cfg.pricing.burst_hold_s)
+        self.burst_coin = coin if src == "coinbase" else f"{coin}@{src}"
+        m = self.model
+        if m is not None:
+            # A pull must reach the quoter now, not at the next mid move.
+            m._mid_moved()
+
+    def _on_trip(self, kind, src, coin, level, thr, onset, as_of, exch_ts):
+        """A trip from the venue process: volume on a leading venue, or the
+        perp move trigger. Rows repeat every TRIP_RESEND_S while it holds;
+        only the onset is logged."""
+        pulls = coin in (self.cfg.pricing.burst_pull_coins.get(src) or ())
+        if onset:
+            ts = "live" if kind == "move" else self.calib[src].source
+            self.trips.record(kind, src, coin, level, thr, thr_source=ts, pulls=pulls, as_of=as_of,
+                              exch_ts=exch_ts)
+        if pulls:
+            self._pull(coin, src, as_of)
+
+    def _wake_drain(self):
+        """Reader thread: a trip frame arrived."""
+        loop, ev = self._loop, self._drain_now
+        if loop is not None and ev is not None:
+            loop.call_soon_threadsafe(ev.set)
 
     def _save_calibrated(self):
         """Persist every source that is calibrated now. Off the loop."""
@@ -133,6 +184,7 @@ class SpotFeed:
         except Exception as e:
             print(f"[KXCRYPTOLEAD15M] burst threshold seed failed ({e!r}); calibrating from live prints", flush=True)
         self._calib_seeded = True
+        self._push_venue_thresholds()
 
     async def _calib_sample_loop(self):
         detectors = {"coinbase": self.bursts, "hyperliquid": self.hl_bursts, **self.perp_bursts}
@@ -153,6 +205,7 @@ class SpotFeed:
                     cal.adopt(await loop.run_in_executor(None, cal.quantiles, cal.snapshot()))
                 except Exception as e:
                     print(f"[KXCRYPTOLEAD15M] burst threshold refresh failed: {e!r}", flush=True)
+            self._push_venue_thresholds()
             if self._persist:
                 try:
                     await loop.run_in_executor(None, self._save_calibrated)
@@ -167,39 +220,53 @@ class SpotFeed:
         if venue in self.perp_bursts:
             # A batch notional, not a real print (venue_process ships sums);
             # the child already persisted the real prints to perp_prints/.
-            usd_1s = self.perp_bursts[venue].add(coin, price * size, as_of)
-            thr = self._threshold(venue, coin)
-        elif venue == "coinbase":
-            self.prints.add(coin, t.get("trade_id"), price, size, t.get("side"), exch_ts, venue=venue)
-            usd_1s = self.bursts.add(coin, price * size, as_of)
-            thr = self._threshold("coinbase", coin)
-        else:
+            self.perp_bursts[venue].add(coin, price * size, as_of)
+        elif venue != "coinbase":
             self.prints.add(coin, t.get("trade_id"), price, size, t.get("side"), exch_ts, venue=venue)
             # Perp and spot share one window: a sweep often hits both.
-            usd_1s = self.hl_bursts.add(coin, price * size, as_of)
-            thr = self._threshold("hyperliquid", coin)
-        if thr is None or usd_1s < thr:
+            self.hl_bursts.add(coin, price * size, as_of)
+        if venue != "coinbase" and self.venues is not None:
+            # Calibration only: the venue process trips these on every print
+            # and sends the trip at once (_on_trip). Tripping here too would be
+            # the same event 0-100ms later, off a 50ms batch.
             return
-        if as_of >= self.burst_until:
-            self.n_bursts += 1
-        self.burst_until = max(self.burst_until, as_of + self.cfg.pricing.burst_hold_s)
-        self.burst_coin = coin if venue == "coinbase" else f"{coin}@{venue}"
-        m = self.model
-        if m is not None:
-            # A pull must reach the quoter now, not at the next mid move.
-            m._mid_moved()
+        if venue == "coinbase":
+            src = "coinbase"
+            self.prints.add(coin, t.get("trade_id"), price, size, t.get("side"), exch_ts, venue=venue)
+            usd_1s = self.bursts.add(coin, price * size, as_of)
+        else:
+            # No venue process (tests): trip in-process like before.
+            src = "hyperliquid" if venue.startswith("hl_") else venue
+            usd_1s = (self.hl_bursts if src == "hyperliquid" else self.perp_bursts[src]).level(coin, as_of)
+        thr = self._threshold(src, coin)
+        pulls = coin in (self.cfg.pricing.burst_pull_coins.get(src) or ())
+        self.trips.observe(src, coin, usd_1s, thr, thr_source=self.calib[src].source, pulls=pulls,
+                           as_of=as_of, exch_ts=exch_ts)
+        if thr is None or usd_1s < thr or not pulls:
+            return
+        self._pull(coin, src, as_of)
 
     def _on_venue_print(self, coin, t, as_of, exch_ts, kind):
         self._on_print(coin, t, as_of, exch_ts, venue=kind)
 
     async def _venue_loop(self):
         """Apply the venue process's batches. Its books go through the same
-        _on_book as Coinbase's, so a venue moving the median wakes the reprice."""
+        _on_book as Coinbase's, so a venue moving the median wakes the reprice.
+        A trip frame wakes this at once (_wake_drain) instead of at the next
+        VENUE_DRAIN_S tick."""
+        self._loop = asyncio.get_running_loop()
+        self._drain_now = asyncio.Event()
+        self.venues.on_urgent = self._wake_drain
+        self._push_venue_thresholds()      # saved / fallback values until the seed finishes
         while True:
-            await asyncio.sleep(VENUE_DRAIN_S)
+            try:
+                await asyncio.wait_for(self._drain_now.wait(), VENUE_DRAIN_S)
+            except asyncio.TimeoutError:
+                pass
+            self._drain_now.clear()
             try:
                 self.venues.ensure_running()
-                self.venues.drain(self._on_book, self._on_venue_print, self.bus.touch)
+                self.venues.drain(self._on_book, self._on_venue_print, self.bus.touch, on_trip=self._on_trip)
             except Exception as e:
                 print(f"[KXCRYPTOLEAD15M] venue drain error: {e!r}", flush=True)
 
@@ -298,3 +365,7 @@ class SpotFeed:
                 await asyncio.get_running_loop().run_in_executor(None, self.prints.write, self.prints.drain())
             except Exception as e:
                 print(f"[KXCRYPTOLEAD15M] prints flush failed: {e!r}")
+            try:
+                await asyncio.get_running_loop().run_in_executor(None, self.trips.write, self.trips.drain())
+            except Exception as e:
+                print(f"[KXCRYPTOLEAD15M] burst trip flush failed: {e!r}")

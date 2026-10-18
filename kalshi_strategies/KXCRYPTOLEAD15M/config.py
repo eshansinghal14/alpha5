@@ -59,6 +59,15 @@ class CryptoPricingParams:
         "Kalshi print 10-15 17:00 to 10-16 08:45 UTC: the toxic flow is while the trailing-1s trigger is "
         "still over (+1.1c/lot to the taker at 10s); from 0.25s after it the flow favours makers, so 1.5s "
         "sat out good trades. 0.5s leaves margin for the cancel/requote round trip.", min=0, step=0.25)
+    burst_pull_coins: dict[str, list[str]] = param(
+        "Per burst source, the coins whose trips pull quotes; any other (source, coin) trip is logged "
+        "only (burst_trips/). Replay 10-16 19:05 to 10-18 06:35 UTC on public Kalshi prints: time pulled "
+        "only by a Hyperliquid trip had flow favouring makers (+1.96c/lot at 10s, except HYPE -1.1c), so "
+        "Hyperliquid pulls on HYPE alone: maker $ on unpulled prints +$2,627 -> +$2,895, pulled 12.8% -> "
+        "~10.5%, big-move coverage 83% -> 81.5%. Requiring 2+ sources or 2-4x the threshold pulled less "
+        "but exposed worse flow (+$1,880 to +$2,040). Key \"perp_move\" is the price-move trigger "
+        "(prints.MOVE_*): 2 of 3 perp venues moving >= their own p99.5 of |0.5s move| one way.",
+        editable=False)
     quote_before_start: bool = param(
         "Quote before the start TWAP is locked (pre-open / forming start average).")
     soft_stale_s: float = param("Feed health: a coin older than this is DEGRADED (priced off last value).",

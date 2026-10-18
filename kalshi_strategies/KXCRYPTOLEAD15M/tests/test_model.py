@@ -210,6 +210,57 @@ def test_spot_burst_pulls_quotes_for_every_market_then_expires():
     assert m.quote_block(m.ticker_of["ETH"], now) is None
 
 
+def _spot(**pricing):
+    from kalshi_strategies.KXCRYPTOLEAD15M.live_feed import SpotFeed
+    cfg = config(recovery_s=0.0, **pricing)
+    spot = SpotFeed(cfg, persist=False, venues=False)
+    spot.trips.persist = True          # buffer rows to drain(); nothing calls write() here
+    return spot
+
+
+def test_log_only_source_trips_are_logged_but_do_not_pull():
+    """burst_pull_coins without HL BTC: an HL BTC crossing is a trip row with
+    pulls=False and leaves quotes up; HL HYPE still pulls."""
+    pull = {"coinbase": list(COINS), "hyperliquid": ["HYPE"]}
+    spot = _spot(burst_pull_coins=pull)
+    spot.calib["hyperliquid"].fallback = {"BTC": 1000.0, "HYPE": 1000.0}
+    mono = time.monotonic()
+    spot._on_print("BTC", {"price": "80000", "size": "0.02"}, mono, mono, venue="hl_perp")    # $1600
+    assert spot.burst_until == 0.0 and spot.n_bursts == 0
+    rows = spot.trips.drain()
+    assert len(rows) == 1 and rows[0]["source"] == "hyperliquid" and rows[0]["pulls"] is False
+    assert rows[0]["ratio"] >= 1.6 - 1e-9 and rows[0]["thr_source"] == "fallback"
+    spot._on_print("HYPE", {"price": "40", "size": "50"}, mono, mono, venue="hl_perp")        # $2000
+    assert spot.burst_until > mono and spot.n_bursts == 1
+    assert spot.trips.drain()[0]["pulls"] is True
+
+
+def test_trip_log_records_onsets_only():
+    spot = _spot(burst_usd_1s={c: 1000.0 for c in COINS})
+    mono = time.monotonic()
+    for i in range(3):          # $1200 / $2400 / $3600 in the same second: one onset
+        spot._on_print("BTC", {"price": "80000", "size": "0.015", "trade_id": i}, mono + 0.1 * i, None)
+    spot._on_print("BTC", {"price": "80000", "size": "0.015", "trade_id": 9}, mono + 1.5, None)  # window reset: $1200
+    rows = spot.trips.drain()
+    assert [r["coin"] for r in rows] == ["BTC"]
+    # Dropped back under, then over again: a new onset.
+    spot._on_print("BTC", {"price": "80000", "size": "0.001", "trade_id": 10}, mono + 3.0, None)
+    spot._on_print("BTC", {"price": "80000", "size": "0.015", "trade_id": 11}, mono + 3.1, None)
+    assert len(spot.trips.drain()) == 1
+
+
+def test_trip_log_write_roundtrip(tmp_path):
+    from kalshi_strategies.KXCRYPTOLEAD15M.prints import TripLog
+    log = TripLog(root=tmp_path)
+    mono = time.monotonic()
+    log.observe("okx_perp", "SOL", 5e5, 2e5, thr_source="live", pulls=True, as_of=mono - 0.08,
+                exch_ts=time.time() - 0.2, now_mono=mono)
+    assert log.write(log.drain()) == 1
+    df = pd.concat(pd.read_parquet(p) for p in tmp_path.rglob("*.parquet"))
+    assert df.iloc[0].source == "okx_perp" and abs(df.iloc[0].seen_delay_s - 0.08) < 1e-9
+    assert abs(df.iloc[0].ratio - 2.5) < 1e-9
+
+
 def test_signal_age_is_oldest_coins_newest_book():
     now = time.time()
     m = _model(now, recovery_s=0.0)

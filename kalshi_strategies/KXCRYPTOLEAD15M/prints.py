@@ -278,6 +278,223 @@ def _seed_perp_rows(source: str, coins, lo: float, hi: float) -> np.ndarray:
     return pd.DataFrame(cols).reindex(columns=list(coins)).fillna(0.0).sort_index().values
 
 
+def seed_move_rows(venue: str, coins, now_wall: float, window_s: float) -> np.ndarray:
+    """|last-trade move over window_s| in bp on the SAMPLE_S grid, last
+    CALIB_WINDOW_S, from perp_prints/: the move trigger's calibration seed."""
+    lo = now_wall - CALIB_WINDOW_S
+    days = {pd.Timestamp(t, unit="s", tz="UTC").strftime("%Y-%m-%d") for t in (lo, now_wall)}
+    parts = [p for d in sorted(days) for p in (PERP_PRINTS_ROOT / d).glob("*.parquet")
+             if p.stem.isdigit() and int(p.stem) / 1e3 >= lo]
+    fr = []
+    for p in parts:
+        try:
+            x = pd.read_parquet(p, columns=["recv_ts", "venue", "coin", "price"])
+        except Exception:
+            continue
+        fr.append(x[x.venue == venue])
+    if not fr:
+        return np.zeros((0, len(coins)))
+    df = pd.concat(fr, ignore_index=True)
+    df = df[df.recv_ts >= lo].sort_values("recv_ts")
+    if df.empty:
+        return np.zeros((0, len(coins)))
+    k = max(1, int(round(window_s / SAMPLE_S)))
+    cols = {}
+    for c, g in df.groupby("coin"):
+        px = pd.Series(g.price.values, index=pd.to_datetime(g.recv_ts, unit="s")).resample(
+            f"{int(SAMPLE_S * 1000)}ms").last().ffill()
+        cols[c] = (1e4 * np.log(px / px.shift(k))).abs()
+    return pd.DataFrame(cols).reindex(columns=list(coins)).fillna(0.0).sort_index().values
+
+
+class PriceTrail:
+    """Per key, the last-trade price now and window_s ago (as-of, on one
+    clock). Keeps one sample at or before the window start and nothing older."""
+
+    def __init__(self, window_s: float):
+        self.window_s = window_s
+        self._q: dict = {}
+
+    def add(self, key, t: float, px: float):
+        q = self._q.get(key)
+        if q is None:
+            q = self._q[key] = collections.deque()
+        q.append((t, px))
+        self._trim(q, t)
+
+    def _trim(self, q, now):
+        cut = now - self.window_s
+        while len(q) >= 2 and q[1][0] <= cut:
+            q.popleft()
+
+    def move_bp(self, key, now: float) -> float | None:
+        """Log move over the trailing window_s in bp; None without a price
+        from at least window_s ago."""
+        q = self._q.get(key)
+        if not q:
+            return None
+        self._trim(q, now)
+        t0, p0 = q[0]
+        if t0 > now - self.window_s or p0 <= 0:
+            return None
+        return 1e4 * float(np.log(q[-1][1] / p0))
+
+
+# Perp price-move trigger: 2 of the 3 perp venues moving >= their own p99.5
+# of |0.5s move| in one direction. Replay 10-16 19:05 to 10-18 06:35 UTC on top
+# of the volume trigger: pulled 10.5% -> 11.6%, maker $ on prints we stay
+# exposed to +$2,560 -> +$3,222, the extra pull time ran -6.5c/lot to makers,
+# big moves covered 80% -> 88%. 0.4-0.75s and p99-p99.7 were all positive; a
+# single venue fired on the 10-17 22:15:37 all-venue print glitch on every
+# coin, 2-of-3 on two.
+MOVE_WINDOW_S = 0.5
+MOVE_QUANTILE = 0.995
+MOVE_AGREE = 2
+# Trip frames from the venue process are re-sent at most this often per key
+# while it stays over, to extend the pull: well inside burst_hold_s, and caps
+# a Binance sweep (thousands of prints/s) at 20 frames/s per key.
+TRIP_RESEND_S = 0.05
+MOVE_SOURCE = "perp_move"
+
+
+class LeadTrigger:
+    """Burst detection for the non-Coinbase sources, run in the venue process
+    on every print so a trip reaches the trading loop without waiting for a
+    batch. Thresholds come from the trading process (its calibrators);
+    None = record-only.
+
+    Volume: the source's trailing-1s notional at or over its threshold
+    (Hyperliquid perp + spot share one window, as in SpotFeed).
+    Move: on `agree` of the perp venues, the last-trade move over window_s at
+    or over that venue's own threshold, all in the same direction.
+
+    on_print returns trip rows (kind, source, coin, level, thr, onset); a row
+    is emitted on the onset and then every TRIP_RESEND_S while it holds."""
+
+    def __init__(self, coins, perps, window_s: float = MOVE_WINDOW_S, agree: int = MOVE_AGREE):
+        self.coins = list(coins)
+        self.perps = tuple(perps)
+        self.det: dict[str, BurstDetector] = {}
+        self.trail = PriceTrail(window_s)
+        self.agree = agree
+        self.vol_thr: dict[str, dict[str, float]] = {}
+        self.move_thr: dict[str, dict[str, float]] = {}
+        self._over: dict[tuple, bool] = {}
+        self._sent: dict[tuple, float] = {}
+
+    def configure(self, vol_thr=None, move_thr=None):
+        if vol_thr is not None:
+            self.vol_thr = vol_thr
+        if move_thr is not None:
+            self.move_thr = move_thr
+
+    @staticmethod
+    def source_of(kind: str) -> str:
+        return "hyperliquid" if kind.startswith("hl_") else kind
+
+    def _emit(self, out, key, hit, now, row):
+        was = self._over.get(key, False)
+        self._over[key] = hit
+        if not hit:
+            return
+        if not was or now - self._sent.get(key, -1e18) >= TRIP_RESEND_S:
+            self._sent[key] = now
+            out.append(row + (not was,))
+
+    def on_print(self, kind: str, coin: str, price: float, size: float, as_of: float) -> list[tuple]:
+        out: list[tuple] = []
+        src = self.source_of(kind)
+        det = self.det.get(src)
+        if det is None:
+            det = self.det[src] = BurstDetector(self.coins)
+        level = det.add(coin, price * size, as_of)
+        thr = (self.vol_thr.get(src) or {}).get(coin)
+        self._emit(out, ("volume", src, coin), thr is not None and level >= thr, as_of,
+                   ("volume", src, coin, level, thr if thr is not None else 0.0))
+        if kind in self.perps:
+            self.trail.add((kind, coin), as_of, price)
+            out += self._move(kind, coin, as_of)
+        return out
+
+    def _move(self, kind, coin, now) -> list[tuple]:
+        out: list[tuple] = []
+        hits = self._agrees(coin, now)
+        row = ("move", MOVE_SOURCE, coin, float(np.mean([abs(m) for m, _ in hits])) if hits else 0.0,
+               float(np.mean([t for _, t in hits])) if hits else 0.0)
+        self._emit(out, ("move", MOVE_SOURCE, coin), bool(hits), now, row)
+        return out
+
+    def _agrees(self, coin, now) -> list[tuple[float, float]]:
+        up, dn = [], []
+        for v in self.perps:
+            thr = (self.move_thr.get(v) or {}).get(coin)
+            m = self.trail.move_bp((v, coin), now)
+            if thr is None or m is None or abs(m) < thr:
+                continue
+            (up if m > 0 else dn).append((m, thr))
+        if len(up) >= self.agree:
+            return up
+        if len(dn) >= self.agree:
+            return dn
+        return []
+
+
+TRIPS_ROOT = Path(_DATA_ROOT) / "kalshi_crypto" / "burst_trips"
+
+
+class TripLog:
+    """One row per trip onset, pulling or not, as append-only parts under
+    burst_trips/{day}/. kind "volume": level is trailing-1s USD; kind "move":
+    level is the mean |move| in bp over the agreeing perp venues."""
+
+    def __init__(self, root: Path = TRIPS_ROOT, persist: bool = True):
+        self.root = Path(root)
+        self.persist = persist
+        self._over: dict[tuple[str, str], bool] = {}
+        self._pending: list[dict] = []
+
+    def record(self, kind: str, source: str, coin: str, level: float, thr: float, *, thr_source: str,
+               pulls: bool, as_of: float, exch_ts: float | None, now_mono: float | None = None) -> dict:
+        mono = time.monotonic() if now_mono is None else now_mono
+        row = {"recv_ts": time.time() - (mono - as_of), "exch_ts": exch_ts, "kind": kind, "source": source,
+               "coin": coin, "level": float(level), "thr": float(thr),
+               "ratio": float(level / thr) if thr else float("nan"), "thr_source": thr_source,
+               "pulls": bool(pulls),
+               # Receipt -> applied on the trading loop (pipe + loop wake for venue-process trips).
+               "seen_delay_s": float(mono - as_of)}
+        if self.persist:
+            self._pending.append(row)
+        return row
+
+    def observe(self, source: str, coin: str, usd_1s: float, thr: float | None, *, thr_source: str,
+                pulls: bool, as_of: float, exch_ts: float | None, now_mono: float | None = None) -> dict | None:
+        """Volume trips detected in this process (Coinbase): call on every
+        print; records onsets only."""
+        key = (source, coin)
+        over = thr is not None and usd_1s >= thr
+        was = self._over.get(key, False)
+        self._over[key] = over
+        if not over or was:
+            return None
+        return self.record("volume", source, coin, usd_1s, thr, thr_source=thr_source, pulls=pulls,
+                           as_of=as_of, exch_ts=exch_ts, now_mono=now_mono)
+
+    def drain(self) -> list[dict]:
+        rows, self._pending = self._pending, []
+        return rows
+
+    def write(self, rows: list[dict]) -> int:
+        """Off the loop."""
+        if not rows:
+            return 0
+        df = pd.DataFrame(rows)
+        day = pd.Timestamp(df.recv_ts.iloc[0], unit="s", tz="UTC").strftime("%Y-%m-%d")
+        d = self.root / day
+        d.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(d / f"{int(time.time() * 1000)}.parquet", index=False)
+        return len(rows)
+
+
 class PrintLog:
     """Raw prints, appended to {coin}_{YYYY-MM-DD}_{HH}.parquet on flush()."""
 

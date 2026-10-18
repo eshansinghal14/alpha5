@@ -94,7 +94,8 @@ def _child_main(plan: dict[str, list[str]]):
     import asyncio
     import signal
     from .venues import ADAPTERS, LEADING_VENUES
-    from ..prints import PERP_BURST_USD_1S
+    from ..prints import (PERP_BURST_USD_1S, PERP_SOURCES, REFRESH_S, SAMPLE_S, BurstCalibrator, LeadTrigger,
+                          seed_move_rows)
 
     # The pipe is the protocol; anything an adapter prints goes to stderr,
     # which the parent leaves on the console/run log.
@@ -109,15 +110,82 @@ def _child_main(plan: dict[str, list[str]]):
     from kalshi_infra.runtime.priority import set_priority
     set_priority("normal")
 
+    control: list[dict] = []
+
     def watch_parent():
-        # Blocks until the parent closes our stdin -- including when it dies.
-        sys.stdin.buffer.read()
-        os._exit(0)
+        # stdin carries the parent's control frames (trigger thresholds); EOF
+        # means the parent closed it or died.
+        inp = sys.stdin.buffer
+        while True:
+            try:
+                msg = _read_frame(inp)
+            except Exception:
+                msg = None
+            if msg is None:
+                os._exit(0)
+            control.append(msg)
     threading.Thread(target=watch_parent, daemon=True).start()
 
     latest: dict[tuple[str, str], tuple] = {}
     prints: list[tuple] = []
     adapters = []
+    coins_all = sorted({c for cs in plan.values() for c in cs})
+    perps = tuple(v for v in PERP_SOURCES if v in plan)
+    trigger = LeadTrigger(coins_all, perps)
+    move_cal = {v: BurstCalibrator(coins_all, None) for v in perps}
+    move_cal_ready = [False]
+
+    def apply_control():
+        while control:
+            trigger.configure(vol_thr=control.pop(0).get("vol"))
+
+    def lead_print(coin, t, as_of, exch_ts, kind):
+        """Trigger check on every leading-venue print; a trip goes out on its
+        own frame at once instead of riding the next SHIP_S batch."""
+        apply_control()
+        try:
+            rows = trigger.on_print(kind, coin, float(t["price"]), float(t["size"]), as_of)
+        except (KeyError, TypeError, ValueError):
+            return
+        if not rows:
+            return
+        recv_wall = time.time() - (time.monotonic() - as_of)
+        try:
+            _write_frame(out, ([], [], [], {"trips": [r + (recv_wall, exch_ts) for r in rows]}))
+        except (BrokenPipeError, OSError):
+            os._exit(0)
+
+    async def move_calibrate():
+        """Rolling MOVE_QUANTILE of each perp venue's |move over window_s|,
+        same cadence as the volume calibrators, seeded from perp_prints/."""
+        loop = asyncio.get_running_loop()
+        for v, cal in move_cal.items():
+            try:
+                rows = await loop.run_in_executor(None, seed_move_rows, v, coins_all, time.time(),
+                                                  trigger.trail.window_s)
+                cal.seed(rows)
+            except Exception as e:
+                print(f"[spot/venues] move seed failed for {v} ({e!r})", flush=True)
+        n = 0
+        while True:
+            now = time.monotonic()
+            for v, cal in move_cal.items():
+                cal.sample({c: abs(trigger.trail.move_bp((v, c), now) or 0.0) for c in coins_all})
+            n += 1
+            if n * SAMPLE_S >= REFRESH_S or not move_cal_ready[0]:
+                n = 0
+                thr = {}
+                for v, cal in move_cal.items():
+                    if cal.ready:
+                        cal.adopt(await loop.run_in_executor(None, _quantile, cal.snapshot()))
+                        thr[v] = dict(cal.live)
+                if thr:
+                    move_cal_ready[0] = True
+                    trigger.configure(move_thr=thr)
+                    status["move_thr"] = thr
+            await asyncio.sleep(SAMPLE_S)
+
+    status: dict = {}
 
     def on_update(vb: VenueBook):
         latest[(vb.venue, vb.coin)] = (
@@ -130,6 +198,8 @@ def _child_main(plan: dict[str, list[str]]):
     perp_usd: dict[tuple[str, str], tuple] = {}
 
     def on_print(coin, t, as_of, exch_ts, kind):
+        if kind in PERP_BURST_USD_1S or kind.startswith("hl_"):
+            lead_print(coin, t, as_of, exch_ts, kind)
         if kind in PERP_BURST_USD_1S:
             try:
                 perp_rows.append({"recv_ts": time.time() - (time.monotonic() - as_of), "exch_ts": exch_ts,
@@ -177,16 +247,19 @@ def _child_main(plan: dict[str, list[str]]):
         nonlocal prints
         while True:
             await asyncio.sleep(SHIP_S)
+            apply_control()
             books, ps = list(latest.values()), prints
             latest.clear()
             prints = []
             # Same 5-tuple shape as a print, with the batch's notional as a
-            # size-1 "print" at price=usd, so the parent needs no new path.
+            # size-1 "print" at price=usd. The parent only calibrates on these
+            # now; the trip itself came from lead_print.
             for (kind, coin), (wall, usd, exch_ts) in perp_usd.items():
                 ps.append((kind, coin, {"price": usd, "size": 1.0, "trade_id": None, "side": None}, wall, exch_ts))
             perp_usd.clear()
+            extra = {"status": dict(status)} if status else {}
             try:
-                _write_frame(out, (books, ps, alive()))
+                _write_frame(out, (books, ps, alive(), extra))
             except (BrokenPipeError, OSError):
                 os._exit(0)
 
@@ -217,9 +290,15 @@ def _child_main(plan: dict[str, list[str]]):
         if recorder is not None:
             recorder.adapters = {ad.venue: ad for ad in adapters}
             tasks += recorder.background_tasks()
-        await asyncio.gather(ship(), record_perps(), *tasks)
+        await asyncio.gather(ship(), record_perps(), move_calibrate(), *tasks)
 
     asyncio.run(main())
+
+
+def _quantile(snap):
+    from ..prints import MOVE_QUANTILE
+    import numpy as np
+    return np.quantile(snap, MOVE_QUANTILE, axis=1) if snap.shape[1] else np.zeros(snap.shape[0])
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +323,11 @@ class VenueProcess:
         self.n_starts = 0
         self.n_dropped = 0
         self.last_exit: int | None = None
+        # Called from the reader thread when a frame carries trips, so the
+        # trading loop can drain at once instead of on its next tick.
+        self.on_urgent = None
+        self._control: dict | None = None
+        self.status: dict = {}
 
     def alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
@@ -263,6 +347,20 @@ class VenueProcess:
         self.n_starts += 1
         threading.Thread(target=self._reader, args=(self._proc,), daemon=True,
                          name="venue-reader").start()
+        if self._control is not None:
+            self.send_control(self._control)      # a restarted child knows nothing
+
+    def send_control(self, msg: dict):
+        """Trigger thresholds for the child ({"vol": {source: {coin: usd}}}).
+        Kept and re-sent to every new child."""
+        self._control = msg
+        p = self._proc
+        if p is None or p.poll() is not None:
+            return
+        try:
+            _write_frame(p.stdin, msg)
+        except (BrokenPipeError, OSError, ValueError):
+            pass
 
     def _reader(self, proc: subprocess.Popen):
         inp = proc.stdout
@@ -277,6 +375,11 @@ class VenueProcess:
                 if len(self._frames) == self._frames.maxlen:
                     self.n_dropped += 1
                 self._frames.append(frame)
+            if len(frame) > 3 and frame[3].get("trips") and self.on_urgent is not None:
+                try:
+                    self.on_urgent()
+                except Exception:
+                    pass
 
     def ensure_running(self):
         """Start the child, or restart a dead one with backoff. Safe to call
@@ -305,13 +408,21 @@ class VenueProcess:
             self._next_try = now + self._backoff
             self._backoff = min(self._backoff * 2, RESTART_MAX_S)
 
-    def drain(self, on_book, on_print=None, on_alive=None, max_batches: int = 50) -> int:
+    def drain(self, on_book, on_print=None, on_alive=None, max_batches: int = 50, on_trip=None) -> int:
         """Apply what the child has shipped. Wall-clock receipt times become
-        this process's monotonic clock here."""
+        this process's monotonic clock here. on_trip(kind, source, coin,
+        level, thr, onset, as_of, exch_ts) per trip row."""
         with self._lock:
             frames = [self._frames.popleft() for _ in range(min(max_batches, len(self._frames)))]
         off = time.monotonic() - time.time()
-        for books, ps, alive in frames:
+        for fr in frames:
+            books, ps, alive = fr[:3]
+            extra = fr[3] if len(fr) > 3 else {}
+            if extra.get("status"):
+                self.status = extra["status"]
+            if on_trip is not None:
+                for kind, source, coin, level, thr, onset, recv_wall, exch_ts in extra.get("trips") or ():
+                    on_trip(kind, source, coin, level, thr, onset, recv_wall + off, exch_ts)
             if on_alive is not None:
                 for venue, coin, wall in alive:
                     on_alive(venue, coin, wall + off)
@@ -342,7 +453,8 @@ class VenueProcess:
 
     def summary(self) -> dict:
         return {"alive": self.alive(), "starts": self.n_starts, "last_exit": self.last_exit,
-                "batches": self.n_batches, "books": self.n_books, "dropped_frames": self.n_dropped}
+                "batches": self.n_batches, "books": self.n_books, "dropped_frames": self.n_dropped,
+                "move_thr_bp": self.status.get("move_thr")}
 
 
 if __name__ == "__main__":
