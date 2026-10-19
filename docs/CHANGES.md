@@ -3,6 +3,15 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-19 — Single-coin 15M crypto no longer run
+
+- `alpha5-crypto` runs the Coin Race alone (`--only KXETH15M` dropped), and
+  `alpha5-crypto15m-shadow` (BTC/SOL/XRP/HYPE paper) is removed. KXETH15M
+  real, 10-18 21:18 -> 10-19 02:18 UTC: 562 maker lots, 30s markout
+  -0.62c/lot, 43% picked off, settled -$7.23 over 13 events.
+- The race keeps pricing on vols implied by those markets: `implied_rates.py`
+  polls their Kalshi mids itself, so no CRYPTO15M process is needed.
+
 ## 2026-10-19 — Coin Race: market-implied shift restored
 
 - `pricing.market_shift_alpha` 0.25 (with `_half_life_s` 60, `_fit_s` 10,

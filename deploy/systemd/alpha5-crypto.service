@@ -1,5 +1,5 @@
 [Unit]
-Description=alpha5 crypto: KXCRYPTOLEAD15M + KXETH15M in one process (shadow unless armed)
+Description=alpha5 crypto: KXCRYPTOLEAD15M (shadow unless armed)
 After=network-online.target chrony.service
 Wants=network-online.target
 
@@ -10,9 +10,10 @@ Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONIOENCODING=utf-8
 # --resume-arm-h 18: a restart re-arms if the last dashboard request was an
 # arm in the last 18h with no STOP since (kalshi_infra.runtime.control.resumable_arm).
-# KXETH15M shares the race's process, SpotFeed and write group (one bucket and
-# quote queue at equal priority): kalshi_strategies/KXCRYPTOLEAD15M/shared.py.
-ExecStart=/opt/alpha5/.venv/bin/python -u -m kalshi_strategies.run --series KXCRYPTOLEAD15M --only KXETH15M --resume-arm-h 18
+# The single-coin 15M series aren't traded (2026-10-19). The race still reads
+# their Kalshi mids for its implied vols (implied_rates.py polls them itself);
+# that needs no CRYPTO15M process. Add `--only KXETH15M` to run one again.
+ExecStart=/opt/alpha5/.venv/bin/python -u -m kalshi_strategies.run --series KXCRYPTOLEAD15M --resume-arm-h 18
 # Trading outranks everything on the box (kalshi_infra/runtime/priority.py).
 # Nice=-5 needs root to grant, which systemd does before dropping to User.
 # The writer child lowers itself to 19; the venue child sets 0.

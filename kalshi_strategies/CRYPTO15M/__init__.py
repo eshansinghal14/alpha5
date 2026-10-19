@@ -1,6 +1,10 @@
 """Single-coin 15-minute up/down (KXBTC15M, KXETH15M, KXSOL15M, KXXRP15M,
 KXHYPE15M), priced off the Coin Race spot stack. Pricing only.
 
+Not run live since 2026-10-19 (ETH: picked off on 43% of maker lots). The
+race doesn't need these processes for its implied vols: it polls the 15M
+mids itself (KXCRYPTOLEAD15M/implied_rates.py).
+
     python -m kalshi_strategies.run --series KXCRYPTOLEAD15M --only KXETH15M   # race + ETH, one process
 
 ETH/SOL/XRP/HYPE share KXCRYPTOLEAD15M's write group (crypto.WRITE_GROUP), so
@@ -25,8 +29,8 @@ COIN_OF = {"KXBTC15M": "BTC", "KXETH15M": "ETH", "KXSOL15M": "SOL", "KXXRP15M": 
 CRYPTO_GROUP = "crypto-shard2"
 GROUP_OF = {"KXBTC15M": "crypto15m-btc", **{t: CRYPTO_GROUP for t in COIN_OF if t != "KXBTC15M"}}
 # CRYPTO15M_GROUP: one write group (so one process and one SpotFeed) for every
-# coin a launcher runs. alpha5-crypto15m-shadow sets it to run BTC/SOL/XRP/HYPE in
-# shadow beside, not inside, the race's process: in it they would load the race's
+# coin a launcher runs, e.g. BTC/SOL/XRP/HYPE in shadow beside, not inside, the
+# race's process (the removed alpha5-crypto15m-shadow did): in it they would load the race's
 # trading loop (ETH alone took its stale_signal share from 2-4% to 6-11%, 10-19).
 # That group's bucket is not the race's, so a series armed there is not budgeted
 # against it.

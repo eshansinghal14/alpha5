@@ -3,7 +3,8 @@
 
 Shares a process, a SpotFeed (shared.py) and a write group with whichever
 single-coin CRYPTO15M series run beside it (run --series KXCRYPTOLEAD15M
---only KXETH15M): one bucket and quote queue at equal priority."""
+--only KXETH15M): one bucket and quote queue at equal priority. Run alone, it
+still reads the single-coin 15M mids for its vols (implied_rates.py)."""
 from __future__ import annotations
 
 from kalshi_infra.runtime.series import Series
