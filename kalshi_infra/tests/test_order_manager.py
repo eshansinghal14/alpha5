@@ -535,6 +535,54 @@ def test_one_level_side_waits_for_grace_before_moving_down():
     assert ex.amends == [(1, 0.08, 15.0)]
 
 
+def test_one_level_side_fair_dip_keeps_a_safe_quote_in_its_queue():
+    """Fair dips a tick and back (10-19 S&P: the wanted top changed every
+    ~0.19s). The resting order is still within edge + keep_inside, so it stays:
+    no cancel, no re-create at the back of the queue."""
+    m, ex, c = mk(keep=0.01, amend=False)
+    m.set_desired("A", "yes", Desired([0.45], 5.0, 0.45, 30.0, 0.46, max_levels=1, behind=1))
+    m.pump(); ack_all(m, ex)
+    m.set_desired("A", "yes", Desired([0.44], 5.0, 0.44, 30.0, 0.46, max_levels=1, behind=1))
+    m.pump()
+    assert ex.cancels == [] and m.missing() == []
+    m.set_desired("A", "yes", Desired([0.45], 5.0, 0.45, 30.0, 0.46, max_levels=1, behind=1))
+    m.pump()
+    assert ex.cancels == [] and len(ex.creates) == 1 and live_px(m) == [0.45]
+
+
+def test_one_level_side_fair_dip_past_keep_inside_still_cancels():
+    m, ex, c = mk(keep=0.01, amend=False)
+    m.set_desired("A", "yes", Desired([0.45], 5.0, 0.45, 30.0, 0.46, max_levels=1, behind=1))
+    m.pump(); ack_all(m, ex)
+    m.set_desired("A", "yes", Desired([0.43], 5.0, 0.43, 30.0, 0.46, max_levels=1, behind=1))
+    assert [r for _, r in ex.cancels] == ["inside_edge"]
+
+
+def test_one_level_side_held_quote_over_the_touch_cap_still_moves_after_grace():
+    """The hold never covers a price over max_ahead_price: that stays the
+    ahead grace's job."""
+    m, ex, c = mk(keep=0.01, amend=False)
+    m.ahead_grace_s = 1.0
+    m.set_desired("A", "yes", Desired([0.45], 5.0, 0.45, 30.0, 0.46, max_levels=1, behind=1))
+    m.pump(); ack_all(m, ex)
+    m.set_desired("A", "yes", Desired([0.44], 5.0, 0.44, 30.0, 0.44, max_levels=1, behind=1))
+    m.pump()
+    assert ex.cancels == []
+    c.t += 1.0
+    m.set_desired("A", "yes", Desired([0.44], 5.0, 0.44, 30.0, 0.44, max_levels=1, behind=1))
+    m.pump()
+    assert [r for _, r in ex.cancels] == ["too_far_ahead"]
+
+
+def test_one_level_side_fair_dip_without_keep_inside_reprices():
+    """keep_inside 0 means no slack above the ladder: the old behaviour."""
+    m, ex, c = mk(keep=0.0, amend=False)
+    m.set_desired("A", "yes", Desired([0.45], 5.0, 0.45, 30.0, 0.46, max_levels=1, behind=1))
+    m.pump(); ack_all(m, ex)
+    m.set_desired("A", "yes", Desired([0.44], 5.0, 0.44, 30.0, 0.46, max_levels=1, behind=1))
+    assert [r for _, r in ex.cancels] == ["inside_edge"]
+
+
 def test_one_level_side_inside_the_edge_still_moves_down_at_once():
     m, ex, c = mk()
     m.ahead_grace_s = 1.0

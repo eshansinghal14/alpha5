@@ -20,7 +20,8 @@ _ET = "America/New_York"
 WRITE_GROUP = "spx-daily"
 # Who gets the shared bucket first (lower first). KXINXDUD is one market and
 # needs few writes; KXINXU's ladder takes whatever it is given (88% of the
-# 240 tokens/s on 2026-10-15), so it goes after DUD.
+# bucket on 2026-10-15, then 240 tokens/s; the full 300 since 10-18), so it
+# goes after DUD.
 WRITE_PRIORITY = {"KXINXDUD": 0, "KXINXU": 1}
 # Sidebar heading (kalshi_viz.app._groups).
 DASHBOARD_GROUP = "S&P"

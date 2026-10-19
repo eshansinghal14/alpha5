@@ -86,7 +86,7 @@ EDGE, LIP = "edge", "lip"
 REJECT_BACKOFF_S = 2.0
 
 # LIP re-queue (cancel + re-create, 12 tokens): at most once per side per this.
-# Five sides at that rate is ~12 tokens/s of the 240/s crypto bucket.
+# Five sides at that rate is ~12 tokens/s of the 300/s crypto bucket.
 LIP_REQUEUE_MIN_S = 5.0
 
 # Window for the live cancel-rate stats in summary().
@@ -462,6 +462,28 @@ class OrderManager:
         floor = min(d.prices)
         return {round(floor - i * TICK, 2) for i in range(1, int(d.behind) + 1)}
 
+    def _held_above(self, d: Desired) -> set[float]:
+        """Prices just past the edge an earlier quote is left at instead of
+        being reused as a spare: above edge_limit by at most keep_inside, the
+        same slack _unsafe gives it, and never over max_ahead_price (that's the
+        ahead grace's to fix). A ladder that stepped back for the touch, not
+        the edge, is not covered.
+
+        Without this, a one-level side is always at its level cap, so a fair
+        dip of one tick made the resting order a spare and it was cancelled as
+        "reprice" though still safe; ~40% came straight back to the same price
+        at the back of the queue (10-19: 74-78% of S&P reprices)."""
+        if not d.prices or d.edge_limit is None:
+            return set()
+        limit = d.edge_limit + self._keep()
+        if d.max_ahead_price is not None:
+            limit = min(limit, d.max_ahead_price)
+        out, p = set(), round(max(max(d.prices), d.edge_limit) + TICK, 2)
+        while p <= limit + 1e-9:
+            out.add(p)
+            p = round(p + TICK, 2)
+        return out
+
     def _over_room(self, ticker, side, d: Desired) -> list[Quote]:
         """Edge quotes to drop so resting size fits under `room`, deepest
         first. Every level counts toward the position cap."""
@@ -648,12 +670,14 @@ class OrderManager:
             # move reuses one, so it's always allowed.
             slots = (None if d.max_levels is None
                      else max(int(d.max_levels), 0) - len(self.live(ticker, side, EDGE)))
+            # At the level cap a spare above the ladder may move down too (see
+            # _spare), unless it's still safe there (_held_above).
+            above_ok = slots is not None and slots <= 0
+            held = self._held_above(d) if above_ok else set()
             spares = sorted(q.price for q in self.live(ticker, side, EDGE)
                             if q.state == RESTING and q.exchange_id is not None
                             and q.order_id not in self._cancel_q and round(q.price, 2) not in wanted | kept
-                            and not self._ahead_wait(q))
-            # At the level cap a spare above the ladder may move down too (see _spare).
-            above_ok = slots is not None and slots <= 0
+                            and not self._ahead_wait(q) and round(q.price, 2) not in held)
             top = d.prices[0]
             for p in d.prices:
                 p = round(p, 2)
@@ -703,7 +727,9 @@ class OrderManager:
         if below:
             return min(below, key=lambda q: q.price)
         if self._at_level_cap(ticker, side, d):
-            above = [q for q in spare if q.price > price + 1e-9 and not self._ahead_wait(q)]
+            held = self._held_above(d)
+            above = [q for q in spare if q.price > price + 1e-9 and not self._ahead_wait(q)
+                     and round(q.price, 2) not in held]
             return min(above, key=lambda q: q.price) if above else None
         return None
 
