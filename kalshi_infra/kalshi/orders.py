@@ -38,8 +38,13 @@ import uuid
 import requests
 
 from kalshi_backtest.core import Order
-from kalshi_infra.api_functions import BASE_URL
 from kalshi_infra.kalshi import auth
+
+# Kalshi's dedicated Trade API host, recommended for API traders (docs
+# getting_started/api_environments). Measured from the EC2 box 2026-10-19:
+# authenticated GET p50 19.7ms here vs 28.6ms on api.elections.kalshi.com.
+# Same keys and signed paths; public market data stays on the shared host.
+BASE_URL = "https://external-api.kalshi.com"
 
 ORDERS_PATH = "/trade-api/v2/portfolio/events/orders"
 
