@@ -3,6 +3,15 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-19 — Dashboard: one page per series, grouped in the sidebar
+
+- Replaces the KXINX+ / KXCRYPTO+ group pages (combined performance panel,
+  series picker, right-hand nav). Each series is its own page again; the
+  sidebar lists them under a heading per folder's `DASHBOARD_GROUP`
+  (Crypto: the Coin Race, then the single-coin 15M series by
+  `DASHBOARD_RANK`; S&P: KXINXU, KXINXDUD), one button each. Folders
+  without a group go under Other.
+
 ## 2026-10-18 — Quoting: one level per side, amend-down, full write budget
 
 - `quote_levels_behind` no longer adds ladder levels. Each side quotes ONE
@@ -24,7 +33,7 @@ Reverse chronological. One section per material change. Entries before
   section of config.json is gone. It never ran armed: 10-14..10-16 shadow
   was 212 of 223 fills taker at -1.3c/contract 10s markout. Bucket pricing
   (`bucket_fairs`, grid/backtest) is kept for research.
-- Dashboard: the folder's series share one sidebar page, "KXINX+"
+- Dashboard (superseded 2026-10-19): the folder's series share one sidebar page, "KXINX+"
   (`DASHBOARD_NAME`). The performance panel pools both series' real fills
   (with a per-series split under "Markout by fill type"). Each series'
   status and theo/NBBO charts sit under its own header. A ticker slider in

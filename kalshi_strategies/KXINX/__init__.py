@@ -22,8 +22,8 @@ WRITE_GROUP = "spx-daily"
 # needs few writes; KXINXU's ladder takes whatever it is given (88% of the
 # 240 tokens/s on 2026-10-15), so it goes after DUD.
 WRITE_PRIORITY = {"KXINXDUD": 0, "KXINXU": 1}
-# One dashboard page for both series (kalshi_viz.app).
-DASHBOARD_NAME = "KXINX+"
+# Sidebar heading (kalshi_viz.app._groups).
+DASHBOARD_GROUP = "S&P"
 
 
 def _pick_event(events, cfg):

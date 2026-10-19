@@ -54,24 +54,19 @@ def _registry():
     return registry()
 
 
+OTHER_GROUP = "Other"
+
+
 @st.cache_resource
-def _pages() -> dict[str, list[str]]:
-    """Sidebar page -> the series it shows. Every folder with the same
-    DASHBOARD_NAME is one page for all their series, in folder order
-    (KXINX+; KXCRYPTO+ = the Coin Race and the single-coin 15M series); every
-    other series is its own page."""
-    reg, out, grouped = _registry(), {}, set()
-    # DASHBOARD_RANK orders folders within a shared page (lower first; KXCRYPTO+: the race on top).
+def _groups() -> dict[str, list[str]]:
+    """Sidebar heading -> its series, one page each. A folder's
+    DASHBOARD_GROUP names its heading (folders sharing one are listed by
+    DASHBOARD_RANK, lower first); a folder without one goes under Other."""
+    out: dict[str, list[str]] = {}
     for mod in sorted(folders().values(), key=lambda m: getattr(m, "DASHBOARD_RANK", 0)):
-        name = getattr(mod, "DASHBOARD_NAME", None)
-        if name:
-            out.setdefault(name, []).extend(t for t in mod.SERIES if t not in out.get(name, []))
-    for name in [n for n, ms in out.items() if len(ms) < 2]:
-        del out[name]
-    for ms in out.values():
-        grouped |= set(ms)
-    out.update({t: [t] for t in reg if t not in grouped})
-    return dict(sorted(out.items()))
+        g = getattr(mod, "DASHBOARD_GROUP", None) or OTHER_GROUP
+        out.setdefault(g, []).extend(mod.SERIES)
+    return dict(sorted(out.items(), key=lambda kv: (kv[0] == OTHER_GROUP, kv[0])))
 
 
 def _stale(page: str) -> bool:
@@ -214,53 +209,10 @@ def _last_summary(series: str) -> dict | None:
     return read_summary(series) or ((latest_summary(series) or (None, None))[1])
 
 
-def _anchor(series: str) -> str:
-    return "s-" + series.lower()
-
-
-def _nav(page: str, members: list[str]):
-    """Fixed table of contents on the right edge: the combined panel, then one
-    link per series section (● = writing today)."""
-    live = {s for s in members if read_summary(s) is not None}
-    links = [f'<a href="#{_anchor(page)}">All series</a>'] + [
-        f'<a href="#{_anchor(s)}">{s}{" ●" if s in live else ""}</a>' for s in members]
-    st.markdown(
-        "<style>"
-        "[data-testid='stMainBlockContainer'], .block-container { padding-right: 11rem; }"
-        ".a5-nav { position: fixed; top: 5rem; right: 1rem; width: 9.5rem; z-index: 100;"
-        " border-left: 1px solid rgba(128,128,128,.35); padding: .25rem 0 .25rem .75rem; font-size: .85rem; }"
-        ".a5-nav a { display: block; padding: .2rem 0; text-decoration: none; opacity: .8; }"
-        ".a5-nav a:hover { opacity: 1; }"
-        ".a5-nav b { display: block; margin-bottom: .3rem; font-size: .75rem; opacity: .6; }"
-        "</style>"
-        f"<div class='a5-nav'><b>{page}</b>{''.join(links)}</div>",
-        unsafe_allow_html=True)
-
-
-def _render_page(page: str, members: list[str]):
-    """One series: its page as before. Several: a combined performance panel
-    (pooled, or one series picked), then each series' section with its own
-    performance panel, status and theo/NBBO charts, and a nav on the right."""
-    st.title(page, anchor=_anchor(page))
-    if len(members) > 1:
-        # Series that have never written (KXCRYPTO+: coins not yet run) would each draw an
-        # empty section; listed here instead, and still editable from the sidebar.
-        idle = [s for s in members if _last_summary(s) is None]
-        members = [s for s in members if s not in idle] or members[:1]
-        if idle:
-            st.caption(f"Not running yet: {', '.join(idle)}")
-    lip = {s: has_lip(_last_summary(s)) for s in members}
-    if len(members) == 1:
-        perf_panel.render(members, page=page, lip=lip[members[0]])
-        _render_series(members[0], page)
-        return
-    _nav(page, members)
-    perf_panel.render(members, page=page, lip=any(lip.values()), title="Strategy performance (real fills), all series")
-    for s in members:
-        st.divider()
-        st.header(s, anchor=_anchor(s))
-        perf_panel.render([s], page=page, lip=lip[s], title=f"{s} performance (real fills)")
-        _render_series(s, page)
+def _render_page(series: str):
+    st.title(series)
+    perf_panel.render(series, lip=has_lip(_last_summary(series)))
+    _render_series(series, series)
 
 
 def _render_series(series: str, page: str):
@@ -388,25 +340,29 @@ def _market_names(series: str) -> list[str]:
     return list(dict.fromkeys(_market_label(t, s.get("event_ticker")) for t in tickers))
 
 
+def _pick(series: str):
+    st.session_state[SERIES_KEY] = series
+
+
 def main():
-    reg, pages = _registry(), _pages()
-    # A session from before the KXINX+ page can still hold "KXINXU" etc.
-    if st.session_state.get(SERIES_KEY) not in (None, *pages):
-        del st.session_state[SERIES_KEY]
+    reg, groups = _registry(), _groups()
+    every = [s for ms in groups.values() for s in ms]
+    # A session from before (or a series since removed) can hold a page that's gone.
+    if st.session_state.get(SERIES_KEY) not in every:
+        st.session_state[SERIES_KEY] = every[0]
+    series = st.session_state[SERIES_KEY]
+    live = {s for s in reg if read_summary(s) is not None}
     with st.sidebar:
-        st.header("Series")
-        live = {s for s in reg if read_summary(s) is not None}
-        page = st.radio("Series", list(pages), label_visibility="collapsed", key=SERIES_KEY,
-                        format_func=lambda p: p + ("  ●" if live & set(pages[p]) else ""))
-        members = pages[page]
+        # One button per series under its heading: one radio can't carry headings,
+        # and one radio per group would leave a selection showing in every group.
+        for g, ms in groups.items():
+            st.subheader(g)
+            for s in ms:
+                st.button(s + ("  ●" if s in live else ""), key=f"nav_{s}", on_click=_pick, args=(s,),
+                          type="primary" if s == series else "secondary", use_container_width=True)
         st.header("Config")
-        series = members[0]
-        if len(members) > 1:
-            series = st.select_slider("Ticker", options=members, key=f"cfg_pick_{page}",
-                                      format_func=lambda s: s + ("  ●" if s in live else ""),
-                                      help="Which series' config.json section the form below edits.")
         config_form.render(reg[series], _market_names(series))
-    _render_page(page, members)
+    _render_page(series)
 
 
 main()

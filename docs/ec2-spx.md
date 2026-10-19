@@ -15,8 +15,8 @@ alpha5-watchdog   unchanged; already covers every series under data/live
 ```
 
 The dashboard needs no change: its series list comes from the registry,
-so the S&P series appear in the same sidebar as crypto (as one "KXINX+"
-page) as soon as their `data/live/<SERIES>/` folders exist on the box.
+so the S&P series appear in the same sidebar as crypto (under the "S&P"
+heading) as soon as their `data/live/<SERIES>/` folders exist on the box.
 
 ## What has to be true first
 
@@ -82,7 +82,7 @@ series and write budget from two machines.
 ## Operating
 
 - Dashboard: `ssh -i ... -N -L 8502:127.0.0.1:8502 ubuntu@<ip>`,
-  then http://localhost:8502. Crypto and the S&P page (KXINX+) are in one sidebar.
+  then http://localhost:8502. The sidebar lists every series under a Crypto or S&P heading.
 - Gateway screen (2FA, stuck dialog):
   `ssh -i ... -N -L 5900:127.0.0.1:5900 ubuntu@<ip>`, then any VNC
   client on localhost:5900 with `VNC_SERVER_PASSWORD`.

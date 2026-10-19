@@ -10,8 +10,8 @@ from kalshi_infra.runtime.series import Series
 from kalshi_strategies.KXCRYPTOLEAD15M.config import CONFIG_PATH, CryptoConfig
 
 TICKER = "KXCRYPTOLEAD15M"
-# One dashboard page with the single-coin 15M series (kalshi_viz.app._pages).
-DASHBOARD_NAME = "KXCRYPTO+"
+# Sidebar heading (kalshi_viz.app._groups).
+DASHBOARD_GROUP = "Crypto"
 # Same string as CRYPTO15M.CRYPTO_GROUP; not imported to keep the race free of it.
 WRITE_GROUP = "crypto-shard2"
 
