@@ -173,7 +173,8 @@ class CoinRacePricer:
                  *, now_s: float, S: float, T: float,
                  start_locked: bool,
                  compute_delta: bool = True,
-                 prev_result: "FairResult | None" = None) -> FairResult:
+                 prev_result: "FairResult | None" = None,
+                 rate_override: np.ndarray | None = None) -> FairResult:
         """Fair win probabilities. `x`, `I` are 5-vectors of log returns
         (x vs the start average; I = (1/60) x sum over end seconds elapsed, 0 before the last minute);
         `tau = T - now_s` in seconds.
@@ -186,7 +187,10 @@ class CoinRacePricer:
         `compute_delta=False` skips the deltas and carries `prev_result`'s
         (they only size the edge). No base-rate shrink unless
         config.shrinkage_lambda > 0 -- it capped the leader at 0.88 in the
-        last minute and cost ~0.09 nats there on validation."""
+        last minute and cost ~0.09 nats there on validation.
+
+        `rate_override`: per-coin per-second variance to use instead of the
+        forecaster's (and vol_mult); the forecaster still supplies correlation."""
         x = np.asarray(x, dtype=float)
         I = np.asarray(I, dtype=float)
         tau = max(float(tau), 0.0)
@@ -202,6 +206,8 @@ class CoinRacePricer:
 
         h = max(tau, 1.0)
         rate, R = self._rates_corr(h, now_s)
+        if rate_override is not None:
+            rate = np.asarray(rate_override, dtype=float)
         self._last_rate, self._last_corr = rate, R
         sd = np.sqrt(np.maximum(rate * te, 0.0))
         V = R * np.outer(sd, sd)
@@ -212,7 +218,8 @@ class CoinRacePricer:
         else:
             # Re-draw only when the covariance itself changes: forecaster
             # state (new 1s data) or horizon bucket (whole seconds of h).
-            key = (getattr(self.forecaster, "version", None), round(h))
+            key = (getattr(self.forecaster, "version", None), round(h),
+                   None if rate_override is None else tuple(np.round(rate, 18)))
             E = self._draws(rate, R, key if key[0] is not None else None)
             probs = self._argmax_probs(mu + math.sqrt(te) * E)
 

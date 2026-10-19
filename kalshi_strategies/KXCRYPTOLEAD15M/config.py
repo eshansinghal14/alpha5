@@ -72,6 +72,33 @@ class CryptoPricingParams:
                             "(1h RV window + 1h correlation seed + slack).", min=0, step=600,
                             apply=APPLY_NEXT_EVENT)
     composite_flush_s: float = param("Persist 1s composite bars this often.", min=1, step=5)
+    vol_source: str = param(
+        "\"implied\": each coin's vol is the one its single-coin 15M market (KXBTC15M, ...) implies over "
+        "the same window (implied_rates.py), correlation stays HAR; every fair is withheld (no_implied_vol) "
+        "while any coin lacks one. \"realized\": the HAR model x vol_mult. 10-19 01:45-01:57 UTC: implied "
+        "0.53-0.82bp/sqrt(s) vs HAR 0.72-1.30, and within 4-8% of what the 15M mids priced.")
+    implied_ema_s: float = param(
+        "Time constant (s) of each coin's implied-vol EMA. 120: KXETH15M 10-18 22:39-23:10 replay, theo-mid "
+        "+0.60c at 900s -> -0.12c at 120s.", min=10, step=10)
+    implied_min_obs: float = param("Decayed accepted readings a coin's EMA needs before it prices.", min=1, step=1)
+    implied_mid_min: float = param("Read a coin's 15M mid only inside [this, implied_mid_max].", min=0.01, max=0.5,
+                                   step=0.01)
+    implied_mid_max: float = param("Upper bound of the 15M mid read.", min=0.5, max=0.99, step=0.01)
+    implied_max_spread: float = param("Read the 15M mid only while its spread is at most this ($).", min=0.001,
+                                      step=0.005)
+    implied_max_mid_age_s: float = param("Ignore a polled 15M quote older than this (s).", min=0.5, step=0.5)
+    implied_mid_noise: float = param("Floor on the 15M mid's own error ($) in a reading's weight.", min=0.001,
+                                     step=0.001)
+    implied_spot_err_bp: float = param("Spot level error (bp) in a reading's weight (the delta term).", min=0,
+                                       step=0.1)
+    implied_lag_s: float = param("Spot move over this many seconds is added to the spot error (Kalshi lag).",
+                                 min=0, step=1)
+    implied_basis_sd_bp: float = param("Basis sd (bp) assumed when backing vol out of a 15M mid.", min=0, step=0.05)
+    implied_max_obs_se: float = param("Drop a reading whose SE of ln(vol) exceeds this.", min=0.05, step=0.05)
+    implied_max_curvature: float = param("Drop a reading where |volga| x SE / |vega| exceeds this.", min=0.05,
+                                         step=0.05)
+    implied_vol_min_bp: float = param("Reject implied vols below this (bp/sqrt(s)).", min=0.01, step=0.05)
+    implied_vol_max_bp: float = param("Reject implied vols above this (bp/sqrt(s)).", min=0.5, step=0.5)
 
 
 @section

@@ -107,6 +107,7 @@ class CoinRaceModel:
         self._dirty = True
         self.basis_bp: dict[str, float] = {}
         self._basis_cache: dict[str, tuple] = {}
+        self.vol_bp: dict[str, float] = {}
 
     def set_wakeup(self, fn):
         self._wake = fn
@@ -154,6 +155,18 @@ class CoinRaceModel:
             if v is not None and m is not None and m > 0:
                 diffs.append(math.log(m / v))
         return float(np.mean(diffs)) if len(diffs) >= BASIS_MIN_S else None
+
+    def _implied(self):
+        """The session's ImpliedRates (on the SpotFeed), or None without one."""
+        return None if self.spot is None else getattr(self.spot, "implied_rates", None)
+
+    def _spot_move(self, coin: str, now_s: float) -> float:
+        """|ln(mid now / mid implied_lag_s ago)|: how far Kalshi may lag spot."""
+        lag = self.cfg.pricing.implied_lag_s
+        bars = self.bus.feeds[coin].tail(int(lag) + 3)
+        old = [b.mid for b in bars if b.ts_s <= now_s - lag]
+        cur = self.bus.mid_nowcast(coin)
+        return abs(math.log(cur / old[-1])) if old and cur else 0.0
 
     def _withhold(self, reason: str):
         self.result = None
@@ -220,11 +233,27 @@ class CoinRaceModel:
             # pricer's remaining-time term never both leave it out.
             n_eff = min(L, max(float(snap.end_n[c]), L - tau)) if tau < L else 0.0
             I[i] = (snap.end_log_sum[c] + x[i] * (n_eff - snap.end_n[c])) / L
+        rate = None
+        iv = self._implied()
+        if iv is not None and tau >= L:
+            # Read whatever vol_source says, so switching to implied finds the EMAs warm.
+            for i, c in enumerate(COINS):
+                iv.observe(now_s, c, float(x[i]), tau, self._spot_move(c, now_s), p)
+        if p.vol_source == "implied":
+            if iv is None:
+                return self._withhold("no_implied_vol:feed")
+            rates = iv.rates(now_s, p)
+            short = [c for c in COINS if rates[c] is None]
+            if short:
+                return self._withhold(f"no_implied_vol:{','.join(short)}")
+            rate = np.array([rates[c] for c in COINS])
+            self.vol_bp = {c: math.sqrt(rates[c]) * 1e4 for c in COINS}
         if compute_delta is None:
             compute_delta = self.result is None or now_s - self._last_delta_s >= p.delta_refresh_s
         self.result = self.pricer.fairs_at(x=x, I=I, tau=tau, now_s=now_s,
                                            S=self.window.S, T=self.window.T, start_locked=True,
-                                           compute_delta=compute_delta, prev_result=self.result)
+                                           compute_delta=compute_delta, prev_result=self.result,
+                                           rate_override=rate)
         if compute_delta:
             self._last_delta_s = now_s
         self._newest_mono = min(newest)
@@ -239,7 +268,9 @@ class CoinRaceModel:
             out[self.ticker_of[c]] = Fair(prob=prob, lo=prob - k * tv, hi=prob + k * tv,
                                           extras={"coin": c, "theo_vol": tv, "tau": self.result.tau,
                                                   "phase": self.result.phase, "cf_basis_bp": self.basis_bp[c],
-                                                  "cf_end_n": snap.end_n[c]})
+                                                  "cf_end_n": snap.end_n[c],
+                                                  "vol_bp": math.sqrt(float(self.pricer._last_rate[i])) * 1e4,
+                                                  "vol_src": p.vol_source})
         return out
 
     # --- FairModel ----------------------------------------------------------
@@ -323,6 +354,10 @@ class CoinRaceModel:
             "venues_in_mid": {c: sorted(b.venue for b in f._live_books(time.monotonic()))
                               for c, f in self.bus.feeds.items()},
             "vol_model": self.forecaster.diagnostics() if hasattr(self.forecaster, "diagnostics") else None,
+            "vol_source": self.cfg.pricing.vol_source,
+            "vol_bp": {c: round(v, 4) for c, v in self.vol_bp.items()},
+            "implied_vol": (None if self._implied() is None
+                            else self._implied().snapshot(time.time(), self.cfg.pricing)),
         }
 
     # --- lifecycle -----------------------------------------------------------
@@ -332,7 +367,10 @@ class CoinRaceModel:
         # their bars and wakeups here.
         self.spot.ensure_running()
         self.spot.attach(self)
-        return []
+        iv = self._implied()
+        # Polled whatever vol_source says, so flipping it to implied mid-event
+        # finds the EMAs already warm.
+        return [] if iv is None else [iv.poll(self.event_ticker)]
 
     async def close(self):
         if self.spot is not None:
