@@ -1,9 +1,10 @@
-﻿# Create the c7g.large in us-east-1: key pair, a security group that only
-# admits SSH from this machine's current IP, Ubuntu 24.04 arm64, 30 GB gp3.
+﻿# Create the live box in us-east-2 (Kalshi's API region): key pair, a
+# security group that only admits SSH from this machine's current IP,
+# Ubuntu 24.04 arm64, gp3 root disk.
 # Requires `aws login` first. Prints the public IP and the next commands.
 param(
-    [string]$Region = "us-east-1",
-    [string]$Type = "c7g.large",
+    [string]$Region = "us-east-2",
+    [string]$Type = "c7g.xlarge",
     [string]$Name = "alpha5-live",
     [int]$DiskGB = 30
 )

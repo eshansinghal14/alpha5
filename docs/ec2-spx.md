@@ -1,7 +1,7 @@
 # S&P on the EC2 box
 
 How to run the S&P strategy (KXINXU + KXINXDUD + pricing hub) on
-`alpha5-live` (us-east-1; c7g.xlarge since 2026-10-14). The public IP changes on every stop/start (no Elastic IP); get it with `aws ec2 describe-instances --filters Name=tag:Name,Values=alpha5-live --query "Reservations[0].Instances[0].PublicIpAddress" --output text`, written `<ip>` below, next to KXCRYPTOLEAD15M, with IB
+`alpha5-live` (us-east-2 since 2026-10-19, c7g.xlarge). The public IP changes on every stop/start (no Elastic IP); get it with `aws ec2 describe-instances --region us-east-2 --filters Name=tag:Name,Values=alpha5-live --query "Reservations[0].Instances[0].PublicIpAddress" --output text`, written `<ip>` below, next to KXCRYPTOLEAD15M, with IB
 Gateway on the same box and one dashboard for both.
 
 ## Shape

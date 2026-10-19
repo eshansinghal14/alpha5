@@ -30,10 +30,11 @@ LOG = os.path.join(LIVE_ROOT, "review_agent.log")
 SETTLE_WAIT_S = 240
 
 EC2_KEY = os.path.join(os.path.expanduser("~"), ".ssh", "alpha5-live-key.pem")
-EC2_REGION, EC2_SG, EC2_NAME = "us-east-1", "sg-0ad95e21cd6ad28e0", "alpha5-live"
-# Fallback only: the box has no Elastic IP, so its address changes on every
-# stop/start (54.81.109.56 -> 3.90.60.158 on the 2026-10-14 resize).
-EC2_IP_FALLBACK = "3.90.60.158"
+# us-east-2 since 2026-10-19, next to Kalshi's API (external-api.kalshi.com is
+# an us-east-2 ELB): order RTT p50 19ms -> 8ms vs us-east-1.
+EC2_REGION, EC2_SG, EC2_NAME = "us-east-2", "sg-0216e64cd58ee302c", "alpha5-live"
+# Fallback only: the box has no Elastic IP, so its address changes on every stop/start.
+EC2_IP_FALLBACK = "3.131.100.179"
 
 
 def ec2_host() -> str:

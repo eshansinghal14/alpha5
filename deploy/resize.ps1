@@ -6,7 +6,7 @@
 #   powershell -File deploy\resize.ps1 -Type c7g.xlarge
 param(
     [Parameter(Mandatory = $true)][string]$Type,
-    [string]$Region = "us-east-1",
+    [string]$Region = "us-east-2",
     [string]$Name = "alpha5-live"
 )
 $ErrorActionPreference = "Stop"
