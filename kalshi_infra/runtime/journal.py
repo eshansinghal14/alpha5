@@ -23,7 +23,10 @@ from kalshi_infra.runtime.persist import LIVE_ROOT
 
 # "orders": our order lifecycle (create/amend/cancel sent and answered, with
 # round-trip times, and every fill with the cancel it raced if any).
-STREAMS = ("bbo", "decisions", "fills", "trades", "orders")
+# "depth": resting size at each price level near the touch, one row per level
+# whose size changed (writer.SnapshotWriter.depth). bbo only has the touch,
+# so it can't place a quote resting behind it in its queue.
+STREAMS = ("bbo", "decisions", "fills", "trades", "orders", "depth")
 
 
 def journal_dir(series: str, date: str, out_root: str = None) -> str:

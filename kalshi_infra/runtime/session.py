@@ -396,6 +396,7 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
 
     def on_quote(book):
         writer.bbo(book)
+        writer.depth(book)
         engine.update_book(book)
         if model_on_book is not None:
             model_on_book(book)

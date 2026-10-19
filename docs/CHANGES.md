@@ -3,6 +3,19 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-19 — Depth journal; single-coin 15M back in shadow
+
+- New journal stream `depth`: resting size at the best 5 prices of each side
+  (yes bids and no bids, own-side prices), one row per level whose size
+  changed (size 0 = emptied). `bbo` only had the touch, so a quote resting
+  behind it couldn't be placed in its queue. Replaying 657 real ETH orders
+  through the paper fill rules filled 47 of 626 real lots: the model puts us
+  behind everything displayed at our price, but the taker that hit us took
+  a median 41% of it. This data is what a tested queue model needs.
+- `alpha5-crypto15m-shadow` is back, all five coins, shadow only, never
+  armed: research on a profitable quoting setup. Same box isolation as before
+  (own process, below_normal, read-only on the spot files).
+
 ## 2026-10-19 — Single-coin 15M crypto no longer run
 
 - `alpha5-crypto` runs the Coin Race alone (`--only KXETH15M` dropped), and

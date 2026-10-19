@@ -31,6 +31,10 @@ JOURNAL_INTERVAL_S = 30.0   # one immutable part file per stream per this
 MAX_DEBUG_ROWS = 20_000     # heavy-write cost scales with this; the oldest half is thinned past it
 MAX_HISTORY_ROWS = 20_000
 STOP_TIMEOUT_S = 15.0
+# Price levels per side kept in the depth journal: a quote stepped back a few
+# ticks from the touch still has its queue recorded (ETH 10-19: 99% of real
+# maker fills were within 3 ticks of the touch).
+DEPTH_LEVELS = 5
 
 
 def _thin(seq: list, cap: int):
@@ -73,6 +77,7 @@ class _Event:
             self.journal._buf["bbo"].append(r)
         self.journal.record_trades(d.get("trades") or [])
         self.journal.record_orders(d.get("orders") or [])
+        self.journal._buf["depth"].extend(d.get("depth") or [])
         self.bbo.extend(d["bbo"])
         _thin(self.bbo, MAX_HISTORY_ROWS)
         self.fair.extend(d["fair"])
@@ -219,6 +224,7 @@ class SnapshotWriter:
         self._spawn()
         self._clear_buffers()
         self._last_bbo: dict[str, tuple] = {}
+        self._last_depth: dict[tuple, float] = {}
         self._last_decision: dict[str, tuple] = {}
         self._fills_sent = 0
 
@@ -234,6 +240,7 @@ class SnapshotWriter:
 
     def _clear_buffers(self):
         self._decisions, self._bbo, self._fair, self._pnl, self._trades = [], [], [], [], []
+        self._depth: list[dict] = []
         self._pnl_by_ticker: dict[str, list] = {}
 
     def _put(self, msg):
@@ -256,6 +263,7 @@ class SnapshotWriter:
         self._date, self._tickers = date, list(tickers)
         self._clear_buffers()
         self._last_bbo.clear()
+        self._last_depth.clear()
         self._last_decision.clear()
         self._fills_sent = 0
         self._put(("start", {"date": date, "tickers": self._tickers}))
@@ -313,6 +321,29 @@ class SnapshotWriter:
         self._bbo.append({"time": book.time, "ticker": book.ticker, "bid": book.bid, "ask": book.ask,
                           "bid_depth": book.bid_depth, "ask_depth": book.ask_depth})
 
+    def depth(self, book, levels: int = DEPTH_LEVELS):
+        """Resting size at the best `levels` prices of each side (yes bids,
+        no bids, own-side prices), one row per (side, price) whose size
+        changed; size 0 when a level emptied. Needs the book's ladder."""
+        lb = getattr(book, "ladder", None)
+        if lb is None:
+            return
+        tk, now = book.ticker, book.time
+        for side, ladder in (("yes", lb.yes_bids), ("no", lb.no_bids)):
+            if not ladder:
+                continue
+            # Prices are cents, so the best `levels` levels lie within `levels`
+            # ticks of the best price only if the book is dense there; a gap
+            # just means fewer rows. Avoids sorting a 100-level ladder per update.
+            best = max(ladder)
+            for i in range(levels):
+                p = round(best - i * 0.01, 2)
+                k = (tk, side, p)
+                z = ladder.get(p, 0.0)
+                if self._last_depth.get(k, 0.0) != z:
+                    self._last_depth[k] = z
+                    self._depth.append({"time": now, "ticker": tk, "side": side, "price": p, "size": z})
+
     def fair(self, row: dict):
         self._fair.append(row)
 
@@ -335,7 +366,7 @@ class SnapshotWriter:
         self._put(("data", {"summary": summary, "decisions": self._decisions, "bbo": self._bbo,
                             "fair": self._fair, "pnl": self._pnl, "pnl_by_ticker": self._pnl_by_ticker,
                             "fills": new_fills, "live_trading": live_trading, "trades": self._trades,
-                            "orders": orders or []}))
+                            "orders": orders or [], "depth": self._depth}))
         self._clear_buffers()
 
 
