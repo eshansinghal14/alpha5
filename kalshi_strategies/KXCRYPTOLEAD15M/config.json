@@ -25,7 +25,7 @@
   },
   "risk": {
     "max_loss_usd": 200.0,
-    "max_signal_age_s": 0.05,
+    "max_signal_age_s": 0.06,
     "max_fair_band": null,
     "max_fair_outside_touch": null,
     "fair_suspect_hold_s": 0.0
@@ -76,10 +76,6 @@
     "recovery_s": 5.0,
     "warmup_s": 14400.0,
     "composite_flush_s": 30.0,
-    "market_shift_alpha": 0.25,
-    "market_shift_half_life_s": 60.0,
-    "market_shift_fit_s": 10.0,
-    "market_shift_max_bp": 5.0,
     "theo_vol_reval_draws": 32,
     "burst_pull_coins": {
       "coinbase": [
@@ -123,6 +119,7 @@
     },
     "vol_source": "implied",
     "implied_fallback_realized": true,
+    "implied_hold_s": 180.0,
     "implied_ema_s": 120.0,
     "implied_min_obs": 20.0,
     "implied_mid_min": 0.15,
@@ -136,6 +133,10 @@
     "implied_max_obs_se": 0.5,
     "implied_max_curvature": 1.0,
     "implied_vol_min_bp": 0.1,
-    "implied_vol_max_bp": 5.0
+    "implied_vol_max_bp": 5.0,
+    "market_shift_alpha": 0.25,
+    "market_shift_half_life_s": 60.0,
+    "market_shift_fit_s": 10.0,
+    "market_shift_max_bp": 5.0
   }
 }

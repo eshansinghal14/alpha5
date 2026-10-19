@@ -96,6 +96,11 @@ class CryptoPricingParams:
         "the event just opened) prices on the HAR rate instead, so the race isn't withheld. 10-19 02:47 "
         "UTC: ETH and HYPE 15M mids at 0.55/0.48 left them at 19 of 20 readings and withheld every fair. "
         "Off = withhold (no_implied_vol) while any coin lacks one.")
+    implied_hold_s: float = param(
+        "A coin's last implied estimate is held this long after its 15M mid stops giving readings, before "
+        "the HAR fallback (or withholding). 180: live journals 10-18 23:25..10-19 03:30 UTC, a 3-min hold was "
+        "3-9% off the later estimate vs HAR's 8-15%; past ~5 min holding lost to HAR for most coins. 0 = no hold.",
+        min=0, step=30)
     implied_ema_s: float = param(
         "Time constant (s) of each coin's implied-vol EMA. 120: KXETH15M 10-18 22:39-23:10 replay, theo-mid "
         "+0.60c at 900s -> -0.12c at 120s.", min=10, step=10)

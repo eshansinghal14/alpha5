@@ -304,7 +304,9 @@ class CoinRaceModel:
                 for i, c in enumerate(COINS):
                     if rates[c] is None:
                         rates[c] = float(har[i])
-            self.vol_src = {c: ("realized" if c in short else "implied") for c in COINS}
+            held = iv.held_age(now_s, p)
+            self.vol_src = {c: ("realized" if c in short else "held" if held[c] is not None else "implied")
+                            for c in COINS}
             rate = np.array([rates[c] for c in COINS])
             self.vol_bp = {c: math.sqrt(rates[c]) * 1e4 for c in COINS}
         # Estimated off the unshifted fair at the same vols, so the shift can't

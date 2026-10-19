@@ -77,6 +77,23 @@ def test_coin_without_implied_falls_back_to_realized():
     assert btc.extras["vol_src"] == "implied" and abs(btc.extras["vol_bp"] - 1.0) < 1e-6
 
 
+def test_last_estimate_held_then_realized():
+    """Readings stop: the last estimate prices for implied_hold_s, then the HAR fallback."""
+    now = time.time()
+    m, iv = _race(now, implied_fallback_realized=True, implied_hold_s=180.0, implied_ema_s=120.0)
+    _fill(iv, COINS, now, s=0.7e-4)
+    out = m._price(now, None)
+    assert m.vol_src["ETH"] == "implied" and abs(out[m.ticker_of["ETH"]].extras["vol_bp"] - 0.7) < 1e-6
+    # 150s with no readings: the 6 decay below implied_min_obs (5) -> held.
+    out = m._price(now + 150, None)
+    assert m.vol_src["ETH"] == "held" and abs(out[m.ticker_of["ETH"]].extras["vol_bp"] - 0.7) < 1e-6
+    assert iv.held_age(now + 150, m.cfg.pricing)["ETH"] is not None
+    # Past the hold: HAR.
+    out = m._price(now + 400, None)
+    har = m.pricer._rates_corr(600.0, now + 400)[0][COINS.index("ETH")]
+    assert m.vol_src["ETH"] == "realized" and abs(out[m.ticker_of["ETH"]].extras["vol_bp"] - math.sqrt(har) * 1e4) < 1e-6
+
+
 def test_no_fallback_withholds():
     now = time.time()
     m, iv = _race(now, implied_fallback_realized=False)

@@ -42,6 +42,8 @@ class ImpliedRates:
         self.n_polls = 0
         self.n_poll_errors = 0
         self._last_obs_sec: dict[str, int] = {}
+        # coin -> (vol, wall time) of the last estimate with enough readings.
+        self._held: dict[str, tuple[float, float]] = {}
 
     async def poll(self, race_event: str):
         tks = single_coin_tickers(race_event)
@@ -90,17 +92,39 @@ class ImpliedRates:
         e.add(now_s, obs, p.implied_ema_s)
 
     def rates(self, now_s: float, p) -> dict[str, float | None]:
-        """Per-coin per-second variance, None where the EMA is short of readings."""
+        """Per-coin per-second variance, None where there is no estimate.
+
+        Once the EMA falls short of implied_min_obs (its 15M mid stopped giving
+        readings), the last value it had with enough readings is held for
+        implied_hold_s. Live journals 10-18 23:25-10-19 03:30 UTC: a 3-minute-old
+        estimate was 3-9% off the later one (median), against the HAR fallback's
+        8-15%; at 10 minutes holding was worse than HAR for 4 of 5 coins."""
         out = {}
         for c in COINS:
             s = self.ema[c].value(now_s, p.implied_ema_s, p.implied_min_obs)
+            if s is not None:
+                self._held[c] = (s, now_s)
+            else:
+                h = self._held.get(c)
+                if h is not None and 0 <= now_s - h[1] <= p.implied_hold_s:
+                    s = h[0]
             out[c] = None if s is None else s * s
+        return out
+
+    def held_age(self, now_s: float, p) -> dict[str, float | None]:
+        """Per coin: seconds the price rests on a held estimate (None = live or none)."""
+        out = {}
+        for c in COINS:
+            live = self.ema[c].value(now_s, p.implied_ema_s, p.implied_min_obs) is not None
+            h = self._held.get(c)
+            out[c] = None if live or h is None or now_s - h[1] > p.implied_hold_s else round(now_s - h[1], 1)
         return out
 
     def snapshot(self, now_s: float, p) -> dict:
         r = self.rates(now_s, p)
+        held = self.held_age(now_s, p)
         return {c: {"vol_bp": None if v is None else round(math.sqrt(v) * 1e4, 4),
-                    "n_eff": round(self.ema[c].n_eff(), 1),
+                    "n_eff": round(self.ema[c].n_eff(), 1), "held_s": held[c],
                     "mid": None if c not in self.mids else round(sum(self.mids[c][:2]) / 2, 4),
                     "rejects": dict(self.ema[c].rejects)} for c, v in r.items()} | {
                         "_polls": self.n_polls, "_poll_errors": self.n_poll_errors}
