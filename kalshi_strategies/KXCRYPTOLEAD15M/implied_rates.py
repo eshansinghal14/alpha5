@@ -44,29 +44,50 @@ class ImpliedRates:
         self._last_obs_sec: dict[str, int] = {}
         # coin -> (vol, wall time) of the last estimate with enough readings.
         self._held: dict[str, tuple[float, float]] = {}
+        # The event whose markets are being polled, and its five tickers.
+        self.event: str | None = None
+        self.tickers: dict[str, str] = {}
 
     async def poll(self, race_event: str):
+        """Poll this event's five 15M markets until another event takes over.
+
+        Each mid is stored with the ticker it came from and read back only for
+        the current event's tickers: a poller is a model feed task, and one
+        left from the previous event wrote its settled (~0/1) mids over the
+        live ones (10-19 05:15 UTC: every coin read 0.002 and fell to HAR)."""
         tks = single_coin_tickers(race_event)
         coin_of = {t: c for c, t in tks.items()}
+        self.event = race_event
+        self.tickers = tks
         loop = asyncio.get_running_loop()
         params = {"tickers": ",".join(tks.values())}
-        while True:
+        while self.event == race_event:
             t0 = time.monotonic()
             try:
                 r = await loop.run_in_executor(None, lambda: kalshi_get("/trade-api/v2/markets", params, max_retries=1))
+                if self.event != race_event:
+                    return
                 now = time.monotonic()
                 for m in r.get("markets", []):
-                    c = coin_of.get(m.get("ticker"))
+                    tk = m.get("ticker")
+                    c = coin_of.get(tk)
                     try:
                         bid, ask = float(m["yes_bid_dollars"]), float(m["yes_ask_dollars"])
                     except (KeyError, TypeError, ValueError):
                         continue
                     if c is not None and 0 < bid < ask < 1:
-                        self.mids[c] = (bid, ask, now)
+                        self.mids[c] = (bid, ask, now, tk)
                 self.n_polls += 1
             except Exception:
                 self.n_poll_errors += 1
             await asyncio.sleep(max(0.05, POLL_S - (time.monotonic() - t0)))
+
+    def _mid(self, coin: str):
+        """(bid, ask, received mono) for the current event's market, else None."""
+        q = self.mids.get(coin)
+        if q is None or (self.tickers and q[3] != self.tickers.get(coin)):
+            return None
+        return q[:3]
 
     def observe(self, now_s: float, coin: str, x: float, tau: float, spot_move: float, p):
         """One reading per coin per second, from the latest polled mid. `x` on
@@ -75,7 +96,7 @@ class ImpliedRates:
         if self._last_obs_sec.get(coin) == sec:
             return
         self._last_obs_sec[coin] = sec
-        q = self.mids.get(coin)
+        q = self._mid(coin)
         if q is None or time.monotonic() - q[2] > p.implied_max_mid_age_s:
             return
         bid, ask, _ = q
@@ -125,7 +146,7 @@ class ImpliedRates:
         held = self.held_age(now_s, p)
         return {c: {"vol_bp": None if v is None else round(math.sqrt(v) * 1e4, 4),
                     "n_eff": round(self.ema[c].n_eff(), 1), "held_s": held[c],
-                    "mid": None if c not in self.mids else round(sum(self.mids[c][:2]) / 2, 4),
+                    "mid": None if (q := self._mid(c)) is None else round((q[0] + q[1]) / 2, 4),
                     "rejects": dict(self.ema[c].rejects)} for c, v in r.items()} | {
                         "_polls": self.n_polls, "_poll_errors": self.n_poll_errors}
 

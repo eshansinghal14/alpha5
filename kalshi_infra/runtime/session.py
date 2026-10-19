@@ -49,6 +49,12 @@ REPRICE_IDLE_S = 1.0        # reprice even without new inputs, so time decay and
 CLOSE_GRACE_S = 1.0
 PREFETCH_BEFORE_CLOSE_S = 30.0
 NO_EVENT_RETRY_S = 300.0    # nothing listed yet (e.g. KXINX lists the next day's event after the close)
+# For this long after the process starts, a wait for a future event is cut to
+# STARTUP_RELOOK_S and the listing re-read: an event that opened seconds ago
+# can be missing from it. 10-19 05:15:08 (8s after the 01:30 race event opened)
+# and 00:00:06 (ETH, 6s in) both scheduled the next event and sat out 15 min.
+STARTUP_RELOOK_WINDOW_S = 60.0
+STARTUP_RELOOK_S = 10.0
 RETRY_S = 30.0              # failed lookup or failed event
 
 
@@ -149,6 +155,7 @@ async def _session_loop(series: Series, writer: SnapshotWriter, *, live_trading:
     done: set[str] = set()
     rolled = False
     nxt: dict = {}     # filled by run_event's prefetch with the next event's lookups
+    relook_until = time.monotonic() + STARTUP_RELOOK_WINDOW_S
     while True:
         if (reason := stopper.poll()) is not None:
             _log(series.ticker, f"STOPPING: {reason}")
@@ -178,6 +185,12 @@ async def _session_loop(series: Series, writer: SnapshotWriter, *, live_trading:
             continue
         start = series.trade_from(ev, store.config)
         wait_s = 0.0 if start is None else (start - _now()).total_seconds()
+        if wait_s > 0 and not event_ticker and not rolled and time.monotonic() < relook_until:
+            _log(series.ticker, f"next listed: {ev.event_ticker} (in {wait_s:.0f}s); re-reading the listing in "
+                                f"{STARTUP_RELOOK_S:.0f}s in case a just-opened event wasn't in it yet")
+            await asyncio.sleep(min(wait_s, STARTUP_RELOOK_S))
+            nxt = {}
+            continue
         if wait_s > 0:
             _log(series.ticker, f"next: {ev.event_ticker}, trading from {start.isoformat()} "
                                 f"(in {wait_s:.0f}s)")

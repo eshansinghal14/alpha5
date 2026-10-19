@@ -28,7 +28,7 @@ def test_rates_from_15m_mids():
     for c, s in true.items():
         m = prob_up(x[c], 0.0, tau, s * s, nu=p.t_nu, basis_sd=p.implied_basis_sd_bp * 1e-4).prob
         assert 0.7 < m < 0.85
-        iv.mids[c] = (m - 0.0025, m + 0.0025, mono)
+        iv.mids[c] = (m - 0.0025, m + 0.0025, mono, f"KX{c}15M-X-00")
     now = time.time()
     for k in range(10):
         for c in COINS:
@@ -41,11 +41,54 @@ def test_rates_from_15m_mids():
 def test_short_coin_has_no_rate_and_stale_mid_is_ignored():
     p = config(implied_min_obs=5.0, implied_max_mid_age_s=1.0).pricing
     iv = ImpliedRates()
-    iv.mids["BTC"] = (0.70, 0.71, time.monotonic() - 5.0)       # 5s old: ignored
+    iv.mids["BTC"] = (0.70, 0.71, time.monotonic() - 5.0, "KXBTC15M-X-00")       # 5s old: ignored
     now = time.time()
     for k in range(10):
         iv.observe(now + k, "BTC", 15e-4, 600.0, 0.0, p)
     assert iv.rates(now + 10, p)["BTC"] is None and iv.ema["BTC"].n_seen == 0
+
+
+def test_previous_events_mid_is_not_read():
+    """A mid from the last event's (settled) market must not feed this event."""
+    p = config(implied_min_obs=1.0).pricing
+    iv = ImpliedRates()
+    iv.event = "KXCRYPTOLEAD15M-26OCT190130"
+    iv.tickers = single_coin_tickers(iv.event)
+    mono = time.monotonic()
+    iv.mids["BTC"] = (0.001, 0.002, mono, "KXBTC15M-26OCT190115-15")    # old event
+    iv.mids["ETH"] = (0.70, 0.71, mono, "KXETH15M-26OCT190130-30")      # this event
+    assert iv._mid("BTC") is None and iv._mid("ETH") is not None
+    snap = iv.snapshot(time.time(), p)
+    assert snap["BTC"]["mid"] is None and abs(snap["ETH"]["mid"] - 0.705) < 1e-9
+
+
+def test_old_poller_stops_when_the_event_changes(monkeypatch):
+    import asyncio
+    import kalshi_strategies.KXCRYPTOLEAD15M.implied_rates as ir
+    calls = []
+
+    def fake_get(path, params, max_retries=8):
+        calls.append(params["tickers"])
+        tk = params["tickers"].split(",")
+        return {"markets": [{"ticker": t, "yes_bid_dollars": "0.40", "yes_ask_dollars": "0.41"} for t in tk]}
+
+    monkeypatch.setattr(ir, "kalshi_get", fake_get)
+    monkeypatch.setattr(ir, "POLL_S", 0.01)
+    iv = ImpliedRates()
+
+    async def run():
+        old = asyncio.create_task(iv.poll("KXCRYPTOLEAD15M-26OCT190115"))
+        await asyncio.sleep(0.05)
+        new = asyncio.create_task(iv.poll("KXCRYPTOLEAD15M-26OCT190130"))
+        await asyncio.sleep(0.05)
+        assert old.done()                                   # the old poller returned by itself
+        n = len(calls)
+        await asyncio.sleep(0.05)
+        assert all("190130" in c for c in calls[n:])        # only the new event is polled
+        new.cancel()
+
+    asyncio.run(run())
+    assert all(q[3].split("-")[1] == "26OCT190130" for q in iv.mids.values())
 
 
 def _race(now, **pricing):
