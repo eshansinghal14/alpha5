@@ -60,11 +60,11 @@ class QuotingParams:
         "Caps edge handed over in a wide market (KXINX 2026-08-17 uncapped: 6% of quotes "
         "overshot best_bid+1 tick, p90 by 24c).", min=0, step=1)
     quote_levels_behind: int = param(
-        "Extra order_lots levels per side, one tick apart, behind the best quote. 0 = one level. "
-        "Every level counts toward max_position and the lean. Also caps how many edge orders a "
-        "side may have live: levels left off the ladder are cancelled (most aggressive first) or "
-        "moved onto it before any new level is created. Ones deeper than the ladder are trimmed "
-        "at the lowest priority.", min=0, max=20, step=1)
+        "Ticks behind the best price an earlier quote may be left resting instead of being "
+        "moved up or cancelled. One order per side either way: within this many ticks the old "
+        "order stays and nothing new is sent (it's back at the top if the price steps back); "
+        "further behind, it is moved up to the best price. 0 = always follow the best price.",
+        min=0, max=20, step=1)
     skip_quote_depth_ahead: float | None = param(
         "Don't add a ladder level when more than this many contracts (others', ours excluded) "
         "already rest at its price or better -- deep behind the touch it almost never fills, so it "

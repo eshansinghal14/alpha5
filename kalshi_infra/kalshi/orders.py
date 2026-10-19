@@ -66,8 +66,11 @@ ORDER_TIMEOUT_S = 5.0
 # Env var through which kalshi_strategies.run gives each child its share of
 # the account's write budget (fraction in (0, 1]).
 WRITE_SHARE_ENV = "KALSHI_WRITE_SHARE"
-# Share of the write budget we actually spend (see KalshiOrderClient.__init__).
-WRITE_HEADROOM = 0.8
+# Share of the write budget we actually spend. 0.8 was for the Basic tier,
+# whose Kalshi bucket held only one second; on Advanced (300/s, 900-token
+# bucket, 2026-10-18) our one-second bucket can't outrun Kalshi's, and no
+# process logged a 429 10-14..18 at 0.8.
+WRITE_HEADROOM = 1.0
 
 
 def _client_id(order: Order) -> str:
@@ -214,9 +217,6 @@ class WriteBudget:
 
     def __init__(self, tokens_per_s: float):
         self.tokens_per_s = tokens_per_s
-        # Metered below Kalshi's own limit: our bucket debits at send, Kalshi's
-        # at arrival, and bursts sized to exactly the limit drew 429s at arm
-        # time (2026-10-09, a 100-token Basic bucket).
         self.rate = tokens_per_s * WRITE_HEADROOM
         # Basic tier holds one second of budget (higher tiers three; one is
         # the safe floor for either).

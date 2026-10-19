@@ -65,7 +65,7 @@ def book(bid=0.40, ask=0.60, depth=100.0):
 
 def setup(real=False, **q):
     q.setdefault("cancels_token", 0.0)
-    q.setdefault("quote_levels_behind", 2)
+    q.setdefault("quote_levels_behind", 0)
     c = cfg(**q)
     quoter = Quoter(c, Model(), FREE, close_time=None)
     client = FakeClient() if real else None
@@ -96,18 +96,18 @@ def fill(eng, exch, side, price=0.41, trade="t1"):
                       "order_id": exch, "trade_id": trade})
 
 
-def test_shadow_rests_the_full_ladder_both_sides():
-    eng, _, _ = setup()
+def test_shadow_rests_one_level_both_sides():
+    eng, _, _ = setup(quote_levels_behind=2)
     fair(eng)
-    assert live_prices(eng, "yes") == [0.41, 0.40, 0.39]
-    assert live_prices(eng, "no") == [0.41, 0.40, 0.39]
+    assert live_prices(eng, "yes") == [0.41]
+    assert live_prices(eng, "no") == [0.41]
     assert all(q.state == om.RESTING for q in eng.om.live())
 
 
 def test_real_mode_sends_creates_and_tracks_exchange_ids():
     eng, _, client = setup(real=True)
     fair(eng)
-    assert len(client.creates) == 6
+    assert len(client.creates) == 2
     assert all(q.exchange_id and q.state == om.RESTING for q in eng.om.live())
 
 
@@ -121,15 +121,16 @@ def test_steady_fair_sends_nothing_more():
     assert len(client.creates) == n and client.cancels == []
 
 
-def test_fair_drop_cancels_only_levels_now_inside_the_edge():
+def test_fair_drop_amends_the_inside_quote_down_not_cancel():
     eng, _, client = setup(real=True)
-    fair(eng, 0.50)                      # yes ladder 0.41/0.40/0.39, edge 0.48
+    fair(eng, 0.50)                      # yes top 0.41, edge 0.48
     top = xid(eng, "yes", 0.41)
-    fair(eng, 0.42)                      # quote reservation 0.40 -> 0.41 yes is inside
-    assert top in client.cancels
-    yes_cancelled = [x for x in client.cancels if x in {top}]
-    assert yes_cancelled == [top]
-    assert live_prices(eng, "yes")[0] <= 0.40
+    n = len(client.creates)
+    fair(eng, 0.42)                      # 0.41 yes is now inside the edge
+    new_top = live_prices(eng, "yes")
+    assert top not in client.cancels and client.amends == [(top, new_top[0])]
+    assert not [c for c in client.creates[n:] if c[1] == "yes"]
+    assert len(new_top) == 1 and new_top[0] < 0.41
 
 
 def test_fair_rise_keeps_old_levels_and_adds_new_ones():
@@ -147,7 +148,7 @@ def test_stale_signal_pulls_every_quote():
     fair(eng)
     quoter.model.age = 5.0
     fair(eng)
-    assert sorted(client.cancels) == sorted(f"ex{i}" for i in range(1, 7))
+    assert sorted(client.cancels) == ["ex1", "ex2"]
     assert eng.om.live() == []
 
 
@@ -156,9 +157,9 @@ def test_pull_quotes_then_nothing_recreated_until_next_decision():
     fair(eng)
     eng.pull_quotes()
     eng.pump_quotes()
-    assert len(client.creates) == 6 and eng.om.live() == []
+    assert len(client.creates) == 2 and eng.om.live() == []
     fair(eng)
-    assert len(client.creates) == 12
+    assert len(client.creates) == 4
 
 
 def test_disarm_cancels_on_kalshi_before_flipping_mode():
@@ -166,7 +167,7 @@ def test_disarm_cancels_on_kalshi_before_flipping_mode():
     fair(eng)
     eng.cancel_resting = lambda: None    # no REST sweep in tests
     eng.set_live_trading(False)
-    assert len(client.cancels) == 6 and not eng.live_trading
+    assert len(client.cancels) == 2 and not eng.live_trading
 
 
 def test_failed_cancel_stays_tracked_and_is_retried():
@@ -175,7 +176,7 @@ def test_failed_cancel_stays_tracked_and_is_retried():
     client.fail_cancel = True
     quoter.model.age = 5.0
     fair(eng)
-    assert len(eng.om.live()) == 6 and all(q.state == om.RESTING for q in eng.om.live())
+    assert len(eng.om.live()) == 2 and all(q.state == om.RESTING for q in eng.om.live())
     client.fail_cancel = False
     fair(eng)
     assert eng.om.live() == []
@@ -217,15 +218,15 @@ def test_order_events_time_the_round_trips_and_flag_a_fill_that_raced_its_cancel
     eng.order_events = []
     fair(eng)
     ev = eng.order_events
-    assert sum(r["event"] == "create_sent" for r in ev) == 6
+    assert sum(r["event"] == "create_sent" for r in ev) == 2
     acks = [r for r in ev if r["event"] == "create_ack"]
-    assert len(acks) == 6 and all(r["status"] == "ok" and r["rtt_s"] >= 0 for r in acks)
+    assert len(acks) == 2 and all(r["status"] == "ok" and r["rtt_s"] >= 0 for r in acks)
     x = xid(eng, "no", 0.41)
     quoter.model.age = 5.0
     fair(eng)                                # stale: everything cancelled
     sent = [r for r in ev if r["event"] == "cancel_sent"]
     ca = [r for r in ev if r["event"] == "cancel_ack"]
-    assert len(sent) == 6 and len(ca) == 6 and all(r["queued_s"] is not None for r in sent)
+    assert len(sent) == 2 and len(ca) == 2 and all(r["queued_s"] is not None for r in sent)
     assert all(r["rtt_s"] >= 0 and r["status"] == "ok" for r in ca)
     fill(eng, x, "no", trade="t9")
     (f,) = [r for r in ev if r["event"] == "fill"]
@@ -308,10 +309,10 @@ def test_requeue_lip_leaves_deep_or_last_quotes():
     assert len(client.cancels) == n
 
 
-def test_position_cap_limits_ladder_depth():
-    eng, _, client = setup(real=True, max_position=2.0)
+def test_position_cap_blocks_a_quote_that_does_not_fit():
+    eng, _, client = setup(real=True, max_position=0.5, order_lots=1.0)
     fair(eng)
-    assert len(live_prices(eng, "yes")) == 2 and len(live_prices(eng, "no")) == 2
+    assert live_prices(eng, "yes") == [] and live_prices(eng, "no") == []
 
 
 def test_lost_create_is_found_and_cancelled_never_double_placed():
@@ -492,10 +493,23 @@ def test_rearm_does_not_rebook_a_quote_fill_seeded_from_kalshi():
     assert _net(eng) == 1.0
 
 
+def test_quote_left_behind_within_quote_levels_behind():
+    """Top steps 0.41 -> 0.42 (others' bid 0.41): with quote_levels_behind 1
+    the old order is left where it is -- no amend, create or cancel."""
+    eng, _, client = setup(real=True, quote_levels_behind=1)
+    fair(eng)
+    n = (len(client.creates), len(client.amends), len(client.cancels))
+    eng.update_book(book(bid=0.41))
+    eng.dispatch(eng.books["A"], pd.Timestamp.now(tz="UTC"))
+    assert (len(client.creates), len(client.amends), len(client.cancels)) == n
+    assert live_prices(eng, "yes") == [0.41]
+
+
 def test_real_touch_improvement_is_one_amend_not_cancel_plus_create():
-    """Others' bid steps up 0.40 -> 0.42: the top follows to 0.43. The
-    deepest spare yes level is amended up; no yes create or cancel."""
-    eng, _, client = setup(real=True, quote_levels_behind=2)
+    """Others' bid steps up 0.40 -> 0.42: the top follows to 0.43, two ticks
+    over our 0.41 -- past quote_levels_behind 1, so it's amended up; no yes
+    create or cancel."""
+    eng, _, client = setup(real=True, quote_levels_behind=1)
     fair(eng)
     yes_before = [c for c in client.creates if c[1] == "yes"]
     eng.update_book(book(bid=0.42))
@@ -507,7 +521,7 @@ def test_real_touch_improvement_is_one_amend_not_cancel_plus_create():
 
 
 def test_shadow_touch_improvement_moves_too():
-    eng, _, _ = setup(quote_levels_behind=2)
+    eng, _, _ = setup(quote_levels_behind=0)
     fair(eng)
     eng.om.sim_bucket._tokens = eng.om.sim_bucket.rate   # refill (the test clock is wall time)
     eng.update_book(book(bid=0.42))
@@ -582,7 +596,7 @@ def test_real_lock_refuses_arm():
 
 
 def _audit_setup():
-    eng, _, client = setup(real=True, quote_levels_behind=1, order_lots=1.0)
+    eng, _, client = setup(real=True, order_lots=2.0)
     fair(eng)
     yes = [xid(eng, "yes", p) for p in live_prices(eng, "yes")]
     return eng, yes
@@ -601,7 +615,8 @@ def test_audit_fills_during_the_positions_read_do_not_halt():
     for q in list(eng.om.live("A", "no")):
         eng.om.on_cancel_done(q.order_id)
     for i, x in enumerate(yes):
-        fill(eng, x, "yes", trade=f"y{i}")
+        fill(eng, x, "yes", trade=f"y{i}a")
+        fill(eng, x, "yes", trade=f"y{i}b")
     assert eng.om.live("A") == [] and eng.ledger_positions()["A"] == 2.0
     eng.audit_positions({"A": {"position": 0.0}}, before=before)
     eng.audit_positions({"A": {"position": 2.0}}, before=eng.ledger_positions())   # next audit: caught up

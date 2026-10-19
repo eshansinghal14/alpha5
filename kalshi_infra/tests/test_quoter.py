@@ -204,11 +204,12 @@ def test_top_level_first_tick_outside_and_capped_inside_touch():
     assert ladder(ctx, "yes") == [0.41] and ladder(ctx, "no") == [0.41]
 
 
-def test_ladder_is_consecutive_ticks_behind_the_top():
+def test_quote_levels_behind_is_slack_not_extra_levels():
     q, ctx = Quoter(cfg(quote_levels_behind=2), Model(), FREE, close_time=None), Ctx()
     step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, Book("A", 0.40, 0.60))
-    assert ladder(ctx, "yes") == [0.41, 0.40, 0.39]
-    assert ladder(ctx, "no") == [0.41, 0.40, 0.39]          # own-side (no) prices
+    for side in ("yes", "no"):
+        d = ctx.desired[("A", side)]
+        assert d.prices == [0.41] and d.max_levels == 1 and d.behind == 2
 
 
 def test_edge_limit_is_first_tick_outside_the_reservation():
@@ -290,13 +291,6 @@ def test_skip_depth_ahead_drops_deep_levels_not_the_touch():
                     close_time=None), Ctx()
     step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, lb({0.40: 300.0, 0.39: 200.0}, {0.40: 100.0}, 0.40, 0.60))
     assert ladder(ctx, "yes") == [0.41]
-
-
-def test_skip_depth_ahead_off_keeps_full_ladder():
-    q, ctx = Quoter(cfg(quote_levels_behind=3, skip_quote_depth_ahead=None), Model(), FREE,
-                    close_time=None), Ctx()
-    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, lb({0.40: 300.0, 0.39: 200.0}, {0.40: 100.0}, 0.40, 0.60))
-    assert ladder(ctx, "yes") == [0.41, 0.40, 0.39, 0.38]
 
 
 def test_touch_improvement_raises_the_top():
@@ -1307,11 +1301,11 @@ def test_loss_budget_never_cuts_a_lip_exit():
 
 
 def test_loss_budget_shrinks_edge_ladder_and_takes():
-    q, ctx = Quoter(cfg(order_lots=10.0, quote_levels_behind=1), Model(), FREE, close_time=None), Ctx()
+    q, ctx = Quoter(cfg(order_lots=20.0, quote_levels_behind=1), Model(), FREE, close_time=None), Ctx()
     q.cfg.risk = risk(max_loss_usd=5.0)
     step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, Book("A", 0.30, 0.70))
     d = ctx.desired[("A", "yes")]
-    # Two yes levels near 0.48/0.47 at 10 lots would risk ~$9.5 if A loses.
+    # One yes level near 0.48 at 20 lots would risk ~$9.6 if A loses.
     assert d.lots * sum(d.prices) <= 5.0 + 1e-6
     assert q.block_counts.get("max_loss_budget", 0) >= 1
 

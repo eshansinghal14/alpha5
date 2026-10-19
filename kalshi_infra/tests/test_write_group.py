@@ -147,7 +147,7 @@ def test_two_live_members_still_share_one_queue():
 
 def test_clients_share_one_write_budget():
     from kalshi_infra.tests.test_shard_billing import _client
-    b = WriteBudget(50.0)                       # 40 usable
+    b = WriteBudget(40.0)
     a, c = _client(0), _client(0)
     for x in (a, c):
         x.budget, x._spent, x._refused, x._lock = b, {}, {}, __import__("threading").Lock()

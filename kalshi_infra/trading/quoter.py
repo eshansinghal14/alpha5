@@ -25,10 +25,11 @@ one round trip of the previous one, so ignoring in-flight size let a market
 run flat -> cap with zero lean charged).
 
 Takes go straight to ctx.buy (top priority, never budgeted). Quotes do NOT:
-the quoter publishes, per side, a ladder of up to quote_levels_behind
-consecutive ticks starting at the first tick outside the quote reservation
-(capped max_improve_ticks inside the near touch -- the touch net of our own
-orders -- and a tick inside the far touch), via ctx.set_quote_ladder. The
+the quoter publishes, per side, one level at the first tick outside the
+quote reservation (capped max_improve_ticks inside the near touch -- the
+touch net of our own orders -- and a tick inside the far touch), plus
+quote_levels_behind: how many ticks under it an earlier order may be left
+resting, via ctx.set_quote_ladder. The
 engine's OrderManager decides what to actually send, in priority order and
 from what the write bucket holds above quoting.cancels_token. A LIP quote
 per side, when lip.enable_lip_quoting is on, goes through the same manager
@@ -962,25 +963,24 @@ class Quoter:
             room = q.max_position + (net - self._inflight(ticker, "no", now))
         room = max(room, 0.0)
         ahead = self._max_ahead_price(ticker, side, market_bid, market_ask, ladder)
-        n = max(int(q.quote_levels_behind), 0) + 1
+        # One level per side. quote_levels_behind is how far an earlier
+        # order may lag behind it and be left resting, not extra levels.
+        behind = max(int(q.quote_levels_behind), 0)
         if until is not None and now < until:
             # Recently hit: keep what's up (still outside the edge), add nothing.
-            return Desired([], q.order_lots, edge_limit, room, ahead, max_levels=n)
+            return Desired([], q.order_lots, edge_limit, room, ahead, max_levels=1, behind=behind)
         top = self._top_price(ticker, side, res, market_bid, market_ask, ladder)
         if top is None:
-            return Desired([], q.order_lots, edge_limit, room, ahead, max_levels=n)
+            return Desired([], q.order_lots, edge_limit, room, ahead, max_levels=1, behind=behind)
         cap = q.skip_quote_depth_ahead
         others = self._others_bids(ticker, side, ladder) if cap is not None else None
         prices = []
-        for i in range(n):
-            p = round(top - i * TICK, 2)
-            if p < MIN_PRICE - 1e-9:
-                break
-            if others is not None and sum(z for px, z in others.items() if px >= p - 1e-9) > cap + 1e-9:
+        if top >= MIN_PRICE - 1e-9:
+            if others is not None and sum(z for px, z in others.items() if px >= top - 1e-9) > cap + 1e-9:
                 self._skipped_deep += 1
-                break                               # every deeper level has at least as much ahead
-            prices.append(p)
-        return Desired(prices, q.order_lots, edge_limit, room, ahead, max_levels=n)
+            else:
+                prices.append(round(top, 2))
+        return Desired(prices, q.order_lots, edge_limit, room, ahead, max_levels=1, behind=behind)
 
     def _max_ahead_price(self, ticker, side, market_bid, market_ask, ladder) -> float | None:
         """Highest own-side price a resting quote may keep relative to OTHERS'

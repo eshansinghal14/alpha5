@@ -36,7 +36,7 @@ def test_real_ladder_under_loop_rests_and_pulls_cleanly():
         eng.order_client = client
         fair(eng)
         await _settle(eng)
-        assert len(client.creates) == 6
+        assert len(client.creates) == 2
         assert all(q.state == om.RESTING for q in eng.om.live())
         # Fair moves twice while orders are in flight: no duplicate creates
         # at a price, and nothing ends up live inside the edge.
@@ -63,6 +63,6 @@ def test_shadow_ladder_under_loop_lands_after_send_latency():
         fair(eng)
         assert all(q.state == om.CREATING for q in eng.om.live())   # not landed yet
         await _settle(eng, 0.2)
-        assert len(eng.om.live()) == 6 and all(q.state == om.RESTING for q in eng.om.live())
+        assert len(eng.om.live()) == 2 and all(q.state == om.RESTING for q in eng.om.live())
 
     asyncio.run(main())

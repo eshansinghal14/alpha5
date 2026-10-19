@@ -3,6 +3,21 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-18 — Quoting: one level per side, amend-down, full write budget
+
+- `quote_levels_behind` no longer adds ladder levels. Each side quotes ONE
+  level; the setting is how many ticks behind the best price an earlier
+  order may be left resting instead of being moved up (no write; it's back
+  at the top if the price steps back). Configs at 1 (CRYPTO15M) now quote
+  one level, not two.
+- A quote pushed inside the edge is amended down to the new best price (10
+  tokens, side stays quoted) instead of cancel (2) + create (10). It still
+  cancels when the order isn't acked yet, the bucket can't cover the amend
+  plus queued cancels, or we already rest at that price. KXINXU 10-16:
+  201k `cancel:inside_edge` against 267k creates.
+- `WRITE_HEADROOM` 0.8 -> 1.0: 300 tokens/s on the Advanced tier (900-token
+  Kalshi bucket vs our one-second bucket); no 429 in any EC2 log 10-14..18.
+
 ## 2026-10-18 — S&P: KXINX range buckets no longer traded; one KXINX+ page
 
 - `kalshi_strategies/KXINX` registers only KXINXU and KXINXDUD; the KXINX

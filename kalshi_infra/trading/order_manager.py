@@ -140,6 +140,11 @@ class Desired:
     # too: creating the new levels under them doubled our size into a sweep
     # (BTC 5 levels / 4.0 lots vs a 2-level ladder, 2026-10-12 17:25:51).
     max_levels: int | None = None
+    # Ticks below the deepest wanted price an earlier quote may keep resting
+    # (quote_levels_behind). It is never created there, only left: when the
+    # top steps up, the old order stays instead of being moved or cancelled,
+    # and if the top steps back it is already in place.
+    behind: int = 0
 
 
 @dataclasses.dataclass
@@ -339,8 +344,14 @@ class OrderManager:
         if d is None:
             d = Desired([], 0.0, None, 0.0)
         self.desired[(ticker, side)] = d
-        for q in self._unsafe(ticker, side, d):
-            self._cancel(q, "inside_edge" if d.edge_limit is not None else "not_quotable")
+        target = self._down_target(ticker, side, d)
+        for q in sorted(self._unsafe(ticker, side, d), key=lambda q: q.price):
+            if d.edge_limit is None:
+                self._cancel(q, "not_quotable")
+            elif target is not None and self._move_down(q, target):
+                target = None                       # one order per price
+            else:
+                self._cancel(q, "inside_edge")
         for q in self._over_room(ticker, side, d):
             self._cancel(q, "room")
         for q in self._over_levels(ticker, side, d):
@@ -408,6 +419,43 @@ class OrderManager:
             return live
         limit = d.edge_limit + self._keep()
         return [q for q in live if q.price > limit + 1e-9]
+
+    def _down_target(self, ticker, side, d: Desired) -> float | None:
+        """The price an inside-edge quote is amended down to: the ladder's
+        best level, if nothing of ours is already there."""
+        if not d.prices or d.edge_limit is None:
+            return None
+        p = round(d.prices[0], 2)
+        if p > d.edge_limit + 1e-9 or self._reject_until.get((ticker, side, EDGE, p), 0.0) > self.clock():
+            return None
+        if any(round(q.price, 2) == p for q in self._active_edge(ticker, side)):
+            return None
+        return p
+
+    def _move_down(self, q: Quote, price: float) -> bool:
+        """Amend an inside-edge quote straight to `price` instead of cancel
+        (2) + create (10): the side stays quoted and it costs 10. Only an
+        acked, resting order, and only if the bucket covers the amend plus the
+        cancels already queued -- otherwise the caller cancels, which is the
+        one write that must not wait."""
+        if q.state != RESTING or q.exchange_id is None or q.order_id in self._cancel_q:
+            return False
+        bucket = self._bucket()
+        if bucket is not None and bucket < COST_AMEND + COST_CANCEL * len(self._cancel_q) - 1e-9:
+            self._bump("move_down_skipped:bucket")
+            return False
+        q.ahead_since = None
+        if not self._move(q, price):
+            return False
+        self._bump("move_down:inside_edge")
+        return True
+
+    def _kept(self, ticker, side, d: Desired) -> set[float]:
+        """Prices below the ladder an earlier quote may stay at (Desired.behind)."""
+        if not d.prices or d.behind <= 0:
+            return set()
+        floor = min(d.prices)
+        return {round(floor - i * TICK, 2) for i in range(1, int(d.behind) + 1)}
 
     def _over_room(self, ticker, side, d: Desired) -> list[Quote]:
         """Edge quotes to drop so resting size fits under `room`, deepest
@@ -573,7 +621,8 @@ class OrderManager:
         for (ticker, side), d in self.desired.items():
             if not d.prices or d.edge_limit is None:
                 continue
-            if self._stale_in_flight(ticker, side, {round(p, 2) for p in d.prices}):
+            kept = self._kept(ticker, side, d)
+            if self._stale_in_flight(ticker, side, {round(p, 2) for p in d.prices} | kept):
                 self._bump("create_deferred:in_flight")
                 continue
             # A cancelling order still occupies its price until confirmed gone:
@@ -581,6 +630,9 @@ class OrderManager:
             # live (and a cancel that fails puts it straight back).
             have = {round(q.price, 2) for q in self.live(ticker, side, EDGE)}
             wanted = {round(p, 2) for p in d.prices}
+            # Earlier quotes resting within `behind` ticks under the ladder
+            # stand in for its levels, one each: nothing is sent for them.
+            stand_in = sum(1 for q in self._active_edge(ticker, side) if round(q.price, 2) in kept)
             # A level is actionable if it can be CREATED within room, or a
             # spare quote below it can be MOVED there (a move adds no size).
             # Levels that are neither aren't queued: at the position cap they
@@ -593,13 +645,16 @@ class OrderManager:
                      else max(int(d.max_levels), 0) - len(self.live(ticker, side, EDGE)))
             spares = sorted(q.price for q in self.live(ticker, side, EDGE)
                             if q.state == RESTING and q.exchange_id is not None
-                            and q.order_id not in self._cancel_q and round(q.price, 2) not in wanted)
+                            and q.order_id not in self._cancel_q and round(q.price, 2) not in wanted | kept)
             # At the level cap a spare above the ladder may move down too (see _spare).
             above_ok = slots is not None and slots <= 0
             top = d.prices[0]
             for p in d.prices:
                 p = round(p, 2)
                 if p in have or p > d.edge_limit + 1e-9:
+                    continue
+                if stand_in > 0:
+                    stand_in -= 1
                     continue
                 if self._reject_until.get((ticker, side, EDGE, p), 0.0) > now:
                     continue
@@ -625,7 +680,7 @@ class OrderManager:
         the side is at its level cap -- then a quote left above the ladder is
         moved down onto it (lowest first), since nothing else can fill the
         ladder and a stale level above it is what a sweep hits first."""
-        wanted = {round(p, 2) for p in d.prices}
+        wanted = {round(p, 2) for p in d.prices} | self._kept(ticker, side, d)
         spare = [q for q in self.live(ticker, side, EDGE)
                  if q.state == RESTING and q.exchange_id is not None and q.order_id not in self._cancel_q
                  and round(q.price, 2) not in wanted]
@@ -736,7 +791,7 @@ class OrderManager:
             if not d.prices or d.edge_limit is None:
                 continue
             floor = min(d.prices)
-            wanted = {round(p, 2) for p in d.prices}
+            wanted = {round(p, 2) for p in d.prices} | self._kept(ticker, side, d)
             extra = sorted((q for q in self.live(ticker, side, EDGE)
                             if q.state == RESTING and q.order_id not in self._cancel_q
                             and round(q.price, 2) not in wanted and q.price < floor - 1e-9),

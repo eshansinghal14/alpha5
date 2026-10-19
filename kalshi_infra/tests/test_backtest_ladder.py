@@ -47,8 +47,7 @@ def test_ladder_rests_and_fills_off_prints():
                       trades=[Trade(ticker="A", time=t1 + pd.Timedelta(seconds=2), price=0.41, size=1.0,
                                     taker_side="no")])
     quotes = [o for o in res.orders if o.intent == "quote"]
-    assert sorted({(o.side, o.price) for o in quotes}) == sorted(
-        {("yes", 0.41), ("yes", 0.40), ("yes", 0.39), ("no", 0.41), ("no", 0.40), ("no", 0.39)})
+    assert sorted({(o.side, o.price) for o in quotes}) == [("no", 0.41), ("yes", 0.41)]
     assert res.portfolio.position("A").yes_qty == 1.0
 
 
@@ -61,8 +60,10 @@ def test_bucket_is_metered_on_sim_time():
     assert 2 <= n <= 4
 
 
-def test_fair_drop_cancels_inside_level():
+def test_fair_drop_moves_the_inside_quote_down():
     fairs = [(T0 + pd.Timedelta(seconds=1), 0.50), (T0 + pd.Timedelta(seconds=2), 0.42)]
-    res, bt, _ = _run(0.0, fairs)
-    top_yes = [o for o in res.orders if o.intent == "quote" and o.side == "yes" and o.price == 0.41]
-    assert top_yes and top_yes[0].order_id in res.cancelled_order_ids
+    res, bt, q = _run(0.0, fairs)
+    yes = [o for o in res.orders if o.intent == "quote" and o.side == "yes"]
+    assert len(yes) == 1 and yes[0].order_id not in res.cancelled_order_ids
+    assert yes[0].price < 0.41                       # amended down, not re-created
+    assert bt._om.counts.get("move_down:inside_edge", 0) == 1

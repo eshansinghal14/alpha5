@@ -161,9 +161,109 @@ def test_keep_inside_leaves_a_quote_within_the_threshold():
     m, ex, _ = mk(keep=0.01)
     m.quotes[1] = om.Quote(1, "A", "yes", 0.41, 1.0, state=om.RESTING, exchange_id="x1")
     m.set_desired("A", "yes", D([0.40], edge=0.40))
-    assert ex.cancels == []
+    assert ex.cancels == [] and ex.amends == []
     m.set_desired("A", "yes", D([0.39], edge=0.39))
-    assert ex.cancels == [(1, "inside_edge")]
+    assert ex.cancels == [] and ex.amends == [(1, 0.39, 1.0)]
+
+
+def test_inside_edge_quote_is_amended_down_to_the_new_top():
+    m, ex, _ = mk()
+    m.set_desired("A", "yes", D([0.41]))
+    m.pump(); ack_all(m, ex)
+    m.set_desired("A", "yes", D([0.38], edge=0.39))
+    assert ex.amends == [(1, 0.38, 1.0)] and ex.cancels == []
+    assert m.counts["move_down:inside_edge"] == 1
+    m.pump()
+    assert len(ex.creates) == 1                    # nothing new created behind it
+    answer_amends(m, ex)
+    assert live_px(m) == [0.38]
+
+
+def test_inside_edge_falls_back_to_cancel_when_the_amend_cant_be_afforded():
+    m, ex, _ = mk(bucket=5.0)                      # covers a cancel (2), not an amend (10)
+    m.quotes[1] = om.Quote(1, "A", "yes", 0.41, 1.0, state=om.RESTING, exchange_id="x1")
+    m.set_desired("A", "yes", D([0.38], edge=0.39))
+    assert ex.amends == [] and ex.cancels == [(1, "inside_edge")]
+
+
+def test_inside_edge_unacked_create_is_still_cancelled_on_ack():
+    m, ex, _ = mk()
+    m.set_desired("A", "yes", D([0.41]))
+    m.pump()                                       # not acked: no id to amend by
+    m.set_desired("A", "yes", D([0.38], edge=0.39))
+    assert ex.amends == [] and m.quotes[1].state == om.CANCELLING
+
+
+def test_inside_edge_not_amended_onto_a_price_we_already_hold():
+    m, ex, _ = mk()
+    m.quotes[1] = om.Quote(1, "A", "yes", 0.41, 1.0, state=om.RESTING, exchange_id="x1")
+    m.quotes[2] = om.Quote(2, "A", "yes", 0.38, 1.0, state=om.RESTING, exchange_id="x2")
+    m.set_desired("A", "yes", D([0.38], edge=0.39))
+    assert ex.amends == [] and ex.cancels == [(1, "inside_edge")]
+
+
+def test_two_inside_edge_quotes_one_amended_one_cancelled():
+    m, ex, _ = mk()
+    m.quotes[1] = om.Quote(1, "A", "yes", 0.42, 1.0, state=om.RESTING, exchange_id="x1")
+    m.quotes[2] = om.Quote(2, "A", "yes", 0.41, 1.0, state=om.RESTING, exchange_id="x2")
+    m.set_desired("A", "yes", D([0.38], edge=0.39))
+    # The one nearest the target (least far inside) moves; the other goes.
+    assert ex.amends == [(2, 0.38, 1.0)] and ex.cancels == [(1, "inside_edge")]
+
+
+# ---------------------------------------------------------------------------
+# Desired.behind (quote_levels_behind): an earlier quote left resting
+# ---------------------------------------------------------------------------
+
+def B(prices, behind, edge=0.48, room=10.0):
+    return Desired(list(prices), 1.0, edge, room, None, max_levels=1, behind=behind)
+
+
+def test_behind_leaves_an_old_quote_when_the_top_steps_up():
+    m, ex, _ = mk()
+    m.set_desired("A", "yes", B([0.41], 2))
+    m.pump(); ack_all(m, ex)
+    m.set_desired("A", "yes", B([0.42], 2))
+    m.pump()
+    m.set_desired("A", "yes", B([0.43], 2))
+    m.pump()
+    assert len(ex.creates) == 1 and ex.amends == [] and ex.cancels == []
+    assert live_px(m) == [0.41]
+
+
+def test_behind_moves_the_quote_up_once_it_lags_further():
+    m, ex, _ = mk()
+    m.set_desired("A", "yes", B([0.41], 2))
+    m.pump(); ack_all(m, ex)
+    m.set_desired("A", "yes", B([0.44], 2))
+    m.pump()
+    assert ex.amends == [(1, 0.44, 1.0)] and len(ex.creates) == 1 and ex.cancels == []
+
+
+def test_behind_zero_follows_the_top():
+    m, ex, _ = mk()
+    m.set_desired("A", "yes", B([0.41], 0))
+    m.pump(); ack_all(m, ex)
+    m.set_desired("A", "yes", B([0.42], 0))
+    m.pump()
+    assert ex.amends == [(1, 0.42, 1.0)]
+
+
+def test_behind_quote_is_not_trimmed():
+    m, ex, _ = mk()
+    m.set_desired("A", "yes", B([0.41], 1))
+    m.pump(); ack_all(m, ex)
+    m.set_desired("A", "yes", B([0.42], 1))
+    m.pump(); m.pump()
+    assert ex.cancels == [] and live_px(m) == [0.41]
+
+
+def test_behind_still_cancels_when_the_top_falls_inside():
+    m, ex, _ = mk()
+    m.set_desired("A", "yes", B([0.41], 3))
+    m.pump(); ack_all(m, ex)
+    m.set_desired("A", "yes", B([0.39], 3, edge=0.39))
+    assert ex.amends == [(1, 0.39, 1.0)]           # inside the edge: moved down, never left
 
 
 def test_keep_inside_never_places_or_moves_inside_the_edge():
@@ -312,7 +412,8 @@ def test_cancel_stats_split_sparse_and_pull():
     m, ex, c = mk()
     m.set_desired("A", "yes", D([0.41, 0.40]))
     m.pump(); ack_all(m, ex)
-    m.set_desired("A", "yes", D([0.39], edge=0.40))
+    m.set_desired("A", "yes", D([0.38], edge=0.39))     # 0.40 amended down, 0.41 cancelled
+    answer_amends(m, ex)
     c.t += 1
     m.pull_all("pull")
     s = m.summary()["cancels"]
