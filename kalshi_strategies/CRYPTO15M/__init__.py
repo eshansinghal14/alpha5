@@ -24,6 +24,14 @@ DASHBOARD_RANK = 1
 COIN_OF = {"KXBTC15M": "BTC", "KXETH15M": "ETH", "KXSOL15M": "SOL", "KXXRP15M": "XRP", "KXHYPE15M": "HYPE"}
 CRYPTO_GROUP = "crypto-shard2"
 GROUP_OF = {"KXBTC15M": "crypto15m-btc", **{t: CRYPTO_GROUP for t in COIN_OF if t != "KXBTC15M"}}
+# CRYPTO15M_GROUP: one write group (so one process and one SpotFeed) for every
+# coin a launcher runs. alpha5-crypto15m-shadow sets it to run BTC/SOL/XRP/HYPE in
+# shadow beside, not inside, the race's process: in it they would load the race's
+# trading loop (ETH alone took its stale_signal share from 2-4% to 6-11%, 10-19).
+# That group's bucket is not the race's, so a series armed there is not budgeted
+# against it.
+if os.environ.get("CRYPTO15M_GROUP"):
+    GROUP_OF = {t: os.environ["CRYPTO15M_GROUP"] for t in COIN_OF}
 # CRYPTO15M_PERSIST=0: a process that doesn't own the shared spot files
 # (composite bars, CF index, prints, burst thresholds) reads them only. Two
 # writers race on the same hourly parquets. Run with the race, it's the race's.
