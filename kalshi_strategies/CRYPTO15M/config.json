@@ -1,11 +1,11 @@
 {
   "KXBTC15M": {
     "quoting": {
-      "max_position": 20.0,
-      "constant_edge": 0.03,
+      "max_position": 5.0,
+      "constant_edge": 0.005,
       "constant_edge_ref_s": null,
-      "edge_fraction": 0.8,
-      "lean_dollars": 0.035,
+      "edge_fraction": 0.1,
+      "lean_dollars": 0.005,
       "max_markets": null,
       "atm_hysteresis": 0,
       "enable_taking": false,
@@ -14,15 +14,15 @@
       "max_improve_ticks": 1,
       "quote_levels_behind": 1,
       "skip_quote_depth_ahead": null,
-      "quote_keep_inside": 0.01,
+      "quote_keep_inside": 0.0,
       "quote_ahead_grace_s": 1.0,
-      "cancels_token": 20.0,
+      "cancels_token": 6.0,
       "requote_delay_s": 0.5,
-      "order_lots": 2.0
+      "order_lots": 0.5
     },
     "trading_time": {
       "real_trading_delay_s": 10.0,
-      "real_trading_cutoff_s": 60.0
+      "real_trading_cutoff_s": 300.0
     },
     "risk": {
       "max_loss_usd": 80.0,
@@ -117,8 +117,8 @@
       "recovery_s": 5.0,
       "warmup_s": 14400.0,
       "composite_flush_s": 30.0,
-      "vol_source": "realized",
-      "implied_ema_s": 900.0,
+      "vol_source": "implied",
+      "implied_ema_s": 120.0,
       "implied_min_obs": 20.0,
       "implied_mid_min": 0.15,
       "implied_mid_max": 0.85,
@@ -289,11 +289,11 @@
   },
   "KXSOL15M": {
     "quoting": {
-      "max_position": 20.0,
-      "constant_edge": 0.03,
+      "max_position": 5.0,
+      "constant_edge": 0.005,
       "constant_edge_ref_s": null,
-      "edge_fraction": 0.8,
-      "lean_dollars": 0.035,
+      "edge_fraction": 0.1,
+      "lean_dollars": 0.005,
       "max_markets": null,
       "atm_hysteresis": 0,
       "enable_taking": false,
@@ -302,15 +302,15 @@
       "max_improve_ticks": 1,
       "quote_levels_behind": 1,
       "skip_quote_depth_ahead": null,
-      "quote_keep_inside": 0.01,
+      "quote_keep_inside": 0.0,
       "quote_ahead_grace_s": 1.0,
-      "cancels_token": 20.0,
+      "cancels_token": 6.0,
       "requote_delay_s": 0.5,
-      "order_lots": 2.0
+      "order_lots": 0.5
     },
     "trading_time": {
       "real_trading_delay_s": 10.0,
-      "real_trading_cutoff_s": 60.0
+      "real_trading_cutoff_s": 300.0
     },
     "risk": {
       "max_loss_usd": 80.0,
@@ -405,8 +405,8 @@
       "recovery_s": 5.0,
       "warmup_s": 14400.0,
       "composite_flush_s": 30.0,
-      "vol_source": "realized",
-      "implied_ema_s": 900.0,
+      "vol_source": "implied",
+      "implied_ema_s": 120.0,
       "implied_min_obs": 20.0,
       "implied_mid_min": 0.15,
       "implied_mid_max": 0.85,
@@ -418,7 +418,7 @@
       "implied_max_curvature": 1.0,
       "implied_vol_min_bp": 0.1,
       "implied_vol_max_bp": 5.0,
-      "vol_off_fast_s": 60.0,
+      "vol_off_fast_s": 30.0,
       "vol_off_ratio": 1.3,
       "vol_off_z": 3.0,
       "vol_off_min_obs": 10.0,
@@ -433,11 +433,11 @@
   },
   "KXXRP15M": {
     "quoting": {
-      "max_position": 20.0,
-      "constant_edge": 0.03,
+      "max_position": 5.0,
+      "constant_edge": 0.005,
       "constant_edge_ref_s": null,
-      "edge_fraction": 0.8,
-      "lean_dollars": 0.035,
+      "edge_fraction": 0.1,
+      "lean_dollars": 0.005,
       "max_markets": null,
       "atm_hysteresis": 0,
       "enable_taking": false,
@@ -446,15 +446,15 @@
       "max_improve_ticks": 1,
       "quote_levels_behind": 1,
       "skip_quote_depth_ahead": null,
-      "quote_keep_inside": 0.01,
+      "quote_keep_inside": 0.0,
       "quote_ahead_grace_s": 1.0,
-      "cancels_token": 20.0,
+      "cancels_token": 6.0,
       "requote_delay_s": 0.5,
-      "order_lots": 2.0
+      "order_lots": 0.5
     },
     "trading_time": {
       "real_trading_delay_s": 10.0,
-      "real_trading_cutoff_s": 60.0
+      "real_trading_cutoff_s": 300.0
     },
     "risk": {
       "max_loss_usd": 80.0,
@@ -549,8 +549,8 @@
       "recovery_s": 5.0,
       "warmup_s": 14400.0,
       "composite_flush_s": 30.0,
-      "vol_source": "realized",
-      "implied_ema_s": 900.0,
+      "vol_source": "implied",
+      "implied_ema_s": 120.0,
       "implied_min_obs": 20.0,
       "implied_mid_min": 0.15,
       "implied_mid_max": 0.85,
@@ -562,7 +562,7 @@
       "implied_max_curvature": 1.0,
       "implied_vol_min_bp": 0.1,
       "implied_vol_max_bp": 5.0,
-      "vol_off_fast_s": 60.0,
+      "vol_off_fast_s": 30.0,
       "vol_off_ratio": 1.3,
       "vol_off_z": 3.0,
       "vol_off_min_obs": 10.0,
@@ -577,11 +577,11 @@
   },
   "KXHYPE15M": {
     "quoting": {
-      "max_position": 20.0,
-      "constant_edge": 0.03,
+      "max_position": 5.0,
+      "constant_edge": 0.005,
       "constant_edge_ref_s": null,
-      "edge_fraction": 0.8,
-      "lean_dollars": 0.035,
+      "edge_fraction": 0.1,
+      "lean_dollars": 0.005,
       "max_markets": null,
       "atm_hysteresis": 0,
       "enable_taking": false,
@@ -590,15 +590,15 @@
       "max_improve_ticks": 1,
       "quote_levels_behind": 1,
       "skip_quote_depth_ahead": null,
-      "quote_keep_inside": 0.01,
+      "quote_keep_inside": 0.0,
       "quote_ahead_grace_s": 1.0,
-      "cancels_token": 20.0,
+      "cancels_token": 6.0,
       "requote_delay_s": 0.5,
-      "order_lots": 2.0
+      "order_lots": 0.5
     },
     "trading_time": {
       "real_trading_delay_s": 10.0,
-      "real_trading_cutoff_s": 60.0
+      "real_trading_cutoff_s": 300.0
     },
     "risk": {
       "max_loss_usd": 80.0,
@@ -693,8 +693,8 @@
       "recovery_s": 5.0,
       "warmup_s": 14400.0,
       "composite_flush_s": 30.0,
-      "vol_source": "realized",
-      "implied_ema_s": 900.0,
+      "vol_source": "implied",
+      "implied_ema_s": 120.0,
       "implied_min_obs": 20.0,
       "implied_mid_min": 0.15,
       "implied_mid_max": 0.85,
@@ -706,7 +706,7 @@
       "implied_max_curvature": 1.0,
       "implied_vol_min_bp": 0.1,
       "implied_vol_max_bp": 5.0,
-      "vol_off_fast_s": 60.0,
+      "vol_off_fast_s": 30.0,
       "vol_off_ratio": 1.3,
       "vol_off_z": 3.0,
       "vol_off_min_obs": 10.0,
