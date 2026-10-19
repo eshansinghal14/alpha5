@@ -3,6 +3,18 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-19 — Coin Race: market-implied shift restored
+
+- `pricing.market_shift_alpha` 0.25 (with `_half_life_s` 60, `_fit_s` 10,
+  `_max_bp` 5) and the model's Kalshi-book input are back; the fit now uses
+  the bump deltas at the vols being priced (implied or HAR). Removed
+  10-18 20:14 UTC on a settlement-accuracy replay that scored it a wash, but
+  quoting did worse without it: 10-18 20:14 -> 10-19 02:32 UTC the share of
+  event time with some market >=3c outside Kalshi's touch went 17% -> 29%, and
+  edge fills taken then went +1.0c/lot (3-10c out) -> -0.5c at 10s. To be
+  re-judged once implied vol (10-19 02:32) has a few hours: if the gap stays
+  under ~15% of time without it, it can go again.
+
 ## 2026-10-19 — Dashboard: one page per series, grouped in the sidebar
 
 - Replaces the KXINX+ / KXCRYPTO+ group pages (combined performance panel,
