@@ -76,6 +76,10 @@
     "recovery_s": 5.0,
     "warmup_s": 14400.0,
     "composite_flush_s": 30.0,
+    "market_shift_alpha": 0.25,
+    "market_shift_half_life_s": 60.0,
+    "market_shift_fit_s": 10.0,
+    "market_shift_max_bp": 5.0,
     "theo_vol_reval_draws": 32,
     "burst_pull_coins": {
       "coinbase": [

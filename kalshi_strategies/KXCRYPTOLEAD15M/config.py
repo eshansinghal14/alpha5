@@ -72,6 +72,20 @@ class CryptoPricingParams:
                             "(1h RV window + 1h correlation seed + slack).", min=0, step=600,
                             apply=APPLY_NEXT_EVENT)
     composite_flush_s: float = param("Persist 1s composite bars this often.", min=1, step=5)
+    market_shift_alpha: float = param(
+        "Share of the market-implied per-coin return shift (the one that would move our five fairs "
+        "onto the Kalshi mids) applied to pricing, after EMA smoothing. 0 disables. 0.25: winner log "
+        "loss a wash on 568 events 10-12..18 (-0.0000, CI +-0.0022), but live edge fills while a market "
+        "sat 3-10c outside Kalshi's touch ran +1.0c/lot with it (10-18 11:14-20:14 UTC) vs -0.5c "
+        "without (20:14-02:32).", min=0, max=1, step=0.05)
+    market_shift_half_life_s: float = param(
+        "EMA half-life of the market-implied shift. 30/60/120 scored within noise of each other.",
+        min=1, step=10)
+    market_shift_fit_s: float = param(
+        "How often a new market-implied shift is estimated (one ridge solve on the bump deltas).",
+        min=0.5, step=0.5)
+    market_shift_max_bp: float = param(
+        "Cap on any one coin's estimated shift, per estimate, in bp of return.", min=0, step=0.5)
     vol_source: str = param(
         "\"implied\": each coin's vol is the one its single-coin 15M market (KXBTC15M, ...) implies over "
         "the same window (implied_rates.py), correlation stays HAR; every fair is withheld (no_implied_vol) "
