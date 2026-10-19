@@ -56,15 +56,20 @@ def _registry():
 
 @st.cache_resource
 def _pages() -> dict[str, list[str]]:
-    """Sidebar page -> the series it shows. A folder with DASHBOARD_NAME
-    (KXINX: "KXINX+") is one page for all its series; every other series is
-    its own page."""
+    """Sidebar page -> the series it shows. Every folder with the same
+    DASHBOARD_NAME is one page for all their series, in folder order
+    (KXINX+; KXCRYPTO+ = the Coin Race and the single-coin 15M series); every
+    other series is its own page."""
     reg, out, grouped = _registry(), {}, set()
-    for mod in folders().values():
+    # DASHBOARD_RANK orders folders within a shared page (lower first; KXCRYPTO+: the race on top).
+    for mod in sorted(folders().values(), key=lambda m: getattr(m, "DASHBOARD_RANK", 0)):
         name = getattr(mod, "DASHBOARD_NAME", None)
-        if name and len(mod.SERIES) > 1:
-            out[name] = list(mod.SERIES)
-            grouped |= set(mod.SERIES)
+        if name:
+            out.setdefault(name, []).extend(t for t in mod.SERIES if t not in out.get(name, []))
+    for name in [n for n, ms in out.items() if len(ms) < 2]:
+        del out[name]
+    for ms in out.values():
+        grouped |= set(ms)
     out.update({t: [t] for t in reg if t not in grouped})
     return dict(sorted(out.items()))
 
@@ -213,6 +218,13 @@ def _render_page(page: str, members: list[str]):
     """One series: its page as before. Several: one combined performance
     panel, then each series' status and theo/NBBO charts under its own header."""
     st.title(page)
+    if len(members) > 1:
+        # Series that have never written (KXCRYPTO+: coins not yet run) would each draw an
+        # empty section; listed here instead, and still editable from the sidebar.
+        idle = [s for s in members if _last_summary(s) is None]
+        members = [s for s in members if s not in idle] or members[:1]
+        if idle:
+            st.caption(f"Not running yet: {', '.join(idle)}")
     perf_panel.render(members, page=page, lip=any(has_lip(_last_summary(s)) for s in members))
     for s in members:
         if len(members) > 1:

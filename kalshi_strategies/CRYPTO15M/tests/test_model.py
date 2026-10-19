@@ -23,7 +23,9 @@ class _Book:
 
 def _cfg(**pricing):
     cfg = load(UpDownConfig, CONFIG_PATH, "KXBTC15M")
-    for k, v in {"min_rv_seconds": 0, "recovery_s": 0.0, **pricing}.items():
+    # Realized vol unless a test asks for implied: the live config is implied for
+    # every coin, which withholds the fair until Kalshi mids have been read.
+    for k, v in {"min_rv_seconds": 0, "recovery_s": 0.0, "vol_source": "realized", **pricing}.items():
         setattr(cfg.pricing, k, v)
     return cfg
 

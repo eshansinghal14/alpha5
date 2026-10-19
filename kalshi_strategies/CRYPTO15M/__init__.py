@@ -18,6 +18,9 @@ from kalshi_infra.runtime.series import Series
 from kalshi_strategies.CRYPTO15M.config import CONFIG_PATH, UpDownConfig
 from kalshi_strategies.KXCRYPTOLEAD15M.shared import get_spot
 
+# One dashboard page with the Coin Race (kalshi_viz.app._pages).
+DASHBOARD_NAME = "KXCRYPTO+"
+DASHBOARD_RANK = 1
 COIN_OF = {"KXBTC15M": "BTC", "KXETH15M": "ETH", "KXSOL15M": "SOL", "KXXRP15M": "XRP", "KXHYPE15M": "HYPE"}
 CRYPTO_GROUP = "crypto-shard2"
 GROUP_OF = {"KXBTC15M": "crypto15m-btc", **{t: CRYPTO_GROUP for t in COIN_OF if t != "KXBTC15M"}}
