@@ -214,10 +214,34 @@ def _last_summary(series: str) -> dict | None:
     return read_summary(series) or ((latest_summary(series) or (None, None))[1])
 
 
+def _anchor(series: str) -> str:
+    return "s-" + series.lower()
+
+
+def _nav(page: str, members: list[str]):
+    """Fixed table of contents on the right edge: the combined panel, then one
+    link per series section (● = writing today)."""
+    live = {s for s in members if read_summary(s) is not None}
+    links = [f'<a href="#{_anchor(page)}">All series</a>'] + [
+        f'<a href="#{_anchor(s)}">{s}{" ●" if s in live else ""}</a>' for s in members]
+    st.markdown(
+        "<style>"
+        "[data-testid='stMainBlockContainer'], .block-container { padding-right: 11rem; }"
+        ".a5-nav { position: fixed; top: 5rem; right: 1rem; width: 9.5rem; z-index: 100;"
+        " border-left: 1px solid rgba(128,128,128,.35); padding: .25rem 0 .25rem .75rem; font-size: .85rem; }"
+        ".a5-nav a { display: block; padding: .2rem 0; text-decoration: none; opacity: .8; }"
+        ".a5-nav a:hover { opacity: 1; }"
+        ".a5-nav b { display: block; margin-bottom: .3rem; font-size: .75rem; opacity: .6; }"
+        "</style>"
+        f"<div class='a5-nav'><b>{page}</b>{''.join(links)}</div>",
+        unsafe_allow_html=True)
+
+
 def _render_page(page: str, members: list[str]):
-    """One series: its page as before. Several: one combined performance
-    panel, then each series' status and theo/NBBO charts under its own header."""
-    st.title(page)
+    """One series: its page as before. Several: a combined performance panel
+    (pooled, or one series picked), then each series' section with its own
+    performance panel, status and theo/NBBO charts, and a nav on the right."""
+    st.title(page, anchor=_anchor(page))
     if len(members) > 1:
         # Series that have never written (KXCRYPTO+: coins not yet run) would each draw an
         # empty section; listed here instead, and still editable from the sidebar.
@@ -225,11 +249,17 @@ def _render_page(page: str, members: list[str]):
         members = [s for s in members if s not in idle] or members[:1]
         if idle:
             st.caption(f"Not running yet: {', '.join(idle)}")
-    perf_panel.render(members, page=page, lip=any(has_lip(_last_summary(s)) for s in members))
+    lip = {s: has_lip(_last_summary(s)) for s in members}
+    if len(members) == 1:
+        perf_panel.render(members, page=page, lip=lip[members[0]])
+        _render_series(members[0], page)
+        return
+    _nav(page, members)
+    perf_panel.render(members, page=page, lip=any(lip.values()), title="Strategy performance (real fills), all series")
     for s in members:
-        if len(members) > 1:
-            st.divider()
-            st.header(s)
+        st.divider()
+        st.header(s, anchor=_anchor(s))
+        perf_panel.render([s], page=page, lip=lip[s], title=f"{s} performance (real fills)")
         _render_series(s, page)
 
 

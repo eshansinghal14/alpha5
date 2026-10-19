@@ -146,13 +146,16 @@ def _concat(frames: list[pd.DataFrame]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True).sort_values("time", ignore_index=True)
 
 
-def render(series: str | list[str], page: str | None = None, lip: bool = False):
+def render(series: str | list[str], page: str | None = None, lip: bool = False,
+           title: str = "Strategy performance (real fills)"):
     """One panel over the series in `series`: pooled as one strategy, or one
     of them picked in the panel. `page`: the dashboard page drawing it
     (defaults to the one series). `lip`: the events carry LIP programs; adds
-    the LIP column."""
+    the LIP column. A page can draw several panels: widget keys include the
+    series shown."""
     members = [series] if isinstance(series, str) else list(series)
     page = page or members[0]
+    key = f"{page}_{'+'.join(members)}"
     ps = [perf.get(s) for s in members]
     for p in ps:
         p.ensure_background()
@@ -170,7 +173,7 @@ def render(series: str | list[str], page: str | None = None, lip: bool = False):
         if len(members) > 1:
             c1, c2 = st.columns([3, 2])
             with c2:
-                pick = st.selectbox("Series", [ALL] + members, key=f"perf_series_{page}",
+                pick = st.selectbox("Series", [ALL] + members, key=f"perf_series_{key}",
                                     label_visibility="collapsed",
                                     help="Every series in this group pooled, or one of them.")
         else:
@@ -181,7 +184,7 @@ def render(series: str | list[str], page: str | None = None, lip: bool = False):
         if errs:
             st.caption("Last performance refresh failed: " + "; ".join(errs))
         with c1:
-            win = st.radio("Window", list(WINDOWS), index=2, horizontal=True, key=f"perf_win_{page}",
+            win = st.radio("Window", list(WINDOWS), index=2, horizontal=True, key=f"perf_win_{key}",
                            label_visibility="collapsed")
         since = None if WINDOWS[win] is None else pd.Timestamp.now(tz="UTC") - WINDOWS[win]
         s = perf.summarize(df, since)
@@ -209,7 +212,7 @@ def render(series: str | list[str], page: str | None = None, lip: bool = False):
             st.caption(f"Updated {min(updated):%H:%M:%S} UTC. Fills are marked once 60s of book follows them.")
 
     with st.container(border=True):
-        st.markdown("##### Strategy performance (real fills)")
+        st.markdown(f"##### {title}")
         body()
 
 
