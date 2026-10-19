@@ -108,6 +108,7 @@ class CoinRaceModel:
         self.basis_bp: dict[str, float] = {}
         self._basis_cache: dict[str, tuple] = {}
         self.vol_bp: dict[str, float] = {}
+        self.vol_src: dict[str, str] = {}
 
     def set_wakeup(self, fn):
         self._wake = fn
@@ -244,8 +245,17 @@ class CoinRaceModel:
                 return self._withhold("no_implied_vol:feed")
             rates = iv.rates(now_s, p)
             short = [c for c in COINS if rates[c] is None]
-            if short:
+            if short and not p.implied_fallback_realized:
                 return self._withhold(f"no_implied_vol:{','.join(short)}")
+            if short:
+                # A coin whose 15M market says nothing about vol right now (mid near
+                # 0.5, pinned, or the event just opened) prices on the HAR model
+                # instead of withholding the whole race.
+                har = self.pricer._rates_corr(max(tau, 1.0), now_s)[0]
+                for i, c in enumerate(COINS):
+                    if rates[c] is None:
+                        rates[c] = float(har[i])
+            self.vol_src = {c: ("realized" if c in short else "implied") for c in COINS}
             rate = np.array([rates[c] for c in COINS])
             self.vol_bp = {c: math.sqrt(rates[c]) * 1e4 for c in COINS}
         if compute_delta is None:
@@ -270,7 +280,8 @@ class CoinRaceModel:
                                                   "phase": self.result.phase, "cf_basis_bp": self.basis_bp[c],
                                                   "cf_end_n": snap.end_n[c],
                                                   "vol_bp": math.sqrt(float(self.pricer._last_rate[i])) * 1e4,
-                                                  "vol_src": p.vol_source})
+                                                  "vol_src": (self.vol_src.get(c, "implied")
+                                                              if p.vol_source == "implied" else "realized")})
         return out
 
     # --- FairModel ----------------------------------------------------------
@@ -356,6 +367,7 @@ class CoinRaceModel:
             "vol_model": self.forecaster.diagnostics() if hasattr(self.forecaster, "diagnostics") else None,
             "vol_source": self.cfg.pricing.vol_source,
             "vol_bp": {c: round(v, 4) for c, v in self.vol_bp.items()},
+            "vol_src_by_coin": dict(self.vol_src),
             "implied_vol": (None if self._implied() is None
                             else self._implied().snapshot(time.time(), self.cfg.pricing)),
         }

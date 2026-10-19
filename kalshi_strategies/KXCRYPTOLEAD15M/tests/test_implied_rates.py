@@ -48,6 +48,43 @@ def test_short_coin_has_no_rate_and_stale_mid_is_ignored():
     assert iv.rates(now + 10, p)["BTC"] is None and iv.ema["BTC"].n_seen == 0
 
 
+def _race(now, **pricing):
+    from kalshi_strategies.KXCRYPTOLEAD15M.tests.test_model import _feed, _model
+    m = _model(now, vol_source="implied", implied_min_obs=5.0, recovery_s=0.0, **pricing)
+    m.spot = type("S", (), {})()
+    m.spot.implied_rates = iv = ImpliedRates()
+    m.spot.sample = lambda now_s: None
+    _feed(m, time.monotonic())
+    return m, iv
+
+
+def _fill(iv, coins, now, s=1e-4):
+    for c in coins:
+        for k in range(6):
+            iv.ema[c].add(now - 6 + k, type("O", (), {"s": s, "se_log": 0.1, "reason": None})(), 120.0)
+
+
+def test_coin_without_implied_falls_back_to_realized():
+    now = time.time()
+    m, iv = _race(now, implied_fallback_realized=True)
+    _fill(iv, [c for c in COINS if c != "ETH"], now)
+    out = m._price(now, None)
+    assert all(f is not None for f in out.values()), m.withheld_reason
+    eth = out[m.ticker_of["ETH"]]
+    har = m.pricer._rates_corr(600.0, now)[0][COINS.index("ETH")]
+    assert eth.extras["vol_src"] == "realized" and abs(eth.extras["vol_bp"] - math.sqrt(har) * 1e4) < 1e-6
+    btc = out[m.ticker_of["BTC"]]
+    assert btc.extras["vol_src"] == "implied" and abs(btc.extras["vol_bp"] - 1.0) < 1e-6
+
+
+def test_no_fallback_withholds():
+    now = time.time()
+    m, iv = _race(now, implied_fallback_realized=False)
+    _fill(iv, [c for c in COINS if c != "ETH"], now)
+    out = m._price(now, None)
+    assert all(f is None for f in out.values()) and m.withheld_reason == "no_implied_vol:ETH"
+
+
 def test_pricer_rate_override():
     from kalshi_strategies.KXCRYPTOLEAD15M.cov_forecaster import ConstantCovForecaster
     from kalshi_strategies.KXCRYPTOLEAD15M.pricer import CoinRacePricer

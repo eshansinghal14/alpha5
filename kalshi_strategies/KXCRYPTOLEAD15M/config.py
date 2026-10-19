@@ -77,6 +77,11 @@ class CryptoPricingParams:
         "the same window (implied_rates.py), correlation stays HAR; every fair is withheld (no_implied_vol) "
         "while any coin lacks one. \"realized\": the HAR model x vol_mult. 10-19 01:45-01:57 UTC: implied "
         "0.53-0.82bp/sqrt(s) vs HAR 0.72-1.30, and within 4-8% of what the 15M mids priced.")
+    implied_fallback_realized: bool = param(
+        "With vol_source implied: a coin with no implied estimate (its 15M mid near 0.5 or pinned, or "
+        "the event just opened) prices on the HAR rate instead, so the race isn't withheld. 10-19 02:47 "
+        "UTC: ETH and HYPE 15M mids at 0.55/0.48 left them at 19 of 20 readings and withheld every fair. "
+        "Off = withhold (no_implied_vol) while any coin lacks one.")
     implied_ema_s: float = param(
         "Time constant (s) of each coin's implied-vol EMA. 120: KXETH15M 10-18 22:39-23:10 replay, theo-mid "
         "+0.60c at 900s -> -0.12c at 120s.", min=10, step=10)

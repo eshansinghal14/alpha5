@@ -118,6 +118,7 @@
       ]
     },
     "vol_source": "implied",
+    "implied_fallback_realized": true,
     "implied_ema_s": 120.0,
     "implied_min_obs": 20.0,
     "implied_mid_min": 0.15,
