@@ -174,7 +174,8 @@ class CoinRacePricer:
                  start_locked: bool,
                  compute_delta: bool = True,
                  prev_result: "FairResult | None" = None,
-                 rate_override: np.ndarray | None = None) -> FairResult:
+                 rate_override: np.ndarray | None = None,
+                 corr_mult: float | None = None) -> FairResult:
         """Fair win probabilities. `x`, `I` are 5-vectors of log returns
         (x vs the start average; I = (1/60) x sum over end seconds elapsed, 0 before the last minute);
         `tau = T - now_s` in seconds.
@@ -190,7 +191,9 @@ class CoinRacePricer:
         last minute and cost ~0.09 nats there on validation.
 
         `rate_override`: per-coin per-second variance to use instead of the
-        forecaster's (and vol_mult); the forecaster still supplies correlation."""
+        forecaster's (and vol_mult); the forecaster still supplies correlation.
+        `corr_mult`: scale the forecaster's off-diagonal correlations by this
+        (in [0, 1], so R stays PSD: a convex mix of R and I)."""
         x = np.asarray(x, dtype=float)
         I = np.asarray(I, dtype=float)
         tau = max(float(tau), 0.0)
@@ -208,6 +211,9 @@ class CoinRacePricer:
         rate, R = self._rates_corr(h, now_s)
         if rate_override is not None:
             rate = np.asarray(rate_override, dtype=float)
+        if corr_mult is not None and corr_mult != 1.0:
+            g = min(max(float(corr_mult), 0.0), 1.0)
+            R = g * R + (1.0 - g) * np.eye(N_COINS)
         self._last_rate, self._last_corr = rate, R
         sd = np.sqrt(np.maximum(rate * te, 0.0))
         V = R * np.outer(sd, sd)
@@ -219,7 +225,8 @@ class CoinRacePricer:
             # Re-draw only when the covariance itself changes: forecaster
             # state (new 1s data) or horizon bucket (whole seconds of h).
             key = (getattr(self.forecaster, "version", None), round(h),
-                   None if rate_override is None else tuple(np.round(rate, 18)))
+                   None if rate_override is None else tuple(np.round(rate, 18)),
+                   None if corr_mult is None else round(float(corr_mult), 6))
             E = self._draws(rate, R, key if key[0] is not None else None)
             probs = self._argmax_probs(mu + math.sqrt(te) * E)
 

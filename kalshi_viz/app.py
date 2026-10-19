@@ -135,6 +135,44 @@ def _render_toggle(series: str, s: dict, idle: bool = False):
         st.warning(f"{s['real']['n_errors']} real order error(s) -- see the process log.")
 
 
+def _render_vol_sources(s: dict):
+    """Coin Race on implied vol: which coins' Kalshi 15M markets aren't giving
+    a vol right now, so the race prices them on a held estimate or the HAR
+    model. Shown only for summaries that carry vol_src_by_coin."""
+    e = s.get("extras") or {}
+    src = e.get("vol_src_by_coin")
+    if not src or e.get("vol_source") != "implied":
+        return
+    iv = e.get("implied_vol") or {}
+    vol = e.get("vol_bp") or {}
+
+    def why(c):
+        v = iv.get(c) or {}
+        mid = v.get("mid")
+        n = v.get("n_eff")
+        bits = []
+        if mid is not None:
+            bits.append(f"15M mid {mid:.3f}")
+        if n is not None:
+            bits.append(f"{n:g} readings")
+        return ", ".join(bits)
+
+    held = [c for c, x in src.items() if x == "held"]
+    realized = [c for c, x in src.items() if x == "realized"]
+    if realized:
+        st.warning("📉 **Realized vol (no Kalshi implied):** "
+                   + "; ".join(f"{c} {vol.get(c, 0):.2f}bp ({why(c)})" for c in realized)
+                   + ". Their 15M market is near 0.5, pinned, or just opened.")
+    if held:
+        st.info("⏳ **Held implied vol (Kalshi readings stopped):** "
+                + "; ".join(f"{c} {vol.get(c, 0):.2f}bp, {((iv.get(c) or {}).get('held_s') or 0):.0f}s old ({why(c)})"
+                            for c in held)
+                + ". Falls back to realized after the hold.")
+    live = [c for c, x in src.items() if x == "implied"]
+    if live and (held or realized):
+        st.caption("Implied from Kalshi: " + ", ".join(f"{c} {vol.get(c, 0):.2f}bp" for c in live))
+
+
 def _render_guards(s: dict):
     blocked = s.get("blocked_reason")
     if s.get("real_lock"):
@@ -155,6 +193,7 @@ def _render_guards(s: dict):
     problem = (s.get("extras") or {}).get("feed_problem")
     if problem:
         st.error(f"📡 Signal feed: {problem}")
+    _render_vol_sources(s)
 
     lip = has_lip(s)
     c = st.columns(3 if lip else 2)

@@ -91,6 +91,24 @@ class CryptoPricingParams:
         "the same window (implied_rates.py), correlation stays HAR; every fair is withheld (no_implied_vol) "
         "while any coin lacks one. \"realized\": the HAR model x vol_mult. 10-19 01:45-01:57 UTC: implied "
         "0.53-0.82bp/sqrt(s) vs HAR 0.72-1.30, and within 4-8% of what the 15M mids priced.")
+    corr_fit: bool = param(
+        "Fit the coin correlation to the race's own Kalshi mids (corr_fit.py): the HAR correlation scaled "
+        "toward independence by g, R_g = g R + (1 - g) I. Replay 10-19 02:33-04:32 UTC: g 0.9 cut "
+        "|theo - mid| 2.70 -> 2.16c and halved the ETH/SOL/HYPE bias; settled log loss unchanged. Off = g 1.")
+    corr_fit_s: float = param("Refit g this often (s).", min=1, step=1)
+    corr_half_life_s: float = param("EMA half-life of g (s); carried across events.", min=1, step=30)
+    corr_mult_min: float = param("Lowest g the fit may choose (0 = independent coins).", min=0, max=1, step=0.05)
+    corr_mult_max: float = param("Highest g the fit may choose (1 = HAR as is).", min=0, max=1, step=0.05)
+    corr_fit_grid: int = param("Grid points over [corr_mult_min, corr_mult_max].", min=3, max=41, step=2)
+    corr_fit_mc_n: int = param("Monte Carlo draws per fit reprice (own pricer, off the loop).", min=1000,
+                               step=1000)
+    corr_fit_max_spread: float = param(
+        "A race leg counts in the fit only while its spread is at most this ($); wider legs are left out "
+        "(weight 0) but still renormalise the mids.", min=0.01, step=0.01)
+    corr_fit_min_legs: int = param("Fit only with at least this many legs within corr_fit_max_spread.", min=2,
+                                   max=5, step=1)
+    corr_fit_min_tau_s: float = param("No fit with fewer than this many seconds left (the end average "
+                                      "dominates; the shift freezes there too).", min=0, step=30)
     implied_fallback_realized: bool = param(
         "With vol_source implied: a coin with no implied estimate (its 15M mid near 0.5 or pinned, or "
         "the event just opened) prices on the HAR rate instead, so the race isn't withheld. 10-19 02:47 "

@@ -39,9 +39,11 @@ async def get_spot(cfg, *, persist: bool = True, tag: str = "crypto", owner: boo
     async with _LOCK:
         loop = asyncio.get_running_loop()
         if _SPOT is None:
+            from kalshi_strategies.KXCRYPTOLEAD15M.corr_fit import CorrFit
             from kalshi_strategies.KXCRYPTOLEAD15M.implied_rates import ImpliedRates
             _SPOT = SpotFeed(cfg, persist=persist)
             _SPOT.implied_rates = ImpliedRates()
+            _SPOT.corr_fit = CorrFit()
             # Disk + REST before the socket's first tick, so an event adopted
             # mid-window has its start average at once.
             now = time.time()

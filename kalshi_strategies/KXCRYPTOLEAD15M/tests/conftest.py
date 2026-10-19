@@ -10,7 +10,8 @@ def config(**pricing_overrides):
     asks for implied: implied withholds every fair until the single-coin 15M
     mids have been read, which these offline tests don't feed."""
     cfg = load(CryptoConfig, CONFIG_PATH)
-    cfg.pricing = dataclasses.replace(cfg.pricing, **{"vol_source": "realized", **pricing_overrides})
+    cfg.pricing = dataclasses.replace(cfg.pricing, **{"vol_source": "realized", "corr_fit": False,
+                                                      **pricing_overrides})
     return cfg
 
 

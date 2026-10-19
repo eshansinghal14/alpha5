@@ -109,8 +109,11 @@ class CoinRaceModel:
         self._basis_cache: dict[str, tuple] = {}
         self.vol_bp: dict[str, float] = {}
         self.vol_src: dict[str, str] = {}
+        self.corr_mult: float | None = None
         # Market-implied relative return shift (see _update_market_shift).
         self._kmid: dict[str, float] = {}
+        self._kbid: dict[str, float] = {}
+        self._kask: dict[str, float] = {}
         self._shift = np.zeros(len(COINS))      # EMA, applied as alpha * _shift
         self._shift_raw = np.zeros(len(COINS))  # latest estimate the EMA chases
         self._shift_t: float | None = None
@@ -126,8 +129,11 @@ class CoinRaceModel:
         ask = 1.0 if book.ask is None else float(book.ask)
         if bid <= 0.0 and ask >= 1.0:
             self._kmid.pop(c, None)
+            self._kbid.pop(c, None)
+            self._kask.pop(c, None)
         elif ask > bid:
             self._kmid[c] = (bid + ask) / 2.0
+            self._kbid[c], self._kask[c] = bid, ask
 
     def _update_market_shift(self, now_s: float, x: np.ndarray, I: np.ndarray, tau: float, rate):
         """Advance the EMA toward the latest market-implied shift and, every
@@ -146,7 +152,8 @@ class CoinRaceModel:
         if now_s - self._shift_fit_t < p.market_shift_fit_s or len(self._kmid) < len(COINS):
             return
         base = self.pricer.fairs_at(x=x, I=I, tau=tau, now_s=now_s, S=self.window.S, T=self.window.T,
-                                    start_locked=True, compute_delta=True, rate_override=rate)
+                                    start_locked=True, compute_delta=True, rate_override=rate,
+                                    corr_mult=getattr(self, "corr_mult", None))
         Dm = base.delta
         if not np.any(Dm):
             return
@@ -209,6 +216,10 @@ class CoinRaceModel:
     def _implied(self):
         """The session's ImpliedRates (on the SpotFeed), or None without one."""
         return None if self.spot is None else getattr(self.spot, "implied_rates", None)
+
+    def _corr_fit(self):
+        """The session's CorrFit (on the SpotFeed), or None without one."""
+        return None if self.spot is None else getattr(self.spot, "corr_fit", None)
 
     def _spot_move(self, coin: str, now_s: float) -> float:
         """|ln(mid now / mid implied_lag_s ago)|: how far Kalshi may lag spot."""
@@ -309,9 +320,21 @@ class CoinRaceModel:
                             for c in COINS}
             rate = np.array([rates[c] for c in COINS])
             self.vol_bp = {c: math.sqrt(rates[c]) * 1e4 for c in COINS}
-        # Estimated off the unshifted fair at the same vols, so the shift can't
-        # feed on itself. Removed 10-18 20:14 UTC and restored: without it, edge
-        # fills while some market sat >=3c outside Kalshi's touch went from
+        # Correlation fitted to the race mids (corr_fit.py), on the unshifted fair.
+        g = None
+        cf = self._corr_fit()
+        if cf is not None and p.corr_fit:
+            if tau >= p.corr_fit_min_tau_s:
+                # The pricer's own correlation (any forecaster API), and its HAR rates
+                # where no implied rate is in force.
+                har_rate, R = self.pricer._rates_corr(max(tau, 1.0), now_s)
+                cf.maybe_fit(now_s, p, R, x, I, tau, har_rate if rate is None else rate, self.window.S,
+                             self.window.T, self._kbid, self._kask, COINS)
+            g = cf.value(p)
+        self.corr_mult = g
+        # Estimated off the unshifted fair at the same vols and correlation, so the
+        # shift can't feed on itself. Removed 10-18 20:14 UTC and restored: without
+        # it, edge fills while some market sat >=3c outside Kalshi's touch went from
         # +1.0c/lot (3-10c out) to -0.5c, and that time share 17% -> 29%.
         self._update_market_shift(now_s, x, I, tau, rate)
         sh = p.market_shift_alpha * self._shift
@@ -323,7 +346,7 @@ class CoinRaceModel:
         self.result = self.pricer.fairs_at(x=x, I=I, tau=tau, now_s=now_s,
                                            S=self.window.S, T=self.window.T, start_locked=True,
                                            compute_delta=compute_delta, prev_result=self.result,
-                                           rate_override=rate)
+                                           rate_override=rate, corr_mult=g)
         if compute_delta:
             self._last_delta_s = now_s
         self._newest_mono = min(newest)
@@ -341,7 +364,8 @@ class CoinRaceModel:
                                                   "cf_end_n": snap.end_n[c],
                                                   "vol_bp": math.sqrt(float(self.pricer._last_rate[i])) * 1e4,
                                                   "vol_src": (self.vol_src.get(c, "implied")
-                                                              if p.vol_source == "implied" else "realized")})
+                                                              if p.vol_source == "implied" else "realized"),
+                                                  "corr_mult": g})
         return out
 
     # --- FairModel ----------------------------------------------------------
@@ -430,6 +454,7 @@ class CoinRaceModel:
             "vol_source": self.cfg.pricing.vol_source,
             "vol_bp": {c: round(v, 4) for c, v in self.vol_bp.items()},
             "vol_src_by_coin": dict(self.vol_src),
+            "corr_fit": (None if self._corr_fit() is None else self._corr_fit().snapshot(self.cfg.pricing)),
             "implied_vol": (None if self._implied() is None
                             else self._implied().snapshot(time.time(), self.cfg.pricing)),
         }

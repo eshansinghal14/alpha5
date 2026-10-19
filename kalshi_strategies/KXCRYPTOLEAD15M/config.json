@@ -1,6 +1,6 @@
 {
   "quoting": {
-    "max_position": 50.0,
+    "max_position": 75.0,
     "constant_edge": 0.035,
     "edge_fraction": 0.8,
     "lean_dollars": 0.035,
@@ -16,8 +16,8 @@
     "quote_ahead_grace_s": 1.0,
     "cancels_token": 40.0,
     "requote_delay_s": 1.0,
-    "order_lots": 10.0,
-    "constant_edge_ref_s": 180.0
+    "order_lots": 15.0,
+    "constant_edge_ref_s": 210.0
   },
   "trading_time": {
     "real_trading_delay_s": 10.0,
@@ -118,6 +118,16 @@
       ]
     },
     "vol_source": "implied",
+    "corr_fit": true,
+    "corr_fit_s": 10.0,
+    "corr_half_life_s": 120.0,
+    "corr_mult_min": 0.75,
+    "corr_mult_max": 1.0,
+    "corr_fit_grid": 11,
+    "corr_fit_mc_n": 4000,
+    "corr_fit_max_spread": 0.05,
+    "corr_fit_min_legs": 3,
+    "corr_fit_min_tau_s": 120.0,
     "implied_fallback_realized": true,
     "implied_hold_s": 180.0,
     "implied_ema_s": 120.0,
