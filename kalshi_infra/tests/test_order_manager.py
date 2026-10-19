@@ -50,10 +50,14 @@ class Ex:
         return self.bucket
 
 
-def mk(bucket=None, reserve=0.0, keep=0.0):
+def mk(bucket=None, reserve=0.0, keep=0.0, amend=True):
+    """`amend`: reprice edge quotes by amend (the older mode most tests here
+    exercise); the live default is cancel + re-create (see the reprice tests)."""
     c = Clock()
     ex = Ex(bucket)
-    return OrderManager(ex, cancels_token=reserve, keep_inside=keep, clock=c), ex, c
+    m = OrderManager(ex, cancels_token=reserve, keep_inside=keep, clock=c)
+    m.reprice_by_amend = amend
+    return m, ex, c
 
 
 def ack_all(m, ex):
@@ -470,6 +474,39 @@ def test_flicker_inside_grace_costs_nothing():
     c.t += 1.0
     m.pump()
     assert ex.amends == [] and ex.cancels == []
+
+
+def test_reprice_default_is_cancel_then_create_never_amend():
+    m, ex, c = mk(amend=False)
+    m.set_desired("A", "yes", Desired([0.17], 15.0, 0.18, 75.0, 0.17, max_levels=1, behind=0))
+    m.pump(); ack_all(m, ex)
+    # Touch moved up a tick: cancel the old order, create the new level once it's gone.
+    m.set_desired("A", "yes", Desired([0.18], 15.0, 0.19, 75.0, 0.18, max_levels=1, behind=0))
+    m.pump()
+    assert ex.amends == [] and ex.cancels == [(1, "reprice")]
+    m.on_cancel_done(1)
+    m.pump()
+    assert [q.price for q in ex.creates] == [0.17, 0.18] and ex.amends == []
+
+
+def test_reprice_default_inside_edge_is_a_cancel():
+    m, ex, c = mk(amend=False)
+    m.set_desired("A", "yes", Desired([0.17], 15.0, 0.18, 75.0, 0.17, max_levels=1, behind=0))
+    m.pump(); ack_all(m, ex)
+    m.set_desired("A", "yes", Desired([0.10], 15.0, 0.10, 75.0, 0.17, max_levels=1, behind=0))
+    assert ex.amends == [] and [r for _, r in ex.cancels] == ["inside_edge"]
+
+
+def test_reprice_default_cancel_never_waits_on_an_amend():
+    """With no edge amends, an edge order is never AMENDING, so its cancel
+    always goes out on the first send."""
+    m, ex, c = mk(amend=False)
+    m.set_desired("A", "yes", Desired([0.17], 15.0, 0.18, 75.0, 0.17, max_levels=1, behind=0))
+    m.pump(); ack_all(m, ex)
+    m.set_desired("A", "yes", Desired([0.18], 15.0, 0.19, 75.0, 0.18, max_levels=1, behind=0))
+    m.pump()
+    m.set_desired("A", "yes", Desired([], 15.0, None, 0.0))
+    assert all(q.state != om.AMENDING for q in m.quotes.values())
 
 
 def test_one_level_side_waits_for_grace_before_moving_down():

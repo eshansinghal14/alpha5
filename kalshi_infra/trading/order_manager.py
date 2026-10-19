@@ -234,6 +234,11 @@ class OrderManager:
         self.ex = executor
         self.clock = clock
         self.clock_wall = time.time
+        # Edge price changes: False = cancel + re-create, True = one amend. An
+        # amend in flight holds that order's cancel until Kalshi answers it
+        # (~25ms), and at ~340 price amends/min (10-19) that sat in front of
+        # pulls; the 2 tokens an amend saves aren't worth it. LIP keeps amends.
+        self.reprice_by_amend = False
         self.sim_bucket = (TokenBucket(sim_bucket_tokens_per_s, clock)
                            if sim_bucket_tokens_per_s is not None else None)
         # Set by WriteGroup.attach: the group then owns the reserve, the
@@ -348,7 +353,7 @@ class OrderManager:
         for q in sorted(self._unsafe(ticker, side, d), key=lambda q: q.price):
             if d.edge_limit is None:
                 self._cancel(q, "not_quotable")
-            elif target is not None and self._move_down(q, target):
+            elif target is not None and self.reprice_by_amend and self._move_down(q, target):
                 target = None                       # one order per price
             else:
                 self._cancel(q, "inside_edge")
@@ -724,7 +729,7 @@ class OrderManager:
                             if round(p, 2) not in have and p <= d.edge_limit + 1e-9), reverse=True)
             for q in late:
                 target = next((p for p in holes if p < q.price - 1e-9), None)
-                if target is not None:
+                if target is not None and self.reprice_by_amend:
                     if not self._can_spend(COST_AMEND):
                         continue
                     holes.remove(target)
@@ -873,7 +878,13 @@ class OrderManager:
         d = self.desired[(ticker, side)]
         spare = self._spare(ticker, side, d, price)
         if spare is not None:
-            return self._move(spare, price)
+            if self.reprice_by_amend:
+                return self._move(spare, price)
+            # Cancel now; the level is created once the cancel is confirmed
+            # (the cancelling order still holds the side's one slot until then).
+            self._cancel(spare, "reprice")
+            self.drain_cancels()
+            return True
         if d.room - self.resting_size(ticker, side) < lots - 1e-9:
             self._bump("create_skipped:room")
             return False

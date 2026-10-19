@@ -60,10 +60,12 @@ def test_bucket_is_metered_on_sim_time():
     assert 2 <= n <= 4
 
 
-def test_fair_drop_moves_the_inside_quote_down():
-    fairs = [(T0 + pd.Timedelta(seconds=1), 0.50), (T0 + pd.Timedelta(seconds=2), 0.42)]
+def test_fair_drop_cancels_the_inside_quote_and_requotes():
+    """Edge reprices are cancel + re-create (OrderManager.reprice_by_amend False)."""
+    fairs = [(T0 + pd.Timedelta(seconds=1), 0.50), (T0 + pd.Timedelta(seconds=2), 0.42),
+             (T0 + pd.Timedelta(seconds=3), 0.42)]
     res, bt, q = _run(0.0, fairs)
     yes = [o for o in res.orders if o.intent == "quote" and o.side == "yes"]
-    assert len(yes) == 1 and yes[0].order_id not in res.cancelled_order_ids
-    assert yes[0].price < 0.41                       # amended down, not re-created
-    assert bt._om.counts.get("move_down:inside_edge", 0) == 1
+    assert yes[0].price == 0.41 and yes[0].order_id in res.cancelled_order_ids
+    assert any(o.price < 0.41 for o in yes[1:])      # re-created lower
+    assert bt._om.counts.get("move_down:inside_edge", 0) == 0

@@ -63,13 +63,14 @@ def book(bid=0.40, ask=0.60, depth=100.0):
     return BookView.from_quote(q, ladder=lb)
 
 
-def setup(real=False, **q):
+def setup(real=False, amend=True, **q):
     q.setdefault("cancels_token", 0.0)
     q.setdefault("quote_levels_behind", 0)
     c = cfg(**q)
     quoter = Quoter(c, Model(), FREE, close_time=None)
     client = FakeClient() if real else None
     eng = LiveEngine(quoter, risk=c.risk, quoting=c.quoting, fees=FREE, order_client=client, event_ticker="E")
+    eng.om.reprice_by_amend = amend
     if real:
         eng.live_trading = True          # bypass the arm reconcile (no REST in tests)
     eng.update_book(book())
