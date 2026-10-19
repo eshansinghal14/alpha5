@@ -234,6 +234,17 @@ def test_order_events_time_the_round_trips_and_flag_a_fill_that_raced_its_cancel
     assert f["cancel_decided_t"] <= f["t"]
 
 
+def test_amend_event_logs_old_and_new_price():
+    eng, _, client = setup(real=True)
+    eng.order_events = []
+    fair(eng)
+    q = eng.om.live("A", "yes")[0]
+    old = q.price
+    eng.om._move(q, round(old - 0.01, 2))
+    (r,) = [r for r in eng.order_events if r["event"] == "amend_sent"]
+    assert r["old_price"] == old and r["new_price"] == round(old - 0.01, 2)
+
+
 def test_order_events_off_by_default():
     eng, _, _ = setup(real=True)
     fair(eng)

@@ -645,7 +645,8 @@ class OrderManager:
                      else max(int(d.max_levels), 0) - len(self.live(ticker, side, EDGE)))
             spares = sorted(q.price for q in self.live(ticker, side, EDGE)
                             if q.state == RESTING and q.exchange_id is not None
-                            and q.order_id not in self._cancel_q and round(q.price, 2) not in wanted | kept)
+                            and q.order_id not in self._cancel_q and round(q.price, 2) not in wanted | kept
+                            and not self._ahead_wait(q))
             # At the level cap a spare above the ladder may move down too (see _spare).
             above_ok = slots is not None and slots <= 0
             top = d.prices[0]
@@ -674,6 +675,15 @@ class OrderManager:
     def _at_level_cap(self, ticker: str, side: str, d: Desired) -> bool:
         return d.max_levels is not None and len(self.live(ticker, side, EDGE)) >= d.max_levels
 
+    def _ahead_wait(self, q: Quote) -> bool:
+        """Too far ahead of others' touch, but still inside quote_ahead_grace_s:
+        not moved down yet. With one order per side every side is at its level
+        cap, and the level-cap move in _spare took a quote above the ladder
+        down at once, so the grace never applied: XRP 10-19 05:42:28 amended
+        ~20x in 1s chasing a 1-lot bid that flickered at the top."""
+        grace = self._fn(self.ahead_grace_fn, self.ahead_grace_s)
+        return q.ahead_since is not None and self.clock() - q.ahead_since < grace - 1e-9
+
     def _spare(self, ticker: str, side: str, d: Desired, price: float) -> Quote | None:
         """Resting edge quote at a price no longer wanted, to move to the
         missing level `price`: the deepest one below it. Upward only, unless
@@ -688,7 +698,7 @@ class OrderManager:
         if below:
             return min(below, key=lambda q: q.price)
         if self._at_level_cap(ticker, side, d):
-            above = [q for q in spare if q.price > price + 1e-9]
+            above = [q for q in spare if q.price > price + 1e-9 and not self._ahead_wait(q)]
             return min(above, key=lambda q: q.price) if above else None
         return None
 

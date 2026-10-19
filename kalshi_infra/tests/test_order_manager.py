@@ -472,6 +472,42 @@ def test_flicker_inside_grace_costs_nothing():
     assert ex.amends == [] and ex.cancels == []
 
 
+def test_one_level_side_waits_for_grace_before_moving_down():
+    """One order per side means every side is at its level cap; the cap path
+    must still respect quote_ahead_grace_s (XRP 10-19 05:42:28: 20 amends in 1s
+    chasing a flickering 1-lot top bid)."""
+    m, ex, c = mk()
+    m.ahead_grace_s = 1.0
+    m.set_desired("A", "yes", Desired([0.17], 15.0, 0.18, 75.0, 0.17, max_levels=1, behind=1))
+    m.pump(); ack_all(m, ex)
+    # The bid we improved on vanishes: others' best 0.07, ladder 0.08.
+    m.set_desired("A", "yes", Desired([0.08], 15.0, 0.18, 75.0, 0.08, max_levels=1, behind=1))
+    m.pump()
+    assert ex.amends == []
+    # ...and comes back inside the grace: nothing was ever sent.
+    c.t += 0.5
+    m.set_desired("A", "yes", Desired([0.17], 15.0, 0.18, 75.0, 0.17, max_levels=1, behind=1))
+    m.pump()
+    assert ex.amends == [] and ex.cancels == []
+    # Gone for longer than the grace: moved down with one amend.
+    m.set_desired("A", "yes", Desired([0.08], 15.0, 0.18, 75.0, 0.08, max_levels=1, behind=1))
+    m.pump()
+    c.t += 1.0
+    m.set_desired("A", "yes", Desired([0.08], 15.0, 0.18, 75.0, 0.08, max_levels=1, behind=1))
+    m.pump()
+    assert ex.amends == [(1, 0.08, 15.0)]
+
+
+def test_one_level_side_inside_the_edge_still_moves_down_at_once():
+    m, ex, c = mk()
+    m.ahead_grace_s = 1.0
+    m.set_desired("A", "yes", Desired([0.17], 15.0, 0.18, 75.0, 0.17, max_levels=1, behind=1))
+    m.pump(); ack_all(m, ex)
+    # Fair dropped: the edge is now 0.10, so 0.17 is unsafe -- no grace.
+    m.set_desired("A", "yes", Desired([0.10], 15.0, 0.10, 75.0, 0.17, max_levels=1, behind=1))
+    assert ex.amends == [(1, 0.10, 15.0)] or [r for _, r in ex.cancels] == ["inside_edge"]
+
+
 def test_too_far_ahead_with_full_ladder_is_cancelled():
     m, ex, c = mk()
     m.ahead_grace_s = 0.0

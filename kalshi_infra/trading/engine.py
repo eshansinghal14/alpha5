@@ -1121,7 +1121,9 @@ class LiveEngine:
             return False
         filled = q.filled
         self.n_real_amends += 1
-        self._oev("amend_sent", q, new_price=price, size=remaining)
+        # OrderManager._move sets q.price to the new price before calling here,
+        # so the row's `price` is already the new one; the old one is prev_price.
+        self._oev("amend_sent", q, old_price=q.prev_price, new_price=price, size=remaining)
 
         def work():
             t0 = time.perf_counter()
