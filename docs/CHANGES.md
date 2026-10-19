@@ -3,6 +3,16 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-19 — KXSOL15M in its own process; other single coins off
+
+- `alpha5-crypto15m-sol` runs KXSOL15M alone at normal priority (resumes an
+  arm like the race). `alpha5-crypto15m-shadow` (all five at below_normal) is
+  removed: armed inside it, SOL's loop lag reached p95 1.1s / max 2.1s and
+  30% of its decisions were stale_signal (16:00 UTC, load 7.6 on 4 cores);
+  22 real lots, 30s markout -1.33c, 61% picked off.
+- Same shard as the race, which can't see its writes: capped at
+  `KALSHI_WRITE_SHARE` 0.2 (60 tokens/s).
+
 ## 2026-10-19 — Depth journal; single-coin 15M back in shadow
 
 - New journal stream `depth`: resting size at the best 5 prices of each side
