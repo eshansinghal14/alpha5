@@ -15,6 +15,11 @@ Reverse chronological. One section per material change. Entries before
 - `alpha5-crypto15m-shadow` is back, all five coins, shadow only, never
   armed: research on a profitable quoting setup. Same box isolation as before
   (own process, below_normal, read-only on the spot files).
+- `CRYPTO15M/research/shadow_tracker.py`, hourly on EC2
+  (`alpha5-crypto15m-track.timer`, last 6h, `data/live/crypto15m_track/`):
+  per coin, the public tape from the resting side by edge vs our theo, and
+  our paper fills by edge and time to close. The tape view doesn't depend on
+  the paper fill model.
 
 ## 2026-10-19 — Single-coin 15M crypto no longer run
 

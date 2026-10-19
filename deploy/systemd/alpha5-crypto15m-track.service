@@ -1,0 +1,10 @@
+[Unit]
+Description=alpha5 single-coin 15M shadow tracker: hourly report (CRYPTO15M/research/shadow_tracker.py)
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/opt/alpha5
+Nice=19
+# Reads the last 6h of journals with column subsets: ~12s, ~0.7 GB (2026-10-19).
+ExecStart=/bin/bash -c 'mkdir -p data/live/crypto15m_track && .venv/bin/python -W ignore -m kalshi_strategies.CRYPTO15M.research.shadow_tracker --since "$(date -u -d "-6 hours" +%%Y-%%m-%%dT%%H:%%M)" > "data/live/crypto15m_track/$(date -u +%%Y-%%m-%%dT%%H%%M).txt" 2>&1'
