@@ -16,6 +16,7 @@ WINDOWS = {"1h": pd.Timedelta(hours=1), "6h": pd.Timedelta(hours=6), "24h": pd.T
 COLORS = {"PnL (settled; open at mid)": "#1e88e5", "1s markout": "#fb8c00", "10s markout": "#e53935",
           "LIP reward": "#43a047", "PnL incl. LIP": "#8e24aa"}
 SOLID = ("PnL (settled; open at mid)", "PnL incl. LIP")
+ALL = "All series"
 
 
 def _usd(v: float) -> str:
@@ -146,9 +147,10 @@ def _concat(frames: list[pd.DataFrame]) -> pd.DataFrame:
 
 
 def render(series: str | list[str], page: str | None = None, lip: bool = False):
-    """One panel over every series in `series`, their fills pooled as one
-    strategy. `page`: the dashboard page drawing it (defaults to the one
-    series). `lip`: the events carry LIP programs; adds the LIP column."""
+    """One panel over the series in `series`: pooled as one strategy, or one
+    of them picked in the panel. `page`: the dashboard page drawing it
+    (defaults to the one series). `lip`: the events carry LIP programs; adds
+    the LIP column."""
     members = [series] if isinstance(series, str) else list(series)
     page = page or members[0]
     ps = [perf.get(s) for s in members]
@@ -165,15 +167,25 @@ def render(series: str | list[str], page: str | None = None, lip: bool = False):
         if any(p.latest is None for p in ps):
             st.caption("Loading performance from the day journals… (first pass takes ~30s)")
             return
-        df = _concat([p.latest for p in ps])
-        errs = [f"{s}: {p.error}" for s, p in zip(members, ps) if p.error]
+        if len(members) > 1:
+            c1, c2 = st.columns([3, 2])
+            with c2:
+                pick = st.selectbox("Series", [ALL] + members, key=f"perf_series_{page}",
+                                    label_visibility="collapsed",
+                                    help="Every series in this group pooled, or one of them.")
+        else:
+            c1, pick = st.container(), ALL
+        shown = [(s, p) for s, p in zip(members, ps) if pick in (ALL, s)]
+        df = _concat([p.latest for _, p in shown])
+        errs = [f"{s}: {p.error}" for s, p in shown if p.error]
         if errs:
             st.caption("Last performance refresh failed: " + "; ".join(errs))
-        win = st.radio("Window", list(WINDOWS), index=2, horizontal=True, key=f"perf_win_{page}",
-                       label_visibility="collapsed")
+        with c1:
+            win = st.radio("Window", list(WINDOWS), index=2, horizontal=True, key=f"perf_win_{page}",
+                           label_visibility="collapsed")
         since = None if WINDOWS[win] is None else pd.Timestamp.now(tz="UTC") - WINDOWS[win]
         s = perf.summarize(df, since)
-        lf = _concat([p.lip_frame() for p in ps]) if lip else None
+        lf = _concat([p.lip_frame() for _, p in shown]) if lip else None
         sp = perf.summarize_split(df, lf, since)
         cols = st.columns(3 if lip else 2)
         with cols[0]:
@@ -184,21 +196,20 @@ def render(series: str | list[str], page: str | None = None, lip: bool = False):
             with cols[2]:
                 _lip(sp["lip"])
         _chart(df, since, lf)
-        _edge_share(perf.summarize_edge(df, _concat([p.prints_frame() for p in ps]), since))
+        _edge_share(perf.summarize_edge(df, _concat([p.prints_frame() for _, p in shown]), since))
         if s.get("fills"):
             st.caption(f"Settled {_usd(s['settled_usd'])} · open {_usd(s['open_usd'])} on {s['unsettled']} fills · "
                        f"fees ${s['fees']:.2f} · max drawdown {_usd(s['max_dd'])} · {s['events']} events")
         with st.expander("Markout by fill type"):
             _table(s)
-            if len(members) > 1 and len(df):
+            if len(shown) > 1 and len(df):
                 _by_series(df, since)
-        updated = [p.updated for p in ps if p.updated is not None]
+        updated = [p.updated for _, p in shown if p.updated is not None]
         if updated:
             st.caption(f"Updated {min(updated):%H:%M:%S} UTC. Fills are marked once 60s of book follows them.")
 
     with st.container(border=True):
-        st.markdown("##### Strategy performance (real fills)"
-                    + (f" -- {' + '.join(members)} combined" if len(members) > 1 else ""))
+        st.markdown("##### Strategy performance (real fills)")
         body()
 
 
