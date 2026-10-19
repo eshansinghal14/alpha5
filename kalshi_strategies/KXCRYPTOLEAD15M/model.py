@@ -31,7 +31,7 @@ from kalshi_infra.trading.fair import Fair
 from kalshi_strategies.KXCRYPTOLEAD15M.composite import DATA_ROOT, CompositeBar, CompositeBus, bar_files
 from kalshi_strategies.KXCRYPTOLEAD15M.pricer import BaseRateTracker, CoinRacePricer, FairResult
 from kalshi_strategies.KXCRYPTOLEAD15M.robust_har import RobustHarForecaster
-from kalshi_strategies.KXCRYPTOLEAD15M.series import COINS, START_END_AVG_S, coin_from_market_ticker
+from kalshi_strategies.KXCRYPTOLEAD15M.series import COINS, SPOT_VENUES, START_END_AVG_S, coin_from_market_ticker
 from kalshi_strategies.KXCRYPTOLEAD15M.settlement_tracker import EventWindow, SettlementTracker
 from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed import FeedHealthMonitor
 
@@ -40,6 +40,10 @@ from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed import FeedHealthMonitor
 # ~1bp of noise per coin that a shorter window would chase.
 BASIS_WINDOW_S = 30
 BASIS_MIN_S = 10
+# A coin's median under half its venues this long is reported as a feed
+# problem. Long enough to skip a venue's own reconnect (bullish/kraken resync
+# in a few seconds, recorder 2026-10-19).
+THIN_VENUES_S = 60.0
 
 
 def load_composite_bars(coin: str, start_s: float, end_s: float, root: Path = DATA_ROOT) -> list[CompositeBar]:
@@ -115,6 +119,7 @@ class CoinRaceModel:
         self._kbid: dict[str, float] = {}
         self._kask: dict[str, float] = {}
         self._shift = np.zeros(len(COINS))      # EMA, applied as alpha * _shift
+        self._thin_since: dict[str, float] = {}
         self._shift_raw = np.zeros(len(COINS))  # latest estimate the EMA chases
         self._shift_t: float | None = None
         self._shift_fit_t = -math.inf
@@ -353,9 +358,16 @@ class CoinRaceModel:
         self._dirty = False
         self.withheld_reason = None
         k = p.ci_vol_multiplier
+        # Shadow: each coin's perp nowcast gap, logged per market and scored
+        # offline (a second pricer pass per decision would double its cost on
+        # the trading loop). Never priced on.
+        pnc = getattr(self.spot, "perp_nowcast", None) if self.spot is not None else None
+        mono = time.monotonic()
         out = {}
         for i, c in enumerate(COINS):
             prob, tv = float(self.result.probs[i]), float(self.result.theo_vol[i])
+            m_spot = self.bus.mid_nowcast(c)
+            _, p_gap, p_n = pnc.nowcast(c, mono, m_spot) if pnc is not None else (None, None, 0)
             # Not clipped to [0, 1]: the band is an edge distance, and clipping
             # would erase the edge on tail coins (fair 0.002, band 0.015).
             out[self.ticker_of[c]] = Fair(prob=prob, lo=prob - k * tv, hi=prob + k * tv,
@@ -365,7 +377,8 @@ class CoinRaceModel:
                                                   "vol_bp": math.sqrt(float(self.pricer._last_rate[i])) * 1e4,
                                                   "vol_src": (self.vol_src.get(c, "implied")
                                                               if p.vol_source == "implied" else "realized"),
-                                                  "corr_mult": g})
+                                                  "corr_mult": g, "spot_mid": m_spot,
+                                                  "perp_gap_bp": p_gap, "perp_n": p_n})
         return out
 
     # --- FairModel ----------------------------------------------------------
@@ -427,12 +440,31 @@ class CoinRaceModel:
             return "spot_burst"
         return None
 
+    def _thin_venues(self, in_mid: dict[str, list[str]]) -> str | None:
+        """Coins whose median has fewer than half its configured venues, held
+        over THIN_VENUES_S. 10-19 07:34-19:18 UTC every coin priced off
+        Coinbase alone and nothing on the dashboard said so."""
+        now = time.monotonic()
+        thin = []
+        for c, have in in_mid.items():
+            want = len(SPOT_VENUES.get(c, ()))
+            if want >= 2 and len(have) * 2 < want:
+                since = self._thin_since.setdefault(c, now)
+                if now - since >= THIN_VENUES_S:
+                    thin.append(f"{c} {len(have)}/{want}")
+            else:
+                self._thin_since.pop(c, None)
+        return f"spot median thin: {', '.join(thin)} venues" if thin else None
+
     def summary_extras(self) -> dict:
         r = self.result
         snap = self.tracker.snapshot(time.time())
+        in_mid = {c: sorted(b.venue for b in f._live_books(time.monotonic())) for c, f in self.bus.feeds.items()}
+        withheld = (None if self.withheld_reason in (None, "before_start")
+                    else f"fair withheld: {self.withheld_reason}")
+        thin = self._thin_venues(in_mid)
         return {
-            "feed_problem": (None if self.withheld_reason in (None, "before_start")
-                             else f"fair withheld: {self.withheld_reason}"),
+            "feed_problem": "; ".join(x for x in (withheld, thin) if x) or None,
             "phase": None if r is None else r.phase, "tau_s": snap.tau, "tau_eff": None if r is None else r.tau_eff,
             "cf_start": dict(snap.start), "cf_start_n": dict(snap.start_n), "cf_end_n": dict(snap.end_n),
             "cf_age_s": self.cf.age_s(), "cf_basis_bp": {c: round(v, 3) for c, v in self.basis_bp.items()},
@@ -448,8 +480,7 @@ class CoinRaceModel:
             "feed_health": self.health.snapshot(),
             "venue_process": (None if self.spot is None or self.spot.venues is None
                               else self.spot.venues.summary()),
-            "venues_in_mid": {c: sorted(b.venue for b in f._live_books(time.monotonic()))
-                              for c, f in self.bus.feeds.items()},
+            "venues_in_mid": in_mid,
             "vol_model": self.forecaster.diagnostics() if hasattr(self.forecaster, "diagnostics") else None,
             "vol_source": self.cfg.pricing.vol_source,
             "vol_bp": {c: round(v, 4) for c, v in self.vol_bp.items()},

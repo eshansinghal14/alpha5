@@ -309,6 +309,13 @@ class UpDownModel:
         sh = p.market_shift_alpha * self._shift
         r = prob_up(x + sh, I, tau, rate, nu=p.t_nu, basis_sd=bsd, reaction_s=p.reaction_latency_s)
         self.result = r
+        # Shadow: the same fair priced off the perp nowcast. Logged, never quoted.
+        pnc = getattr(self.spot, "perp_nowcast", None)
+        p_px, p_gap, p_n = pnc.nowcast(self.coin, mono, mid) if pnc is not None else (None, None, 0)
+        p_prob = None
+        if p_gap is not None:
+            p_prob = prob_up(x + sh + p_gap * 1e-4, I, tau, rate, nu=p.t_nu, basis_sd=bsd,
+                             reaction_s=p.reaction_latency_s).prob
         self._newest_mono = max(books)
         self._dirty = False
         self.withheld_reason = None
@@ -319,6 +326,7 @@ class UpDownModel:
                                           "shift_bp": sh * 1e4, "shift_ema_bp": self._shift * 1e4,
                                           "start": start, "start_src": self.start_src, "cf_basis_bp": b * 1e4,
                                           "cf_end_n": n_end, "spot_mid": mid, "kmid": self._kmid(),
+                                          "perp_mid": p_px, "perp_gap_bp": p_gap, "perp_n": p_n, "perp_prob": p_prob,
                                           "vol_bp": math.sqrt(rate) * 1e4, "vol_src": vol_src,
                                           "realized_vol_bp": math.sqrt(self._realized_rate(max(tau, 1.0))) * 1e4,
                                           "iv_n_eff": implied_ema(self.spot, self.coin).n_eff(),

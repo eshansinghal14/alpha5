@@ -3,6 +3,25 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-19 — Venue reader fix; perp nowcast (shadow)
+
+- `venue_process._read_frame` read a frame with one unbuffered `read(n)`,
+  which returns one pipe read's worth (4096 bytes on Linux). A big frame (a
+  24k prints/s Binance sweep at 07:32 UTC) came back short, was taken as EOF,
+  and the reader thread exited while the child stayed alive. Every
+  non-Coinbase venue then left the median for 11h44m (07:34-19:18 UTC, until
+  the next restart): BTC/ETH 6 -> 1 venues, XRP 4 -> 1; perp pulls and perp
+  prints stopped too. Reads now loop until the frame is complete, and a live
+  child whose reader has ended is killed and restarted.
+- `feed_problem` now reports a coin whose spot median has under half its
+  configured venues for over 60s ("spot median thin: BTC 1/6 ..."). Nothing
+  flagged the 10-19 outage.
+- `perp_nowcast.py` (shadow only): the spot mid moved to where the perps
+  (Binance/Bybit/OKX median, each net of its trailing 30s basis to our spot)
+  already are, capped at 2bp, spot-only under 2 fresh venues. Logged on
+  decision rows as `x_perp_gap_bp`, `x_perp_n` (race, per coin) and
+  `x_perp_prob` / `x_perp_mid` (SOL). Never priced on.
+
 ## 2026-10-19 — KXSOL15M in its own process; other single coins off
 
 - `alpha5-crypto15m-sol` runs KXSOL15M alone at normal priority (resumes an

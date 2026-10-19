@@ -115,7 +115,10 @@ _DECISION_FIELDS = ("market_bid", "market_ask", "prob_raw", "prob_lo", "prob_hi"
 
 
 def _decision_key(row: dict) -> tuple:
-    return tuple(row.get(k) for k in _DECISION_FIELDS)
+    # The crypto perp nowcast (shadow) can move while nothing priced does;
+    # at 0.1bp it adds a row only on a real lead, not on every tick's jitter.
+    g = row.get("x_perp_gap_bp")
+    return tuple(row.get(k) for k in _DECISION_FIELDS) + (None if g is None else round(g, 1),)
 
 
 class StopAll(Exception):

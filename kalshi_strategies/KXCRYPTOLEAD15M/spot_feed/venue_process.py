@@ -75,13 +75,29 @@ def _write_frame(out, obj):
     out.flush()
 
 
+def _read_exact(inp, n: int) -> bytes | None:
+    """`n` bytes, or None at EOF. The pipes are unbuffered (bufsize=0), and an
+    unbuffered read returns at most one pipe read's worth (4096 bytes per
+    piece on Linux). A big frame read in one call came back short and was
+    taken as EOF: the reader thread exited, the child blocked on a full pipe,
+    and every non-Coinbase venue dropped out of the median for 11h44m
+    (2026-10-19 07:34-19:18 UTC, after a 24k prints/s Binance sweep)."""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = inp.read(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return bytes(buf)
+
+
 def _read_frame(inp):
-    head = inp.read(_LEN.size)
-    if len(head) < _LEN.size:
+    head = _read_exact(inp, _LEN.size)
+    if head is None:
         return None
     (n,) = _LEN.unpack(head)
-    data = inp.read(n)
-    if len(data) < n:
+    data = _read_exact(inp, n)
+    if data is None:
         return None
     return pickle.loads(data)
 
@@ -196,6 +212,7 @@ def _child_main(plan: dict[str, list[str]]):
 
     perp_rows: list[dict] = []
     perp_usd: dict[tuple[str, str], tuple] = {}
+    perp_last: dict[tuple[str, str], tuple] = {}
 
     def on_print(coin, t, as_of, exch_ts, kind):
         if kind in PERP_BURST_USD_1S or kind.startswith("hl_"):
@@ -215,6 +232,9 @@ def _child_main(plan: dict[str, list[str]]):
             agg = perp_usd.get(k)
             wall = time.time() - (time.monotonic() - as_of)
             perp_usd[k] = (wall, (agg[1] if agg else 0.0) + perp_rows[-1]["price"] * perp_rows[-1]["size"], exch_ts)
+            # The parent's perp nowcast needs the price itself, which the
+            # notional sum loses: the last trade of the batch, per (venue, coin).
+            perp_last[k] = (perp_rows[-1]["price"], wall, exch_ts)
             return
         prints.append((kind, coin, t, time.time() - (time.monotonic() - as_of), exch_ts))
 
@@ -258,6 +278,9 @@ def _child_main(plan: dict[str, list[str]]):
                 ps.append((kind, coin, {"price": usd, "size": 1.0, "trade_id": None, "side": None}, wall, exch_ts))
             perp_usd.clear()
             extra = {"status": dict(status)} if status else {}
+            if perp_last:
+                extra["perp_px"] = [(v, c, px, wall, ex) for (v, c), (px, wall, ex) in perp_last.items()]
+                perp_last.clear()
             try:
                 _write_frame(out, (books, ps, alive(), extra))
             except (BrokenPipeError, OSError):
@@ -328,6 +351,8 @@ class VenueProcess:
         self.on_urgent = None
         self._control: dict | None = None
         self.status: dict = {}
+        self._reader_thread: threading.Thread | None = None
+        self.n_reader_restarts = 0
 
     def alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
@@ -345,8 +370,9 @@ class VenueProcess:
             stderr=None, bufsize=0, creationflags=flags)
         self._started_at = self._clock()
         self.n_starts += 1
-        threading.Thread(target=self._reader, args=(self._proc,), daemon=True,
-                         name="venue-reader").start()
+        self._reader_thread = threading.Thread(target=self._reader, args=(self._proc,), daemon=True,
+                                               name="venue-reader")
+        self._reader_thread.start()
         if self._control is not None:
             self.send_control(self._control)      # a restarted child knows nothing
 
@@ -383,7 +409,16 @@ class VenueProcess:
 
     def ensure_running(self):
         """Start the child, or restart a dead one with backoff. Safe to call
-        every drain."""
+        every drain. A child whose reader thread has ended is killed and
+        restarted too: nothing would ever read its pipe again."""
+        if self.alive() and self._reader_thread is not None and not self._reader_thread.is_alive():
+            self.n_reader_restarts += 1
+            print("[spot/venues] reader stopped while the venue process was alive; restarting it", flush=True)
+            self._proc.kill()
+            try:
+                self._proc.wait(2)
+            except Exception:
+                pass
         if not self.plan or self.alive():
             if self.alive() and self._clock() - self._started_at > HEALTHY_S:
                 self._backoff = RESTART_MIN_S
@@ -408,10 +443,12 @@ class VenueProcess:
             self._next_try = now + self._backoff
             self._backoff = min(self._backoff * 2, RESTART_MAX_S)
 
-    def drain(self, on_book, on_print=None, on_alive=None, max_batches: int = 50, on_trip=None) -> int:
+    def drain(self, on_book, on_print=None, on_alive=None, max_batches: int = 50, on_trip=None,
+              on_perp_px=None) -> int:
         """Apply what the child has shipped. Wall-clock receipt times become
         this process's monotonic clock here. on_trip(kind, source, coin,
-        level, thr, onset, as_of, exch_ts) per trip row."""
+        level, thr, onset, as_of, exch_ts) per trip row; on_perp_px(venue,
+        coin, price, as_of) per perp's last trade in a batch."""
         with self._lock:
             frames = [self._frames.popleft() for _ in range(min(max_batches, len(self._frames)))]
         off = time.monotonic() - time.time()
@@ -423,6 +460,9 @@ class VenueProcess:
             if on_trip is not None:
                 for kind, source, coin, level, thr, onset, recv_wall, exch_ts in extra.get("trips") or ():
                     on_trip(kind, source, coin, level, thr, onset, recv_wall + off, exch_ts)
+            if on_perp_px is not None:
+                for venue, coin, px, recv_wall, _ex in extra.get("perp_px") or ():
+                    on_perp_px(venue, coin, px, recv_wall + off)
             if on_alive is not None:
                 for venue, coin, wall in alive:
                     on_alive(venue, coin, wall + off)
@@ -453,6 +493,8 @@ class VenueProcess:
 
     def summary(self) -> dict:
         return {"alive": self.alive(), "starts": self.n_starts, "last_exit": self.last_exit,
+                "reader_alive": self._reader_thread is not None and self._reader_thread.is_alive(),
+                "reader_restarts": self.n_reader_restarts,
                 "batches": self.n_batches, "books": self.n_books, "dropped_frames": self.n_dropped,
                 "move_thr_bp": self.status.get("move_thr")}
 

@@ -17,6 +17,7 @@ import time
 
 from kalshi_strategies.KXCRYPTOLEAD15M.cf_index import CfIndex
 from kalshi_strategies.KXCRYPTOLEAD15M.composite import CompositeBus
+from kalshi_strategies.KXCRYPTOLEAD15M.perp_nowcast import PerpNowcast
 from kalshi_strategies.KXCRYPTOLEAD15M.prints import (AUTO_SOURCES, HL_BURST_USD_1S, MOVE_SOURCE, PERP_BURST_USD_1S,
                                                        PERP_SOURCES, REFRESH_S, load_thresholds, save_thresholds,
                                                        SAMPLE_S, BurstCalibrator, BurstDetector, PrintLog,
@@ -90,6 +91,8 @@ class SpotFeed:
         self._wakes: dict[str, list] = {c: [] for c in COINS}
         self._tasks: list[asyncio.Task] = []
         self.bursts = BurstDetector(COINS)
+        # Shadow only: logged on decision rows, never priced on (perp_nowcast.py).
+        self.perp_nowcast = PerpNowcast()
         self.prints = PrintLog(persist=persist)
         self.trips = TripLog(persist=persist)
         self.coinbase.on_print = self._on_print
@@ -280,7 +283,8 @@ class SpotFeed:
             self._drain_now.clear()
             try:
                 self.venues.ensure_running()
-                self.venues.drain(self._on_book, self._on_venue_print, self.bus.touch, on_trip=self._on_trip)
+                self.venues.drain(self._on_book, self._on_venue_print, self.bus.touch, on_trip=self._on_trip,
+                                  on_perp_px=self.perp_nowcast.on_perp)
             except Exception as e:
                 print(f"[KXCRYPTOLEAD15M] venue drain error: {e!r}", flush=True)
 
@@ -336,13 +340,12 @@ class SpotFeed:
 
     def _on_book(self, vb):
         ms = self._wakes.get(vb.coin)
-        if not ms:
-            self.bus.observe(vb)
-            return
         before = self.bus.mid_nowcast(vb.coin)
         self.bus.observe(vb)
-        if self.bus.mid_nowcast(vb.coin) != before:
-            for m in ms:
+        after = self.bus.mid_nowcast(vb.coin)
+        if after != before:
+            self.perp_nowcast.on_spot(vb.coin, after)
+            for m in ms or ():
                 m._mid_moved()
 
     def sample(self, now_s: float):

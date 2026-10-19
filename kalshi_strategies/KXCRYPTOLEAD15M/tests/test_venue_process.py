@@ -52,6 +52,57 @@ def test_frame_roundtrip():
     assert vp._read_frame(buf) is None          # EOF
 
 
+class _Trickle(io.RawIOBase):
+    """A pipe that hands back at most `step` bytes per read, like an
+    unbuffered Linux pipe under load."""
+
+    def __init__(self, data: bytes, step: int = 4096):
+        self._b, self._i, self._step = data, 0, step
+
+    def readable(self):
+        return True
+
+    def read(self, n=-1):
+        k = min(n, self._step, len(self._b) - self._i)
+        out = self._b[self._i:self._i + k]
+        self._i += k
+        return out
+
+
+def test_frame_bigger_than_one_pipe_read_is_reassembled():
+    """10-19 07:34 UTC: a sweep's frame came back short, read as EOF, and the
+    reader quit -- every non-Coinbase venue left the median for 11h44m."""
+    buf = io.BytesIO()
+    obj = ([("kraken", "BTC", i) for i in range(20_000)], [], [])
+    vp._write_frame(buf, obj)
+    inp = _Trickle(buf.getvalue())
+    assert vp._read_frame(inp) == obj
+    assert vp._read_frame(inp) is None
+
+
+def test_truncated_frame_is_eof():
+    buf = io.BytesIO()
+    vp._write_frame(buf, ([1], [], []))
+    assert vp._read_frame(_Trickle(buf.getvalue()[:-3])) is None
+
+
+def test_dead_reader_restarts_a_live_child(monkeypatch):
+    _stubbed(monkeypatch, n=1)                   # stays alive reading stdin
+    p = vp.VenueProcess({"kraken": ["BTC"]})
+    p.ensure_running()
+    try:
+        assert p.alive() and p.n_starts == 1
+        p._reader_thread.join(0)
+        p._reader_thread = type("Dead", (), {"is_alive": lambda self: False})()
+        p.ensure_running()                       # kills the orphaned child
+        assert not p.alive() and p.n_reader_restarts == 1
+        p._next_try = 0.0
+        p.ensure_running()
+        assert p.alive() and p.n_starts == 2 and p.summary()["reader_alive"]
+    finally:
+        p.stop()
+
+
 def test_books_prints_and_keepalive_reach_the_parent(monkeypatch):
     _stubbed(monkeypatch)
     p = vp.VenueProcess({"kraken": ["BTC"]})

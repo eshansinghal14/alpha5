@@ -494,3 +494,18 @@ def test_on_book_empty_market_is_dropped():
     m.on_book(_Bk(m.ticker_of["BTC"], None, None))   # no market at all
     assert "BTC" not in m._kmid
 
+
+
+def test_thin_spot_median_is_a_feed_problem_after_a_minute():
+    """10-19 07:34-19:18 UTC every coin priced off Coinbase alone (venue
+    reader died) and the dashboard said nothing."""
+    from kalshi_strategies.KXCRYPTOLEAD15M import model as mod
+    now = time.time()
+    m = _model(now, recovery_s=0.0)
+    _feed(m, time.monotonic())                       # coinbase only, for every coin
+    assert "thin" not in (m.summary_extras()["feed_problem"] or "")   # not yet THIN_VENUES_S
+    for c in m._thin_since:
+        m._thin_since[c] -= mod.THIN_VENUES_S + 1
+    fp = m.summary_extras()["feed_problem"]
+    assert fp and "BTC 1/6" in fp and "ETH 1/6" in fp and "XRP 1/4" in fp
+    assert "SOL" not in fp and "HYPE" not in fp      # Coinbase-only by design
