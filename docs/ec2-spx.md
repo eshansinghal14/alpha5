@@ -11,6 +11,7 @@ alpha5-ibgateway  docker: IB Gateway + IBC + Xvfb   127.0.0.1:4001 (API), :5900 
 alpha5-spx        run --series KXINX   -> hub (only IB client) + one process for KXINXU + KXINXDUD
 alpha5-crypto     unchanged (nice -5, real money)
 alpha5-dashboard  one Streamlit for every series (sidebar), 127.0.0.1:8502
+alpha5-perf       performance-panel data for every series (the dashboard only reads it)
 alpha5-watchdog   unchanged; already covers every series under data/live
 ```
 
@@ -81,8 +82,12 @@ series and write budget from two machines.
 
 ## Operating
 
-- Dashboard: `ssh -i ... -N -L 8502:127.0.0.1:8502 ubuntu@<ip>`,
+- Dashboard: `ssh -i ... -N -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -L 8502:127.0.0.1:8502 ubuntu@<ip>`,
   then http://localhost:8502. The sidebar lists every series under a Crypto or S&P heading.
+  The keepalive stops idle NAT/Wi-Fi timeouts from silently dropping the tunnel.
+- The performance panel reads what `alpha5-perf` (`kalshi_viz/perf_worker.py`) writes to
+  `data/live/<series>/perf/`. Its state survives restarts; the first start after a deploy
+  rescans the journals (minutes on KXCRYPTOLEAD15M) and the panel waits until then.
 - Gateway screen (2FA, stuck dialog):
   `ssh -i ... -N -L 5900:127.0.0.1:5900 ubuntu@<ip>`, then any VNC
   client on localhost:5900 with `VNC_SERVER_PASSWORD`.

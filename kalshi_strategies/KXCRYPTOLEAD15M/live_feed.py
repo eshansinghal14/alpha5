@@ -36,6 +36,10 @@ from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed.venues import LEADING_VENUES
 VENUE_STALE_S = 5.0
 # How often the venue process's batches are applied on the trading loop.
 VENUE_DRAIN_S = 0.05
+# A perp-priced coin's increment must move this much (bp) to wake the race's
+# reprice. 0.5bp is ~2 HYPE ticks at $40; the increment only matters past
+# ~1bp (10-20: Coinbase followed >1bp increments 73-75% of the time).
+PERP_WAKE_BP = 0.5
 
 
 def venue_plan() -> dict[str, list[str]]:
@@ -94,6 +98,7 @@ class SpotFeed:
         self.bursts = BurstDetector(COINS)
         # Shadow only: logged on decision rows, never priced on (perp_nowcast.py).
         self.perp_nowcast = PerpNowcast()
+        self._perp_woke: dict[str, float] = {}
         self.prints = PrintLog(persist=persist)
         self.trips = TripLog(persist=persist)
         self.coinbase.on_print = self._on_print
@@ -344,6 +349,18 @@ class SpotFeed:
                 if model in ms:
                     ms.remove(model)
 
+    def _perp_inc_moved(self, coin: str, now: float) -> bool:
+        """The coin's latest-mover increment has moved PERP_WAKE_BP since the
+        reprice it last woke. Every Binance HYPE touch change woke the race's
+        full 5-coin reprice: stale_signal 12.7% -> 25% of decisions, loop lag
+        p95 10 -> 55ms (10-20 19:51-20:00 UTC)."""
+        _, inc = self.perp_nowcast.increment(coin, now, self.bus.mid_nowcast(coin))
+        inc = inc or 0.0
+        if abs(inc - self._perp_woke.get(coin, 0.0)) < PERP_WAKE_BP:
+            return False
+        self._perp_woke[coin] = inc
+        return True
+
     def _on_book(self, vb):
         if vb.venue in PERPS:
             if not vb.is_resyncing and not vb.is_crossed():
@@ -351,10 +368,13 @@ class SpotFeed:
                 if mid is not None:
                     self.perp_nowcast.on_perp(vb.venue, vb.coin, mid, vb.receive_ts)
                     # Models priced on the nowcast reprice on a perp move too.
-                    for m in self._wakes.get(vb.coin, ()):
-                        wakes = getattr(m, "perp_wakes", None)
-                        if (wakes(vb.coin) if wakes is not None
-                                else getattr(m.cfg.pricing, "perp_pricing", False)):
+                    ms = self._wakes.get(vb.coin, ())
+                    race = [m for m in ms if getattr(m, "perp_wakes", None) is not None and m.perp_wakes(vb.coin)]
+                    if race and self._perp_inc_moved(vb.coin, vb.receive_ts):
+                        for m in race:
+                            m._mid_moved()
+                    for m in ms:
+                        if getattr(m, "perp_wakes", None) is None and getattr(m.cfg.pricing, "perp_pricing", False):
                             m._mid_moved()
             return
         ms = self._wakes.get(vb.coin)
@@ -363,6 +383,7 @@ class SpotFeed:
         after = self.bus.mid_nowcast(vb.coin)
         if after != before:
             self.perp_nowcast.on_spot(vb.coin, after)
+            self._perp_woke[vb.coin] = 0.0          # increment resets on a spot move
             for m in ms or ():
                 m._mid_moved()
 

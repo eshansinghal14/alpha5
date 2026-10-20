@@ -3,6 +3,24 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-20 — Dashboard performance data in its own process
+
+The dashboard on EC2 sat at ~33% CPU and 2 GB RSS (2.5 GB peak) with the
+browser reconnecting. Its perf refresh threads ran inside the Streamlit
+process and held the GIL through cold journal passes: 64s on KXINXU and
+over 11 minutes on KXCRYPTOLEAD15M (25k bbo + 25k decisions parts, 10
+days), redone on every dashboard restart (18 restarts on 10-20).
+
+- New `kalshi_viz/perf_worker.py` (unit `alpha5-perf`, nice 19,
+  MemoryMax 1500M) refreshes every series every 30s, one thread each, and
+  writes `data/live/<series>/perf/{fills,lip,prints}.parquet` + `meta.json`.
+  The panel only reads those (`perf.read_result`); no refresh threads in
+  Streamlit anymore (`ensure_background` / `IDLE_S` removed).
+- `Perf` state is pickled to `perf/state.pkl` (first pass, then every 5
+  min), so a restart only catches up. `perf.STATE_VERSION` invalidates it.
+- Tunnel command gets `ServerAliveInterval=15` so idle drops don't
+  silently kill the dashboard's websocket.
+
 ## 2026-10-20 — One write bucket per shard; HYPE priced on Binance's lead
 
 - **Write budget.** Shard 2 was sliced per process: race 300/s (100%), the
@@ -25,6 +43,11 @@ Reverse chronological. One section per material change. Entries before
   0.20-0.46, so SOL stays on spot. Coinbase HYPE prints ~9/min vs Binance
   ~900/min; receipt latency is not the issue (Coinbase HYPE p50 17ms, BTC 14ms).
   Set to ["HYPE"]. Decision rows log `x_priced_on` (latest | spot).
+  First version woke the 5-coin reprice on every Binance HYPE touch change:
+  live 19:51-20:00 UTC stale_signal 12.7% -> 25% of decisions, loop lag p95
+  10 -> 55ms; set back to [] at 20:00 (stale 16.8%, p95 9.6ms). Now a perp
+  move wakes it only once the increment has moved `live_feed.PERP_WAKE_BP`
+  (0.5bp) since the last wake.
 
 ## 2026-10-20 — Cancels on their own lane; burst trips pull at once
 
