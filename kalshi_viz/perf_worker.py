@@ -19,6 +19,10 @@ from kalshi_viz import perf
 
 REFRESH_S = 30.0
 SAVE_EVERY_S = 300.0
+# One first pass at a time: all 8 series' cold scans at once went past the
+# unit's 1500M cap and were OOM-killed (EC2, 10-20 20:11). From saved state a
+# first pass is ~1s, so the queue only matters after a STATE_VERSION bump.
+_FIRST_PASS = threading.Semaphore(1)
 
 
 def state_path(series: str) -> str:
@@ -33,7 +37,12 @@ def run_series(series: str, every_s: float = REFRESH_S, save_every_s: float = SA
     while stop is None or not stop.is_set():
         t = time.monotonic()
         try:
-            df = p.refresh()
+            if first:
+                with _FIRST_PASS:
+                    t = time.monotonic()
+                    df = p.refresh()
+            else:
+                df = p.refresh()
             perf.write_result(p, df)
             if first or time.monotonic() - saved >= save_every_s:
                 p.save(state_path(series))
