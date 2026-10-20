@@ -144,6 +144,9 @@ class Perf:
 
     def __setstate__(self, state):
         self.__dict__.update(state)
+        # States saved before _price_prints dropped unpriced prints.
+        if len(self._prints) and self._prints.theo.isna().any():
+            self._prints = self._prints[self._prints.theo.notna()].reset_index(drop=True)
         self._lock = threading.Lock()
         self._theo_cache = {}
         self._settle_tried = {}
@@ -421,8 +424,13 @@ class Perf:
         for _, g in p[ready].groupby(p[ready].time.dt.floor(CHUNK)):
             g = g.sort_values("time").reset_index(drop=True)
             done.append(g.assign(theo=self._with_theo(g)))
-        if done:
-            x = pd.concat(([self._prints] if len(self._prints) else []) + done, ignore_index=True)
+        # Only priced prints are kept: edge share skips the rest, and keeping
+        # them grew KXBTC15M's tape to 2.3M rows (435 MB, 211k priced) and
+        # OOM-killed alpha5-perf (10-20).
+        done = [g[g.theo.notna()] for g in done]
+        if any(len(g) for g in done):
+            x = pd.concat(([self._prints] if len(self._prints) else []) + [g for g in done if len(g)],
+                          ignore_index=True)
             # A print is journaled once per process; a restart mid-event can't
             # replay it, but two parts of one day can still overlap a reconnect.
             has_id = x.trade_id.notna()
@@ -432,7 +440,7 @@ class Perf:
 
     def prints_frame(self) -> pd.DataFrame:
         """(time, ticker, trade_id, yes_price, size, theo): every public print
-        on this series' markets since the tape started being journaled."""
+        on this series' markets that we had an armed theo for."""
         with self._lock:
             return self._prints.copy()
 

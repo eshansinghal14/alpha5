@@ -72,7 +72,7 @@ def test_edge_share_end_to_end(tmp_path, monkeypatch):
     df = p.refresh()
     assert list(df.theo.round(2)) == [0.50, 0.60]
     pr = p.prints_frame()
-    assert len(pr) == 3 and pr.theo.isna().sum() == 1
+    assert list(pr.trade_id) == ["P1", "P2"]   # P3 (shadow, no theo) isn't kept
 
     E = perf.summarize_edge(df, pr)
     assert E["prints"] == 2
