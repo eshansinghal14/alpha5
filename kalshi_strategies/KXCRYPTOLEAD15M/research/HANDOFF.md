@@ -26,8 +26,13 @@ Change details with measurements are in `docs/CHANGES.md` (2026-10-19/20 entries
 | Unit | Runs | Notes |
 |---|---|---|
 | alpha5-crypto | KXCRYPTOLEAD15M (race), Nice -5 | owns spot files + recorder |
-| alpha5-crypto15m | KXETH15M KXSOL15M KXXRP15M KXHYPE15M, one process | replaces alpha5-crypto15m-sol (disabled) |
-| alpha5-crypto15m-btc | KXBTC15M alone | started 17:49 on SOL sizing; raised box load to 5.7-7 |
+| alpha5-crypto15m | KXETH15M KXSOL15M KXXRP15M KXHYPE15M, one process | **disarmed + disabled 10-20 ~21:45 UTC** |
+| alpha5-crypto15m-btc | KXBTC15M alone | **disarmed + disabled 10-20 ~21:45 UTC** |
+
+Single coins stopped: every coin negative on 10-20 real fills (1s markout
+-0.15 to -0.79c/lot; settled SOL -$2.28 over 79 events, BTC -$0.73, ETH/XRP/
+HYPE -$0.04 to -$0.18). The race's implied vols poll the 15M mids itself and
+don't need these processes. Re-enable with `systemctl enable --now`.
 | alpha5-spx | KXINXU / KXINXDUD | untouched today |
 | alpha5-dashboard | streamlit :8502 | perf threads now stop after 120s unviewed |
 
