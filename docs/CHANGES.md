@@ -3,6 +3,20 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-20 — Latest-mover nowcast (shadow); cap stays 2bp
+
+- `PerpNowcast.increment`: spot plus Binance's move since spot last moved,
+  capped at `CAP_BP`; it resets on every spot move, so a spot-led move is
+  never pulled back while Binance hasn't updated (nowcast() pulls it back by
+  the gap). Shadow only: race decision rows `x_perp_inc_bp`, KXSOL15M rows
+  `x_inc_bp` / `x_inc_prob` (fair priced the same way as `x_perp_prob`).
+- Cap left at 2bp. SOL 10-20 00:25-02:50 UTC, 10ms grid, Binance trade input:
+  |gap| > 2bp 22% of the time, but spot closed ~0% of gaps over 1bp within 1s
+  (basis drift, not lead), and every cap above 0 predicted spot 200ms ahead
+  worse (rms 0.51bp at 0 -> 1.28 at 2bp -> 2.04 at 5bp). Informed-taker
+  half-move -20ms at 2bp vs -30 at 5bp. On the bookTicker input (3 min) the
+  gap never exceeded 3bp, so the cap doesn't bind there at all.
+
 ## 2026-10-20 — Coinbase prints from the Exchange feed
 
 - `CoinbaseAdapter` opens a second socket to Coinbase Exchange's public feed

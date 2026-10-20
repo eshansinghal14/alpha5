@@ -43,6 +43,39 @@ def test_gap_is_capped():
     assert gap == pytest.approx(pn.CAP_BP)
 
 
+def test_increment_is_binance_move_since_spot_last_moved():
+    n = pn.PerpNowcast()
+    t = _warm(n)
+    assert n.increment("ETH", t, 100.0)[1] == pytest.approx(0.0, abs=1e-9)
+    n.on_perp("binance_perp", "ETH", 100.05 * math.exp(1e-4), t + 0.05)       # Binance +1bp first
+    px, inc = n.increment("ETH", t + 0.05, 100.0)
+    assert inc == pytest.approx(1.0, abs=1e-6) and px > 100.0
+    s1 = 100.0 * math.exp(1e-4)
+    n.on_spot("ETH", s1)                                                       # spot catches up
+    assert n.increment("ETH", t + 0.1, s1)[1] == pytest.approx(0.0, abs=1e-9)  # not counted twice
+
+
+def test_increment_never_pulls_a_spot_move_back():
+    """Spot moves first: nowcast() would subtract it until Binance agrees,
+    the increment leaves it alone."""
+    n = pn.PerpNowcast()
+    t = _warm(n)
+    s1 = 100.0 * math.exp(1.5e-4)
+    n.on_spot("ETH", s1)
+    _, gap, _ = n.nowcast("ETH", t + 0.01, s1)
+    _, inc = n.increment("ETH", t + 0.01, s1)
+    assert gap == pytest.approx(-1.5, abs=0.05) and inc == pytest.approx(0.0, abs=1e-9)
+
+
+def test_increment_capped_and_stale_binance_is_spot():
+    n = pn.PerpNowcast()
+    t = _warm(n)
+    n.on_perp("binance_perp", "ETH", 100.05 * math.exp(10e-4), t + 0.05)
+    assert n.increment("ETH", t + 0.05, 100.0)[1] == pytest.approx(pn.CAP_BP)
+    px, inc = n.increment("ETH", t + 0.05 + pn.FRESH_S + 1, 100.0)
+    assert inc is None and px == 100.0
+
+
 def test_binance_alone_moves_the_nowcast_before_the_others():
     """The others haven't moved yet: the median wouldn't, Binance does."""
     n = pn.PerpNowcast()

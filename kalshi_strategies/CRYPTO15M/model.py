@@ -319,6 +319,15 @@ class UpDownModel:
             dx = p_gap * 1e-4
             I_p = I + (dx * (n_eff - n_end) / L if tau < L else 0.0)
             perp_r = prob_up(x + sh + dx, I_p, tau, rate, nu=p.t_nu, basis_sd=bsd, reaction_s=p.reaction_latency_s)
+        # Shadow: the latest-mover nowcast (spot + Binance's move since spot
+        # last moved), priced the same way, logged as x_inc_prob.
+        _, p_inc = pnc.increment(self.coin, mono, mid) if pnc is not None else (None, None)
+        inc_prob = None
+        if p_inc is not None:
+            dxi = p_inc * 1e-4
+            I_i = I + (dxi * (n_eff - n_end) / L if tau < L else 0.0)
+            inc_prob = prob_up(x + sh + dxi, I_i, tau, rate, nu=p.t_nu, basis_sd=bsd,
+                               reaction_s=p.reaction_latency_s).prob
         priced_on = "perp" if p.perp_pricing and perp_r is not None else "spot"
         r = perp_r if priced_on == "perp" else spot_r
         self.result = r
@@ -334,6 +343,7 @@ class UpDownModel:
                                           "cf_end_n": n_end, "spot_mid": mid, "kmid": self._kmid(),
                                           "perp_mid": p_px, "perp_gap_bp": p_gap, "perp_n": p_n,
                                           "perp_prob": None if perp_r is None else perp_r.prob,
+                                          "inc_bp": p_inc, "inc_prob": inc_prob,
                                           "spot_prob": spot_r.prob, "priced_on": priced_on,
                                           "vol_bp": math.sqrt(rate) * 1e4, "vol_src": vol_src,
                                           "realized_vol_bp": math.sqrt(self._realized_rate(max(tau, 1.0))) * 1e4,

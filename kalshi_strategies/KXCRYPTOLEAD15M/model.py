@@ -368,6 +368,7 @@ class CoinRaceModel:
             prob, tv = float(self.result.probs[i]), float(self.result.theo_vol[i])
             m_spot = self.bus.mid_nowcast(c)
             _, p_gap, p_n = pnc.nowcast(c, mono, m_spot) if pnc is not None else (None, None, 0)
+            _, p_inc = pnc.increment(c, mono, m_spot) if pnc is not None else (None, None)
             # Not clipped to [0, 1]: the band is an edge distance, and clipping
             # would erase the edge on tail coins (fair 0.002, band 0.015).
             out[self.ticker_of[c]] = Fair(prob=prob, lo=prob - k * tv, hi=prob + k * tv,
@@ -378,7 +379,7 @@ class CoinRaceModel:
                                                   "vol_src": (self.vol_src.get(c, "implied")
                                                               if p.vol_source == "implied" else "realized"),
                                                   "corr_mult": g, "spot_mid": m_spot,
-                                                  "perp_gap_bp": p_gap, "perp_n": p_n})
+                                                  "perp_gap_bp": p_gap, "perp_n": p_n, "perp_inc_bp": p_inc})
         return out
 
     # --- FairModel ----------------------------------------------------------

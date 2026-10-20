@@ -64,10 +64,31 @@ class PerpNowcast:
         self._basis: dict[tuple[str, str], collections.deque] = {}     # (venue, coin) -> (t, log perp - log spot)
         self._bsum: dict[tuple[str, str], float] = {}
         self._spot: dict[str, float] = {}                              # coin -> latest log spot
+        # Latest-mover state per coin: Binance's log price when spot last
+        # moved, so `increment` is only what Binance did since then.
+        self._lead_at_spot: dict[str, float] = {}
 
     def on_spot(self, coin: str, mid: float | None):
         if mid is not None and mid > 0:
             self._spot[coin] = math.log(mid)
+            p = self._px.get((LEAD, coin))
+            if p is not None:
+                self._lead_at_spot[coin] = p[0]
+
+    def increment(self, coin: str, now: float, spot_mid: float | None) -> tuple[float | None, float | None]:
+        """Latest-mover nowcast (shadow): spot plus Binance's move since spot
+        last moved, capped at CAP_BP. Unlike nowcast(), a spot move is never
+        pulled back toward the perp level while Binance hasn't updated: the
+        increment resets to 0 on every spot move. Returns (price, inc_bp);
+        inc None when Binance is stale or hasn't printed since startup."""
+        if spot_mid is None or spot_mid <= 0:
+            return None, None
+        p, ref = self._px.get((LEAD, coin)), self._lead_at_spot.get(coin)
+        if p is None or ref is None or now - p[1] > FRESH_S:
+            return spot_mid, None
+        cap = CAP_BP * 1e-4
+        inc = max(-cap, min(cap, p[0] - ref))
+        return spot_mid * math.exp(inc), inc * 1e4
 
     def on_perp(self, venue: str, coin: str, price: float, t: float):
         if price <= 0:
