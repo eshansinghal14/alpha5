@@ -1,3 +1,126 @@
+# CURRENT STATE — 2026-10-20 ~18:00 UTC (read this first)
+
+Everything below the line further down is historical (pre-2026-10-09 reorg).
+Change details with measurements are in `docs/CHANGES.md` (2026-10-19/20 entries).
+
+## Box and access
+
+- Live box moved 2026-10-19 to **us-east-2**, `i-0474a645b0354d5c1`, c7g.xlarge
+  (4 vCPU, 7.7 GB), `ubuntu@3.131.100.179`, key `~/.ssh/alpha5-live-key.pem`.
+  Old us-east-1 box terminated. AWS CLI default region is us-east-2.
+- SG `sg-0216e64cd58ee302c` allows SSH from `73.13.41.0/24` and `165.123.0.0/16`.
+  Your IP changes; add a /32 with `aws ec2 authorize-security-group-ingress
+  --group-id sg-0216e64cd58ee302c --protocol tcp --port 22 --cidr <ip>/32`.
+- Dashboard: `ssh -i $env:USERPROFILE\.ssh\alpha5-live-key.pem -N -L 8502:127.0.0.1:8502 ubuntu@3.131.100.179`.
+- Box code: `ec2-live` at `bf09f77`. Deploy = push, then on the box
+  `git fetch && git merge --ff-only origin/ec2-live` **after confirming
+  origin has the new sha** (twice a pull ran before GitHub had the push and
+  restarted old code), then restart units. Restart `alpha5-dashboard` too when
+  a config key is added (it rejects unknown keys).
+- Analysis on the box: `/opt/alpha5/deploy/review_py.sh script.py` (1 GiB cap;
+  full-day decision journals OOM it — read only the windows needed).
+  py-spy installed at `/tmp/pyspy/bin/py-spy` (lost on reboot).
+
+## Services (systemd)
+
+| Unit | Runs | Notes |
+|---|---|---|
+| alpha5-crypto | KXCRYPTOLEAD15M (race), Nice -5 | owns spot files + recorder |
+| alpha5-crypto15m | KXETH15M KXSOL15M KXXRP15M KXHYPE15M, one process | replaces alpha5-crypto15m-sol (disabled) |
+| alpha5-crypto15m-btc | KXBTC15M alone | started 17:49 on SOL sizing; raised box load to 5.7-7 |
+| alpha5-spx | KXINXU / KXINXDUD | untouched today |
+| alpha5-dashboard | streamlit :8502 | perf threads now stop after 120s unviewed |
+
+All crypto series are ARMED (dashboard requests). Single-coin sizing:
+SOL and BTC at 0.1 lots / max_position 0.5 / max_signal_age_s 0.04;
+**ETH, XRP, HYPE still on loose settings** (0.5 lots, max pos 5, edge 0.005,
+max_signal_age_s 0.75) — decide: tighten to SOL's or disarm.
+Uncommitted live config edits on the box (both crypto configs, KXINX) — keep
+them when deploying (a pull doesn't touch them; don't stash while running).
+
+## What changed 10-19/20 (all live)
+
+Feeds / latency:
+- Coinbase prints from Exchange `matches` (~55ms sooner than Advanced Trade;
+  SOL 69 -> 10ms). Book still Advanced Trade `level2` (Exchange
+  `level2_batch` tried 05:29-05:50 10-20: batching tripped stale_signal,
+  reverted `coinbase.EX_BOOK = False`). Unbatched Exchange level2 needs an
+  institutional account — user's personal account can't get one.
+- Venue books with a touch change ship immediately (no 50ms batch).
+- Perp book updates with unchanged touch dropped (keep-alive 0.25s).
+- Hyperliquid and Bybit no longer run. Perps = Binance + OKX.
+- Recording only from the race's venue child.
+
+Pricing:
+- HYPE priced on the depth-weighted CF replica (`series.DEPTH_PRICED`).
+- Perp nowcast: Binance book mid only; OKX checks it (>3bp apart -> spot
+  unchanged; Binance stale -> OKX). Latest-mover increment (spot + Binance's
+  move since spot last moved, cap 2bp) — KXSOL15M prices on it
+  (`pricing.perp_mode = "latest"`); race only logs it (`x_perp_inc_bp`).
+- Cap left at 2bp (higher caps predicted spot worse).
+
+## Findings (so they aren't re-tested)
+
+- Coinbase-alone vs multi-venue median vs CF index: median wins for BTC/ETH/XRP
+  (~30%); keep the median. HYPE replica 0.67bp vs touch 0.98bp.
+- SOL quoting is not profitable: widening edge, taking stale quotes, pulling
+  on spot moves (replay) all failed. Theo isn't biased (theo-mid +0.17c,
+  vol ratio 1.001, our spot level tracks CF better than Kalshi's implied one);
+  market_shift_alpha > 0 makes it worse — keep 0 for single coins.
+- Single-coin tape test (theo +/- 1-4c): every coin negative at 1/10/60s;
+  XRP worst (settled t -3.7), SOL least bad.
+- Race by time left: first 1-5 min of each event loses (first minute
+  settled -22c/lot, t -2.9); 5-1 min before cutoff best. HYPE the clear
+  losing coin. 15-lot quotes (order_lots 10->15 on 10-19 04:15) coincide
+  with the markout drift: full-quote fills are the adverse ones.
+- OKX/Bybit check replay: fires 73-122/h, spot sides with them 66-85% — keep a check.
+- CME (direct, not via IBKR) would be ~30-140ms ahead of Binance for
+  BTC/ETH/SOL/XRP, none for HYPE; IBKR is slower than Binance. Not pursued.
+
+## THE OPEN PROBLEM: where the losses come from (analysis 10-20 18:00 UTC)
+
+Script: `/tmp/gap.py <SERIES> <hours>` on the box (copy in the session temp
+dir). Classifies each real maker fill:
+
+Race, last 9h (293 fills):
+| | fills | mo1 | mo10 | mo10 $ | settled $ |
+|---|---|---|---|---|---|
+| RACE: cancel already decided, fill won | 131 (45%) | -1.09 | -0.40 | -6.42 | -17.93 |
+| BLIND: theo not past the quote | 162 (55%) | +0.63 | +1.23 | +18.87 | +53.47 |
+
+- Race losses ARE latency. Our cancel decision lands median 7.6ms AFTER
+  Kalshi's fill time (p10 22ms after, p90 20ms before) + ~4-6ms one way to
+  Kalshi => we lose by ~10-20ms. 119/133 of those cancels are
+  `not_quotable` (burst/stale pulls arriving too late).
+- When a pull trip was near a fill: triggering print's exchange time median
+  26ms BEFORE the fill, but it reached our box 14ms AFTER. The taker reacts
+  within ~26ms of the print; we take ~40ms just to receive it (Coinbase
+  network alone is ~13ms) -> most of that is inside our process.
+- 22 fills came 10-50ms AFTER we decided to cancel — should have made it.
+
+SOL, last 9h (1,258 fills): 82% BLIND (-0.85c at 10s), 18% RACE. SOL's loss
+is mostly flow we can't see, not latency.
+
+## Next steps (in order)
+
+1. **Cancel queueing.** Why do cancels decided 10-50ms before a fill still
+   lose? Check `orders` journal `queued_s` (decide -> send) and whether
+   cancels wait behind creates in the write group's queue / token bucket.
+   Make cancels jump everything. Cheapest likely win.
+2. **Trigger-to-pull path.** Trip prints reach us ~40ms after exchange time
+   (median) vs ~13ms Coinbase network. Measure each hop: socket recv ->
+   venue child parse -> pipe -> parent drain -> trip handler -> cancel send.
+3. **Price what's left:** widen early-event (first 1-5 min) or delay real
+   trading (`trading_time.real_trading_delay_s`); revert race order_lots
+   15 -> 10; cut HYPE in the race.
+4. Box CPU: with BTC single-coin running, load 5.7-7 on 4 cores and race
+   loop lag p95 rose 7.7 -> 27ms. If race stale_signal climbs, stop
+   alpha5-crypto15m-btc or resize to c7g.2xlarge.
+5. Watch the race's `max_signal_age_s` 0.03 (user's edit): ~16-18% of
+   decisions are over it.
+
+---
+
 > **Historical (pre-2026-10-09 reorg).** Paths and run commands below refer to the
 > removed `kalshi_crypto/` package. Current layout: `kalshi_strategies/KXCRYPTOLEAD15M/`;
 > run with `python -m kalshi_strategies.run --series KXCRYPTOLEAD15M`. See `docs/live-trading.md`.
