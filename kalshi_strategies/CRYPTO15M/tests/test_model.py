@@ -218,3 +218,35 @@ def test_withheld_before_start():
     m, spot = _setup(now)
     _feed(spot, "BTC")
     assert m.reprice(m.window.S - 10)[m.ticker] is None and m.withheld_reason == "before_start"
+
+
+def _perps_ahead(spot, coin, bp):
+    """Perps sit level with spot for a basis window, then move `bp` ahead."""
+    mono = time.monotonic()
+    for i in range(30):
+        for v in ("binance_perp", "bybit_perp", "okx_perp"):
+            spot.perp_nowcast.on_perp(v, coin, PX[coin], mono - 3 + i * 0.1)
+    for v in ("binance_perp", "bybit_perp", "okx_perp"):
+        spot.perp_nowcast.on_perp(v, coin, PX[coin] * math.exp(bp * 1e-4), mono)
+
+
+def test_perp_pricing_switch():
+    now = time.time()
+    m, spot = _setup(now, perp_pricing=False)
+    _feed(spot, "BTC")
+    _perps_ahead(spot, "BTC", 1.0)
+    f = m.reprice(now)[m.ticker]
+    assert f.extras["priced_on"] == "spot" and f.prob == f.extras["spot_prob"]
+    assert f.extras["perp_prob"] > f.extras["spot_prob"]          # perps up: higher P(up)
+    m.cfg.pricing.perp_pricing = True
+    m._dirty = True
+    f = m.reprice(now)[m.ticker]
+    assert f.extras["priced_on"] == "perp" and f.prob == f.extras["perp_prob"] > f.extras["spot_prob"]
+
+
+def test_perp_pricing_falls_back_to_spot_without_fresh_perps():
+    now = time.time()
+    m, spot = _setup(now, perp_pricing=True)
+    _feed(spot, "BTC")
+    f = m.reprice(now)[m.ticker]
+    assert f.extras["priced_on"] == "spot" and f.extras["perp_prob"] is None

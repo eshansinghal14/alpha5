@@ -91,6 +91,11 @@ class UpDownPricingParams:
     tradeable_max: float = param("As tradeable_min, upper side.", min=0.5, max=1.0, step=0.01)
     burst_own_coin_only: bool = param(
         "Spot bursts pull quotes only on the bursting coin's market (off: any coin's burst pulls all).")
+    perp_pricing: bool = param(
+        "Price on the perp nowcast: x moved by how far the Binance/Bybit/OKX median (net of each one's "
+        "trailing 30s basis to our spot) already is from our spot mid, capped at 2bp; plain spot when fewer "
+        "than 2 perps traded in the last 2s (perp_nowcast.py). Off: priced on spot, perp fair logged only. "
+        "Perps led our spot median ~250ms (ETH 10-18/19).")
     market_shift_alpha: float = param(
         "Share of the market-implied shift in x (the one putting our fair on the Kalshi mid) applied, "
         "after EMA smoothing. 0 disables.", min=0, max=1, step=0.05)

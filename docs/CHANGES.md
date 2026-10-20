@@ -3,6 +3,18 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-20 — KXSOL15M prices on the perp nowcast
+
+- New `pricing.perp_pricing` (CRYPTO15M, per coin, live-editable): the fair
+  is priced with x moved by the perp nowcast's gap (and the not-yet-printed
+  end seconds with it); plain spot when fewer than 2 perps are fresh. Implied
+  vol and the market shift stay on the spot input. On for KXSOL15M only, as a
+  live test of whether a faster theo makes single-coin quoting pay; off for
+  the others. Decision rows carry `x_spot_prob`, `x_perp_prob`, `x_priced_on`.
+  SOL 10-20 00:16-00:21 UTC: a perp reading on 97% of decisions (3 fresh
+  venues 83%), |gap| p50 0.6bp / p90 1.4bp, |perp fair - spot fair| p50
+  0.6c / p90 1.9c.
+
 ## 2026-10-19 — Venue reader fix; perp nowcast (shadow)
 
 - `venue_process._read_frame` read a frame with one unbuffered `read(n)`,

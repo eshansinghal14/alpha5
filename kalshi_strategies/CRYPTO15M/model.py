@@ -307,15 +307,21 @@ class UpDownModel:
             return self._withhold("no_implied_vol")
         self._market_shift(now_s, x, I, tau, rate, bsd)
         sh = p.market_shift_alpha * self._shift
-        r = prob_up(x + sh, I, tau, rate, nu=p.t_nu, basis_sd=bsd, reaction_s=p.reaction_latency_s)
-        self.result = r
-        # Shadow: the same fair priced off the perp nowcast. Logged, never quoted.
+        spot_r = prob_up(x + sh, I, tau, rate, nu=p.t_nu, basis_sd=bsd, reaction_s=p.reaction_latency_s)
+        # The perp nowcast fair: x moved by the perps' lead, and so is every
+        # end-average second filled with x (they haven't printed yet). Implied
+        # vol and the market shift stay on the spot input: they compare
+        # against Kalshi, which prices off spot.
         pnc = getattr(self.spot, "perp_nowcast", None)
         p_px, p_gap, p_n = pnc.nowcast(self.coin, mono, mid) if pnc is not None else (None, None, 0)
-        p_prob = None
+        perp_r = None
         if p_gap is not None:
-            p_prob = prob_up(x + sh + p_gap * 1e-4, I, tau, rate, nu=p.t_nu, basis_sd=bsd,
-                             reaction_s=p.reaction_latency_s).prob
+            dx = p_gap * 1e-4
+            I_p = I + (dx * (n_eff - n_end) / L if tau < L else 0.0)
+            perp_r = prob_up(x + sh + dx, I_p, tau, rate, nu=p.t_nu, basis_sd=bsd, reaction_s=p.reaction_latency_s)
+        priced_on = "perp" if p.perp_pricing and perp_r is not None else "spot"
+        r = perp_r if priced_on == "perp" else spot_r
+        self.result = r
         self._newest_mono = max(books)
         self._dirty = False
         self.withheld_reason = None
@@ -326,7 +332,9 @@ class UpDownModel:
                                           "shift_bp": sh * 1e4, "shift_ema_bp": self._shift * 1e4,
                                           "start": start, "start_src": self.start_src, "cf_basis_bp": b * 1e4,
                                           "cf_end_n": n_end, "spot_mid": mid, "kmid": self._kmid(),
-                                          "perp_mid": p_px, "perp_gap_bp": p_gap, "perp_n": p_n, "perp_prob": p_prob,
+                                          "perp_mid": p_px, "perp_gap_bp": p_gap, "perp_n": p_n,
+                                          "perp_prob": None if perp_r is None else perp_r.prob,
+                                          "spot_prob": spot_r.prob, "priced_on": priced_on,
                                           "vol_bp": math.sqrt(rate) * 1e4, "vol_src": vol_src,
                                           "realized_vol_bp": math.sqrt(self._realized_rate(max(tau, 1.0))) * 1e4,
                                           "iv_n_eff": implied_ema(self.spot, self.coin).n_eff(),
