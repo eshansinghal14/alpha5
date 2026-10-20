@@ -1,0 +1,19 @@
+[Unit]
+Description=alpha5 dashboard performance data (reads the journals, writes data/live/<series>/perf)
+After=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/opt/alpha5
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/alpha5/.venv/bin/python -u -W ignore -m kalshi_viz.perf_worker
+# Lowest priority, like the dashboard: it only reads what the writers produce.
+Nice=19
+# So a runaway pass is killed here instead of taking memory from the trading
+# processes; the box has no swap.
+MemoryMax=1500M
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

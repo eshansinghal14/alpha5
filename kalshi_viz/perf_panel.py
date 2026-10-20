@@ -1,6 +1,6 @@
 """Strategy performance panel: cumulative PnL with 1s/10s markout over a
-chosen window, and the summary numbers beside it. Data from kalshi_viz.perf,
-refreshed in a background thread so a page render never waits on it."""
+chosen window, and the summary numbers beside it. Data is what
+kalshi_viz.perf_worker last wrote; a page render never computes it."""
 from __future__ import annotations
 
 import math
@@ -140,8 +140,6 @@ def _table(s: dict):
 
 def render(series: str, lip: bool = False):
     """`lip`: the series' events carry LIP programs; adds the LIP column."""
-    p = perf.get(series)
-    p.ensure_background()
 
     @st.fragment(run_every="15s")
     def body():
@@ -150,17 +148,19 @@ def render(series: str, lip: bool = False):
         if st.session_state.get("dash_series", series) != series:
             st.rerun(scope="app")
             return
-        df = p.latest
-        if df is None:
-            st.caption("Loading performance from the day journals… (first pass takes ~30s)")
+        r = perf.read_result(series)
+        if r is None:
+            st.caption("Waiting for the performance worker's first pass over the journals "
+                       "(`python -m kalshi_viz.perf_worker`; on EC2 the alpha5-perf unit).")
             return
-        if p.error:
-            st.caption(f"Last performance refresh failed: {p.error}")
+        df = r.fills
+        if r.error:
+            st.caption(f"Last performance refresh failed: {r.error}")
         win = st.radio("Window", list(WINDOWS), index=2, horizontal=True, key=f"perf_win_{series}",
                        label_visibility="collapsed")
         since = None if WINDOWS[win] is None else pd.Timestamp.now(tz="UTC") - WINDOWS[win]
         s = perf.summarize(df, since)
-        lf = p.lip_frame() if lip else None
+        lf = r.lip if lip else None
         sp = perf.summarize_split(df, lf, since)
         cols = st.columns(3 if lip else 2)
         with cols[0]:
@@ -171,14 +171,14 @@ def render(series: str, lip: bool = False):
             with cols[2]:
                 _lip(sp["lip"])
         _chart(df, since, lf)
-        _edge_share(perf.summarize_edge(df, p.prints_frame(), since))
+        _edge_share(perf.summarize_edge(df, r.prints, since))
         if s.get("fills"):
             st.caption(f"Settled {_usd(s['settled_usd'])} · open {_usd(s['open_usd'])} on {s['unsettled']} fills · "
                        f"fees ${s['fees']:.2f} · max drawdown {_usd(s['max_dd'])} · {s['events']} events")
         with st.expander("Markout by fill type"):
             _table(s)
-        if p.updated is not None:
-            st.caption(f"Updated {p.updated:%H:%M:%S} UTC. Fills are marked once 60s of book follows them.")
+        if r.updated is not None:
+            st.caption(f"Updated {r.updated:%H:%M:%S} UTC. Fills are marked once 60s of book follows them.")
 
     with st.container(border=True):
         st.markdown("##### Strategy performance (real fills)")

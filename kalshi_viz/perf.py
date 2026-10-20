@@ -12,11 +12,13 @@ OOM-killed the review queries on 2026-10-12.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import functools
 import glob
 import json
 import math
 import os
+import pickle
 import re
 import threading
 import time
@@ -25,6 +27,7 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
+from kalshi_infra.config import atomic_write_json
 from kalshi_infra.runtime.persist import LIVE_ROOT
 from kalshi_infra.trading.lip import payable_usd
 
@@ -47,11 +50,9 @@ _FILL_KEY = ["exchange_order_id", "trade_id", "time", "price", "size"]
 # so a print after a restart or gap isn't priced off the pre-gap theo. A
 # safety bound, not a measurement.
 THEO_TOL = pd.Timedelta("5min")
-# A series' background refresh stops once its panel hasn't been rendered for
-# this long, and the next render restarts it (state is kept, so it only
-# catches up). Every series viewed since the dashboard started kept a thread
-# refreshing every 30s: 8 of them took the dashboard to 70-110% CPU (10-20).
-IDLE_S = 120.0
+# Bump when Perf's accumulated state changes shape: a pickle from another
+# version is discarded and the journals are rescanned.
+STATE_VERSION = 1
 
 
 @functools.lru_cache(maxsize=4096)
@@ -125,38 +126,50 @@ class Perf:
         self._settle_path = os.path.join(self.root, "settlements.json")
         self._settle: dict[str, str] = self._load_settlements()
         self._settle_tried: dict[str, float] = {}
-        # Background refresh for the dashboard: the first pass over a day of
-        # journals takes ~20-40s, too long to block a page render.
-        self.latest: pd.DataFrame | None = None
-        self.updated: pd.Timestamp | None = None
-        self.error: str | None = None
-        self._thread: threading.Thread | None = None
-        self._bg_lock = threading.Lock()
-        self._viewed = 0.0
         # Decisions part -> its live-row theo (time, ticker, theo). Parts are
         # written once, so each is read once; entries older than the window
         # being marked are dropped. Re-reading 5+ min of parts per 30s refresh
         # was ~31% of the dashboard's CPU (10-20).
         self._theo_cache: dict[str, pd.DataFrame] = {}
 
-    def ensure_background(self, every_s: float = 30.0) -> None:
-        """Call on every render of this series' panel."""
-        with self._bg_lock:
-            self._viewed = time.monotonic()
-            if self._thread is None or not self._thread.is_alive():
-                self._thread = threading.Thread(target=self._loop, args=(every_s,), daemon=True,
-                                                name=f"perf-{self.series}")
-                self._thread.start()
+    # -- persistence ----------------------------------------------------------
+    # A cold pass rescans every journal part: 64s on KXINXU and >11 min on
+    # KXCRYPTOLEAD15M (25k bbo + 25k decisions parts, 10 days; 10-20). Keeping
+    # the state across restarts makes a restart only catch up.
 
-    def _loop(self, every_s: float) -> None:
-        while True:
-            if time.monotonic() - self._viewed > IDLE_S:
-                return
-            try:
-                self.latest, self.updated, self.error = self.refresh(), pd.Timestamp.now(tz="UTC"), None
-            except Exception as e:
-                self.error = repr(e)
-            time.sleep(every_s)
+    _TRANSIENT = ("_lock", "_theo_cache", "_settle_tried")
+
+    def __getstate__(self):
+        return {k: v for k, v in self.__dict__.items() if k not in self._TRANSIENT}
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
+        self._theo_cache = {}
+        self._settle_tried = {}
+
+    def save(self, path: str) -> None:
+        with self._lock:
+            blob = pickle.dumps((STATE_VERSION, self), protocol=pickle.HIGHEST_PROTOCOL)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp-{os.getpid()}"
+        with open(tmp, "wb") as fh:
+            fh.write(blob)
+        os.replace(tmp, path)
+
+    @classmethod
+    def load(cls, series: str, path: str) -> "Perf":
+        """The saved state if it is this version and this series, else fresh."""
+        try:
+            with open(path, "rb") as fh:
+                version, p = pickle.load(fh)
+            if version == STATE_VERSION and isinstance(p, cls) and p.series == series:
+                p.root = os.path.join(LIVE_ROOT, series)
+                p._settle_path = os.path.join(p.root, "settlements.json")
+                return p
+        except Exception:
+            pass
+        return cls(series)
 
     # -- settlement ---------------------------------------------------------
 
@@ -446,6 +459,72 @@ def get(series: str) -> Perf:
         if series not in _STORE:
             _STORE[series] = Perf(series)
         return _STORE[series]
+
+
+# -- worker output ------------------------------------------------------------
+# kalshi_viz.perf_worker refreshes every series in its own process and writes
+# these; the dashboard only reads them. In-process refresh threads held the
+# GIL long enough to stall Streamlit's websockets (10-20: 33% CPU and 2 GB
+# RSS in the dashboard, browser reconnecting).
+
+def out_dir(series: str) -> str:
+    return os.path.join(LIVE_ROOT, series, "perf")
+
+
+@dataclasses.dataclass
+class Result:
+    fills: pd.DataFrame
+    lip: pd.DataFrame
+    prints: pd.DataFrame
+    updated: pd.Timestamp | None
+    error: str | None
+
+
+def write_result(p: Perf, fills: pd.DataFrame, error: str | None = None) -> None:
+    d = out_dir(p.series)
+    os.makedirs(d, exist_ok=True)
+    for name, df in (("fills", fills), ("lip", p.lip_frame()), ("prints", p.prints_frame())):
+        tmp = os.path.join(d, f"{name}.parquet.tmp-{os.getpid()}")
+        df.to_parquet(tmp, index=False)
+        os.replace(tmp, os.path.join(d, f"{name}.parquet"))
+    atomic_write_json(os.path.join(d, "meta.json"),
+                      {"updated": pd.Timestamp.now(tz="UTC").isoformat(), "error": error})
+
+
+def write_error(series: str, error: str) -> None:
+    path = os.path.join(out_dir(series), "meta.json")
+    try:
+        with open(path) as fh:
+            meta = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        meta = {"updated": None}
+    atomic_write_json(path, {**meta, "error": error})
+
+
+_RESULT_CACHE: dict[str, tuple[tuple, Result]] = {}
+
+
+def read_result(series: str) -> Result | None:
+    """The worker's latest output, re-read only when meta.json changes
+    (written last). None until the worker's first pass for this series."""
+    d = out_dir(series)
+    meta_path = os.path.join(d, "meta.json")
+    try:
+        st_ = os.stat(meta_path)
+        key = (st_.st_mtime_ns, st_.st_size)
+        hit = _RESULT_CACHE.get(series)
+        if hit is not None and hit[0] == key:
+            return hit[1]
+        with open(meta_path) as fh:
+            meta = json.load(fh)
+        frames = {n: pd.read_parquet(os.path.join(d, f"{n}.parquet")) for n in ("fills", "lip", "prints")}
+    except (OSError, ValueError):
+        hit = _RESULT_CACHE.get(series)
+        return hit[1] if hit else None
+    r = Result(updated=pd.Timestamp(meta["updated"]) if meta.get("updated") else None,
+               error=meta.get("error"), **frames)
+    _RESULT_CACHE[series] = (key, r)
+    return r
 
 
 def window(df: pd.DataFrame, since: pd.Timestamp | None) -> pd.DataFrame:

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Quick health readout of the live service.
 cd /opt/alpha5
-for u in alpha5-crypto alpha5-spx alpha5-ibgateway alpha5-dashboard alpha5-watchdog; do
+for u in alpha5-crypto alpha5-spx alpha5-ibgateway alpha5-dashboard alpha5-perf alpha5-watchdog; do
   printf '%-18s %s\n' "$u" "$(systemctl is-active $u)"
 done
 printf '%-18s %s\n' "ib api :4001" "$(timeout 2 bash -c '</dev/tcp/127.0.0.1/4001' 2>/dev/null && echo open || echo CLOSED)"
