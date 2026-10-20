@@ -46,6 +46,14 @@ from .base import VenueBook, VenueAdapter, OrderBookLevel
 from ..series import COINBASE_PRODUCTS
 
 WS_URL = "wss://advanced-trade-ws.coinbase.com"
+# Coinbase Exchange public feed: same matching engine, delivered sooner. Same
+# trade ids on both, us-east-2 box 10-20 02:27 UTC, 5 min: Coinbase trade time
+# -> receipt p50 SOL 10ms / BTC 12 / HYPE 9 here vs 69 / 70 / 56 on Advanced
+# Trade, i.e. each trade ~55ms sooner (p10 17ms, p90 98ms). Its book channels
+# (level2_batch) were no faster than Advanced Trade's level2, and full level2
+# needs auth, so the book stays on Advanced Trade; this feed carries prints
+# (matches), which drive the held through-the-touch print and on_print.
+EX_WS_URL = "wss://ws-feed.exchange.coinbase.com"
 RECONNECT_DELAY_S = 1.0
 # The heartbeats channel sends one message per second on the connection,
 # so a silent socket is dead well before this.
@@ -229,13 +237,22 @@ class CoinbaseAdapter(VenueAdapter):
         # clock skew (this box ran 0.9s slow on 2026-10-08), so
         # (wall - exch - offset_min) is how long a message sat in OUR
         # buffers. See _data_age.
-        self._offsets: collections.deque[tuple[float, float]] = collections.deque()
+        # One window per feed: the Exchange feed's offsets run ~55ms lower, and
+        # a shared minimum would age every Advanced Trade book by that much.
+        self._offsets: dict[str, collections.deque[tuple[float, float]]] = {
+            "at": collections.deque(), "ex": collections.deque()}
         # Last view handed out per coin; its receive_ts is advanced in place
         # by _mark_fresh, since the composite holds on to these objects.
         self._views: dict[str, VenueBook] = {}
         # Optional: callable(coin, trade_dict, as_of, exch_ts) for every live
         # print (not the subscribe snapshot). Sync; must be cheap.
         self.on_print = None
+        # Prints come from the Exchange feed while it is connected (it is
+        # ~55ms sooner); Advanced Trade's market_trades are then ignored so
+        # nothing is counted twice. Falls back to them if the Exchange feed drops.
+        self.ex_live = False
+        self._ex_seen: collections.deque = collections.deque(maxlen=4096)
+        self._ex_seen_set: set = set()
 
     def latest(self, coin: str) -> VenueBook | None:
         pb = self._books.get(coin)
@@ -264,6 +281,84 @@ class CoinbaseAdapter(VenueAdapter):
         return self.latest(coin)
 
     async def run(self, on_update: Callable[[VenueBook], Awaitable[None] | None]):
+        await asyncio.gather(self._run_at(on_update), self._run_ex(on_update))
+
+    async def _run_ex(self, on_update):
+        """Exchange feed: matches (every print). Never touches the book's
+        levels; a print through the touch becomes the held print, as before."""
+        product_ids = [COINBASE_PRODUCTS[c] for c in self.coins]
+        while True:
+            try:
+                async with websockets.connect(EX_WS_URL, open_timeout=15, ping_interval=20,
+                                              ping_timeout=15, max_size=MAX_FRAME_SIZE) as ws:
+                    await ws.send(json.dumps({"type": "subscribe", "product_ids": product_ids,
+                                              "channels": ["matches", "heartbeat"]}))
+                    print(f"[spot/coinbase] exchange feed: matches + heartbeat to {product_ids}")
+                    while True:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=RECV_TIMEOUT_S)
+                        except asyncio.TimeoutError:
+                            print("[spot/coinbase] exchange feed recv timeout -- reconnecting")
+                            break
+                        d = json.loads(raw)
+                        ty = d.get("type")
+                        if ty == "subscriptions":
+                            self.ex_live = True
+                            continue
+                        if ty == "error":
+                            print(f"[spot/coinbase] exchange feed error: {d.get('message')} {d.get('reason')}")
+                            break
+                        coin = self._coin_by_product.get(d.get("product_id"))
+                        if coin is None:
+                            continue
+                        exch_ts = _parse_iso_ts(d["time"]) if d.get("time") else None
+                        mono = time.monotonic()
+                        as_of = mono - self._data_age(exch_ts, mono, "ex")
+                        if ty == "match":
+                            await self._ex_match(coin, d, as_of, exch_ts, on_update)
+            except (OSError, websockets.ConnectionClosed) as e:
+                print(f"[spot/coinbase] exchange feed connection error ({e!r}); retrying in {RECONNECT_DELAY_S}s")
+            except Exception as e:
+                print(f"[spot/coinbase] exchange feed unexpected error: {e!r}; reconnecting")
+            self.ex_live = False
+            await asyncio.sleep(RECONNECT_DELAY_S)
+
+    def _new_trade(self, coin: str, tid) -> bool:
+        k = (coin, str(tid))
+        if k in self._ex_seen_set:
+            return False
+        if len(self._ex_seen) == self._ex_seen.maxlen:
+            self._ex_seen_set.discard(self._ex_seen[0])
+        self._ex_seen.append(k)
+        self._ex_seen_set.add(k)
+        return True
+
+    async def _ex_match(self, coin, d, as_of, exch_ts, on_update):
+        if not self._new_trade(coin, d.get("trade_id")):
+            return
+        # Advanced Trade's market_trades shape, so on_print consumers are unchanged
+        # (side is the taker's: BUY/SELL on both feeds for the same trade id).
+        t = {"product_id": d["product_id"], "trade_id": d.get("trade_id"), "price": d["price"],
+             "size": d["size"], "side": str(d.get("side", "")).upper(), "time": d.get("time")}
+        if self.on_print is not None:
+            self.on_print(coin, t, as_of, exch_ts)
+        pb = self._books[coin]
+        if pb.is_resyncing or pb.last_receive_ts == 0.0:
+            return
+        before = pb.trade_px
+        pb.apply_trade(float(t["price"]), as_of)
+        if pb.trade_px != before:
+            await self._emit(coin, on_update)
+
+    async def _emit(self, coin, on_update):
+        pb = self._books[coin]
+        vb = pb.to_venue_book(self.venue, COINBASE_PRODUCTS[coin], coin, max_levels=PER_MSG_LEVELS)
+        self._views[coin] = vb
+        result = on_update(vb)
+        if asyncio.iscoroutine(result):
+            await result
+
+    async def _run_at(self, on_update: Callable[[VenueBook], Awaitable[None] | None]):
         product_ids = [COINBASE_PRODUCTS[c] for c in self.coins]
         while True:
             try:
@@ -356,7 +451,7 @@ class CoinbaseAdapter(VenueAdapter):
                 pb.is_resyncing = True
             await asyncio.sleep(RECONNECT_DELAY_S)
 
-    def _data_age(self, exch_ts: float | None, mono_now: float) -> float:
+    def _data_age(self, exch_ts: float | None, mono_now: float, feed: str = "at") -> float:
         """Seconds this message has spent queued on our side: received but
         not yet processed. `ws.recv()` hands back frames websockets already
         buffered, so after an event-loop stall a backlog all reads as
@@ -367,7 +462,7 @@ class CoinbaseAdapter(VenueAdapter):
         if exch_ts is None:
             return 0.0
         off = time.time() - exch_ts
-        q = self._offsets
+        q = self._offsets[feed]
         while q and q[0][0] < mono_now - OFFSET_WINDOW_S:
             q.popleft()
         while q and q[-1][1] >= off:      # monotonic deque -> O(1) running min
@@ -422,8 +517,15 @@ class CoinbaseAdapter(VenueAdapter):
         newest: dict[str, dict] = {}
         for t in event.get("trades", []) or []:
             pid = t.get("product_id")
-            if self.on_print is not None and pid in self._coin_by_product:
-                self.on_print(self._coin_by_product[pid], t, as_of, exch_ts)
+            if pid not in self._coin_by_product:
+                continue
+            coin = self._coin_by_product[pid]
+            # The Exchange feed delivers the same trade ~55ms sooner; skip what
+            # it already sent (or everything while it is connected).
+            if self.ex_live or not self._new_trade(coin, t.get("trade_id")):
+                continue
+            if self.on_print is not None:
+                self.on_print(coin, t, as_of, exch_ts)
             if pid in self._coin_by_product and (pid not in newest or t.get("time", "") >= newest[pid].get("time", "")):
                 newest[pid] = t
         for pid, t in newest.items():

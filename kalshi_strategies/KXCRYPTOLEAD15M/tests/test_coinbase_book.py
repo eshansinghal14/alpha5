@@ -158,6 +158,42 @@ def test_every_live_print_reaches_on_print():
     assert len(seen) == 3
 
 
+def test_exchange_feed_prints_drive_the_held_print_and_at_duplicates_are_dropped():
+    """Exchange `match` is the same trade ~55ms sooner: it reaches on_print
+    and sets the held print; the Advanced Trade copy of it is ignored."""
+    import asyncio
+    ad = CoinbaseAdapter(coins=["SOL"])
+    pb = ad._books["SOL"]
+    pb.apply_snapshot(bids=[(100.0, 1)], asks=[(100.1, 1)])
+    pb.last_receive_ts = 1.0
+    seen, views = [], []
+    ad.on_print = lambda coin, t, as_of, ts: seen.append((coin, str(t["trade_id"]), t["side"]))
+    m = {"type": "match", "product_id": "SOL-USD", "trade_id": 7, "price": "100.3", "size": "2",
+         "side": "buy", "time": "2026-10-20T02:30:00.000000Z"}
+    asyncio.run(ad._ex_match("SOL", m, 2.0, None, views.append))
+    assert seen == [("SOL", "7", "BUY")]
+    assert views and views[-1].mid() == 100.3                   # held through-the-touch print
+    at = {"type": "update", "trades": [{"product_id": "SOL-USD", "trade_id": "7", "price": "100.3",
+                                        "size": "2", "side": "BUY", "time": "2026-10-20T02:30:00Z"}]}
+    asyncio.run(ad._handle_trades(at, 2.05, views.append))       # same trade, later: dropped
+    assert len(seen) == 1
+    ad.ex_live = True                                            # while connected, AT prints are ignored
+    at2 = {"type": "update", "trades": [{**at["trades"][0], "trade_id": "8"}]}
+    asyncio.run(ad._handle_trades(at2, 2.1, views.append))
+    assert len(seen) == 1
+    ad.ex_live = False                                           # Exchange feed down: AT carries prints again
+    asyncio.run(ad._handle_trades(at2, 2.2, views.append))
+    assert seen[-1][:2] == ("SOL", "8")
+
+
+def test_exchange_feed_offsets_dont_age_the_book_feed():
+    ad = CoinbaseAdapter(coins=["SOL"])
+    import time as _t
+    now = _t.time()
+    ad._data_age(now - 0.010, 1.0, "ex")
+    assert ad._data_age(now - 0.070, 1.0, "at") == 0.0           # its own minimum, not the Exchange one
+
+
 def test_custom_max_levels_param():
     pb = _ProductBook()
     pb.apply_snapshot(bids=[(100.0 - 0.01 * i, 1.0) for i in range(20)],

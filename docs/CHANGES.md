@@ -3,6 +3,21 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-20 — Coinbase prints from the Exchange feed
+
+- `CoinbaseAdapter` opens a second socket to Coinbase Exchange's public feed
+  (`wss://ws-feed.exchange.coinbase.com`, `matches`): every print reaches
+  `on_print` (bursts, PrintLog) and the held through-the-touch print from
+  there. Advanced Trade `market_trades` are ignored while it is connected and
+  carry prints again if it drops; trade ids are de-duplicated across both.
+  The book stays on Advanced Trade `level2`. Same trade ids side by side,
+  us-east-2 10-20 02:27 UTC, 5 min: Coinbase trade time -> receipt p50
+  SOL 69 -> 10ms, BTC 70 -> 12, HYPE 56 -> 9 (each trade ~55ms sooner, p10
+  17 / p90 98). Exchange `level2_batch` was no faster than Advanced Trade's
+  level2 (SOL p50 24 vs 24ms) and full `level2` needs auth, so it isn't used.
+  Smoke test on the box, new adapter, 90s: 677 prints, 0 duplicates, print
+  delay p50 SOL 13ms / BTC 15ms.
+
 ## 2026-10-20 — Perp nowcast on Binance alone
 
 - `perp_nowcast` uses Binance's book mid (net of its 30s basis) instead of
