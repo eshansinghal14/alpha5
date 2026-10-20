@@ -76,5 +76,5 @@ picks it up.
 
 Drive the same `Quoter` through `kalshi_backtest.engine.Backtest`, feeding
 your fairs as `FairUpdate` external events (see
-`KXINX/backtest/run_backtest.py`). Fees come from
+`KXCRYPTOLEAD15M/backtest/run_backtest.py`). Fees come from
 `kalshi.fees.for_event` exactly as live.

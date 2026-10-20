@@ -23,8 +23,10 @@ SILENT_RECONNECT_S = 60.0
 
 @dataclasses.dataclass(frozen=True)
 class HoldParams:
-    """Liquidity-pull hold, the live counterpart of the backtest's
-    grid_pricing.hold_through_wide_spread. Values come from config."""
+    """Liquidity-pull hold: while a contract's spread is over `multiplier` x
+    its trailing median, its last normal quote is held (a pulled offer
+    leaves a stale far-away ask that spikes the finite difference). Values
+    come from config."""
     baseline_s: float
     multiplier: float
     settle_s: float

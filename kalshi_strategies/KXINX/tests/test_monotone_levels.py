@@ -1,8 +1,6 @@
 import numpy as np
-import pandas as pd
 
 from kalshi_strategies.KXINX import bl_pricing as pricing
-from kalshi_strategies.KXINX import grid_pricing
 from kalshi_strategies.KXINX.live_pricing import compute_live_bucket_probs
 
 
@@ -55,19 +53,3 @@ def test_live_buckets_sum_to_one_with_noisy_chain():
     # bands untouched
     for t in new:
         assert new[t][0] <= new[t][1] <= new[t][2]
-
-
-def test_grid_matches_live_row():
-    strikes = np.arange(7600.0, 7905.0, 5.0)
-    rng = np.random.default_rng(1)
-    call, put = _chain(strikes, 7752.0, 12.0, noise=rng.normal(0, 0.6, strikes.size))
-    mk = _markets(list(range(7650, 7876, 25)))
-    grid = pd.date_range("2026-08-27 15:00", periods=1, freq="2s", tz="UTC")
-    cm = pd.DataFrame([call], index=grid, columns=strikes)
-    pm = pd.DataFrame([put], index=grid, columns=strikes)
-    sp = pd.DataFrame([np.full(strikes.size, 0.2)], index=grid, columns=strikes)
-    _, mid, _ = grid_pricing.bucket_probabilities_ci(mk, cm, sp, pm, sp, grid, monotone=True)
-    live = compute_live_bucket_probs(mk, strikes, call, call - 0.1, call + 0.1,
-                                     strikes, put, put - 0.1, put + 0.1, monotone=True)
-    for t, (_, m, _) in live.items():
-        assert abs(mid[t].iloc[0] - m) < 1e-9

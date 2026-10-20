@@ -1,9 +1,7 @@
 """
-IB TWS/Gateway helpers for live SPXW option streaming.
-
-Live-only. Historical option quotes still come from databento_functions
-(IB's historical option endpoints are too slow and line-limited for a full
-chain). See docs/ib-migration.md for the overall shape.
+IB TWS/Gateway helpers for live SPXW option streaming, and the Kalshi-side
+bucket/strike selection that decides what to subscribe to. IB is the only
+option-data source. See docs/ib-migration.md for the overall shape.
 """
 import datetime
 import logging
@@ -14,12 +12,57 @@ from zoneinfo import ZoneInfo
 
 from kalshi_infra import keys
 
-# Kalshi-side helpers are venue-agnostic; reusing them keeps backtest and
-# live paths selecting the same strikes from the same bucket boundaries.
-from kalshi_infra.databento_functions import (_kxinx_event_markets, bracket_listed_strikes,
-                                 select_event_buckets, IB_MARKET_DATA_LINES)
-
 ET = ZoneInfo("America/New_York")
+
+# IB's default market-data allowance is ~100 concurrent L1 lines, and
+# reqMktData spends one per OPTION CONTRACT, not per Kalshi bucket: a full
+# KXINXU event (60 markets) brackets out to ~124 contracts.
+IB_MARKET_DATA_LINES = 100
+
+
+def event_markets(event_ticker: str) -> list[dict]:
+    """Full Kalshi market objects for an S&P event (floor_strike/cap_strike,
+    close_time, strike_type), live and uncached."""
+    from kalshi_infra import api_functions
+    data = api_functions.kalshi_get("/trade-api/v2/markets", params={"event_ticker": event_ticker, "limit": 200})
+    return data.get("markets", [])
+
+
+def bracket_listed_strikes(boundaries: set[float], listed_strikes: list[float]) -> set[float]:
+    """For each boundary, the nearest listed strike and its immediate
+    listed neighbours on both sides. Adjacent buckets share a boundary, so
+    using each bucket's own nearest strike alone would difference across the
+    ~$25 gap between Kalshi boundaries instead of the ~$5 between listed
+    strikes. `listed_strikes` must be sorted ascending."""
+    wanted = set()
+    for b in boundaries:
+        idx0 = min(range(len(listed_strikes)), key=lambda i: abs(listed_strikes[i] - b))
+        for i in (idx0 - 1, idx0, idx0 + 1):
+            if 0 <= i < len(listed_strikes):
+                wanted.add(listed_strikes[i])
+    return wanted
+
+
+def select_event_buckets(event_ticker: str, n: int) -> list[str]:
+    """The `n` tickers in `event_ticker` closest to 50/50 on Kalshi's touch.
+    Markets without a two-sided quote rank last (an absent quote is not an
+    at-the-money one); ties fall back to open interest."""
+    markets = event_markets(event_ticker)
+
+    def _f(m, key):
+        try:
+            return float(m.get(key))
+        except (TypeError, ValueError):
+            return None
+
+    def _key(m):
+        oi = _f(m, "open_interest_fp") or 0.0
+        bid, ask = _f(m, "yes_bid_dollars"), _f(m, "yes_ask_dollars")
+        if bid is None or ask is None or bid <= 0 or ask >= 1.0 or ask <= bid:
+            return (1, 0.0, -oi)
+        return (0, abs((bid + ask) / 2.0 - 0.5), -oi)
+
+    return [m["ticker"] for m in sorted(markets, key=_key)[:n]]
 
 # 10090 "part of requested market data is not subscribed": fires once per
 # SPXW contract because the account lacks the SPX index feed. The OPRA leg
@@ -128,11 +171,10 @@ def resolve_event_strikes(event_ticker: str, tickers: list[str] | None = None) -
     """Which SPXW strikes and expiry to subscribe to for `event_ticker`.
 
     Pure Kalshi-side computation -- no IB call. `tickers` scopes the
-    universe to those buckets' boundaries (same convention as
-    load_kxinx_event_option_quotes). The full event's market list still
-    flows through unchanged so every bucket is priced.
+    universe to those buckets' boundaries. The full event's market list
+    still flows through unchanged so every bucket is priced.
     """
-    all_markets = _kxinx_event_markets(event_ticker)
+    all_markets = event_markets(event_ticker)
     if not all_markets:
         raise ValueError(f"no Kalshi markets found for {event_ticker}")
     if tickers is not None:

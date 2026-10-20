@@ -487,8 +487,7 @@ class LiveEngine:
         WORSE OF THE TWO, not one or the other. They answer different
         questions and diverge by a lot (measured at $131 on one KXINXU
         ladder): touch marking is the liquidation value, prob marking is
-        what markout_analysis reports and what the backtest is compared
-        against. A risk limit should trip on whichever says we are down,
+        the model's own view. A risk limit should trip on whichever says we are down,
         and in particular must not be talked out of tripping by our own
         model -- that is why touch is kept in the test rather than replaced
         by the markout number.
@@ -804,9 +803,7 @@ class LiveEngine:
         right basis for the failsafe -- a risk limit should not be talked out
         of tripping by our own model.
 
-        mark="prob": marks at the option-implied probability, matching
-        markout_analysis.compute_pnl_over_day so the live curve is directly
-        comparable to a backtest of the same day. Note this marks to our OWN
+        mark="prob": marks at the model's fair probability. Note this marks to our OWN
         model: if the model is wrong, this number flatters us, which is
         exactly why it doesn't gate the failsafe. Falls back to touch marking
         for any ticker with no current signal.

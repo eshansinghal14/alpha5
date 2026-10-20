@@ -27,7 +27,7 @@ import sys
 
 import pandas as pd
 
-from kalshi_infra import databento_functions as dbf
+from kalshi_infra.api_functions import kalshi_get
 from kalshi_infra import predexon_functions as pf
 from kalshi_backtest.core import Quote, Trade
 from kalshi_backtest.book import replay_ws_ticks
@@ -340,8 +340,8 @@ def load_trades(event_ticker: str) -> dict[str, list[Trade]]:
 
 def load_settlement(event_ticker: str) -> dict[str, str | None]:
     """{ticker: 'yes'/'no'/None} from Kalshi's own LIVE markets endpoint
-    (databento_functions._kxinx_event_markets, uncached -- always current)
-    -- None means not yet settled (still open) or unknown.
+    (_event_markets, uncached -- always current) -- None means not yet
+    settled (still open) or unknown.
 
     Deliberately NOT Predexon's cached event_markets listing
     (predexon_functions.get_event_markets): confirmed directly that
@@ -354,8 +354,12 @@ def load_settlement(event_ticker: str) -> dict[str, str | None]:
     fills, $111 in real fees) even though the outcome was long since known
     -- not a "the strategy broke even that day" result, a data-staleness
     bug. Live means no caching layer to go stale here again."""
-    markets = dbf._kxinx_event_markets(event_ticker)
+    markets = _event_markets(event_ticker)
     return {m["ticker"]: m.get("result") or None for m in markets}
+
+
+def _event_markets(event_ticker: str) -> list[dict]:
+    return kalshi_get("/trade-api/v2/markets", params={"event_ticker": event_ticker, "limit": 1000}).get("markets", [])
 
 
 _FIDELITY_OF = {"kalshi_ws": "l2", "predexon": "top_of_book", "kalshi_1min": "candle"}
@@ -402,7 +406,7 @@ def load_event_data(event_ticker: str, source: str | None = None, allow_predexon
     source_by_ticker = {t: resolved for t, qs in quotes.items() if qs}
     fidelity_by_ticker = {t: _FIDELITY_OF[resolved] for t in source_by_ticker}
 
-    all_tickers = {m["ticker"] for m in dbf._kxinx_event_markets(event_ticker)}
+    all_tickers = {m["ticker"] for m in _event_markets(event_ticker)}
     missing = all_tickers - set(source_by_ticker)
     if missing and source is None:  # only auto-backfill when the caller didn't force a specific source
         fallback_order = [s for s in SOURCE_PRIORITY if s != resolved and available_sources(event_ticker)[s]]

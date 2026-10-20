@@ -3,6 +3,20 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-20 — Databento removed; IB is the only option source
+
+- Deleted `kalshi_infra/databento_functions.py` and everything that only
+  existed to replay its SPXW history: the S&P backtest
+  (`KXINX/backtest/`, `grid_pricing.py`, `signal_grid.py`,
+  `ib_emulation.py`), `research/run_ib_sweep.py`,
+  `research/spxw_kxinx_lag.ipynb`, `tests/parity/backtest_spx_parity.py`,
+  and the unused `kalshi_infra/spx_cash.py`. `databento` dropped from
+  `deploy/requirements-live.txt`.
+- The Kalshi-side helpers the live S&P model used from it moved, unchanged,
+  to `ib_functions`: `event_markets`, `bracket_listed_strikes`,
+  `select_event_buckets`, `IB_MARKET_DATA_LINES` (same results on
+  KXINXU-26OCT20H1600). Live S&P pricing is unchanged.
+
 ## 2026-10-20 — KXSOL15M prices on the perp nowcast
 
 - New `pricing.perp_pricing` (CRYPTO15M, per coin, live-editable): the fair

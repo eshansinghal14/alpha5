@@ -17,9 +17,9 @@ here.
   deeper write-ups here.
 - [`ec2-spx.md`](ec2-spx.md) — running the S&P strategy and IB Gateway
   (docker, IBC) on the EC2 box next to crypto; sizing, 2FA, one dashboard.
-- [`ib-migration.md`](ib-migration.md) — switch of the live options
-  stream from Databento ES-daily to IB SPXW (2026-10-05). Live-feed
-  architecture, IB contract spec, line budget.
+- [`ib-migration.md`](ib-migration.md) — the S&P option feed: IB SPXW,
+  the only option-data source. Live-feed architecture, IB contract spec,
+  line budget.
 
 ## Quick start
 

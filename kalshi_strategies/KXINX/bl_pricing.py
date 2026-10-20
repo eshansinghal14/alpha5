@@ -3,8 +3,8 @@ Two ways to back out a risk-neutral probability that the S&P 500 lands
 above/below a given level at expiry -- i.e. the option-market-implied
 version of a KXINX bucket probability -- from SPXW 0DTE option quotes:
 
-1. **Model-free (Breeden-Litzenberger)** -- prob_above_finite_diff. Used by
-   grid_pricing.bucket_probabilities. P(S_T > K) = -dC/dK
+1. **Model-free (Breeden-Litzenberger)** -- the spline fits live_pricing
+   uses (prob_above_from_splines), and prob_above_finite_diff. P(S_T > K) = -dC/dK
    (equivalently 1 - dP/dK from puts), estimated as a discrete finite
    difference of the quoted price-vs-strike curve. No volatility, no
    time-to-expiry, no assumption about how variance accrues through the

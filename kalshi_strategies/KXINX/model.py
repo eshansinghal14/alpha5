@@ -17,7 +17,6 @@ import time
 import traceback
 from collections import deque
 
-from kalshi_infra import databento_functions as dbf
 from kalshi_infra import ib_functions as ibf
 from kalshi_infra.config import load
 from kalshi_infra.kalshi.markets import EventInfo
@@ -67,7 +66,7 @@ class SpxEventModel:
         self.cfg = cfg
         self.series = series_ticker
         self.event_ticker = ev.event_ticker
-        self.markets = dbf._kxinx_event_markets(ev.event_ticker)
+        self.markets = ibf.event_markets(ev.event_ticker)
         self.tickers = [m["ticker"] for m in self.markets]
         self._order = ibf.ordered_tickers(self.markets)
         self._centre = ibf.kalshi_centre(ev.event_ticker)

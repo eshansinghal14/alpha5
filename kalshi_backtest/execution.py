@@ -5,11 +5,11 @@ Three separate delays:
   - wire_s: time for a KALSHI market data event that truly happened at
     exchange time T to become visible to the strategy
     (visible_time = T + wire_s).
-  - signal_s: the same idea for an EXTERNAL signal feed (the SPXW/ES
-    option-implied probability), which arrives over Databento rather than
-    Kalshi's wire and additionally has to be priced before it's actionable
-    (signal_visible_time = T + signal_s). Kept distinct from wire_s because
-    they are different feeds with different latencies -- see
+  - signal_s: the same idea for an EXTERNAL signal feed (caller-supplied
+    external_events, e.g. crypto spot composites), which arrives over its
+    own feed rather than Kalshi's wire and has to be priced before it's
+    actionable (signal_visible_time = T + signal_s). Kept distinct from
+    wire_s because they are different feeds with different latencies -- see
     MEASURED_SIGNAL_S.
   - send_s + processing_s: time from the strategy's decision to when an
     order it submits actually lands at the exchange. processing_s is NOT a
@@ -58,20 +58,11 @@ from kalshi_backtest.book import BookView
 # matching leg dominates and the response leg is comparatively fast.
 MEASURED_SEND_S = 0.034
 
-# MEASURED_SIGNAL_S: delay on the OPTION-SIDE signal path, i.e. how long
-# after an ES-daily option quote truly changes before the strategy could
-# possibly act on it. Two components:
-#   ~0.0245s  Databento live gateway -> us (half of a measured 48.9ms TCP RTT
-#             to glbx-mdp3.lsg.databento.com). The exchange -> Databento
-#             capture leg is NOT added on top: cached quote times are already
-#             Databento's own ts_recv (see databento_functions), so it's
-#             baked into the grid timestamps this delay is applied to.
-#   ~0.0075s  our own pricing computation (median, measured over 300 runs of
-#             live_pricing.compute_live_bucket_probs + pick_atm_signal on a
-#             real 29-strike / 30-bucket event; p95 9.5ms).
-# The Databento leg is a network-RTT estimate rather than an end-to-end
-# feed measurement -- refine it with a live-feed timestamp comparison if the
-# strategy ever turns out to be sensitive at the ~10ms level.
+# MEASURED_SIGNAL_S: default delay on an external signal path, from the
+# signal's own timestamp to when the strategy could act on it. Measured
+# 2026-08 for an option feed (~24.5ms network, half a 48.9ms RTT, + ~7.5ms
+# pricing); that feed is gone (IB only now), so treat it as a placeholder and
+# pass LatencyModel(signal_s=...) measured for whatever feed a backtest replays.
 MEASURED_SIGNAL_S = 0.032
 
 
@@ -79,13 +70,9 @@ MEASURED_SIGNAL_S = 0.032
 class LatencyModel:
     wire_s: float = 1.0
     send_s: float = MEASURED_SEND_S
-    # Applied to caller-supplied external_events (the SPXW/ES option-implied
-    # signal) instead of wire_s. These are two genuinely different feeds:
-    # wire_s is Kalshi's own market-data delay, whereas the option signal
-    # arrives over Databento and then has to be priced before it's actionable.
-    # An earlier version delayed external events by wire_s, which modeled the
-    # option side as if it arrived over Kalshi's wire -- wrong feed, wrong
-    # number, and it silently omitted pricing cost entirely.
+    # Applied to caller-supplied external_events instead of wire_s: wire_s is
+    # Kalshi's own market-data delay, an external signal arrives over its own
+    # feed and has to be priced first.
     signal_s: float = MEASURED_SIGNAL_S
 
     def visible_time(self, true_time: pd.Timestamp) -> pd.Timestamp:

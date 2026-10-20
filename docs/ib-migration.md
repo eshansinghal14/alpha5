@@ -1,45 +1,17 @@
-# Live options feed: Databento ES → IB SPXW
+# S&P options feed: IB SPXW
 
-**Date:** 2026-10-05
-**Scope:** Live trading only. Backtest unaffected.
-
-*Paths updated after the 2026-10-09 reorg, and again 2026-10-13: the feed
-is `kalshi_strategies/KXINX/ib_feed.py`, owned by the shared pricing hub
-(`KXINX/hub.py`), one IB connection for every S&P series.*
-
-## What changed
-
-The live option stream used to be:
-
-- Databento Live client
-- `GLBX.MDP3` dataset (ES futures options)
-- `databento.Live` callback thread → `call_soon_threadsafe` into asyncio
-- ES → SPX basis adjustment on every tick
-
-It is now:
+Interactive Brokers is the only option-data source. The feed is
+`kalshi_strategies/KXINX/ib_feed.py`, owned by the shared pricing hub
+(`KXINX/hub.py`): one IB connection for every S&P series.
 
 - `ib_async` client (fallback `ib_insync`)
 - TWS or IB Gateway on localhost socket (`keys.IB_HOST:IB_PORT`)
-- Native SPXW options from CBOE/OPRA
-- Callbacks dispatch on the same asyncio loop as the signal loop — no
-  thread bridge
-- No basis adjustment — strikes are cash-SPX directly
+- Native SPXW options from CBOE/OPRA, strikes in cash SPX (no basis)
+- Callbacks dispatch on the trading asyncio loop — no thread bridge
 
-## Why
-
-- IB has native SPXW access with an OPRA subscription; the account's
-  Databento license didn't cover live OPRA.
-- Eliminating ES → SPX basis estimation removes a whole class of
-  drift and the `rebase()` state machine the retired feed carried.
-- IB is also where real orders will be routed; keeping the market data
-  and the execution venue on the same account simplifies entitlements.
-
-## Why keep Databento for backtest
-
-IB historical option endpoints are slow and line-rate-limited; a full
-0DTE chain backfill would take hours and bump into daily limits.
-Databento's cmbp-1 OPRA pull remains the only practical bulk source.
-`load_kxinx_event_option_quotes` is unchanged.
+Databento (ES options live until 2026-10-05, SPXW history for the S&P
+backtest) was removed on 2026-10-20, along with that backtest
+(`grid_pricing`, `signal_grid`, `ib_emulation`, `KXINX/backtest/`).
 
 ## Interface the live feed satisfies
 
@@ -86,8 +58,8 @@ Required market-data subscriptions on the IB account:
 ## Line budget
 
 IB's default `maxTicker` limit is 100 L1 market-data lines, one per
-contract. See `databento_functions.IB_MARKET_DATA_LINES` and
-`select_event_buckets`.
+contract. See `ib_functions.IB_MARKET_DATA_LINES` and
+`ib_functions.select_event_buckets`.
 
 Measured 2026-08-29 (KXINX-26AUG28H1600):
 
@@ -163,8 +135,7 @@ filtered.
 
 That's the per-contract gap between quote changes, not wire latency
 (IB doesn't send exchange timestamps). The ~100ms floor matches IB's
-documented options conflation, which `ib_emulation.IB_OPTIONS_CONFLATION_MS`
-already models for the backtest.
+documented options conflation.
 
 **Fair value vs Kalshi** (`check_fair_value.py`, 40s, 10s samples):
 
@@ -196,5 +167,5 @@ check `systematic=false`, and it shuts down cleanly on cancel.
 - Reconnect robustness past a basic retry (no exponential backoff, no
   snapshot replay after reconnect — the next tick re-fills the book).
 - Multi-event concurrent streaming (one event per process).
-- Historical option data via IB (Databento is the sole historical
-  source; use its cache).
+- Historical option data or an S&P backtest: IB's historical option
+  endpoints are slow and line-limited for a full 0DTE chain.

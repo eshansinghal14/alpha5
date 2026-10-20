@@ -17,7 +17,6 @@ import statistics
 import numpy as np
 import pandas as pd
 
-from kalshi_infra import databento_functions as dbf
 from kalshi_infra import keys
 from kalshi_infra.api_functions import kalshi_get
 from kalshi_infra.config import load
@@ -60,7 +59,7 @@ async def main(series: str, seconds: float, interval_s: float):
         raise SystemExit(f"no tradeable {series} event right now")
     event = ev.event_ticker
     h = load(HubConfig, CONFIG_PATH, HUB_KEY)
-    scope = dbf.select_event_buckets(event, cfg.quoting.max_markets or 5)
+    scope = ibf.select_event_buckets(event, cfg.quoting.max_markets or 5)
     resolved = ibf.resolve_event_strikes(event, tickers=scope)
     # +10 so this never collides with the hub's clientId.
     feed = LiveIBFeed(resolved["expiry"], resolved["strikes"], client_id=keys.IB_CLIENT_ID + 10 + h.ib_client_id_offset,

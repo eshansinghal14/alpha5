@@ -355,9 +355,9 @@ class Backtest:
             for t in trades:
                 self._push(self.latency.visible_time(t.time), "wakeup", ("trade", ticker, t))
         # signal_visible_time, NOT visible_time: an external signal comes off
-        # the OPTION feed (Databento) and has to be priced before it can be
-        # acted on, which is a different delay from Kalshi's own market-data
-        # wire_s -- see LatencyModel.signal_visible_time / MEASURED_SIGNAL_S.
+        # its own feed and has to be priced before it can be acted on, a
+        # different delay from Kalshi's own market-data wire_s -- see
+        # LatencyModel.signal_visible_time / MEASURED_SIGNAL_S.
         for true_time, ext_payload in (external_events or []):
             self._push(self.latency.signal_visible_time(true_time), "wakeup", ("external", None, ext_payload))
 

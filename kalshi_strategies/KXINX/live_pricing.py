@@ -1,7 +1,6 @@
 """
-Live, single-snapshot counterpart to grid_pricing.bucket_probabilities_ci
--- same Breeden-Litzenberger math, same floor/cap combination arithmetic,
-evaluated against ONE current quote snapshot instead of a day's grid. Pure
+Bucket probabilities from ONE current SPXW quote snapshot (IB): Breeden-
+Litzenberger P(S_T > K) per level, combined into floor/cap buckets. Pure
 computation, no I/O.
 
 LevelPricer fits the six price curves once per snapshot and answers
