@@ -3,6 +3,18 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-20 — Perp nowcast on the perps' book mid
+
+- `perp_nowcast` is fed each perp's top-of-book mid (Binance `bookTicker`,
+  Bybit `orderbook.1`, OKX `bbo-tbt`) from `SpotFeed._on_book`, instead of
+  the last trade of each 50 ms ship. Resyncing or crossed books are skipped;
+  perps still never enter the spot median. The venue process no longer ships
+  `perp_px`. Binance, 3 min us-east-2 recording 10-20 00:58 UTC: bookTicker
+  and trades both arrive p50 ~72ms after Binance's transaction time; on a 50 ms
+  grid the last trade reversed its previous step 4-6% of the time (bid/ask
+  bounce; HYPE 4.7%) and the book mid 0% (HYPE 1.1%), 1 s moves the same.
+  Affects the race's shadow `x_perp_*` and KXSOL15M's `perp_pricing`.
+
 ## 2026-10-20 — Databento removed; IB is the only option source
 
 - Deleted `kalshi_infra/databento_functions.py` and everything that only

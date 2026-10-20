@@ -51,6 +51,36 @@ def test_one_fresh_venue_falls_back_to_spot():
     assert k == 1 and gap is None and px == 100.0
 
 
+def _vb(venue, coin, bid, ask, t, resync=False):
+    from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed.base import OrderBookLevel, VenueBook
+    return VenueBook(venue=venue, product=coin, coin=coin, bids=(OrderBookLevel(bid, 1.0),),
+                     asks=(OrderBookLevel(ask, 1.0),), receive_ts=t, is_resyncing=resync)
+
+
+def test_spot_feed_feeds_perp_book_mids_not_trades():
+    """Perp books reach the nowcast through SpotFeed._on_book as their mid;
+    they stay out of the spot median."""
+    from kalshi_strategies.KXCRYPTOLEAD15M.live_feed import SpotFeed
+    from kalshi_strategies.KXCRYPTOLEAD15M.tests.conftest import config
+    spot = SpotFeed(config(recovery_s=0.0), persist=False, venues=False)
+    spot.bus.feeds["ETH"].venues = ("coinbase",)           # as live: perps never enter the median
+    for i in range(30):
+        t = 100.0 + i * 0.1
+        spot._on_book(_vb("coinbase", "ETH", 99.99, 100.01, t))
+        for v in pn.PERPS:
+            spot._on_book(_vb(v, "ETH", 100.04, 100.06, t))
+    assert spot.bus.mid_nowcast("ETH") == pytest.approx(100.0)
+    t = 103.0
+    for v in pn.PERPS:                                     # perp books up 1bp
+        m = 100.05 * math.exp(1e-4)
+        spot._on_book(_vb(v, "ETH", m - 0.01, m + 0.01, t))
+    _, gap, k = spot.perp_nowcast.nowcast("ETH", t, 100.0)
+    assert k == 3 and gap == pytest.approx(1.0, abs=0.05)
+    spot._on_book(_vb("binance_perp", "ETH", 200.0, 201.0, t + 0.01, resync=True))   # resyncing: ignored
+    _, gap, _ = spot.perp_nowcast.nowcast("ETH", t + 0.01, 100.0)
+    assert gap == pytest.approx(1.0, abs=0.05)
+
+
 def test_median_ignores_one_outlier_venue():
     n = pn.PerpNowcast()
     t = _warm(n)

@@ -17,7 +17,7 @@ import time
 
 from kalshi_strategies.KXCRYPTOLEAD15M.cf_index import CfIndex
 from kalshi_strategies.KXCRYPTOLEAD15M.composite import CompositeBus
-from kalshi_strategies.KXCRYPTOLEAD15M.perp_nowcast import PerpNowcast
+from kalshi_strategies.KXCRYPTOLEAD15M.perp_nowcast import PERPS, PerpNowcast
 from kalshi_strategies.KXCRYPTOLEAD15M.prints import (AUTO_SOURCES, HL_BURST_USD_1S, MOVE_SOURCE, PERP_BURST_USD_1S,
                                                        PERP_SOURCES, REFRESH_S, load_thresholds, save_thresholds,
                                                        SAMPLE_S, BurstCalibrator, BurstDetector, PrintLog,
@@ -283,8 +283,7 @@ class SpotFeed:
             self._drain_now.clear()
             try:
                 self.venues.ensure_running()
-                self.venues.drain(self._on_book, self._on_venue_print, self.bus.touch, on_trip=self._on_trip,
-                                  on_perp_px=self.perp_nowcast.on_perp)
+                self.venues.drain(self._on_book, self._on_venue_print, self.bus.touch, on_trip=self._on_trip)
             except Exception as e:
                 print(f"[KXCRYPTOLEAD15M] venue drain error: {e!r}", flush=True)
 
@@ -339,6 +338,11 @@ class SpotFeed:
                     ms.remove(model)
 
     def _on_book(self, vb):
+        if vb.venue in PERPS:
+            if not vb.is_resyncing and not vb.is_crossed():
+                mid = vb.book_mid()
+                if mid is not None:
+                    self.perp_nowcast.on_perp(vb.venue, vb.coin, mid, vb.receive_ts)
         ms = self._wakes.get(vb.coin)
         before = self.bus.mid_nowcast(vb.coin)
         self.bus.observe(vb)

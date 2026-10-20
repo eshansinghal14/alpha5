@@ -212,7 +212,6 @@ def _child_main(plan: dict[str, list[str]]):
 
     perp_rows: list[dict] = []
     perp_usd: dict[tuple[str, str], tuple] = {}
-    perp_last: dict[tuple[str, str], tuple] = {}
 
     def on_print(coin, t, as_of, exch_ts, kind):
         if kind in PERP_BURST_USD_1S or kind.startswith("hl_"):
@@ -232,9 +231,6 @@ def _child_main(plan: dict[str, list[str]]):
             agg = perp_usd.get(k)
             wall = time.time() - (time.monotonic() - as_of)
             perp_usd[k] = (wall, (agg[1] if agg else 0.0) + perp_rows[-1]["price"] * perp_rows[-1]["size"], exch_ts)
-            # The parent's perp nowcast needs the price itself, which the
-            # notional sum loses: the last trade of the batch, per (venue, coin).
-            perp_last[k] = (perp_rows[-1]["price"], wall, exch_ts)
             return
         prints.append((kind, coin, t, time.time() - (time.monotonic() - as_of), exch_ts))
 
@@ -278,9 +274,6 @@ def _child_main(plan: dict[str, list[str]]):
                 ps.append((kind, coin, {"price": usd, "size": 1.0, "trade_id": None, "side": None}, wall, exch_ts))
             perp_usd.clear()
             extra = {"status": dict(status)} if status else {}
-            if perp_last:
-                extra["perp_px"] = [(v, c, px, wall, ex) for (v, c), (px, wall, ex) in perp_last.items()]
-                perp_last.clear()
             try:
                 _write_frame(out, (books, ps, alive(), extra))
             except (BrokenPipeError, OSError):
@@ -443,12 +436,10 @@ class VenueProcess:
             self._next_try = now + self._backoff
             self._backoff = min(self._backoff * 2, RESTART_MAX_S)
 
-    def drain(self, on_book, on_print=None, on_alive=None, max_batches: int = 50, on_trip=None,
-              on_perp_px=None) -> int:
+    def drain(self, on_book, on_print=None, on_alive=None, max_batches: int = 50, on_trip=None) -> int:
         """Apply what the child has shipped. Wall-clock receipt times become
         this process's monotonic clock here. on_trip(kind, source, coin,
-        level, thr, onset, as_of, exch_ts) per trip row; on_perp_px(venue,
-        coin, price, as_of) per perp's last trade in a batch."""
+        level, thr, onset, as_of, exch_ts) per trip row."""
         with self._lock:
             frames = [self._frames.popleft() for _ in range(min(max_batches, len(self._frames)))]
         off = time.monotonic() - time.time()
@@ -460,9 +451,6 @@ class VenueProcess:
             if on_trip is not None:
                 for kind, source, coin, level, thr, onset, recv_wall, exch_ts in extra.get("trips") or ():
                     on_trip(kind, source, coin, level, thr, onset, recv_wall + off, exch_ts)
-            if on_perp_px is not None:
-                for venue, coin, px, recv_wall, _ex in extra.get("perp_px") or ():
-                    on_perp_px(venue, coin, px, recv_wall + off)
             if on_alive is not None:
                 for venue, coin, wall in alive:
                     on_alive(venue, coin, wall + off)

@@ -5,13 +5,18 @@ OKX USDT perps) already are, for pricing a few hundred ms sooner.
     gap      = median over fresh venues of (log perp_v - basis_v) - log spot_mid
     nowcast  = spot_mid * exp(clip(gap, +-CAP_BP))
 
-basis_v is venue v's trailing BASIS_S mean of log(perp_v / spot_mid): USDT
-quote and funding, so only the perps' lead carries over, never their level.
-As spot catches up the gap closes on its own.
+perp_v is the venue's top-of-book mid (Binance bookTicker, Bybit orderbook.1,
+OKX bbo-tbt). basis_v is venue v's trailing BASIS_S mean of
+log(perp_v / spot_mid): USDT quote and funding, so only the perps' lead
+carries over, never their level. As spot catches up the gap closes on its own.
 
-ETH 10-18/19 (old us-east-1 box): perp prints led our spot median by ~250ms,
-and a nowcast like this moved with the Kalshi mid at 0s where our input lagged
-it by ~200ms. Shadow only: logged as x_perp_* on decision rows, never priced on.
+Fed the book mid, not the last trade: a last trade bounces between bid and
+ask, and on a 3 min us-east-2 recording (10-20 00:58 UTC) Binance bookTicker
+arrived as fast as trades (p50 ~72ms both) and moved with them on big moves.
+
+ETH 10-18/19 (old us-east-1 box, trade input): perps led our spot median by
+~250ms, and the nowcast moved with the Kalshi mid at 0s where our input lagged
+it by ~200ms. Shadow only on the race: logged as x_perp_* on decision rows.
 """
 from __future__ import annotations
 
@@ -27,8 +32,8 @@ BASIS_S = 30.0
 # Largest correction (bp). ETH nowcast vs spot input: p90 1.9bp, p99 6.2bp
 # (10-18/19); past ~2bp it was mostly perps decoupling from spot.
 CAP_BP = 2.0
-# A venue's last trade older than this is left out; under MIN_VENUES fresh
-# the nowcast is the spot mid unchanged.
+# A venue whose book hasn't changed for this long is left out; under
+# MIN_VENUES fresh the nowcast is the spot mid unchanged.
 FRESH_S = 2.0
 MIN_VENUES = 2
 # Basis samples a venue needs before it counts.
@@ -36,8 +41,9 @@ MIN_BASIS_N = 20
 
 
 class PerpNowcast:
-    """Per coin. `on_perp` / `on_spot` on one monotonic clock;
-    `nowcast(coin, now, spot_mid)` -> (price, gap_bp clipped, n fresh venues)."""
+    """Per coin. `on_perp(venue, coin, book mid, t)` / `on_spot` on one
+    monotonic clock; `nowcast(coin, now, spot_mid)` -> (price, gap_bp
+    clipped, n fresh venues)."""
 
     def __init__(self):
         self._px: dict[tuple[str, str], tuple[float, float]] = {}      # (venue, coin) -> (log px, t)
