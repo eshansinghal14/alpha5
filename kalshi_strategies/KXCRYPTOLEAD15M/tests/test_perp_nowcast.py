@@ -43,12 +43,38 @@ def test_gap_is_capped():
     assert gap == pytest.approx(pn.CAP_BP)
 
 
-def test_one_fresh_venue_falls_back_to_spot():
+def test_binance_alone_moves_the_nowcast_before_the_others():
+    """The others haven't moved yet: the median wouldn't, Binance does."""
     n = pn.PerpNowcast()
     t = _warm(n)
-    n.on_perp("binance_perp", "ETH", 100.05 * math.exp(1e-4), t + pn.FRESH_S + 1)
-    px, gap, k = n.nowcast("ETH", t + pn.FRESH_S + 1, 100.0)
-    assert k == 1 and gap is None and px == 100.0
+    n.on_perp("binance_perp", "ETH", 100.05 * math.exp(1e-4), t + 0.05)
+    _, gap, k = n.nowcast("ETH", t + 0.05, 100.0)
+    assert k == 3 and gap == pytest.approx(1.0, abs=0.05)
+
+
+def test_binance_far_from_every_other_venue_is_vetoed():
+    n = pn.PerpNowcast()
+    t = _warm(n)
+    n.on_perp("binance_perp", "ETH", 100.05 * math.exp(10e-4), t + 0.05)   # bad Binance print
+    n.on_perp("okx_perp", "ETH", 100.05 * math.exp(1e-4), t + 0.05)
+    n.on_perp("bybit_perp", "ETH", 100.05 * math.exp(1e-4), t + 0.05)
+    _, gap, _ = n.nowcast("ETH", t + 0.05, 100.0)
+    assert gap == pytest.approx(1.0, abs=0.05)                           # median of all three
+
+
+def test_binance_stale_falls_back_to_the_others_then_spot():
+    n = pn.PerpNowcast()
+    t = _warm(n)
+    late = t + pn.FRESH_S + 1
+    n.on_perp("okx_perp", "ETH", 100.05 * math.exp(1e-4), late)
+    n.on_perp("bybit_perp", "ETH", 100.05 * math.exp(1e-4), late)
+    _, gap, k = n.nowcast("ETH", late, 100.0)
+    assert k == 2 and gap == pytest.approx(1.0, abs=0.05)
+    n2 = pn.PerpNowcast()
+    t2 = _warm(n2)
+    n2.on_perp("okx_perp", "ETH", 100.05 * math.exp(1e-4), t2 + pn.FRESH_S + 1)
+    px, gap, k = n2.nowcast("ETH", t2 + pn.FRESH_S + 1, 100.0)
+    assert k == 1 and gap is None and px == 100.0                        # one non-Binance venue: spot
 
 
 def _vb(venue, coin, bid, ask, t, resync=False):

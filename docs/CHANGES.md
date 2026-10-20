@@ -3,6 +3,18 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-20 — Perp nowcast on Binance alone
+
+- `perp_nowcast` uses Binance's book mid (net of its 30s basis) instead of
+  the median of Binance/OKX/Bybit, which moved only when the second venue did.
+  OKX/Bybit only veto: Binance is dropped for the median of all fresh venues
+  when it is over `CHECK_BP` (3bp) from every other one; without a fresh
+  Binance the median of the others needs 2, else spot. 9,523 informed
+  KXSOL15M takers 10-20 00:25-02:15 UTC (Kalshi mid >= 1c their way in 5s,
+  our receipt clock): half of each venue's move at Binance -10ms, OKX +15ms,
+  Bybit +45ms, Coinbase spot -2.5ms; Binance 0.29bp done at the print vs
+  0.16-0.18 for the others; first over Coinbase on 72% of paired moves.
+
 ## 2026-10-20 — Venue books sent at once; HYPE priced on the depth-weighted replica
 
 - Venue process: a book whose touch (best bid/ask or resync state) changed is
