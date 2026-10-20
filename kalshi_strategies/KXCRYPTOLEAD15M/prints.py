@@ -34,7 +34,7 @@ HL_BURST_USD_1S = {"BTC": 200_700, "ETH": 625_400, "SOL": 13_100, "XRP": 5_000, 
 # Offshore perps. No static fallback: each stays record-only until its own
 # BurstCalibrator has MIN_CALIB_S of live samples. These trade 10-50x Coinbase
 # volume, so borrowing Coinbase's or Hyperliquid's numbers would trip constantly.
-PERP_SOURCES = ("binance_perp", "bybit_perp", "okx_perp")
+PERP_SOURCES = ("binance_perp", "okx_perp")      # Bybit dropped 10-20 (spot_feed.venues.LEADING_VENUES)
 PERP_BURST_USD_1S: dict[str, dict[str, float]] = {v: {} for v in PERP_SOURCES}
 
 
@@ -340,7 +340,8 @@ class PriceTrail:
         return 1e4 * float(np.log(q[-1][1] / p0))
 
 
-# Perp price-move trigger: 2 of the 3 perp venues moving >= their own p99.5
+# Perp price-move trigger: 2 perp venues moving >= their own p99.5 (Binance and
+# OKX since Bybit was dropped 10-20, so both must agree; was 2 of 3)
 # of |0.5s move| in one direction. Replay 10-16 19:05 to 10-18 06:35 UTC on top
 # of the volume trigger: pulled 10.5% -> 11.6%, maker $ on prints we stay
 # exposed to +$2,560 -> +$3,222, the extra pull time ran -6.5c/lot to makers,

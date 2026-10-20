@@ -1,6 +1,6 @@
 """
-Perp nowcast: the spot-median mid moved to where the perps (Binance, Bybit,
-OKX USDT perps) already are, for pricing a few hundred ms sooner.
+Perp nowcast: the spot-median mid moved to where the perps (Binance, with OKX
+as its check) already are, for pricing a few hundred ms sooner.
 
     gap      = (log perp_LEAD - basis_LEAD) - log spot_mid       (Binance)
     nowcast  = spot_mid * exp(clip(gap, +-CAP_BP))
@@ -11,8 +11,9 @@ informed KXSOL15M takers 10-20 00:25-02:15 UTC (Kalshi mid >= 1c their way in
 5s, our receipt clock), half of each venue's move came at Binance -10ms, OKX
 +15, Bybit +45, Coinbase spot -2.5; Binance showed 0.29bp at the print vs
 0.17 for the others, and beat Coinbase on 72% of paired moves (median 85ms).
-OKX/Bybit only veto: Binance is dropped (median of the rest instead) when it
-is more than CHECK_BP from every other fresh venue.
+OKX only checks: when Binance is more than CHECK_BP from OKX the nowcast is
+spot unchanged (with one checker neither can be trusted); when Binance is
+stale, OKX stands in.
 
 perp_v is the venue's top-of-book mid (Binance bookTicker, Bybit orderbook.1,
 OKX bbo-tbt). basis_v is venue v's trailing BASIS_S mean of
@@ -34,10 +35,13 @@ import math
 
 import numpy as np
 
-PERPS = ("binance_perp", "bybit_perp", "okx_perp")
+# Bybit dropped 10-20: slowest perp to us (p50 113-145ms vs OKX 80-120), and
+# OKX alone covers the veto and the stale-Binance fallback.
+PERPS = ("binance_perp", "okx_perp")
 LEAD = "binance_perp"
-# Binance vs each other fresh venue, both net of basis. Above the cap so a
-# real lead (|gap| p90 1.4bp, SOL 10-20) isn't vetoed while the others catch up.
+# Binance vs OKX, both net of basis. Above the cap so a real lead (|gap| p90
+# 1.4bp, SOL 10-20) isn't vetoed while OKX catches up. 6 h replay 10-20: it
+# fired 73-122/h (~0.2s each) and spot 1s later sided with the others 66-85%.
 CHECK_BP = 3.0
 # Basis averaging window. Long next to the ~250ms lead, so a lead doesn't leak
 # into the basis and cancel itself; short enough to follow funding drift.
@@ -46,10 +50,9 @@ BASIS_S = 30.0
 # (10-18/19); past ~2bp it was mostly perps decoupling from spot.
 CAP_BP = 2.0
 # A venue whose book hasn't changed for this long is left out. Without a
-# usable Binance, the median of the others needs MIN_VENUES fresh, else the
-# nowcast is the spot mid unchanged.
+# usable Binance the nowcast uses OKX if fresh, else the spot mid unchanged.
 FRESH_S = 2.0
-MIN_VENUES = 2
+MIN_VENUES = 1
 # Basis samples a venue needs before it counts.
 MIN_BASIS_N = 20
 
@@ -118,11 +121,13 @@ class PerpNowcast:
         lead = vals.get(LEAD)
         others = [x for v, x in vals.items() if v != LEAD]
         if lead is not None and others and all(abs(lead - x) > CHECK_BP * 1e-4 for x in others):
-            lead = None                      # Binance disagrees with everyone else: don't trust it
+            # With one checker a bad Binance tick and a bad OKX tick look the
+            # same, so neither is trusted: spot unchanged until they agree.
+            return spot_mid, None, len(vals)
         if lead is not None:
             est = lead
-        elif len(vals) >= MIN_VENUES:
-            est = float(np.median(list(vals.values())))
+        elif len(others) >= MIN_VENUES:
+            est = float(np.median(others))      # Binance stale: OKX stands in
         else:
             return spot_mid, None, len(vals)
         gap = est - math.log(spot_mid)

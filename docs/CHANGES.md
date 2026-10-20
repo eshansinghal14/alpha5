@@ -3,6 +3,21 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-20 — Bybit dropped; dashboard refreshes only what is viewed
+
+- Bybit is no longer run (`LEADING_VENUES`, `PERP_SOURCES`, `perp_nowcast.PERPS`):
+  slowest perp to us (p50 113-145ms vs Binance ~75ms, OKX ~80-120ms), second
+  heaviest feed. The nowcast checks Binance against OKX alone: more than
+  CHECK_BP apart -> spot unchanged (one checker can't say which is wrong);
+  Binance stale -> OKX. `perp_move` now needs Binance and OKX to agree (was 2
+  of 3). 6 h replay 10-20 (SOL/BTC/HYPE): the check fired 73-122/h, ~0.2s
+  each, and spot 1s later sided with the others 66-85% of the time.
+- Dashboard: a series' perf refresh thread stops once its panel hasn't been
+  rendered for 120s (`perf.IDLE_S`) and restarts on the next render; every
+  series ever viewed used to refresh every 30s (8 threads, dashboard at
+  70-110% CPU). Decisions parts' theo is read once per part and cached
+  (re-reading was ~31% of the dashboard's CPU).
+
 ## 2026-10-20 — Feed load cuts; all five single coins in one process
 
 - Perp book updates whose touch prices are unchanged are dropped at the

@@ -47,6 +47,11 @@ _FILL_KEY = ["exchange_order_id", "trade_id", "time", "price", "size"]
 # so a print after a restart or gap isn't priced off the pre-gap theo. A
 # safety bound, not a measurement.
 THEO_TOL = pd.Timedelta("5min")
+# A series' background refresh stops once its panel hasn't been rendered for
+# this long, and the next render restarts it (state is kept, so it only
+# catches up). Every series viewed since the dashboard started kept a thread
+# refreshing every 30s: 8 of them took the dashboard to 70-110% CPU (10-20).
+IDLE_S = 120.0
 
 
 @functools.lru_cache(maxsize=4096)
@@ -127,9 +132,17 @@ class Perf:
         self.error: str | None = None
         self._thread: threading.Thread | None = None
         self._bg_lock = threading.Lock()
+        self._viewed = 0.0
+        # Decisions part -> its live-row theo (time, ticker, theo). Parts are
+        # written once, so each is read once; entries older than the window
+        # being marked are dropped. Re-reading 5+ min of parts per 30s refresh
+        # was ~31% of the dashboard's CPU (10-20).
+        self._theo_cache: dict[str, pd.DataFrame] = {}
 
     def ensure_background(self, every_s: float = 30.0) -> None:
+        """Call on every render of this series' panel."""
         with self._bg_lock:
+            self._viewed = time.monotonic()
             if self._thread is None or not self._thread.is_alive():
                 self._thread = threading.Thread(target=self._loop, args=(every_s,), daemon=True,
                                                 name=f"perf-{self.series}")
@@ -137,6 +150,8 @@ class Perf:
 
     def _loop(self, every_s: float) -> None:
         while True:
+            if time.monotonic() - self._viewed > IDLE_S:
+                return
             try:
                 self.latest, self.updated, self.error = self.refresh(), pd.Timestamp.now(tz="UTC"), None
             except Exception as e:
@@ -284,27 +299,35 @@ class Perf:
         """(time, ticker, theo) from the decisions journal; theo is NaN on
         shadow rows and rows with no usable fair (blocked, or parts written
         before the live column existed)."""
+        empty = pd.DataFrame({"time": pd.Series(dtype="datetime64[ns, UTC]"),
+                              "ticker": pd.Series(dtype=object), "theo": pd.Series(dtype=float)})
+        for p in [p for p in self._theo_cache if self._dec.get(p, (lo, lo))[1] < lo]:
+            del self._theo_cache[p]
         out = []
         for p, (a, b) in self._dec.items():
             if b < lo or a > hi:
                 continue
-            try:
-                if not {"prob", "live"} <= set(pq.read_schema(p).names):
-                    continue
-                x = pq.read_table(p, columns=["time", "ticker", "prob", "live"],
-                                  filters=[("ticker", "in", list(tickers))]).to_pandas()
-            except Exception:
-                continue
+            x = self._theo_cache.get(p)
+            if x is None:
+                try:
+                    if not {"prob", "live"} <= set(pq.read_schema(p).names):
+                        x = empty
+                    else:
+                        x = pq.read_table(p, columns=["time", "ticker", "prob", "live"]).to_pandas()
+                        # Shadow rows stay, as NaN: they end the armed theo before them.
+                        live = x["live"].fillna(False).astype(bool)
+                        x = x.assign(theo=pd.to_numeric(x["prob"], errors="coerce").where(live))[
+                            ["time", "ticker", "theo"]]
+                except Exception:
+                    continue          # mid-write; next refresh
+                self._theo_cache[p] = x
             if len(x):
-                out.append(x)
+                out.append(x[x.ticker.isin(tickers)])
+        out = [x for x in out if len(x)]
         if not out:
-            return pd.DataFrame({"time": pd.Series(dtype="datetime64[ns, UTC]"),
-                                 "ticker": pd.Series(dtype=object), "theo": pd.Series(dtype=float)})
+            return empty
         x = pd.concat(out, ignore_index=True)
-        x = x[(x.time >= lo) & (x.time <= hi)].sort_values("time")
-        live = x["live"].fillna(False).astype(bool)
-        x["theo"] = pd.to_numeric(x["prob"], errors="coerce").where(live)
-        return x[["time", "ticker", "theo"]]
+        return x[(x.time >= lo) & (x.time <= hi)].sort_values("time")
 
     def _with_theo(self, f: pd.DataFrame) -> pd.Series:
         """Our theo in force at each row's time (aligned to f's index)."""

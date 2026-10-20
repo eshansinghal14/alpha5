@@ -626,8 +626,10 @@ class OkxPerpAdapter(_PerpSignal):
 # is no longer run (the adapter stays): its prints reached us p50 ~400ms after
 # trade time (us-east-2, 10-20 16:00 UTC) vs Binance ~80ms, its prior-0.5s
 # return explained 0.2-0.4% of Coinbase's next 1s move vs 1.3-10.5% for Binance
-# (10-19), and it only pulled HYPE.
-LEADING_VENUES = ("binance_perp", "bybit_perp", "okx_perp")
+# (10-19), and it only pulled HYPE. Bybit is no longer run either (10-20):
+# slowest perp to us (p50 113-145ms vs Binance ~75, OKX ~80-120), second
+# heaviest feed, and OKX alone covers the nowcast check and the move trigger.
+LEADING_VENUES = ("binance_perp", "okx_perp")
 
 ADAPTERS = {a.venue: a for a in (KrakenAdapter, BitstampAdapter, GeminiAdapter, CryptoComAdapter, BullishAdapter,
                                  HyperliquidAdapter, BinancePerpAdapter, BybitPerpAdapter, OkxPerpAdapter)}

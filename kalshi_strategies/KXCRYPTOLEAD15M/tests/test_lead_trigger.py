@@ -62,7 +62,7 @@ def test_move_trigger_opposite_directions_do_not_agree():
     lt = LeadTrigger(COINS, PERPS)
     lt.configure(move_thr={v: {"ETH": 3.0} for v in PERPS})
     _move(lt, "binance_perp", "ETH", 1.0, 2500.0, 2502.0)                       # +8bp
-    assert _move(lt, "bybit_perp", "ETH", 1.0, 2500.0, 2498.0) == []            # -8bp
+    assert _move(lt, "okx_perp", "ETH", 1.0, 2500.0, 2498.0) == []              # -8bp
 
 
 def test_move_trigger_off_without_thresholds():
@@ -110,7 +110,8 @@ def test_venue_thresholds_leave_out_too_hot_and_coinbase():
 def test_hyperliquid_not_in_the_venue_plan():
     from kalshi_strategies.KXCRYPTOLEAD15M.live_feed import venue_plan
     plan = venue_plan()
-    assert "hyperliquid" not in plan and all(v in plan for v in ("binance_perp", "bybit_perp", "okx_perp"))
+    assert "hyperliquid" not in plan and "bybit_perp" not in plan
+    assert all(v in plan for v in ("binance_perp", "okx_perp"))
 
 
 def test_perp_bbo_with_unchanged_touch_is_dropped_but_kept_alive():

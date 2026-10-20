@@ -19,7 +19,7 @@ def test_steady_basis_gives_no_correction():
     n = pn.PerpNowcast()
     t = _warm(n)
     px, gap, k = n.nowcast("ETH", t, 100.0)
-    assert k == 3 and gap == pytest.approx(0.0, abs=1e-6) and px == pytest.approx(100.0)
+    assert k == len(pn.PERPS) and gap == pytest.approx(0.0, abs=1e-6) and px == pytest.approx(100.0)
 
 
 def test_perps_lead_moves_the_nowcast_then_closes_as_spot_catches_up():
@@ -82,32 +82,29 @@ def test_binance_alone_moves_the_nowcast_before_the_others():
     t = _warm(n)
     n.on_perp("binance_perp", "ETH", 100.05 * math.exp(1e-4), t + 0.05)
     _, gap, k = n.nowcast("ETH", t + 0.05, 100.0)
-    assert k == 3 and gap == pytest.approx(1.0, abs=0.05)
+    assert k == 2 and gap == pytest.approx(1.0, abs=0.05)
 
 
-def test_binance_far_from_every_other_venue_is_vetoed():
+def test_binance_far_from_okx_falls_back_to_spot():
     n = pn.PerpNowcast()
     t = _warm(n)
     n.on_perp("binance_perp", "ETH", 100.05 * math.exp(10e-4), t + 0.05)   # bad Binance print
     n.on_perp("okx_perp", "ETH", 100.05 * math.exp(1e-4), t + 0.05)
-    n.on_perp("bybit_perp", "ETH", 100.05 * math.exp(1e-4), t + 0.05)
-    _, gap, _ = n.nowcast("ETH", t + 0.05, 100.0)
-    assert gap == pytest.approx(1.0, abs=0.05)                           # median of all three
+    px, gap, k = n.nowcast("ETH", t + 0.05, 100.0)
+    assert gap is None and px == 100.0 and k == 2
 
 
-def test_binance_stale_falls_back_to_the_others_then_spot():
+def test_binance_stale_falls_back_to_okx_then_spot():
     n = pn.PerpNowcast()
     t = _warm(n)
     late = t + pn.FRESH_S + 1
     n.on_perp("okx_perp", "ETH", 100.05 * math.exp(1e-4), late)
-    n.on_perp("bybit_perp", "ETH", 100.05 * math.exp(1e-4), late)
     _, gap, k = n.nowcast("ETH", late, 100.0)
-    assert k == 2 and gap == pytest.approx(1.0, abs=0.05)
+    assert k == 1 and gap == pytest.approx(1.0, abs=0.05)
     n2 = pn.PerpNowcast()
-    t2 = _warm(n2)
-    n2.on_perp("okx_perp", "ETH", 100.05 * math.exp(1e-4), t2 + pn.FRESH_S + 1)
-    px, gap, k = n2.nowcast("ETH", t2 + pn.FRESH_S + 1, 100.0)
-    assert k == 1 and gap is None and px == 100.0                        # one non-Binance venue: spot
+    _warm(n2)
+    px, gap, k = n2.nowcast("ETH", t + pn.FRESH_S + 5, 100.0)
+    assert k == 0 and gap is None and px == 100.0                        # nothing fresh: spot
 
 
 def _vb(venue, coin, bid, ask, t, resync=False):
@@ -134,7 +131,7 @@ def test_spot_feed_feeds_perp_book_mids_not_trades():
         m = 100.05 * math.exp(1e-4)
         spot._on_book(_vb(v, "ETH", m - 0.01, m + 0.01, t))
     _, gap, k = spot.perp_nowcast.nowcast("ETH", t, 100.0)
-    assert k == 3 and gap == pytest.approx(1.0, abs=0.05)
+    assert k == 2 and gap == pytest.approx(1.0, abs=0.05)
     spot._on_book(_vb("binance_perp", "ETH", 200.0, 201.0, t + 0.01, resync=True))   # resyncing: ignored
     _, gap, _ = spot.perp_nowcast.nowcast("ETH", t + 0.01, 100.0)
     assert gap == pytest.approx(1.0, abs=0.05)
@@ -161,11 +158,10 @@ def test_depth_priced_coin_prices_on_the_replica_and_bars_match():
     assert deep.mid_nowcast() == pytest.approx(bar.mid)     # sample() keeps the replica as the mid
 
 
-def test_median_ignores_one_outlier_venue():
+def test_bad_okx_print_does_not_move_a_fresh_binance():
     n = pn.PerpNowcast()
     t = _warm(n)
     n.on_perp("binance_perp", "ETH", 100.05 * math.exp(1e-4), t + 0.05)
-    n.on_perp("bybit_perp", "ETH", 100.05 * math.exp(1e-4), t + 0.05)
-    n.on_perp("okx_perp", "ETH", 100.05 * math.exp(50e-4), t + 0.05)   # bad print
-    _, gap, _ = n.nowcast("ETH", t + 0.05, 100.0)
-    assert gap == pytest.approx(1.0, abs=0.05)
+    n.on_perp("okx_perp", "ETH", 100.05 * math.exp(50e-4), t + 0.05)   # bad OKX print
+    px, gap, _ = n.nowcast("ETH", t + 0.05, 100.0)
+    assert gap is None and px == 100.0                                 # disagreement: spot, not OKX
