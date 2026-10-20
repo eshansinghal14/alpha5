@@ -3,6 +3,19 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-20 — KXSOL15M prices on the latest-mover nowcast
+
+- New `pricing.perp_mode` (CRYPTO15M, live-editable): with `perp_pricing` on,
+  `"latest"` prices on spot + Binance's move since spot last moved
+  (`PerpNowcast.increment`), `"gap"` on the previous Binance-vs-spot gap;
+  spot when the chosen one has no reading. `"latest"` for every coin (only
+  KXSOL15M has `perp_pricing` on). `x_priced_on` is now spot / perp / latest.
+  KXSOL15M 10-20 03:00-04:12 UTC, 7,837 informed takers (Kalshi mid >= 1c
+  their way in 5s), our receipt clock: half-move latest -10ms, gap +20ms,
+  spot -5ms; at the print latest had 0.20c of the move done, gap 0.01c (it sat
+  0.08-0.1c against the taker for the second before, pulling back spot-led
+  moves). Paired on 2,555 takers: latest earlier than gap on 40%, later on 9%.
+
 ## 2026-10-20 — Latest-mover nowcast (shadow); cap stays 2bp
 
 - `PerpNowcast.increment`: spot plus Binance's move since spot last moved,

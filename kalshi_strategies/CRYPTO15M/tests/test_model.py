@@ -3,6 +3,7 @@ import math
 import time
 
 import pandas as pd
+import pytest
 
 from kalshi_infra.config import load
 from kalshi_infra.kalshi.markets import EventInfo
@@ -232,7 +233,7 @@ def _perps_ahead(spot, coin, bp):
 
 def test_perp_pricing_switch():
     now = time.time()
-    m, spot = _setup(now, perp_pricing=False)
+    m, spot = _setup(now, perp_pricing=False, perp_mode="gap")
     _feed(spot, "BTC")
     _perps_ahead(spot, "BTC", 1.0)
     f = m.reprice(now)[m.ticker]
@@ -242,6 +243,21 @@ def test_perp_pricing_switch():
     m._dirty = True
     f = m.reprice(now)[m.ticker]
     assert f.extras["priced_on"] == "perp" and f.prob == f.extras["perp_prob"] > f.extras["spot_prob"]
+
+
+def test_perp_mode_latest_prices_on_binance_move_since_spot():
+    now = time.time()
+    m, spot = _setup(now, perp_pricing=True, perp_mode="latest")
+    mono = time.monotonic()
+    spot.perp_nowcast.on_perp("binance_perp", "BTC", PX["BTC"], mono - 0.2)
+    _feed(spot, "BTC", mult=1.00001)                               # spot moves after Binance's last print
+    f = m.reprice(now)[m.ticker]
+    assert f.extras["priced_on"] == "latest" and f.extras["inc_bp"] == pytest.approx(0.0, abs=1e-9)
+    spot.perp_nowcast.on_perp("binance_perp", "BTC", PX["BTC"] * math.exp(1e-4), mono)   # then Binance +1bp
+    m._dirty = True
+    f = m.reprice(now)[m.ticker]
+    assert f.extras["priced_on"] == "latest" and f.prob == f.extras["inc_prob"] > f.extras["spot_prob"]
+    assert f.extras["inc_bp"] == pytest.approx(1.0, abs=1e-6)
 
 
 def test_perp_pricing_falls_back_to_spot_without_fresh_perps():

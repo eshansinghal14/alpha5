@@ -319,17 +319,21 @@ class UpDownModel:
             dx = p_gap * 1e-4
             I_p = I + (dx * (n_eff - n_end) / L if tau < L else 0.0)
             perp_r = prob_up(x + sh + dx, I_p, tau, rate, nu=p.t_nu, basis_sd=bsd, reaction_s=p.reaction_latency_s)
-        # Shadow: the latest-mover nowcast (spot + Binance's move since spot
-        # last moved), priced the same way, logged as x_inc_prob.
+        # The latest-mover nowcast (spot + Binance's move since spot last
+        # moved), priced the same way; logged as x_inc_prob either way.
         _, p_inc = pnc.increment(self.coin, mono, mid) if pnc is not None else (None, None)
-        inc_prob = None
+        inc_r = None
         if p_inc is not None:
             dxi = p_inc * 1e-4
             I_i = I + (dxi * (n_eff - n_end) / L if tau < L else 0.0)
-            inc_prob = prob_up(x + sh + dxi, I_i, tau, rate, nu=p.t_nu, basis_sd=bsd,
-                               reaction_s=p.reaction_latency_s).prob
-        priced_on = "perp" if p.perp_pricing and perp_r is not None else "spot"
-        r = perp_r if priced_on == "perp" else spot_r
+            inc_r = prob_up(x + sh + dxi, I_i, tau, rate, nu=p.t_nu, basis_sd=bsd, reaction_s=p.reaction_latency_s)
+        inc_prob = None if inc_r is None else inc_r.prob
+        if p.perp_pricing and p.perp_mode == "latest" and inc_r is not None:
+            priced_on, r = "latest", inc_r
+        elif p.perp_pricing and p.perp_mode == "gap" and perp_r is not None:
+            priced_on, r = "perp", perp_r
+        else:
+            priced_on, r = "spot", spot_r
         self.result = r
         self._newest_mono = max(books)
         self._dirty = False
