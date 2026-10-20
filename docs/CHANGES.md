@@ -3,6 +3,19 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-20 — Coinbase book from the Exchange feed
+
+- `CoinbaseAdapter` builds its book views from the Exchange feed's
+  `level2_batch` (top 50 levels) while it is synced, keeping Advanced Trade
+  `level2` running as the fallback (used again the moment the Exchange
+  connection drops). It also subscribes `ticker`: the touch after each match,
+  held like a through-the-touch print until the book reaches it.
+  `coinbase.EX_BOOK = False` reverts the book to Advanced Trade. Same-window
+  test 10-20 02:27 UTC, touch-change delay p50/p90: BTC 45/186ms on Advanced
+  Trade vs 15/41ms, SOL 24/54 vs 24/52, HYPE 31/54 vs 29/56. Smoke test on the
+  box, 90 s: every view from the Exchange book, none crossed or empty, mid
+  matching Advanced Trade's to 0.00bp p50 / 0.3-0.6bp p99.
+
 ## 2026-10-20 — KXSOL15M prices on the latest-mover nowcast
 
 - New `pricing.perp_mode` (CRYPTO15M, live-editable): with `perp_pricing` on,

@@ -10,6 +10,7 @@ read so the emitted VenueBook is always uncrossed.
 import os
 import sys
 
+import pytest
 
 from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed.coinbase import (CoinbaseAdapter, _ProductBook,
                                                                   MAX_BOOK_LEVELS)
@@ -184,6 +185,44 @@ def test_exchange_feed_prints_drive_the_held_print_and_at_duplicates_are_dropped
     ad.ex_live = False                                           # Exchange feed down: AT carries prints again
     asyncio.run(ad._handle_trades(at2, 2.2, views.append))
     assert seen[-1][:2] == ("SOL", "8")
+
+
+def _ex_ready(ad, coin="SOL", bid=100.0, ask=100.1):
+    import time as _t
+    ad.ex_book_live = True
+    ad._ex_snapshot(coin, {"bids": [[str(bid), "5"]], "asks": [[str(ask), "5"]]}, _t.monotonic())
+
+
+def test_views_come_from_the_exchange_book_while_synced_then_fall_back():
+    import asyncio, time as _t
+    ad = CoinbaseAdapter(coins=["SOL"])
+    at = ad._books["SOL"]
+    at.apply_snapshot(bids=[(99.0, 1)], asks=[(99.2, 1)])
+    at.last_receive_ts = _t.monotonic()
+    views = []
+    _ex_ready(ad)
+    asyncio.run(ad._ex_l2update("SOL", {"changes": [["buy", "100.05", "2"]]}, _t.monotonic(), None, views.append))
+    assert views and views[-1].best_bid() == 100.05 and views[-1].best_ask() == 100.1
+    n = len(views)
+    ev = {"product_id": "SOL-USD", "type": "update", "updates": [{"side": "bid", "price_level": "99.1", "new_quantity": "1"}]}
+    asyncio.run(ad._handle_event(ev, _t.monotonic(), None, 1, views.append))
+    assert len(views) == n                                     # AT kept current, not emitted
+    assert at.bids.peekitem(-1)[0] == 99.1
+    ad.ex_book_live = False                                    # Exchange feed down: AT is the source again
+    asyncio.run(ad._handle_event(ev, _t.monotonic(), None, 2, views.append))
+    assert views[-1].best_bid() == 99.1
+
+
+def test_ticker_touch_outside_the_book_is_held_until_the_book_reaches_it():
+    import asyncio, time as _t
+    ad = CoinbaseAdapter(coins=["SOL"])
+    views = []
+    _ex_ready(ad)
+    asyncio.run(ad._ex_ticker("SOL", {"best_bid": "100.20", "best_ask": "100.30"}, _t.monotonic(), views.append))
+    assert views and views[-1].mid() == pytest.approx(100.25)  # above the book's ask: held
+    asyncio.run(ad._ex_l2update("SOL", {"changes": [["sell", "100.1", "0"], ["sell", "100.3", "5"],
+                                                    ["buy", "100.2", "5"]]}, _t.monotonic(), None, views.append))
+    assert views[-1].trade_px is None and views[-1].mid() == pytest.approx(100.25)
 
 
 def test_exchange_feed_offsets_dont_age_the_book_feed():

@@ -54,6 +54,11 @@ WS_URL = "wss://advanced-trade-ws.coinbase.com"
 # needs auth, so the book stays on Advanced Trade; this feed carries prints
 # (matches), which drive the held through-the-touch print and on_print.
 EX_WS_URL = "wss://ws-feed.exchange.coinbase.com"
+# Book from the Exchange feed's level2_batch (top 50 levels) while it is
+# synced, Advanced Trade level2 as the fallback; plus its ticker. Same 5 min
+# test: touch-change delay p50/p90 BTC 45/186ms on Advanced Trade vs 15/41ms
+# here, SOL 24/54 vs 24/52, HYPE 31/54 vs 29/56. False = book on Advanced Trade.
+EX_BOOK = True
 RECONNECT_DELAY_S = 1.0
 # The heartbeats channel sends one message per second on the connection,
 # so a silent socket is dead well before this.
@@ -239,8 +244,11 @@ class CoinbaseAdapter(VenueAdapter):
         # buffers. See _data_age.
         # One window per feed: the Exchange feed's offsets run ~55ms lower, and
         # a shared minimum would age every Advanced Trade book by that much.
+        # The Exchange book ("exb", level2_batch, ~50ms batches) gets its own too:
+        # against the matches minimum its batching read as up to ~60ms of
+        # queueing (p99, 10-20 smoke test) and would trip the 30ms signal-age limit.
         self._offsets: dict[str, collections.deque[tuple[float, float]]] = {
-            "at": collections.deque(), "ex": collections.deque()}
+            "at": collections.deque(), "ex": collections.deque(), "exb": collections.deque()}
         # Last view handed out per coin; its receive_ts is advanced in place
         # by _mark_fresh, since the composite holds on to these objects.
         self._views: dict[str, VenueBook] = {}
@@ -253,10 +261,25 @@ class CoinbaseAdapter(VenueAdapter):
         self.ex_live = False
         self._ex_seen: collections.deque = collections.deque(maxlen=4096)
         self._ex_seen_set: set = set()
+        # Exchange level2_batch books (top 50 levels). While one is synced and
+        # its connection is up, views are built from it instead of the
+        # Advanced Trade book, which keeps running as the fallback.
+        self._ex_books: dict[str, _ProductBook] = {c: _ProductBook() for c in self.coins}
+        self.ex_book_live = False
+
+    def _src(self, coin: str) -> _ProductBook:
+        """The book views are built from: Exchange when usable, else Advanced Trade."""
+        if EX_BOOK and self.ex_book_live:
+            eb = self._ex_books[coin]
+            if not eb.is_resyncing and eb.last_receive_ts > 0.0:
+                return eb
+        return self._books[coin]
 
     def latest(self, coin: str) -> VenueBook | None:
-        pb = self._books.get(coin)
-        if pb is None or pb.last_receive_ts == 0.0:
+        if coin not in self._books:
+            return None
+        pb = self._src(coin)
+        if pb.last_receive_ts == 0.0:
             return None
         vb = pb.to_venue_book(self.venue, COINBASE_PRODUCTS[coin], coin)
         self._views[coin] = vb
@@ -268,12 +291,17 @@ class CoinbaseAdapter(VenueAdapter):
         per-product clock read a quiet HYPE book (>1s between changes, ~4x
         a minute on 2026-10-09) as stale and tripped the cross-coin skew
         withhold while its book was in fact current."""
-        for coin, pb in self._books.items():
+        self._mark_books_fresh(self._books, as_of, not (EX_BOOK and self.ex_book_live))
+
+    def _mark_books_fresh(self, books: dict, as_of: float, owns_views: bool):
+        """`owns_views`: these books are what the emitted views come from, so
+        the views' freshness follows this connection."""
+        for coin, pb in books.items():
             if pb.is_resyncing or pb.last_receive_ts == 0.0:
                 continue
             pb.last_receive_ts = as_of
             vb = self._views.get(coin)
-            if vb is not None:
+            if vb is not None and (owns_views or self._src(coin) is pb):
                 vb.receive_ts = as_of
 
     def deep_book(self, coin: str) -> VenueBook | None:
@@ -284,16 +312,18 @@ class CoinbaseAdapter(VenueAdapter):
         await asyncio.gather(self._run_at(on_update), self._run_ex(on_update))
 
     async def _run_ex(self, on_update):
-        """Exchange feed: matches (every print). Never touches the book's
-        levels; a print through the touch becomes the held print, as before."""
+        """Exchange feed: matches (every print), ticker (touch after each
+        match) and level2_batch (top-50 book, the view source while synced).
+        A print or ticker touch newer than the book is held, as before."""
         product_ids = [COINBASE_PRODUCTS[c] for c in self.coins]
+        channels = ["matches", "heartbeat"] + (["level2_batch", "ticker"] if EX_BOOK else [])
         while True:
             try:
                 async with websockets.connect(EX_WS_URL, open_timeout=15, ping_interval=20,
                                               ping_timeout=15, max_size=MAX_FRAME_SIZE) as ws:
                     await ws.send(json.dumps({"type": "subscribe", "product_ids": product_ids,
-                                              "channels": ["matches", "heartbeat"]}))
-                    print(f"[spot/coinbase] exchange feed: matches + heartbeat to {product_ids}")
+                                              "channels": channels}))
+                    print(f"[spot/coinbase] exchange feed: {' + '.join(channels)} to {product_ids}")
                     while True:
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=RECV_TIMEOUT_S)
@@ -304,24 +334,69 @@ class CoinbaseAdapter(VenueAdapter):
                         ty = d.get("type")
                         if ty == "subscriptions":
                             self.ex_live = True
+                            self.ex_book_live = EX_BOOK
                             continue
                         if ty == "error":
                             print(f"[spot/coinbase] exchange feed error: {d.get('message')} {d.get('reason')}")
                             break
+                        mono = time.monotonic()
                         coin = self._coin_by_product.get(d.get("product_id"))
                         if coin is None:
                             continue
                         exch_ts = _parse_iso_ts(d["time"]) if d.get("time") else None
-                        mono = time.monotonic()
-                        as_of = mono - self._data_age(exch_ts, mono, "ex")
+                        as_of = mono - self._data_age(exch_ts, mono, "exb" if ty == "l2update" else "ex")
                         if ty == "match":
                             await self._ex_match(coin, d, as_of, exch_ts, on_update)
+                        elif ty == "snapshot":
+                            self._ex_snapshot(coin, d, mono)
+                        elif ty == "l2update":
+                            await self._ex_l2update(coin, d, as_of, exch_ts, on_update)
+                        elif ty == "ticker":
+                            await self._ex_ticker(coin, d, as_of, on_update)
+                        if ty in ("heartbeat", "l2update", "ticker", "match"):
+                            # One in-order connection: any message proves every synced
+                            # Exchange book current (see _mark_fresh).
+                            self._mark_books_fresh(self._ex_books, as_of if ty != "heartbeat" else mono, True)
             except (OSError, websockets.ConnectionClosed) as e:
                 print(f"[spot/coinbase] exchange feed connection error ({e!r}); retrying in {RECONNECT_DELAY_S}s")
             except Exception as e:
                 print(f"[spot/coinbase] exchange feed unexpected error: {e!r}; reconnecting")
             self.ex_live = False
+            self.ex_book_live = False
+            for eb in self._ex_books.values():
+                eb.clear()
+                eb.last_receive_ts = 0.0
             await asyncio.sleep(RECONNECT_DELAY_S)
+
+    def _ex_snapshot(self, coin, d, mono):
+        eb = self._ex_books[coin]
+        eb.clear()
+        eb.apply_snapshot([(float(p), float(q)) for p, q in d.get("bids", [])],
+                          [(float(p), float(q)) for p, q in d.get("asks", [])])
+        eb.last_receive_ts = mono
+
+    async def _ex_l2update(self, coin, d, as_of, exch_ts, on_update):
+        eb = self._ex_books[coin]
+        if eb.is_resyncing:
+            return
+        for side, p, q in d.get("changes", []):
+            eb.apply_change("bid" if side == "buy" else "ask", float(p), float(q))
+        eb.settle_trade(as_of)
+        eb.last_exchange_ts = exch_ts
+        eb.last_receive_ts = as_of
+        if self._src(coin) is eb:
+            await self._emit(coin, on_update)
+
+    async def _ex_ticker(self, coin, d, as_of, on_update):
+        """The touch right after a match, sent before level2_batch's next
+        batch: its mid is held like a through-the-touch print until the book
+        reaches it (only when it lies outside the book's touch)."""
+        try:
+            bb, ba = float(d["best_bid"]), float(d["best_ask"])
+        except (KeyError, TypeError, ValueError):
+            return
+        if 0 < bb < ba:
+            await self._held(coin, 0.5 * (bb + ba), as_of, on_update)
 
     def _new_trade(self, coin: str, tid) -> bool:
         k = (coin, str(tid))
@@ -342,16 +417,21 @@ class CoinbaseAdapter(VenueAdapter):
              "size": d["size"], "side": str(d.get("side", "")).upper(), "time": d.get("time")}
         if self.on_print is not None:
             self.on_print(coin, t, as_of, exch_ts)
-        pb = self._books[coin]
+        await self._held(coin, float(t["price"]), as_of, on_update)
+
+    async def _held(self, coin, price: float, as_of: float, on_update):
+        """A price newer than the book (a print, or the ticker's touch) held
+        on whichever book views come from, until that book reaches it."""
+        pb = self._src(coin)
         if pb.is_resyncing or pb.last_receive_ts == 0.0:
             return
         before = pb.trade_px
-        pb.apply_trade(float(t["price"]), as_of)
+        pb.apply_trade(price, as_of)
         if pb.trade_px != before:
             await self._emit(coin, on_update)
 
     async def _emit(self, coin, on_update):
-        pb = self._books[coin]
+        pb = self._src(coin)
         vb = pb.to_venue_book(self.venue, COINBASE_PRODUCTS[coin], coin, max_levels=PER_MSG_LEVELS)
         self._views[coin] = vb
         result = on_update(vb)
@@ -499,14 +579,14 @@ class CoinbaseAdapter(VenueAdapter):
         # the theo kill switch and the cross-coin skew guard all read it.
         pb.last_receive_ts = as_of
         pb.last_seq = seq
+        # Kept current as the fallback, but not emitted while the Exchange
+        # book is the source (two books' views would interleave).
+        if self._src(coin) is not pb:
+            return
         # Per message: a THIN view (top PER_MSG_LEVELS) -- enough for the
         # mid, feed health and phantom-cross pruning. The 1000-level view
         # the CF replica wants is built once a second via deep_book().
-        vb = pb.to_venue_book(self.venue, product_id, coin, max_levels=PER_MSG_LEVELS)
-        self._views[coin] = vb
-        result = on_update(vb)
-        if asyncio.iscoroutine(result):
-            await result
+        await self._emit(coin, on_update)
 
     async def _handle_trades(self, event: dict, as_of: float,
                              on_update: Callable[[VenueBook], Awaitable[None] | None],
@@ -529,19 +609,7 @@ class CoinbaseAdapter(VenueAdapter):
             if pid in self._coin_by_product and (pid not in newest or t.get("time", "") >= newest[pid].get("time", "")):
                 newest[pid] = t
         for pid, t in newest.items():
-            coin = self._coin_by_product[pid]
-            pb = self._books[coin]
-            if pb.is_resyncing or pb.last_receive_ts == 0.0:
-                continue
-            before = pb.trade_px
-            pb.apply_trade(float(t["price"]), as_of)
-            if pb.trade_px == before:
-                continue
-            vb = pb.to_venue_book(self.venue, pid, coin, max_levels=PER_MSG_LEVELS)
-            self._views[coin] = vb
-            result = on_update(vb)
-            if asyncio.iscoroutine(result):
-                await result
+            await self._held(self._coin_by_product[pid], float(t["price"]), as_of, on_update)
 
 
 def _parse_iso_ts(s: str) -> float | None:
