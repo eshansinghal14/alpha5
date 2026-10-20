@@ -41,7 +41,11 @@
       "max_signal_age_s": 0.25,
       "max_fair_band": 0.3,
       "max_fair_outside_touch": 0.15,
-      "fair_suspect_hold_s": 30.0
+      "fair_suspect_hold_s": 30.0,
+      "fair_lag_max": 0.02,
+      "fair_lag_window_s": 1.0,
+      "fair_lag_markets": 2,
+      "fair_lag_hold_s": 3.0
     },
     "runtime": {
       "quote_fill_poll_s": 1.0,
@@ -107,7 +111,11 @@
       "max_signal_age_s": 0.2,
       "max_fair_band": 0.3,
       "max_fair_outside_touch": 0.15,
-      "fair_suspect_hold_s": 30.0
+      "fair_suspect_hold_s": 30.0,
+      "fair_lag_max": null,
+      "fair_lag_window_s": 1.0,
+      "fair_lag_markets": null,
+      "fair_lag_hold_s": 3.0
     },
     "runtime": {
       "quote_fill_poll_s": 1.0,

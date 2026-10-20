@@ -130,6 +130,20 @@ class RiskParams:
         "Keep a market blocked this long after its last failed check. The 10-16 break flickered "
         "between bad and plausible-looking readings for up to 33s, and the plausible ones were up to "
         "19c from the Kalshi mid.", min=0, max=600, step=5)
+    # Fair-lag guard (trading/fair_lag.py). S&P values replayed on KXINXU/DUD
+    # 10-16/19/20: W 1s, L 2c, 2 markets, 3s caught all nine 10-20 11:12 YES
+    # fills (-$10 at 60s) and blocked 9% of KXINXU side-time; per market only,
+    # 7 of 9.
+    fair_lag_max: float | None = param(
+        "Block YES bids on a market when Kalshi's mid fell this much more than our fair over "
+        "fair_lag_window_s (NO bids when it rose): our fair is stale, not right. null = off.",
+        min=0.005, max=0.5, step=0.005)
+    fair_lag_window_s: float = param("Window for fair_lag_max.", min=0.1, max=30, step=0.1)
+    fair_lag_markets: int | None = param(
+        "When this many priced markets (fair 5-95c) lag the same way at once, block that side on "
+        "every market. null = each market only blocks itself.", min=1, step=1)
+    fair_lag_hold_s: float = param("Keep a fair-lag block this long after its last trigger.",
+                                   min=0, max=120, step=0.5)
 
 
 @section

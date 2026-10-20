@@ -24,7 +24,8 @@ def immediate_takes(monkeypatch):
     monkeypatch.setattr(quoter_mod, "TAKE_HOLD_S", 0.0)
 
 
-GUARD_OFF = dict(max_fair_band=None, max_fair_outside_touch=None, fair_suspect_hold_s=0.0)
+GUARD_OFF = dict(max_fair_band=None, max_fair_outside_touch=None, fair_suspect_hold_s=0.0,
+                 fair_lag_max=None, fair_lag_window_s=1.0, fair_lag_markets=None, fair_lag_hold_s=3.0)
 
 
 def risk(**r):
@@ -421,6 +422,67 @@ def test_book_move_alone_can_flag_a_fair():
     step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, Book("A", 0.48, 0.52))
     step(q, ctx, book=Book("A", 0.80, 0.82), dt=0.1)
     assert ctx.desired[("A", "yes")] is None and q.debug_log[-1]["block_bid"] == "fair_suspect"
+
+
+LAG = dict(fair_lag_max=0.02, fair_lag_window_s=1.0, fair_lag_markets=2, fair_lag_hold_s=3.0)
+
+
+def _freeze(q, ctx, tickers, mid0, drop, fair0):
+    """10-20 11:12 shape: Kalshi mids fall `drop` over 1s, our fairs don't move."""
+    for t, m in zip(tickers, mid0):
+        ctx.books[t] = Book(t, round(m - 0.01, 2), round(m + 0.01, 2))
+    step(q, ctx, {t: Fair(f, f - 0.01, f + 0.01) for t, f in zip(tickers, fair0)})
+    for i in range(1, 11):
+        ctx.time = ctx.time + pd.Timedelta(seconds=0.1)
+        for t, m in zip(tickers, mid0):
+            mm = round(m - drop * i / 10, 2)
+            ctx.books[t] = Book(t, round(mm - 0.01, 2), round(mm + 0.01, 2), time=ctx.time)
+            ctx.last_event = ctx.books[t]
+            q(ctx)
+
+
+def test_fair_lag_blocks_yes_bids_when_kalshi_falls_under_a_frozen_fair():
+    q, ctx = Quoter(cfg(risk_kw=LAG), Model(), FREE, close_time=None), Ctx()
+    _freeze(q, ctx, ["A", "B"], [0.63, 0.50], 0.05, [0.64, 0.51])
+    by = {r["ticker"]: r for r in q.debug_log[-2:]}
+    assert by["A"]["block_bid"] == "fair_lag" and by["B"]["block_bid"] == "fair_lag"
+    assert by["A"]["block_ask"] is None
+    assert not ladder(ctx, "yes") and ladder(ctx, "no")
+
+
+def test_fair_lag_one_market_blocks_only_itself_below_the_market_count():
+    q, ctx = Quoter(cfg(risk_kw=LAG), Model(), FREE, close_time=None), Ctx()
+    ctx.books["B"] = Book("B", 0.49, 0.51)
+    step(q, ctx, {"B": Fair(0.50, 0.49, 0.51)})
+    _freeze(q, ctx, ["A"], [0.63], 0.05, [0.64])
+    step(q, ctx, {"B": Fair(0.50, 0.49, 0.51)})
+    by = {r["ticker"]: r for r in q.debug_log}
+    assert by["A"]["block_bid"] == "fair_lag" and by["B"]["block_bid"] is None
+
+
+def test_fair_lag_fair_moving_with_kalshi_is_not_blocked():
+    q, ctx = Quoter(cfg(risk_kw=LAG), Model(), FREE, close_time=None), Ctx()
+    ctx.books["A"] = Book("A", 0.62, 0.64)
+    step(q, ctx, {"A": Fair(0.64, 0.63, 0.65)})
+    for i in range(1, 11):
+        m = round(0.63 - 0.005 * i, 3)
+        ctx.books["A"] = Book("A", round(m - 0.01, 3), round(m + 0.01, 3))
+        step(q, ctx, {"A": Fair(round(0.64 - 0.005 * i, 3), 0.6, 0.66)}, dt=0.1)
+    assert "fair_lag" not in q.block_counts
+
+
+def test_fair_lag_clears_after_hold():
+    q, ctx = Quoter(cfg(risk_kw=LAG), Model(), FREE, close_time=None), Ctx()
+    _freeze(q, ctx, ["A", "B"], [0.63, 0.50], 0.05, [0.64, 0.51])
+    for _ in range(40):                                  # 4s steady after the drop
+        step(q, ctx, {"A": Fair(0.64, 0.63, 0.65), "B": Fair(0.51, 0.50, 0.52)}, dt=0.1)
+    assert q.debug_log[-1]["block_bid"] is None
+
+
+def test_fair_lag_off_when_null():
+    q, ctx = Quoter(cfg(), Model(), FREE, close_time=None), Ctx()
+    _freeze(q, ctx, ["A", "B"], [0.63, 0.50], 0.05, [0.64, 0.51])
+    assert "fair_lag" not in q.block_counts
 
 
 def test_guard_off_by_default():

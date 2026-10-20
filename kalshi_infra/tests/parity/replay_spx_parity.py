@@ -108,7 +108,8 @@ def new_cfg(oc):
     return types.SimpleNamespace(
         quoting=q, trading_time=P.TradingTimeParams(real_trading_delay_s=0, real_trading_cutoff_s=0),
         risk=P.RiskParams(max_loss_usd=1e9, max_signal_age_s=1e9, max_fair_band=None,
-                          max_fair_outside_touch=None, fair_suspect_hold_s=0.0),
+                          max_fair_outside_touch=None, fair_suspect_hold_s=0.0, fair_lag_max=None,
+                          fair_lag_window_s=1.0, fair_lag_markets=None, fair_lag_hold_s=3.0),
         lip=P.LipSettings(enable_lip_quoting=False, lip_cheap_max_price=0.2, lip_max_price=0.5, lip_offer_max_price=0.5, lip_markets=None,
                           lip_bid_lots=0.0, lip_offer_lots=0.0,
                           lip_constant_edge=None,

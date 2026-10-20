@@ -46,6 +46,7 @@ import pandas as pd
 
 from kalshi_infra.kalshi.venue import MAX_PRICE, MIN_PRICE, TICK
 from kalshi_infra.trading.fair import Fair, FairUpdate
+from kalshi_infra.trading.fair_lag import FairLagGuard
 from kalshi_infra.trading.lip import LipTracker, levels_with_ours, others_ladder, remaining_cap_usd, reward_rate
 from kalshi_infra.trading.order_manager import Desired, LipTarget
 from kalshi_infra.trading.params import lip_yes_price
@@ -134,6 +135,7 @@ class Quoter:
         self._lip_last: dict[tuple[str, str], LipTarget] = {}
         # Per ticker: epoch seconds until which its fair is held as suspect.
         self._suspect_until: dict[str, float] = {}
+        self._lag = FairLagGuard()
         # Per (ticker, side): own-side price our top edge quote was alone at
         # (see _front_hold).
         self._front: dict[tuple[str, str], float] = {}
@@ -270,9 +272,11 @@ class Quoter:
         fair = self.fairs.get(ticker)
         if fair is None:
             return
+        book = ctx.book(ticker)
+        if book is not None and book.bid is not None and book.ask is not None:
+            self._lag.observe(ticker, now_s, (book.bid + book.ask) / 2, fair.prob, r)
         bad = r.max_fair_band is not None and fair.hi - fair.lo > r.max_fair_band
         lim = r.max_fair_outside_touch
-        book = ctx.book(ticker)
         if not bad and lim is not None and book is not None:
             bad = ((book.bid is not None and fair.prob < book.bid - lim)
                    or (book.ask is not None and fair.prob > book.ask + lim))
@@ -391,6 +395,10 @@ class Quoter:
         else:
             block_bid = self.model.side_block(ticker, "yes", fair, now_s)
             block_ask = self.model.side_block(ticker, "no", fair, now_s)
+            if not block_bid and self._lag.blocked(ticker, "yes", now_s):
+                block_bid = "fair_lag"
+            if not block_ask and self._lag.blocked(ticker, "no", now_s):
+                block_ask = "fair_lag"
         if block_bid:
             self._block(block_bid)
         if block_ask and block_ask != block_bid:
