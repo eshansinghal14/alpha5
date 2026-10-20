@@ -16,9 +16,12 @@ Reverse chronological. One section per material change. Entries before
   ~400ms after trade time vs Binance ~80ms, and it only pulled HYPE.
 - A venue child under `CRYPTO15M_PERSIST=0` no longer records books, venue
   prints or perp prints (they were written twice, once per trading process).
-- `alpha5-crypto15m` runs KXBTC15M, KXETH15M, KXSOL15M, KXXRP15M and KXHYPE15M
-  in one process (one SpotFeed, one venue child, one 20% write bucket), in
-  place of `alpha5-crypto15m-sol`.
+- `alpha5-crypto15m` runs KXETH15M, KXSOL15M, KXXRP15M and KXHYPE15M in one
+  process (one SpotFeed, one venue child, one 20% write bucket), in place of
+  `alpha5-crypto15m-sol`; `alpha5-crypto15m-btc` runs KXBTC15M alone (10%).
+  All five in one process ran at 71% CPU with loop lag p95 75ms in shadow
+  (10-20 16:45 UTC): BTC's Kalshi book changes touch ~300/s vs 20-77/s for
+  each of the others, each running the full dispatch.
 - The multi-second Coinbase print holds seen in the probe were the race
   process's Advanced Trade / Exchange sockets reconnecting (recv timeout
   after a ConnectionClosed, 1 s retry): 1-2 per 15 min event 07:15-10:00 UTC,

@@ -1,10 +1,10 @@
 """Single-coin 15-minute up/down (KXBTC15M, KXETH15M, KXSOL15M, KXXRP15M,
 KXHYPE15M), priced off the Coin Race spot stack. Pricing only.
 
-All five run in one process (alpha5-crypto15m: CRYPTO15M_GROUP=crypto15m, so
-one SpotFeed, one venue child and one write bucket; normal priority, below
-the race). The race doesn't need them for its implied vols: it polls the 15M
-mids itself (KXCRYPTOLEAD15M/implied_rates.py).
+ETH/SOL/XRP/HYPE run in one process (alpha5-crypto15m: CRYPTO15M_GROUP=crypto15m,
+so one SpotFeed, one venue child and one write bucket) and KXBTC15M in its own
+(alpha5-crypto15m-btc); normal priority, below the race. The race doesn't need
+them for its implied vols: it polls the 15M mids itself (KXCRYPTOLEAD15M/implied_rates.py).
 
     python -m kalshi_strategies.run --series KXCRYPTOLEAD15M --only KXETH15M   # race + ETH, one process
 

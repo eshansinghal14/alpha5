@@ -1,0 +1,28 @@
+[Unit]
+Description=alpha5 KXBTC15M (single-coin 15M), shadow unless armed
+After=network-online.target chrony.service alpha5-crypto.service
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/opt/alpha5
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+# Own process: its Kalshi book changes touch ~300/s (10-20), as much as the
+# other four coins together, and runs the full dispatch on each.
+Environment=CRYPTO15M_GROUP=crypto15m-btc
+Environment=ALPHA5_PRIORITY=normal
+Nice=0
+Environment=CRYPTO15M_PERSIST=0
+# Shard 2 with alpha5-crypto and alpha5-crypto15m: 10% of 300/s (30/s).
+Environment=KALSHI_WRITE_SHARE=0.1
+ExecStart=/opt/alpha5/.venv/bin/python -u -m kalshi_strategies.run --only KXBTC15M --resume-arm-h 18
+KillSignal=SIGINT
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/opt/alpha5/data/live/crypto15m-btc.out.log
+StandardError=append:/opt/alpha5/data/live/crypto15m-btc.err.log
+
+[Install]
+WantedBy=multi-user.target
