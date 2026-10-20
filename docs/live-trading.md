@@ -194,8 +194,12 @@ and counted on the dashboard.
 ## Rate limit
 
 Kalshi meters writes in tokens (`GET /account/endpoint_costs`): create and
-amend 10, cancel 2. `KalshiOrderClient` keeps a token bucket at this
-process's share of the account refill rate. Orders that would overdraw it
+amend 10, cancel 2, billed per exchange shard. Every process on the machine
+trading one shard draws on ONE bucket at the shard's full refill rate
+(`orders.SharedWriteBudget`, a lock-guarded file in `/dev/shm`), so the race
+and the single coins share the whole budget instead of fixed slices.
+`quoting.max_write_tokens_per_s` (dashboard) optionally caps one series'
+creates and amends on top of that; null = uncapped. Orders that would overdraw it
 are dropped (the quoter re-decides next tick); cancels always go through.
 Cancels are sent from their own thread pool and HTTP session
 (`engine.CANCEL_WORKERS`), so they never wait behind creates, REST polls or

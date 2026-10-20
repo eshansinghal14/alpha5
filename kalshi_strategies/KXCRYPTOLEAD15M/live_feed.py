@@ -350,10 +350,11 @@ class SpotFeed:
                 mid = vb.book_mid()
                 if mid is not None:
                     self.perp_nowcast.on_perp(vb.venue, vb.coin, mid, vb.receive_ts)
-                    # Models priced on the nowcast reprice on a perp move too;
-                    # the race only logs it, so it isn't woken for it.
+                    # Models priced on the nowcast reprice on a perp move too.
                     for m in self._wakes.get(vb.coin, ()):
-                        if getattr(m.cfg.pricing, "perp_pricing", False):
+                        wakes = getattr(m, "perp_wakes", None)
+                        if (wakes(vb.coin) if wakes is not None
+                                else getattr(m.cfg.pricing, "perp_pricing", False)):
                             m._mid_moved()
             return
         ms = self._wakes.get(vb.coin)

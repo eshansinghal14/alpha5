@@ -37,7 +37,7 @@ def cfg(risk_kw=None, **q):
                 lean_dollars=0.02, max_markets=None, atm_hysteresis=0,
                 enable_taking=True, enable_quoting=True, quoting_edge=0.0, max_improve_ticks=1, quote_levels_behind=0,
                 skip_quote_depth_ahead=None, quote_keep_inside=0.0, quote_ahead_grace_s=1.0,
-                cancels_token=20.0, requote_delay_s=1.0)
+                cancels_token=20.0, requote_delay_s=1.0, max_write_tokens_per_s=None)
     base.update(q)
     return types.SimpleNamespace(
         quoting=P.QuotingParams(**base),

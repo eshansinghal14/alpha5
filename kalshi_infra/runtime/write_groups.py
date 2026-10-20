@@ -12,7 +12,7 @@ from __future__ import annotations
 import dataclasses
 import threading
 
-from kalshi_infra.kalshi.orders import WRITE_HEADROOM, WriteBudget, process_write_tokens_per_s
+from kalshi_infra.kalshi.orders import WRITE_HEADROOM, WriteBudget, shard_budget
 from kalshi_infra.trading.order_manager import WriteGroup
 
 # Basic tier refill rate (2026-10-09), used when the account limit can't be
@@ -39,8 +39,15 @@ def get(name: str, shard: int | None) -> Shared:
         s = _GROUPS.get(key)
         if s is not None:
             return s
+    budget = None
     try:
-        rate = process_write_tokens_per_s() if shard is not None else FALLBACK_TOKENS_PER_S
+        if shard is not None:
+            # The shard's machine-wide bucket: the group shares it with every
+            # other process trading this shard.
+            budget = shard_budget(shard)
+            rate = budget.tokens_per_s
+        else:
+            rate = FALLBACK_TOKENS_PER_S
     except Exception as e:
         print(f"[write_group {name}] WARN: account write limit unreadable ({e!r}); "
               f"modelling {FALLBACK_TOKENS_PER_S:g} tokens/s", flush=True)
@@ -48,10 +55,10 @@ def get(name: str, shard: int | None) -> Shared:
     with _LOCK:
         s = _GROUPS.get(key)
         if s is None:
-            budget = WriteBudget(rate)
+            budget = budget or WriteBudget(rate)
             s = _GROUPS[key] = Shared(budget, WriteGroup(sim_tokens_per_s=rate * WRITE_HEADROOM))
-            print(f"[write_group {name}] shard {shard}: one bucket of {budget.rate:g} tokens/s "
-                  f"shared by its series", flush=True)
+            print(f"[write_group {name}] shard {shard}: {budget.rate:g} tokens/s bucket shared by its series"
+                  + (" and every other process on the shard" if shard is not None else ""), flush=True)
         return s
 
 

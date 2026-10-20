@@ -110,6 +110,7 @@ class CoinRaceModel:
         # A mid has moved since the last _price, so the fair lags its inputs.
         self._dirty = True
         self.basis_bp: dict[str, float] = {}
+        self.priced_on: dict[str, str] = {}
         self._basis_cache: dict[str, tuple] = {}
         self.vol_bp: dict[str, float] = {}
         self.vol_src: dict[str, str] = {}
@@ -173,6 +174,14 @@ class CoinRaceModel:
 
     def set_wakeup(self, fn):
         self._wake = fn
+
+    def _perp_priced(self) -> set:
+        coins = getattr(self.cfg.pricing, "perp_priced_markets", [])
+        return set(COINS) if coins is None else set(coins)
+
+    def perp_wakes(self, coin: str) -> bool:
+        """SpotFeed: does a perp book move on `coin` change this model's fair?"""
+        return coin in self._perp_priced()
 
     def set_pull_hook(self, fn):
         self._pull_hook = fn
@@ -293,8 +302,18 @@ class CoinRaceModel:
         tau = max(0.0, self.window.T - now_s)
         L = float(START_END_AVG_S)
         x, I, n_eff = np.zeros(len(COINS)), np.zeros(len(COINS)), np.zeros(len(COINS))
+        pnc = getattr(self.spot, "perp_nowcast", None) if self.spot is not None else None
+        on_perp = self._perp_priced()
+        mono_now = time.monotonic()
+        self.priced_on = {}
         for i, c in enumerate(COINS):
             m, b = self.bus.mid_nowcast(c), self._basis(c)
+            if c in on_perp and pnc is not None and m is not None and m > 0:
+                # Spot moved by Binance's lead; plain spot while Binance is stale.
+                px, inc = pnc.increment(c, mono_now, m)
+                if inc is not None:
+                    m = px
+                self.priced_on[c] = "latest" if inc is not None else "spot"
             if m is None or m <= 0:
                 return self._withhold("no_mid")
             if b is None:
@@ -366,10 +385,7 @@ class CoinRaceModel:
         self._dirty = False
         self.withheld_reason = None
         k = p.ci_vol_multiplier
-        # Shadow: each coin's perp nowcast gap, logged per market and scored
-        # offline (a second pricer pass per decision would double its cost on
-        # the trading loop). Never priced on.
-        pnc = getattr(self.spot, "perp_nowcast", None) if self.spot is not None else None
+        # Both perp nowcasts logged per market; only perp_priced_markets price on one.
         mono = time.monotonic()
         out = {}
         for i, c in enumerate(COINS):
@@ -387,7 +403,8 @@ class CoinRaceModel:
                                                   "vol_src": (self.vol_src.get(c, "implied")
                                                               if p.vol_source == "implied" else "realized"),
                                                   "corr_mult": g, "spot_mid": m_spot,
-                                                  "perp_gap_bp": p_gap, "perp_n": p_n, "perp_inc_bp": p_inc})
+                                                  "perp_gap_bp": p_gap, "perp_n": p_n, "perp_inc_bp": p_inc,
+                                                  "priced_on": self.priced_on.get(c, "spot")})
         return out
 
     # --- FairModel ----------------------------------------------------------

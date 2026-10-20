@@ -28,6 +28,7 @@
       "quote_keep_inside": 0.01,
       "quote_ahead_grace_s": 1.0,
       "cancels_token": 30.0,
+      "max_write_tokens_per_s": null,
       "requote_delay_s": 1.0,
       "order_lots": 5.0,
       "constant_edge_ref_s": null
@@ -98,6 +99,7 @@
       "quote_keep_inside": 0.01,
       "quote_ahead_grace_s": 1.0,
       "cancels_token": 40.0,
+      "max_write_tokens_per_s": null,
       "requote_delay_s": 1.0,
       "order_lots": 15.0,
       "constant_edge_ref_s": null

@@ -87,6 +87,11 @@ class QuotingParams:
         "In a write group (the S&P series) one reserve covers the shared bucket: the largest "
         "member's value.",
         min=0, step=2.0)
+    max_write_tokens_per_s: float | None = param(
+        "Cap on this series' write spend (tokens/s). Every process on a shard shares that shard's whole "
+        "bucket (300/s on Advanced, 10-20); null = no cap, take what's free. Set one only if this series "
+        "starves the others. Cancels are never held back by it.",
+        min=1, step=10)
     requote_delay_s: float = param(
         "After our quote on a (market, side) is hit, that side adds no new levels this long "
         "(levels already up stay).", min=0, max=120, step=0.5)

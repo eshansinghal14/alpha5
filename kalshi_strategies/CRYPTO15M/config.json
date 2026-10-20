@@ -17,6 +17,7 @@
       "quote_keep_inside": 0.0,
       "quote_ahead_grace_s": 1.0,
       "cancels_token": 6.0,
+      "max_write_tokens_per_s": null,
       "requote_delay_s": 0.5,
       "order_lots": 0.5
     },
@@ -167,6 +168,7 @@
       "quote_keep_inside": 0.0,
       "quote_ahead_grace_s": 1.0,
       "cancels_token": 6.0,
+      "max_write_tokens_per_s": null,
       "requote_delay_s": 0.5,
       "order_lots": 0.5
     },
@@ -317,6 +319,7 @@
       "quote_keep_inside": 0.0,
       "quote_ahead_grace_s": 1.0,
       "cancels_token": 6.0,
+      "max_write_tokens_per_s": null,
       "requote_delay_s": 0.5,
       "order_lots": 0.5
     },
@@ -467,6 +470,7 @@
       "quote_keep_inside": 0.0,
       "quote_ahead_grace_s": 1.0,
       "cancels_token": 6.0,
+      "max_write_tokens_per_s": null,
       "requote_delay_s": 0.5,
       "order_lots": 0.5
     },
@@ -617,6 +621,7 @@
       "quote_keep_inside": 0.0,
       "quote_ahead_grace_s": 1.0,
       "cancels_token": 6.0,
+      "max_write_tokens_per_s": null,
       "requote_delay_s": 0.5,
       "order_lots": 0.5
     },

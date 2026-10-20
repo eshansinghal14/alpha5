@@ -3,6 +3,7 @@ import math
 import time
 
 import pandas as pd
+import pytest
 
 from kalshi_infra.kalshi.markets import EventInfo
 from kalshi_strategies.KXCRYPTOLEAD15M.cf_index import STALE_S, CfIndex
@@ -274,6 +275,43 @@ def test_no_side_blocks():
     _feed(m, time.monotonic())
     fairs = m.reprice(now)
     assert all(m.side_block(t, s, f, now) is None for t, f in fairs.items() for s in ("yes", "no"))
+
+
+def test_perp_priced_coin_moves_with_binance_lead_others_stay_on_spot():
+    """HYPE in perp_priced_markets: Binance up 2bp since Coinbase last moved
+    lifts HYPE's fair and wakes the reprice; the same move on SOL (spot-priced)
+    changes nothing."""
+    from kalshi_strategies.KXCRYPTOLEAD15M.live_feed import SpotFeed
+    now = time.time()
+    cfg = config(recovery_s=0.0, perp_priced_markets=["HYPE"])
+    spot = SpotFeed(cfg, persist=False, venues=False)
+    spot.forecaster = ConstantCovForecaster()
+    S = int(now) - 300
+    spot.cf = _cf_at(S, now)
+    m = CoinRaceModel(_event(S, S + 900), cfg, cf=spot.cf, spot=spot)
+    spot.attach(m)
+    _bars(m, now)
+    mono = time.monotonic()
+    for c in COINS:
+        spot._on_book(_book(c, mono))
+    for c in ("HYPE", "SOL"):
+        spot._on_book(VenueBook(venue="binance_perp", product="x", coin=c, bids=(OrderBookLevel(PX[c] - 0.01, 1.0),),
+                                asks=(OrderBookLevel(PX[c] + 0.01, 1.0),), receive_ts=mono))
+    for c in COINS:                       # a spot move after Binance's first tick sets the increment's reference
+        spot._on_book(_book(c, mono, 1.00001))
+    base = m.reprice(now)
+    assert base[m.ticker_of["HYPE"]].extras["priced_on"] == "latest"
+    assert base[m.ticker_of["SOL"]].extras["priced_on"] == "spot"
+    woke = []
+    m.set_wakeup(lambda: woke.append(1))
+    for c in ("HYPE", "SOL"):
+        up = PX[c] * math.exp(5e-4)
+        spot._on_book(VenueBook(venue="binance_perp", product="x", coin=c, bids=(OrderBookLevel(up - 0.01, 1.0),),
+                                asks=(OrderBookLevel(up + 0.01, 1.0),), receive_ts=mono + 0.01))
+    assert woke == [1]                                     # HYPE's perp move only
+    moved = m.reprice(now)
+    assert moved[m.ticker_of["HYPE"]].prob > base[m.ticker_of["HYPE"]].prob + 1e-4
+    assert moved[m.ticker_of["HYPE"]].extras["perp_inc_bp"] == pytest.approx(2.0)
 
 
 def test_spot_burst_pulls_quotes_for_every_market_then_expires():

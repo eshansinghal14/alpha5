@@ -30,7 +30,11 @@ is per-call there):
   * one persistent requests.Session, reused for every order,
   * the private key parsed once at construction, not per request.
 """
+import contextlib
 import dataclasses
+import mmap
+import os
+import struct
 import threading
 import time
 import uuid
@@ -256,6 +260,96 @@ class WriteBudget:
             self._last = time.monotonic()
 
 
+class SharedWriteBudget(WriteBudget):
+    """One write bucket for every process on this machine trading `shard`:
+    the token count lives in a small shared file, updated under a file lock,
+    so the race and the single coins draw on the shard's whole budget
+    together instead of fixed slices of it. Fixed slices left the shard
+    oversubscribed (300 + 60 + 30 against Kalshi's 300, 45 race 429s on
+    10-20) while most of each slice sat unused (59% of 300 used overall).
+
+    Monotonic time is system-wide on Linux and Windows, so every process
+    refills off one clock. Same interface as WriteBudget."""
+
+    _SIZE = struct.Struct("<dd")          # tokens, last refill (time.monotonic)
+
+    def __init__(self, tokens_per_s: float, shard: int, path: str | None = None):
+        self.tokens_per_s = tokens_per_s
+        self.rate = tokens_per_s * WRITE_HEADROOM
+        self.capacity = self.rate
+        self.path = path or _shared_budget_path(shard)
+        self._lock = threading.Lock()     # threads of this process; the file lock covers processes
+        new = not os.path.exists(self.path)
+        self._fd = os.open(self.path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o644)
+        if os.fstat(self._fd).st_size < self._SIZE.size:
+            os.write(self._fd, self._SIZE.pack(self.capacity, time.monotonic()))
+            new = True
+        self._mm = mmap.mmap(self._fd, self._SIZE.size)
+        if new:
+            with self._locked():
+                self._mm[:] = self._SIZE.pack(self.capacity, time.monotonic())
+
+    @contextlib.contextmanager
+    def _locked(self):
+        with self._lock:
+            _flock(self._fd, True)
+            try:
+                yield
+            finally:
+                _flock(self._fd, False)
+
+    def _update(self, fn):
+        """fn(tokens after refill) -> (new tokens, result), under the lock."""
+        with self._locked():
+            tokens, last = self._SIZE.unpack(self._mm[:])
+            now = time.monotonic()
+            # After a reboot the stored clock is from the old boot.
+            elapsed = max(0.0, now - last) if last <= now else 0.0
+            tokens = min(self.capacity, tokens + elapsed * self.rate)
+            tokens, out = fn(tokens)
+            self._mm[:] = self._SIZE.pack(tokens, now)
+            return out
+
+    def tokens_now(self) -> float:
+        return self._update(lambda t: (t, t))
+
+    def take(self, cost: float, force: bool = False) -> bool:
+        return self._update(lambda t: (t, False) if t < cost and not force else (t - cost, True))
+
+    def empty(self):
+        self._update(lambda t: (min(t, 0.0), None))
+
+
+def _shared_budget_path(shard: int) -> str:
+    import tempfile
+    root = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
+    return os.path.join(root, f"alpha5-write-shard{int(shard)}.bucket")
+
+
+def _flock(fd: int, on: bool):
+    if os.name == "nt":
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_LOCK if on else msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_EX if on else fcntl.LOCK_UN)
+
+
+_SHARED: dict[int, SharedWriteBudget] = {}
+_SHARED_LOCK = threading.Lock()
+
+
+def shard_budget(shard: int) -> WriteBudget:
+    """The machine-wide bucket for `shard` at the account's full refill rate
+    (one per process). KALSHI_WRITE_SHARE no longer splits it."""
+    with _SHARED_LOCK:
+        b = _SHARED.get(shard)
+        if b is None:
+            b = _SHARED[shard] = SharedWriteBudget(write_budget_tokens_per_s(), shard)
+        return b
+
+
 class KalshiOrderClient:
     """Places real IOC orders and reads real positions. Every method here
     does blocking network I/O and MUST be called off the asyncio event loop
@@ -292,9 +386,11 @@ class KalshiOrderClient:
     @classmethod
     def from_account(cls, shard: int | None = None, budget: WriteBudget | None = None) -> "KalshiOrderClient":
         """`shard`: the exchange_index every write is pinned to (see
-        _shard_field). Without a shared `budget`, this process's share of the
-        account budget comes from WRITE_SHARE_ENV, which kalshi_strategies.run
-        sets per SHARD: processes on different shards don't share a bucket."""
+        _shard_field). A pinned client draws on the machine-wide bucket for
+        that shard (shard_budget) unless a `budget` is passed; unpinned falls
+        back to this process's WRITE_SHARE_ENV slice."""
+        if budget is None and shard is not None:
+            budget = shard_budget(shard)
         c = cls(tokens_per_s=process_write_tokens_per_s() if budget is None else budget.tokens_per_s,
                 budget=budget)
         c.shard = shard
@@ -363,16 +459,32 @@ class KalshiOrderClient:
             self._spent, self._refused, self._429 = {}, {}, {}
             self._t0 = time.monotonic()
 
+    # Optional cap on THIS client's spend, tokens/s, on top of the shared
+    # bucket (quoting.max_write_tokens_per_s, read live). None = uncapped.
+    cap_fn = None
+    _cap: "WriteBudget | None" = None
+
+    def _cap_bucket(self) -> "WriteBudget | None":
+        rate = self.cap_fn() if self.cap_fn is not None else None
+        if not rate:
+            self._cap = None
+            return None
+        if self._cap is None or abs(self._cap.tokens_per_s - rate) > 1e-9:
+            self._cap = WriteBudget(rate)
+        return self._cap
+
     def tokens_now(self) -> float:
-        """Tokens currently in the bucket (may be negative after a forced
-        cancel). Spends nothing."""
-        return self.budget.tokens_now()
+        """Tokens this client may spend now: the shared bucket, or its own cap
+        if that's lower (may be negative after a forced cancel)."""
+        t = self.budget.tokens_now()
+        cap = self._cap_bucket()
+        return t if cap is None else min(t, cap.tokens_now())
 
     def can_afford(self, kind: str = "order", reserve: float = 0.0) -> bool:
         """Would `kind` be allowed now with `reserve` tokens left over?
         Spends nothing. Lets the quoter skip building an order the bucket
         would refuse."""
-        return self.budget.tokens_now() >= self.COST[kind] + reserve
+        return self.tokens_now() >= self.COST[kind] + reserve
 
     def allow_now(self, kind: str = "order", force: bool = False, reason: str = "untagged") -> bool:
         """Spend `kind`'s tokens from the bucket, or refuse.
@@ -386,7 +498,13 @@ class KalshiOrderClient:
         refused cancel leaves a real order resting where we no longer want
         it, which is strictly worse than a 429."""
         cost = self.COST[kind]
-        ok = self.budget.take(cost, force=force)
+        cap = self._cap_bucket()
+        if cap is not None and not force and cap.tokens_now() < cost:
+            ok = False
+        else:
+            ok = self.budget.take(cost, force=force)
+            if ok and cap is not None:
+                cap.take(cost, force=True)
         with self._lock:
             if not ok:
                 self._refused[(kind, reason)] = self._refused.get((kind, reason), 0) + 1

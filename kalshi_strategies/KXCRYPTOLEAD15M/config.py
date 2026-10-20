@@ -62,6 +62,13 @@ class CryptoPricingParams:
         "but exposed worse flow (+$1,880 to +$2,040). Key \"perp_move\" is the price-move trigger "
         "(prints.MOVE_*): 2 of 3 perp venues moving >= their own p99.5 of |0.5s move| one way.",
         editable=False)
+    perp_priced_markets: list[str] | None = param(
+        "Coins whose x is the latest-mover perp nowcast (perp_nowcast.increment: spot + Binance's move "
+        "since spot last moved, capped 2bp) instead of the spot mid. Race decisions 10-20 16:30-19:30 UTC: "
+        "on HYPE, a Binance increment over 1bp was followed by Coinbase the same way 73-75% of the time "
+        "(0.25-2s ahead), covering 0.50-0.73 of it; on SOL 28-56% and 0.20-0.46, so SOL stays on spot. "
+        "Coinbase HYPE prints ~9/min vs Binance's ~900/min. The start TWAP and CF basis stay on spot. "
+        "null = every coin.")
     soft_stale_s: float = param("Feed health: a coin older than this is DEGRADED (priced off last value).",
                                 min=0.1, step=0.5)
     hard_stale_s: float = param("A coin older than this is DOWN: the joint is unknowable, all fairs withheld.",

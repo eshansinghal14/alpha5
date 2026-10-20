@@ -301,8 +301,10 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
     quoter = Quoter(cfg, model, fee_sched, close_time=ev.close_time, lip=lip, record_debug=True)
     order_client, err = prep["order_client"]
     if err is None:
-        _log(S, f"write budget {order_client.tokens_per_s:g} tokens/s on shard {order_client.shard} "
-                f"(~{order_client.max_orders_per_s:g} orders/s) from Kalshi account limits")
+        order_client.cap_fn = lambda: cfg.quoting.max_write_tokens_per_s
+        cap = cfg.quoting.max_write_tokens_per_s
+        _log(S, f"write budget {order_client.tokens_per_s:g} tokens/s on shard {order_client.shard}, shared by "
+                f"every process on it" + (f", this series capped at {cap:g}/s" if cap else ", no per-series cap"))
     else:
         _log(S, f"WARN: no order client ({err!r}); real trading cannot be armed")
     engine = LiveEngine(quoter, risk=cfg.risk, quoting=cfg.quoting, fees=fee_sched,

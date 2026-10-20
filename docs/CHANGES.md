@@ -3,6 +3,29 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-20 — One write bucket per shard; HYPE priced on Binance's lead
+
+- **Write budget.** Shard 2 was sliced per process: race 300/s (100%), the
+  four single coins 60/s, BTC 30/s -- 390/s against Kalshi's 300, while total
+  use averaged ~176/s (race 138, single coins ~27 + ~11). The race took 45
+  429s on 10-20. Now every process pinned to a shard shares one bucket at the
+  shard's full rate (`orders.SharedWriteBudget`: tokens + last refill in a
+  16-byte file under `/dev/shm`, updated under `flock`; write groups use it
+  too). `KALSHI_WRITE_SHARE` no longer applies to shard-pinned clients and is
+  gone from the crypto units. New `quoting.max_write_tokens_per_s` (dashboard,
+  live): optional per-series cap on creates/amends; cancels never wait on it.
+  null everywhere.
+- **HYPE on the perp nowcast.** New `pricing.perp_priced_markets` (race,
+  dashboard checkboxes): those coins' x uses `perp_nowcast.increment` (spot +
+  Binance's move since spot last moved, 2bp cap) instead of the spot mid, and
+  their perp book moves wake the reprice. Start TWAP, CF basis and settlement
+  stay on spot/CF. Race decisions 10-20 16:30-19:30 UTC: on HYPE a Binance
+  increment over 1bp was followed by Coinbase the same way 73-75% of the time
+  over 0.25-2s, covering 0.50-0.73 of it (slope 0.57-0.88); on SOL 28-56% /
+  0.20-0.46, so SOL stays on spot. Coinbase HYPE prints ~9/min vs Binance
+  ~900/min; receipt latency is not the issue (Coinbase HYPE p50 17ms, BTC 14ms).
+  Set to ["HYPE"]. Decision rows log `x_priced_on` (latest | spot).
+
 ## 2026-10-20 — Cancels on their own lane; burst trips pull at once
 
 Measured on the race, 10-20 15:15-18:15 UTC, orders journal (178k cancels):

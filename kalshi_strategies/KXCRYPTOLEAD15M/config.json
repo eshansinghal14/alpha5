@@ -15,6 +15,7 @@
     "quote_keep_inside": 0.01,
     "quote_ahead_grace_s": 1.0,
     "cancels_token": 40.0,
+    "max_write_tokens_per_s": null,
     "requote_delay_s": 1.0,
     "order_lots": 15.0,
     "constant_edge_ref_s": 210.0
@@ -75,6 +76,9 @@
       "HYPE": 3650
     },
     "burst_hold_s": 0.5,
+    "perp_priced_markets": [
+      "HYPE"
+    ],
     "soft_stale_s": 3.0,
     "hard_stale_s": 15.0,
     "recovery_s": 5.0,
