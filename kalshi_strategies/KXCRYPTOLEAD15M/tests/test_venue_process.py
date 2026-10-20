@@ -163,6 +163,37 @@ def test_control_reaches_child_and_trip_frame_wakes_parent(monkeypatch):
         p.stop()
 
 
+BOOK_STUB = r"""
+import sys, time
+sys.path.insert(0, {root!r})
+from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed import venue_process as vp
+out = sys.stdout.buffer
+now = time.time()
+vp._write_frame(out, ([("binance_perp", "BTC", "btcusdt", ((100.0, 1.0),), ((100.2, 1.0),), now, now, False)], [], [], {{}}))
+sys.stdin.buffer.read()
+"""
+
+
+def test_immediate_book_frame_wakes_parent(monkeypatch):
+    """A touch change ships on its own frame (books only) and wakes the
+    drain, instead of waiting for the SHIP_S batch and the drain tick."""
+    from kalshi_infra import REPO_ROOT
+    code = BOOK_STUB.format(root=str(REPO_ROOT))
+    real_popen = vp.subprocess.Popen
+    monkeypatch.setattr(vp.subprocess, "Popen", lambda args, **kw: real_popen([sys.executable, "-c", code], **kw))
+    p = vp.VenueProcess({"binance_perp": ["BTC"]})
+    woke = []
+    p.on_urgent = lambda: woke.append(1)
+    p.ensure_running()
+    try:
+        assert _wait(lambda: woke)
+        books = []
+        p.drain(books.append)
+        assert books and (books[0].venue, books[0].best_bid()) == ("binance_perp", 100.0)
+    finally:
+        p.stop()
+
+
 def test_dead_child_is_restarted_with_backoff(monkeypatch):
     _stubbed(monkeypatch, n=1, tail="")          # exits right after one frame
     clock = [0.0]

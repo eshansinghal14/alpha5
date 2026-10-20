@@ -52,6 +52,12 @@ SPOT_VENUES = {
     "XRP":  ("coinbase", "kraken", "bitstamp", "crypto_com"),
     "HYPE": ("coinbase",),
 }
+# Coins priced on the depth-weighted CF replica of their books (cf_rate)
+# instead of the touch mid. HYPE vs the real CF index after the model's 30s
+# basis, 10-18 10:14 -> 10-20 00:34 UTC (104k s): replica 0.67bp rms vs
+# Coinbase touch mid 0.98bp, better in 8/8 six-hour blocks; adding
+# Kraken/Bitstamp to the median was worse (0.99). Re-score before adding a coin.
+DEPTH_PRICED = frozenset({"HYPE"})
 # Per-index parameters from the methodology tables: deviation-from-mid D,
 # potentially-erroneous threshold, and retrieval lag threshold (s). CME CF RTI
 # methodology v16.8 table 6.2 for the four majors (D 0.5% BTC / 1% others,
@@ -95,7 +101,7 @@ def coin_from_market_ticker(ticker: str) -> str | None:
 
 __all__ = [
     "SERIES_TICKER", "COINS", "COINBASE_PRODUCTS", "CF_CONSTITUENTS", "SETTLEMENT_INDEX", "INDEX_PARAMS",
-    "SPOT_VENUES",
+    "SPOT_VENUES", "DEPTH_PRICED",
     "EVENT_WINDOW_S", "START_END_AVG_S", "RETURN_ROUNDING_PCT",
     "TICK", "MIN_QUOTE_PRICE", "MAX_QUOTE_PRICE",
     "market_ticker", "coin_from_market_ticker",

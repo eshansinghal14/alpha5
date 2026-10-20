@@ -38,6 +38,10 @@ from .base import OrderBookLevel, VenueBook
 SHIP_S = 0.05
 # Levels per side shipped: the mid needs one, the diagnostic CF replica a few.
 SHIP_LEVELS = 10
+# A book whose touch (best bid/ask or resync state) changed goes out on its
+# own frame at once and wakes the parent's drain; size-only changes, prints
+# and keep-alives still ride the SHIP_S batch.
+IMMEDIATE = True
 # Frames buffered on the trading side; on overflow the oldest is dropped (the
 # next frame carries newer books for anything that changed).
 MAX_FRAMES = 400
@@ -203,12 +207,26 @@ def _child_main(plan: dict[str, list[str]]):
 
     status: dict = {}
 
+    last_touch: dict[tuple[str, str], tuple] = {}
+
     def on_update(vb: VenueBook):
-        latest[(vb.venue, vb.coin)] = (
-            vb.venue, vb.coin, vb.product,
-            tuple((l.price, l.size) for l in vb.bids[:SHIP_LEVELS]),
-            tuple((l.price, l.size) for l in vb.asks[:SHIP_LEVELS]),
-            time.time() - (time.monotonic() - vb.receive_ts), vb.exchange_ts, vb.is_resyncing)
+        k = (vb.venue, vb.coin)
+        row = (vb.venue, vb.coin, vb.product,
+               tuple((l.price, l.size) for l in vb.bids[:SHIP_LEVELS]),
+               tuple((l.price, l.size) for l in vb.asks[:SHIP_LEVELS]),
+               time.time() - (time.monotonic() - vb.receive_ts), vb.exchange_ts, vb.is_resyncing)
+        touch = (vb.best_bid(), vb.best_ask(), vb.is_resyncing)
+        if not IMMEDIATE or last_touch.get(k) == touch:
+            latest[k] = row            # size-only change: rides the next batch
+            return
+        # Touch moved: send it now. Waiting for the batch cost 0-50ms here plus
+        # 0-50ms on the parent's drain tick, about the size of the perps' lead.
+        last_touch[k] = touch
+        latest.pop(k, None)
+        try:
+            _write_frame(out, ([row], [], [], {}))
+        except (BrokenPipeError, OSError):
+            os._exit(0)
 
     perp_rows: list[dict] = []
     perp_usd: dict[tuple[str, str], tuple] = {}
@@ -339,8 +357,9 @@ class VenueProcess:
         self.n_starts = 0
         self.n_dropped = 0
         self.last_exit: int | None = None
-        # Called from the reader thread when a frame carries trips, so the
-        # trading loop can drain at once instead of on its next tick.
+        # Called from the reader thread when a frame carries trips or an
+        # immediate book, so the trading loop drains at once instead of on its
+        # next tick.
         self.on_urgent = None
         self._control: dict | None = None
         self.status: dict = {}
@@ -394,7 +413,8 @@ class VenueProcess:
                 if len(self._frames) == self._frames.maxlen:
                     self.n_dropped += 1
                 self._frames.append(frame)
-            if len(frame) > 3 and frame[3].get("trips") and self.on_urgent is not None:
+            urgent = len(frame) > 3 and (frame[3].get("trips") or (frame[0] and not frame[1] and not frame[2]))
+            if urgent and self.on_urgent is not None:
                 try:
                     self.on_urgent()
                 except Exception:

@@ -3,6 +3,22 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-20 — Venue books sent at once; HYPE priced on the depth-weighted replica
+
+- Venue process: a book whose touch (best bid/ask or resync state) changed is
+  written on its own frame immediately and wakes the parent's drain, instead
+  of waiting for the 50 ms `SHIP_S` batch and then the 50 ms `VENUE_DRAIN_S`
+  tick (0-100 ms, ~50 ms mean). Size-only changes, prints and keep-alives
+  still ride the batch (`venue_process.IMMEDIATE`). Perp book moves now also
+  wake models that price on the perp nowcast (KXSOL15M); the race only logs it.
+- `series.DEPTH_PRICED = {"HYPE"}`: HYPE's pricing mid, per message and in the
+  1s bars, is the CF replica (`cf_rate.compute_cf_spot`) of its 25-level
+  Coinbase view instead of the touch mid, so basis and vol are fitted on the
+  same series. A held through-the-touch print still wins while it holds.
+  Scored against the real CF index after the model's 30s basis, 10-18 10:14 ->
+  10-20 00:34 UTC: 0.67bp rms vs 0.98bp for the touch mid, better in 8/8
+  six-hour blocks. ~0.23 ms per HYPE message on the c7g box.
+
 ## 2026-10-20 — Perp nowcast on the perps' book mid
 
 - `perp_nowcast` is fed each perp's top-of-book mid (Binance `bookTicker`,

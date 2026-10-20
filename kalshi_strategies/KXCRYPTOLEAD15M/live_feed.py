@@ -23,7 +23,7 @@ from kalshi_strategies.KXCRYPTOLEAD15M.prints import (AUTO_SOURCES, HL_BURST_USD
                                                        SAMPLE_S, BurstCalibrator, BurstDetector, PrintLog,
                                                        TripLog, seed_rows)
 from kalshi_strategies.KXCRYPTOLEAD15M.robust_har import RobustHarForecaster
-from kalshi_strategies.KXCRYPTOLEAD15M.series import COINS, SPOT_VENUES
+from kalshi_strategies.KXCRYPTOLEAD15M.series import COINS, DEPTH_PRICED, SPOT_VENUES
 from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed import FeedHealthMonitor
 from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed.coinbase import CoinbaseAdapter
 from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed.venue_process import VenueProcess
@@ -64,7 +64,8 @@ class SpotFeed:
         self.cfg = cfg
         self.bus = CompositeBus(coins=COINS, persist=persist,
                                 venues=SPOT_VENUES if venues else None,
-                                venue_stale_s=VENUE_STALE_S if venues else None)
+                                venue_stale_s=VENUE_STALE_S if venues else None,
+                                depth_priced=DEPTH_PRICED if venues else frozenset())
         self.coinbase = CoinbaseAdapter(coins=list(COINS))
         self.venues = VenueProcess(venue_plan()) if venues else None
         self._venue_atexit = False
@@ -343,6 +344,12 @@ class SpotFeed:
                 mid = vb.book_mid()
                 if mid is not None:
                     self.perp_nowcast.on_perp(vb.venue, vb.coin, mid, vb.receive_ts)
+                    # Models priced on the nowcast reprice on a perp move too;
+                    # the race only logs it, so it isn't woken for it.
+                    for m in self._wakes.get(vb.coin, ()):
+                        if getattr(m.cfg.pricing, "perp_pricing", False):
+                            m._mid_moved()
+            return
         ms = self._wakes.get(vb.coin)
         before = self.bus.mid_nowcast(vb.coin)
         self.bus.observe(vb)

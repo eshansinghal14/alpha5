@@ -81,6 +81,27 @@ def test_spot_feed_feeds_perp_book_mids_not_trades():
     assert gap == pytest.approx(1.0, abs=0.05)
 
 
+def test_depth_priced_coin_prices_on_the_replica_and_bars_match():
+    """A depth-priced coin's pricing mid and bar mid are the CF replica of
+    its book; a thin top level no longer sets it alone."""
+    from kalshi_strategies.KXCRYPTOLEAD15M.composite import CompositeFeed
+    from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed.base import OrderBookLevel, VenueBook
+    import time as _t
+    bids = (OrderBookLevel(78.99, 0.1),) + tuple(OrderBookLevel(78.90 - 0.01 * i, 50.0) for i in range(24))
+    asks = tuple(OrderBookLevel(79.01 + 0.01 * i, 50.0) for i in range(25))
+    vb = VenueBook(venue="coinbase", product="HYPE-USD", coin="HYPE", bids=bids, asks=asks,
+                   receive_ts=_t.monotonic())
+    plain = CompositeFeed("HYPE", persist=False)
+    deep = CompositeFeed("HYPE", persist=False, depth_priced=True)
+    plain.observe(vb)
+    deep.observe(vb)
+    assert plain.mid_nowcast() == pytest.approx(79.0)
+    assert deep.mid_nowcast() < 79.0 - 0.02                 # the 0.1-lot bid barely counts
+    bar = deep.sample(1000.0)
+    assert bar.mid == pytest.approx(deep.mid_nowcast()) and bar.mid == pytest.approx(bar.price)
+    assert deep.mid_nowcast() == pytest.approx(bar.mid)     # sample() keeps the replica as the mid
+
+
 def test_median_ignores_one_outlier_venue():
     n = pn.PerpNowcast()
     t = _warm(n)

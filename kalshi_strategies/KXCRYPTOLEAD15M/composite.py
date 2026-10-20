@@ -100,11 +100,15 @@ class CompositeFeed:
 
     def __init__(self, coin: str, history_s: int = 3600,
                  persist: bool = True, persist_dir: Path = DATA_ROOT,
-                 venues: tuple[str, ...] | None = None, venue_stale_s: float | None = None):
+                 venues: tuple[str, ...] | None = None, venue_stale_s: float | None = None,
+                 depth_priced: bool = False):
         """`venues`: which venues' books form the mid (None = every venue
         observed). `venue_stale_s`: a venue whose book is older than this
-        leaves the median until it updates again."""
+        leaves the median until it updates again. `depth_priced`: the pricing
+        mid (per message and in the bars) is the CF replica of the live books,
+        not the median touch mid."""
         self.coin = coin
+        self.depth_priced = depth_priced
         self.venues = None if venues is None else tuple(venues)
         self.venue_stale_s = venue_stale_s
         self._venue_books: dict[str, VenueBook] = {}
@@ -132,13 +136,21 @@ class CompositeFeed:
         if vb.coin != self.coin or (self.venues is not None and vb.venue not in self.venues):
             return
         self._venue_books[vb.venue] = vb
-        # Per message only the MID is needed (the pricing series). The CF
-        # replica is depth-weighted over hundreds of levels and only feeds
-        # diagnostics, so it runs once a second in sample(). Running it on
-        # every message was ~4ms x ~85 msg/s of event-loop time.
-        mids = [b.mid() for b in self._live_books(vb.receive_ts)]
+        # Per message only the MID is needed (the pricing series). For most
+        # coins the CF replica only feeds diagnostics, so it runs once a second
+        # in sample(); on every message it was ~4ms x ~85 msg/s (deep books).
+        # A depth-priced coin runs it here on its 25-level view: ~0.23ms per
+        # HYPE message on the c7g box (2026-10-20).
+        live = self._live_books(vb.receive_ts)
+        mids = [b.mid() for b in live]
         if mids:
             m = float(np.median(mids))
+            # A held through-the-touch print (Coinbase trade_px) is newer than
+            # any book, so it still wins while it holds.
+            if self.depth_priced and not any(b.trade_px is not None for b in live):
+                res = compute_cf_spot(self.coin, live)
+                if res is not None and not res.is_fallback:
+                    m = res.price
             self._mid = m
             prev = self._nowcast
             self._nowcast = CFSpotResult(
@@ -201,14 +213,17 @@ class CompositeFeed:
             # the next tick can try again inside the same second if a
             # venue update arrives.
             return None
-        self._nowcast = res
+        # A depth-priced coin's bars carry the replica as their mid, so the
+        # basis and vol are fitted on the same series the fair is priced on.
+        bar_mid = res.price if self.depth_priced and not res.is_fallback else res.fallback_median_mid
+        self._nowcast = dataclasses.replace(res, fallback_median_mid=bar_mid)
         bar = CompositeBar(
             coin=self.coin, ts_s=float(second_s), price=res.price,
             utilized_depth=res.utilized_depth,
             n_venues_in=res.n_venues_in,
             n_venues_dropped=res.n_venues_dropped,
             is_fallback=res.is_fallback,
-            fallback_mid=res.fallback_median_mid,
+            fallback_mid=bar_mid,
             nowcast_count=self._nowcast_count,
         )
         self._bars.append(bar)
@@ -299,12 +314,13 @@ class CompositeBus:
 
     def __init__(self, coins=COINS, persist: bool = True,
                  persist_dir: Path = DATA_ROOT, venues: dict[str, tuple] | None = None,
-                 venue_stale_s: float | None = None):
-        """`venues`: coin -> venues forming that coin's mid (missing = all)."""
+                 venue_stale_s: float | None = None, depth_priced=frozenset()):
+        """`venues`: coin -> venues forming that coin's mid (missing = all).
+        `depth_priced`: coins priced on the CF replica (CompositeFeed)."""
         venues = venues or {}
         self.feeds: dict[str, CompositeFeed] = {
             c: CompositeFeed(c, persist=persist, persist_dir=persist_dir, venues=venues.get(c),
-                             venue_stale_s=venue_stale_s) for c in coins
+                             venue_stale_s=venue_stale_s, depth_priced=c in depth_priced) for c in coins
         }
 
     def touch(self, venue: str, coin: str, receive_ts: float):
