@@ -197,6 +197,9 @@ Kalshi meters writes in tokens (`GET /account/endpoint_costs`): create and
 amend 10, cancel 2. `KalshiOrderClient` keeps a token bucket at this
 process's share of the account refill rate. Orders that would overdraw it
 are dropped (the quoter re-decides next tick); cancels always go through.
+Cancels are sent from their own thread pool and HTTP session
+(`engine.CANCEL_WORKERS`), so they never wait behind creates, REST polls or
+file writes on the loop's default executor.
 
 ## Snapshot files
 

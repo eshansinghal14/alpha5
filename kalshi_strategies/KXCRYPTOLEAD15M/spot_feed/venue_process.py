@@ -468,14 +468,18 @@ class VenueProcess:
         with self._lock:
             frames = [self._frames.popleft() for _ in range(min(max_batches, len(self._frames)))]
         off = time.monotonic() - time.time()
+        # Trips first, from every frame: a trip pulls quotes, and the books
+        # queued ahead of it only reprice.
+        if on_trip is not None:
+            for fr in frames:
+                extra = fr[3] if len(fr) > 3 else {}
+                for kind, source, coin, level, thr, onset, recv_wall, exch_ts in extra.get("trips") or ():
+                    on_trip(kind, source, coin, level, thr, onset, recv_wall + off, exch_ts)
         for fr in frames:
             books, ps, alive = fr[:3]
             extra = fr[3] if len(fr) > 3 else {}
             if extra.get("status"):
                 self.status = extra["status"]
-            if on_trip is not None:
-                for kind, source, coin, level, thr, onset, recv_wall, exch_ts in extra.get("trips") or ():
-                    on_trip(kind, source, coin, level, thr, onset, recv_wall + off, exch_ts)
             if on_alive is not None:
                 for venue, coin, wall in alive:
                     on_alive(venue, coin, wall + off)

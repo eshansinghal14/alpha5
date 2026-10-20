@@ -57,6 +57,30 @@ def test_real_ladder_under_loop_rests_and_pulls_cleanly():
     asyncio.run(main())
 
 
+def test_cancel_does_not_wait_behind_a_full_default_executor():
+    """Default executor saturated with slow work (creates, REST polls, parquet
+    writes): a cancel still starts at once on its own pool."""
+    async def main():
+        loop = asyncio.get_running_loop()
+        import concurrent.futures
+        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(2))
+        eng, _, _ = setup(real=True)
+        client = SlowClient()
+        eng.order_client = client
+        eng.order_events = []
+        fair(eng)
+        await _settle(eng, 0.15)
+        assert len(eng.om.live()) == 2
+        for _ in range(4):
+            loop.run_in_executor(None, time.sleep, 0.5)
+        eng.pull_quotes()
+        await asyncio.sleep(0.1)
+        ca = [r for r in eng.order_events if r["event"] == "cancel_ack"]
+        assert len(ca) == 2 and all(r["pickup_s"] < 0.05 for r in ca)
+
+    asyncio.run(main())
+
+
 def test_shadow_ladder_under_loop_lands_after_send_latency():
     async def main():
         eng, _, _ = setup()

@@ -33,6 +33,7 @@ class _Session:
 def _client(shard):
     c = KalshiOrderClient.__new__(KalshiOrderClient)
     c._session = _Session()
+    c._cancel_session = c._session          # one recorder for every write, in order
     c._key = None
     c.timeout_s = 1.0
     c.shard = shard

@@ -89,6 +89,33 @@ def test_on_trip_pulls_and_logs_the_onset_only():
     assert len(rows) == 1 and rows[0]["kind"] == "move" and rows[0]["ratio"] == pytest.approx(1.5)
 
 
+class _Hooked:
+    """A model attached to the feed with a pull hook (see SpotFeed._pull)."""
+
+    def __init__(self, spot, block):
+        self.cfg, self.spot, self.block = spot.cfg, spot, block
+        self.pulled, self.woke = 0, 0
+
+    def quote_block(self, ticker, now_s):
+        return "spot_burst" if self.block and time.monotonic() < self.spot.burst_until else None
+
+    def pull_if_blocked(self):
+        if self.quote_block(None, time.time()):
+            self.pulled += 1
+
+    def _mid_moved(self):
+        self.woke += 1
+
+
+def test_pulling_trip_pulls_through_the_hook_before_the_reprice_wake():
+    spot = _spot()
+    pulls, quiet = _Hooked(spot, True), _Hooked(spot, False)
+    spot.models += [pulls, quiet]
+    spot._on_trip("move", MOVE_SOURCE, "XRP", 6.0, 4.0, True, time.monotonic(), None)
+    assert pulls.pulled == 1 and pulls.woke == 1
+    assert quiet.pulled == 0 and quiet.woke == 1          # its quote_block says no
+
+
 def test_on_trip_respects_burst_pull_coins():
     spot = _spot()
     mono = time.monotonic()

@@ -13,6 +13,7 @@ import os
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from kalshi_infra import REPO_ROOT
 from kalshi_infra.keys import KALSHI_API_KEY as API_KEY, KALSHI_PRIVATE_KEY_PATH
@@ -32,13 +33,21 @@ def load_private_key():
 
 
 def sign(method: str, path: str, key=None) -> tuple[str, str]:
-    """(timestamp_ms, base64 signature) for `method path`."""
+    """(timestamp_ms, base64 signature) for `method path`. The key type picks
+    the algorithm (Kalshi verifies by the registered public key).
+
+    Ed25519 is the fast one: on the c7g box 10-20, RSA-PSS 1.32ms per sign
+    vs Ed25519 0.044ms, and the RSA sign held the GIL (a spinning main
+    thread ran at half speed beside a signing thread), so every write cost
+    the trading loop ~1.3ms."""
     key = key or load_private_key()
     ts = str(int(datetime.datetime.now().timestamp() * 1000))
-    sig = key.sign((ts + method.upper() + path).encode("utf-8"),
-                   padding.PSS(mgf=padding.MGF1(hashes.SHA256()),
-                               salt_length=padding.PSS.DIGEST_LENGTH),
-                   hashes.SHA256())
+    msg = (ts + method.upper() + path).encode("utf-8")
+    if isinstance(key, Ed25519PrivateKey):
+        sig = key.sign(msg)
+    else:
+        sig = key.sign(msg, padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
+                       hashes.SHA256())
     return ts, base64.b64encode(sig).decode("utf-8")
 
 

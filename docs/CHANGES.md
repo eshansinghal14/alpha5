@@ -3,6 +3,37 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-20 — Cancels on their own lane; burst trips pull at once
+
+Measured on the race, 10-20 15:15-18:15 UTC, orders journal (178k cancels):
+decide -> send (`queued_s`) p50 0ms, p90 29ms; send -> ack on the loop p50
+32ms, p90 64ms, of which the Kalshi round trip measured on the worker was
+only p50 11ms. The extra time grew with writes in flight: 4ms with none, 14ms
+with 1-2, 24-34ms with 3-12 (p90 31 -> 62ms). Cancels shared the loop's
+default executor (8 threads) with creates, amends, REST polls and the feed's
+parquet writes. Of 38 fills that came after we decided to cancel, 20 were
+sent after the fill and the rest spent p50 34ms in that overhead.
+
+- Cancels run on their own 16-thread pool (`engine.CANCEL_WORKERS`) and
+  their own `requests.Session` with a 16-connection pool, warmed at client
+  build (a cold connection is ~105ms vs ~34ms warm). Orphan and sweep cancels
+  use it too. Bucket and priority rules are unchanged.
+- `create_ack` / `cancel_ack` journal rows add `pickup_s` (submit -> worker
+  start) and `done_wait_s` (worker done -> callback on the loop), so the next
+  measurement can tell queueing from the round trip from loop lag.
+- A pulling `spot_burst` trip now cancels from the trip callback
+  (`SpotFeed._pull` -> `model.pull_if_blocked` -> `engine.pull_burst`), ahead
+  of the reprice and quoter pass that used to send the cancels (race reprice
+  p95 8ms + dispatch p95 4ms). Each model checks its own `quote_block` first,
+  so single coins with `burst_own_coin_only` still pull only on their own coin.
+  Reason in the journal and counts: `pull_burst`.
+- Venue drain applies every queued frame's trips before any of its books.
+- `auth.sign` accepts an Ed25519 key. On the box, RSA-PSS takes 1.32ms per
+  sign and holds the GIL (a spinning main thread ran at half speed beside a
+  signing thread); Ed25519 takes 0.044ms. Using it needs a new Ed25519 API
+  key in Kalshi settings and `KALSHI_PRIVATE_KEY_PATH` pointed at it; nothing
+  else changes.
+
 ## 2026-10-20 — Bybit dropped; dashboard refreshes only what is viewed
 
 - Bybit is no longer run (`LEADING_VENUES`, `PERP_SOURCES`, `perp_nowcast.PERPS`):

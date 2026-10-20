@@ -194,6 +194,17 @@ def test_immediate_book_frame_wakes_parent(monkeypatch):
         p.stop()
 
 
+def test_drain_applies_trips_before_books_queued_ahead_of_them():
+    p = vp.VenueProcess({"kraken": ["BTC"]})
+    now = time.time()
+    book = ("kraken", "BTC", "BTC/USD", ((100.0, 1.0),), ((100.2, 1.0),), now, None, False)
+    p._frames.extend([([book], [], [], {}), ([book], [], [], {}),
+                      ([], [], [], {"trips": [("move", "perp_move", "BTC", 5.0, 3.0, True, now, now)]})])
+    seen = []
+    p.drain(lambda vb: seen.append("book"), on_trip=lambda *a: seen.append("trip"))
+    assert seen == ["trip", "book", "book"]
+
+
 def test_dead_child_is_restarted_with_backoff(monkeypatch):
     _stubbed(monkeypatch, n=1, tail="")          # exits right after one frame
     clock = [0.0]

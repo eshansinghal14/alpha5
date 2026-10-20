@@ -84,6 +84,24 @@ SHADOW_WRITE_TOKENS_PER_S = 100.0 * 0.8
 # side-convention error in how the response was read, not a better fill.
 PRICE_SANITY_TOL = 0.01
 
+# Cancels run on their own threads. On the loop's default executor (8 workers
+# on the 4-core box) they queued behind creates, amends, REST polls and the
+# feed's parquet writes: race 10-20 15:15-18:15 UTC, a cancel's send -> ack on
+# the loop was p50 32ms vs an 11ms worker round trip, and that overhead grew
+# with writes in flight (4ms with none, 34ms with 8-12). Sized above the most
+# cancels one pull sends at once (a full race pull is 10 quotes).
+CANCEL_WORKERS = 16
+_CANCEL_POOL = None
+
+
+def _cancel_pool():
+    global _CANCEL_POOL
+    if _CANCEL_POOL is None:
+        import concurrent.futures
+        _CANCEL_POOL = concurrent.futures.ThreadPoolExecutor(CANCEL_WORKERS, thread_name_prefix="cancel")
+    return _CANCEL_POOL
+
+
 # cancel_resting: pause between list-and-cancel passes, and the overall cap.
 # The cap exceeds the configured order timeout (5s) so any POST in flight at
 # shutdown has landed or timed out before the sweep can give up.
@@ -1049,7 +1067,7 @@ class LiveEngine:
             self.n_real_quotes += 1
             self.n_real_in_flight += 1
             self._oev("create_sent", q, size=q.size)
-            self._run_blocking(lambda: self._timed(lambda: self._rest_blocking(order)),
+            self._run_blocking(self._timed(lambda: self._rest_blocking(order)),
                                lambda res: self._on_real_quote_timed(order, res))
             return True
         # Shadow: lands after the modelled send latency, against the book then.
@@ -1079,8 +1097,10 @@ class LiveEngine:
                 self._cancel_decided.popitem(last=False)
         self._oev("cancel_sent", q, reason=reason,
                   queued_s=None if q.cancel_at is None else time.time() - q.cancel_at)
-        self._run_blocking(lambda: self._timed(lambda: self._cancel_send(exchange_id, ticker)),
-                           lambda res: self._on_cancel_result(q.order_id, res[0], reason, rtt=res[1]))
+        self._run_blocking(self._timed(lambda: self._cancel_send(exchange_id, ticker)),
+                           lambda res: self._on_cancel_result(q.order_id, res[0], reason, rtt=res[1],
+                                                              pickup=res[2], done_wait=time.perf_counter() - res[3]),
+                           executor=_cancel_pool())
 
     def _om_amend(self, q, price: float, remaining: float) -> bool:
         """Move a resting quote to `price` (own-side) and `remaining` resting
@@ -1155,15 +1175,23 @@ class LiveEngine:
 
     @staticmethod
     def _timed(work):
-        """(work(), seconds it took) -- on the worker thread, so the RTT excludes
-        the loop's wait to run the done callback."""
-        t0 = time.perf_counter()
-        r = work()
-        return r, time.perf_counter() - t0
+        """Returns a callable for the worker: (work(), seconds it took, seconds
+        from submit to the worker starting it, perf_counter when it finished).
+        Time submitted is taken here, on the loop, so `pickup` is the
+        executor's queue wait and the RTT excludes the done-callback wait."""
+        t_sub = time.perf_counter()
 
-    def _run_blocking(self, work, done):
-        """Run `work` on the default executor and `done(result)` back on the
-        loop; inline when there is no running loop (tests)."""
+        def run():
+            t0 = time.perf_counter()
+            r = work()
+            t1 = time.perf_counter()
+            return r, t1 - t0, t0 - t_sub, t1
+        return run
+
+    def _run_blocking(self, work, done, executor=None):
+        """Run `work` on `executor` (None = the loop's default) and
+        `done(result)` back on the loop; inline when there is no running loop
+        (tests)."""
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -1171,7 +1199,7 @@ class LiveEngine:
         if loop is None:
             done(work())
             return
-        loop.run_in_executor(None, work).add_done_callback(
+        loop.run_in_executor(executor, work).add_done_callback(
             lambda f: loop.call_soon_threadsafe(done, f.result()) if not loop.is_closed() else None)
 
     def _schedule_shadow(self, order: Order):
@@ -1218,10 +1246,11 @@ class LiveEngine:
             return None, exc
 
     def _on_real_quote_timed(self, order: Order, res: tuple):
-        result, rtt = res
+        result, rtt, pickup, t_done = res
         ack, exc = result
         self._oev("create_ack", order_id=order.order_id, ticker=order.ticker, side=order.side, price=order.price,
-                  role=getattr(order, "role", None), rtt_s=rtt,
+                  role=getattr(order, "role", None), rtt_s=rtt, pickup_s=pickup,
+                  done_wait_s=time.perf_counter() - t_done,
                   exchange_id=None if ack is None else ack.exchange_order_id,
                   status="ok" if exc is None else f"err:{http_status(exc)}")
         self._on_real_quote_result(order, result)
@@ -1364,10 +1393,12 @@ class LiveEngine:
         self.order_client.allow_now("cancel", force=True, reason=reason)
         return self._cancel_send(exchange_id, ticker)
 
-    def _on_cancel_result(self, order_id: int, result: tuple, reason: str = "retry", rtt: float | None = None):
+    def _on_cancel_result(self, order_id: int, result: tuple, reason: str = "retry", rtt: float | None = None,
+                          pickup: float | None = None, done_wait: float | None = None):
         ok, exc = result
         q = self.om.quotes.get(order_id)
-        self._oev("cancel_ack", q, order_id=order_id, reason=reason, rtt_s=rtt,
+        self._oev("cancel_ack", q, order_id=order_id, reason=reason, rtt_s=rtt, pickup_s=pickup,
+                  done_wait_s=done_wait,
                   status=("ok" if ok else "gone") if exc is None else f"err:{http_status(exc)}")
         if exc is not None:
             if http_status(exc) == 429:
@@ -1390,7 +1421,8 @@ class LiveEngine:
         """Cancel by exchange id, for orders we never got to track (a session
         reset or an unreadable response mid-flight). Pass the ticker: without
         it the cancel can't be routed to a non-zero shard."""
-        self._run_blocking(lambda: self._cancel_blocking(exchange_id, ticker, reason), lambda res: None)
+        self._run_blocking(lambda: self._cancel_blocking(exchange_id, ticker, reason), lambda res: None,
+                           executor=_cancel_pool())
 
     # -----------------------------------------------------------------
     # Real fills (websocket `fill` channel, plus a REST backstop)
@@ -1513,6 +1545,13 @@ class LiveEngine:
         session reset). Nothing is re-created until the quoter publishes
         again. Cancelling a resting offer is not flattening."""
         self.om.pull_all("pull")
+
+    def pull_burst(self):
+        """pull_quotes from a feed callback (spot_burst trip), ahead of the
+        reprice that would have pulled them. Only if something is up: trips
+        resend every 50ms while they hold."""
+        if self.has_uncancelled_quotes():
+            self.om.pull_all("pull_burst")
 
     def cancel_resting(self):
         """BLOCKING sweep: cancel every order this account still has resting

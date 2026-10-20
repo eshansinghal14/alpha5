@@ -313,6 +313,9 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
     attach = getattr(model, "attach_engine", None)   # optional: models that read our positions
     if attach is not None:
         attach(engine)
+    pull_hook = getattr(model, "set_pull_hook", None)   # optional: models whose feeds can pull at once
+    if pull_hook is not None:
+        pull_hook(engine.pull_burst)
     group = None
     if series.write_group is not None:
         shard = order_client.shard if order_client is not None else None

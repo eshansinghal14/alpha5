@@ -163,6 +163,16 @@ def test_pull_quotes_then_nothing_recreated_until_next_decision():
     assert len(client.creates) == 4
 
 
+def test_pull_burst_cancels_everything_once():
+    eng, _, client = setup(real=True)
+    fair(eng)
+    eng.pull_burst()
+    assert sorted(client.cancels) == ["ex1", "ex2"] and eng.om.live() == []
+    assert eng.om.counts["cancel:pull_burst"] == 2
+    eng.pull_burst()                         # trip resend with nothing up: no writes
+    assert len(client.cancels) == 2
+
+
 def test_disarm_cancels_on_kalshi_before_flipping_mode():
     eng, _, client = setup(real=True)
     fair(eng)
@@ -229,6 +239,7 @@ def test_order_events_time_the_round_trips_and_flag_a_fill_that_raced_its_cancel
     ca = [r for r in ev if r["event"] == "cancel_ack"]
     assert len(sent) == 2 and len(ca) == 2 and all(r["queued_s"] is not None for r in sent)
     assert all(r["rtt_s"] >= 0 and r["status"] == "ok" for r in ca)
+    assert all(r["pickup_s"] >= 0 and r["done_wait_s"] >= 0 for r in ca + acks)
     fill(eng, x, "no", trade="t9")
     (f,) = [r for r in ev if r["event"] == "fill"]
     assert f["state"] == "gone" and f["cancel_decided_t"] is not None and f["cancel_reason"]

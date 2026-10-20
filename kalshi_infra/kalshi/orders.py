@@ -36,6 +36,7 @@ import time
 import uuid
 
 import requests
+import requests.adapters
 
 from kalshi_backtest.core import Order
 from kalshi_infra.kalshi import auth
@@ -267,6 +268,13 @@ class KalshiOrderClient:
         (see write_budget_tokens_per_s). `budget`: a bucket shared with other
         clients; tokens_per_s is then taken from it."""
         self._session = requests.Session()
+        # Cancels get their own connection pool: on the shared one a burst of
+        # creates (12 in flight, 10-20) could hold every pooled connection.
+        self._cancel_session = requests.Session()
+        # One pooled connection per cancel worker (engine.CANCEL_WORKERS); past
+        # the default 10, urllib3 opens and discards a fresh TLS connection
+        # (~105ms vs ~34ms warm, see execution.MEASURED_SEND_S).
+        self._cancel_session.mount("https://", requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=16))
         self._key = auth.load_private_key()
         self._lock = threading.Lock()
         self.budget = budget if budget is not None else WriteBudget(tokens_per_s)
@@ -290,7 +298,16 @@ class KalshiOrderClient:
         c = cls(tokens_per_s=process_write_tokens_per_s() if budget is None else budget.tokens_per_s,
                 budget=budget)
         c.shard = shard
+        c.warm()
         return c
+
+    def warm(self):
+        """Open the cancel session's connection now, so the first cancel of an
+        event isn't the one paying for TCP+TLS. A public GET: no write tokens."""
+        try:
+            self._cancel_session.get(BASE_URL + "/trade-api/v2/exchange/status", timeout=self.timeout_s)
+        except Exception:
+            pass
 
     # Exchange shard every order write is pinned to, or None to auto-route.
     # Per GET /getting_started/rate_limits (2026-10-10): a single create,
@@ -483,8 +500,8 @@ class KalshiOrderClient:
             raise ValueError(f"cancel {exchange_order_id}: market_ticker is required")
         path = f"{ORDERS_PATH}/{exchange_order_id}"
         params = {"market_ticker": market_ticker, **self._shard_field()}
-        resp = self._session.delete(BASE_URL + path, headers=self._headers("DELETE", path),
-                                    params=params, timeout=self.timeout_s)
+        resp = self._cancel_session.delete(BASE_URL + path, headers=self._headers("DELETE", path),
+                                           params=params, timeout=self.timeout_s)
         if resp.status_code == 404:
             return False
         _raise_with_body(resp)

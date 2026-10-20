@@ -86,6 +86,14 @@ class UpDownModel:
     def set_wakeup(self, fn):
         self._wake = fn
 
+    def set_pull_hook(self, fn):
+        self._pull_hook = fn
+
+    def pull_if_blocked(self):
+        """SpotFeed, on a pulling trip: pull every quote now if quote_block says so."""
+        if getattr(self, "_pull_hook", None) is not None and self.quote_block(self.ticker, time.time()):
+            self._pull_hook()
+
     def _mid_moved(self):
         self._dirty = True
         if self._wake is not None:

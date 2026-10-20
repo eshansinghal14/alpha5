@@ -174,6 +174,14 @@ class CoinRaceModel:
     def set_wakeup(self, fn):
         self._wake = fn
 
+    def set_pull_hook(self, fn):
+        self._pull_hook = fn
+
+    def pull_if_blocked(self):
+        """SpotFeed, on a pulling trip: pull every quote now if quote_block says so."""
+        if getattr(self, "_pull_hook", None) is not None and self.quote_block(None, time.time()):
+            self._pull_hook()
+
     def _on_book(self, vb):
         """Venue book (without a SpotFeed). Wakes the reprice only when the
         coin's mid moves: level2 sends ~64 msg/s across the five coins but the

@@ -101,19 +101,43 @@ Race, last 9h (293 fills):
 SOL, last 9h (1,258 fills): 82% BLIND (-0.85c at 10s), 18% RACE. SOL's loss
 is mostly flow we can't see, not latency.
 
+## Cancel path measured 10-20 ~18:30 UTC (code changed, NOT yet deployed)
+
+Race orders journal 15:15-18:15 (178k cancels); script `cq.py`/`cq2.py` in
+the session temp dir:
+- Not the bucket or the queue: `queued_s` p50 0 / p90 29ms (the p90 is
+  `after_ack`, a cancel decided while the create was still in flight);
+  `cancel_deferred:bucket` 119 of ~6k cancels; bucket utilization 46%.
+- The loss is AFTER we send: send -> ack on the loop p50 32ms vs the worker's
+  own Kalshi round trip p50 11ms. That gap grows with writes in flight
+  (4ms at 0, 24-34ms at 3-12): cancels shared the default executor with
+  creates, REST polls and parquet writes.
+- 38 fills after a decided cancel: 20 had the cancel sent AFTER the fill
+  (mostly `after_ack`: the create hadn't returned yet, nothing to cancel by);
+  the rest had p50 34ms overhead on top of a 16ms RTT.
+- Pulling trips: `seen_delay_s` (receipt -> applied) p50 2-3ms for venue
+  trips; network (exch -> recv) Binance p50 139ms, OKX 130ms, perp_move 225ms
+  (the move window), Coinbase 8ms. The in-process hop is small; the network
+  hop for perps is what's large.
+- RSA signing 1.32ms per write, holds the GIL. py-spy 30s: the main thread
+  is mostly `pricer._argmax_probs` / `fairs_at` and order_manager `live()`.
+
+Changes (see CHANGES.md "Cancels on their own lane"): cancel thread pool +
+session, trip -> pull directly, trips drained before books, Ed25519 signing
+support, `pickup_s` / `done_wait_s` on acks. Deploy, then re-run `cq2.py`:
+expect cancel overhead near the 0-in-flight figure (~4ms p50).
+
 ## Next steps (in order)
 
-1. **Cancel queueing.** Why do cancels decided 10-50ms before a fill still
-   lose? Check `orders` journal `queued_s` (decide -> send) and whether
-   cancels wait behind creates in the write group's queue / token bucket.
-   Make cancels jump everything. Cheapest likely win.
-2. **Trigger-to-pull path.** Trip prints reach us ~40ms after exchange time
-   (median) vs ~13ms Coinbase network. Measure each hop: socket recv ->
-   venue child parse -> pipe -> parent drain -> trip handler -> cancel send.
+1. **Deploy and re-measure the cancel lane** (above). If `after_ack` races
+   remain the bulk, the next lever is fewer creates that are cancelled on
+   arrival (52% of creates are cancelled within 100ms of their ack).
+2. **Ed25519 key** (user action: generate in Kalshi settings, point
+   `KALSHI_PRIVATE_KEY_PATH` at it). Saves ~1.3ms of GIL per write.
 3. **Price what's left:** widen early-event (first 1-5 min) or delay real
    trading (`trading_time.real_trading_delay_s`); revert race order_lots
    15 -> 10; cut HYPE in the race.
-4. Box CPU: with BTC single-coin running, load 5.7-7 on 4 cores and race
+4. Box CPU: with BTC single-coin running, load 4.3-7 on 4 cores and race
    loop lag p95 rose 7.7 -> 27ms. If race stale_signal climbs, stop
    alpha5-crypto15m-btc or resize to c7g.2xlarge.
 5. Watch the race's `max_signal_age_s` 0.03 (user's edit): ~16-18% of

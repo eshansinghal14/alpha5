@@ -161,8 +161,14 @@ class SpotFeed:
         self.burst_coin = coin if src == "coinbase" else f"{coin}@{src}"
         self.burst_until_by_coin[coin] = max(self.burst_until_by_coin.get(coin, 0.0),
                                              as_of + self.cfg.pricing.burst_hold_s)
-        # A pull must reach the quoter now, not at the next mid move. Every
-        # model: the race pulls the whole event on any coin's burst.
+        # Cancels go out from here, before the reprice and quoter pass that
+        # would otherwise send them (race 10-20: reprice p95 8ms + dispatch p95
+        # 4ms after the loop wakes). Each model decides from its own
+        # quote_block whether this burst is one it pulls on.
+        for m in self.models:
+            pull = getattr(m, "pull_if_blocked", None)
+            if pull is not None:
+                pull()
         for m in self.models:
             m._mid_moved()
 
