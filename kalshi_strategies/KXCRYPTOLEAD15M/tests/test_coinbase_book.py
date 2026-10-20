@@ -193,8 +193,10 @@ def _ex_ready(ad, coin="SOL", bid=100.0, ask=100.1):
     ad._ex_snapshot(coin, {"bids": [[str(bid), "5"]], "asks": [[str(ask), "5"]]}, _t.monotonic())
 
 
-def test_views_come_from_the_exchange_book_while_synced_then_fall_back():
+def test_views_come_from_the_exchange_book_while_synced_then_fall_back(monkeypatch):
     import asyncio, time as _t
+    from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed import coinbase as cbm
+    monkeypatch.setattr(cbm, "EX_BOOK", True)
     ad = CoinbaseAdapter(coins=["SOL"])
     at = ad._books["SOL"]
     at.apply_snapshot(bids=[(99.0, 1)], asks=[(99.2, 1)])
@@ -213,8 +215,10 @@ def test_views_come_from_the_exchange_book_while_synced_then_fall_back():
     assert views[-1].best_bid() == 99.1
 
 
-def test_ticker_touch_outside_the_book_is_held_until_the_book_reaches_it():
+def test_ticker_touch_outside_the_book_is_held_until_the_book_reaches_it(monkeypatch):
     import asyncio, time as _t
+    from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed import coinbase as cbm
+    monkeypatch.setattr(cbm, "EX_BOOK", True)
     ad = CoinbaseAdapter(coins=["SOL"])
     views = []
     _ex_ready(ad)

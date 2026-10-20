@@ -58,7 +58,10 @@ EX_WS_URL = "wss://ws-feed.exchange.coinbase.com"
 # synced, Advanced Trade level2 as the fallback; plus its ticker. Same 5 min
 # test: touch-change delay p50/p90 BTC 45/186ms on Advanced Trade vs 15/41ms
 # here, SOL 24/54 vs 24/52, HYPE 31/54 vs 29/56. False = book on Advanced Trade.
-EX_BOOK = True
+# Off: live 10-20 05:29-05:45 UTC the race's signal age went p50 10 -> 24ms and
+# decisions over the 30ms limit 14% -> 40%; level2_batch's ~50ms batching shows
+# up as book age, which the oldest-coin signal age takes in full.
+EX_BOOK = False
 RECONNECT_DELAY_S = 1.0
 # The heartbeats channel sends one message per second on the connection,
 # so a silent socket is dead well before this.

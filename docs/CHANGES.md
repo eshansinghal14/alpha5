@@ -3,6 +3,22 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-20 — Coinbase book back on Advanced Trade
+
+- `coinbase.EX_BOOK = False`. Live 05:29-05:45 UTC on the Exchange
+  `level2_batch` book, the race's signal age went p50 10 -> 24ms, p99 55 ->
+  98ms, and decisions over the 30ms limit 14% -> 40% (over 60ms 0.7% -> 6%).
+  Its ~50ms batches leave the book up to a batch old between messages, and the
+  race's signal age is the oldest coin's newest book. Exchange `matches` still
+  carry prints. The Exchange-book code stays for a later try (e.g. with the
+  batch age not counted against the limit).
+- Same 30 min recording (05:15-05:45 UTC), each candidate vs the real CF index
+  after the model's 30s basis, rms bp: BTC Coinbase alone 0.47, median of
+  6 venues 0.33; ETH 0.73 vs 0.53; XRP 0.66 vs 0.43. The other venues' median
+  alone (0.39 / 0.56 / 0.47) also beat Coinbase alone, and "Coinbase unless
+  > X bp from the others" was no better than Coinbase alone at any X. The
+  multi-venue median stays for BTC/ETH/XRP.
+
 ## 2026-10-20 — Coinbase book from the Exchange feed
 
 - `CoinbaseAdapter` builds its book views from the Exchange feed's
