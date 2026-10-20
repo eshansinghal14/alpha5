@@ -3,6 +3,27 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-20 — Feed load cuts; all five single coins in one process
+
+- Perp book updates whose touch prices are unchanged are dropped at the
+  adapter, except one per 0.25 s per coin (`venues.PERP_SAME_TOUCH_S`). Binance
+  bookTicker is ~711 msg/s on BTC for ~6 mid changes/s; the perp books only
+  feed the nowcast mid and the recorder. Probe 10-20 16:19 UTC (bare listener
+  beside the live venue child, same trade ids): Binance prints held in our
+  process p50 6ms / p90 178 / p99 685ms over the network's 73 / 99 / 154ms,
+  rising with burst size (busiest quarter p90 396ms).
+- Hyperliquid is no longer run (`LEADING_VENUES`): prints reached us p50
+  ~400ms after trade time vs Binance ~80ms, and it only pulled HYPE.
+- A venue child under `CRYPTO15M_PERSIST=0` no longer records books, venue
+  prints or perp prints (they were written twice, once per trading process).
+- `alpha5-crypto15m` runs KXBTC15M, KXETH15M, KXSOL15M, KXXRP15M and KXHYPE15M
+  in one process (one SpotFeed, one venue child, one 20% write bucket), in
+  place of `alpha5-crypto15m-sol`.
+- The multi-second Coinbase print holds seen in the probe were the race
+  process's Advanced Trade / Exchange sockets reconnecting (recv timeout
+  after a ConnectionClosed, 1 s retry): 1-2 per 15 min event 07:15-10:00 UTC,
+  none since; a 4 min re-probe at 16:33 had p99 85ms, max 140ms.
+
 ## 2026-10-20 — Coinbase book back on Advanced Trade
 
 - `coinbase.EX_BOOK = False`. Live 05:29-05:45 UTC on the Exchange

@@ -104,4 +104,22 @@ def test_venue_thresholds_leave_out_too_hot_and_coinbase():
     spot.calib["binance_perp"]._n = spot.calib["binance_perp"]._buf.shape[1]     # ready
     thr = spot._venue_thresholds()
     assert "coinbase" not in thr and thr["binance_perp"]["BTC"] == 1e6
-    assert "BTC" in thr["hyperliquid"]                                         # static HL fallback
+    assert "BTC" in thr["hyperliquid"]          # static HL fallback (sent, unused: no HL adapter runs)
+
+
+def test_hyperliquid_not_in_the_venue_plan():
+    from kalshi_strategies.KXCRYPTOLEAD15M.live_feed import venue_plan
+    plan = venue_plan()
+    assert "hyperliquid" not in plan and all(v in plan for v in ("binance_perp", "bybit_perp", "okx_perp"))
+
+
+def test_perp_bbo_with_unchanged_touch_is_dropped_but_kept_alive():
+    from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed import venues as vn
+    ad = vn.BinancePerpAdapter(["BTC"])
+    out = []
+    ad._bbo("BTC", "100.0", "1", "100.1", "2", 1.00, None, out.append)
+    ad._bbo("BTC", "100.0", "5", "100.1", "2", 1.05, None, out.append)            # size only: dropped
+    assert len(out) == 1 and ad.n_bbo_dropped == 1
+    ad._bbo("BTC", "100.0", "5", "100.1", "2", 1.00 + vn.PERP_SAME_TOUCH_S + 0.01, None, out.append)  # keep-alive
+    ad._bbo("BTC", "100.05", "5", "100.1", "2", 1.30, None, out.append)           # touch moved
+    assert len(out) == 3 and out[-1].best_bid() == 100.05

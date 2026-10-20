@@ -252,12 +252,14 @@ def _child_main(plan: dict[str, list[str]]):
             return
         prints.append((kind, coin, t, time.time() - (time.monotonic() - as_of), exch_ts))
 
+    owns_files = os.environ.get("CRYPTO15M_PERSIST", "1") != "0"
+
     async def record_perps():
         nonlocal perp_rows
         while True:
             await asyncio.sleep(PERP_FLUSH_S)
             rows, perp_rows = perp_rows, []
-            if rows:
+            if rows and owns_files:
                 try:
                     await asyncio.get_running_loop().run_in_executor(None, _write_perp_prints, rows)
                 except Exception as e:
@@ -298,7 +300,10 @@ def _child_main(plan: dict[str, list[str]]):
                 os._exit(0)
 
     recorder = None
-    if RECORD_IN_VENUE_PROCESS:
+    # A second trading process (the single coins, CRYPTO15M_PERSIST=0) runs
+    # its own venue child on the same sockets; recording twice wrote every
+    # book sample and print twice. Only the owner's child records.
+    if RECORD_IN_VENUE_PROCESS and os.environ.get("CRYPTO15M_PERSIST", "1") != "0":
         try:
             from ..research.record_books import Recorder
             recorder = Recorder(adapters={})

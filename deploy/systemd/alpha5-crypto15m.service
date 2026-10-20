@@ -1,0 +1,32 @@
+[Unit]
+Description=alpha5 single-coin 15M (KXBTC15M, KXETH15M, KXSOL15M, KXXRP15M, KXHYPE15M), shadow unless armed
+After=network-online.target chrony.service alpha5-crypto.service
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/opt/alpha5
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+# All five in one process: one SpotFeed (one Coinbase socket set, one venue
+# child) and one write bucket. Replaces alpha5-crypto15m-sol; a process per
+# coin would run a venue child each (~30% CPU, ~1 GB per child, 10-20 16:00 UTC).
+Environment=CRYPTO15M_GROUP=crypto15m
+Environment=ALPHA5_PRIORITY=normal
+Nice=0
+# alpha5-crypto writes the shared spot files and records books/prints; this
+# process and its venue child only read them.
+Environment=CRYPTO15M_PERSIST=0
+# Same shard (2) as alpha5-crypto, which can't see this process's writes:
+# capped at 20% of the 300/s budget (60/s). SOL alone used ~24/s (10-20).
+Environment=KALSHI_WRITE_SHARE=0.2
+ExecStart=/opt/alpha5/.venv/bin/python -u -m kalshi_strategies.run --only KXBTC15M KXETH15M KXSOL15M KXXRP15M KXHYPE15M --resume-arm-h 18
+KillSignal=SIGINT
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/opt/alpha5/data/live/crypto15m.out.log
+StandardError=append:/opt/alpha5/data/live/crypto15m.err.log
+
+[Install]
+WantedBy=multi-user.target

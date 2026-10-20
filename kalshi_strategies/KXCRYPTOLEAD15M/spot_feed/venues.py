@@ -81,6 +81,8 @@ class _Venue:
                                               ping_timeout=15, max_size=MAX_FRAME) as ws:
                     for pb in self._books.values():
                         pb.clear()
+                    if hasattr(self, "_last_touch"):
+                        self._last_touch.clear()      # first book after a resubscribe always goes out
                     await self._subscribe(ws)
                     while True:
                         raw = await asyncio.wait_for(ws.recv(), RECV_TIMEOUT_S)
@@ -477,6 +479,13 @@ class HyperliquidAdapter(_Venue):
 # constituent median. Top of book + every print.
 # ---------------------------------------------------------------------------
 
+# A perp book update whose touch prices are unchanged is dropped, except one
+# per this interval per coin (keeps the book's age and size current). Binance
+# bookTicker: ~711 msg/s on BTC for ~6 mid changes/s (10-20 recording); the
+# perp books only feed the nowcast mid and the recorder.
+PERP_SAME_TOUCH_S = 0.25
+
+
 class _PerpSignal(_Venue):
     """Emits a 1-level book under `venue` and every print to `on_print`
     (same signature as HyperliquidAdapter's, kind = venue)."""
@@ -484,8 +493,16 @@ class _PerpSignal(_Venue):
     def __init__(self, coins):
         super().__init__(coins)
         self.on_print = None
+        self._last_touch: dict[str, tuple] = {}
+        self.n_bbo_dropped = 0
 
     def _bbo(self, coin, bid, bsz, ask, asz, as_of, exch_ts, on_update):
+        touch = (bid, ask)
+        last = self._last_touch.get(coin)
+        if last is not None and last[0] == touch and as_of - last[1] < PERP_SAME_TOUCH_S:
+            self.n_bbo_dropped += 1
+            return None
+        self._last_touch[coin] = (touch, as_of)
         pb = self._books[coin]
         pb.apply_snapshot([(float(bid), float(bsz))], [(float(ask), float(asz))])
         pb.last_receive_ts, pb.last_exchange_ts = as_of, exch_ts
@@ -605,8 +622,12 @@ class OkxPerpAdapter(_PerpSignal):
                             "BUY" if t["side"] == "buy" else "SELL", as_of, int(t["ts"]) / 1e3)
 
 
-# Venues that are signals only: never in a median, never priced.
-LEADING_VENUES = ("hyperliquid", "binance_perp", "bybit_perp", "okx_perp")
+# Venues that are signals only: never in a median, never priced. Hyperliquid
+# is no longer run (the adapter stays): its prints reached us p50 ~400ms after
+# trade time (us-east-2, 10-20 16:00 UTC) vs Binance ~80ms, its prior-0.5s
+# return explained 0.2-0.4% of Coinbase's next 1s move vs 1.3-10.5% for Binance
+# (10-19), and it only pulled HYPE.
+LEADING_VENUES = ("binance_perp", "bybit_perp", "okx_perp")
 
 ADAPTERS = {a.venue: a for a in (KrakenAdapter, BitstampAdapter, GeminiAdapter, CryptoComAdapter, BullishAdapter,
                                  HyperliquidAdapter, BinancePerpAdapter, BybitPerpAdapter, OkxPerpAdapter)}
