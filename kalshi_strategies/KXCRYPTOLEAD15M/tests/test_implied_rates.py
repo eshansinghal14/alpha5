@@ -97,6 +97,7 @@ def _race(now, **pricing):
     m.spot = type("S", (), {})()
     m.spot.implied_rates = iv = ImpliedRates()
     m.spot.sample = lambda now_s: None
+    m.spot.burst_until = 0.0
     _feed(m, time.monotonic())
     return m, iv
 
@@ -143,6 +144,48 @@ def test_no_fallback_withholds():
     _fill(iv, [c for c in COINS if c != "ETH"], now)
     out = m._price(now, None)
     assert all(f is None for f in out.values()) and m.withheld_reason == "no_implied_vol:ETH"
+
+
+def _vol_bars(m, coin, now, bp_per_10s):
+    """60s of 1s bars for `coin` whose 10s returns are +-bp_per_10s (realized
+    per-second vol = bp_per_10s / sqrt(10))."""
+    from kalshi_strategies.KXCRYPTOLEAD15M.composite import CompositeBar
+    f = m.bus.feeds[coin]
+    p0 = f._bars[-1].mid if f._bars else 100.0
+    f._bars.clear()
+    for k in range(80):
+        p = p0 * math.exp((bp_per_10s * 1e-4) * (1 if (k // 10) % 2 else 0))
+        f._bars.append(CompositeBar(coin, float(int(now) - 80 + k), p, 1.0, 1, 0, False, p, 1))
+
+
+def test_held_vol_pulls_when_realized_runs_away_from_the_held_value():
+    """Held 0.7bp/sqrt(s); realized ~2.5x that -> held_vol pull. Back near the
+    held value -> no new pull; the hold expires."""
+    now = time.time()
+    m, iv = _race(now, implied_fallback_realized=False, implied_hold_s=600.0, implied_ema_s=120.0,
+                  held_vol_check=True, held_vol_window_s=60.0, held_vol_ratio=2.0, held_vol_hold_s=30.0)
+    _fill(iv, COINS, now, s=0.7e-4)
+    m._price(now, None)
+    _vol_bars(m, "ETH", now, 0.7 * 2.5 * math.sqrt(10))          # bars end at the CF horizon (basis needs overlap)
+    m._price(now + 150, None)
+    assert m.vol_src["ETH"] == "held", m.vol_src
+    assert m.held_vol_ratio["ETH"] > 2.0, m.held_vol_ratio
+    assert m.quote_block(None, now + 150) == "held_vol"
+    m._held_vol_until = time.monotonic() - 1                 # hold expired
+    _vol_bars(m, "ETH", now, 0.7 * math.sqrt(10))            # realized back at the held value
+    m._price(now + 151, None)
+    assert 0.5 < m.held_vol_ratio["ETH"] < 2.0 and m.quote_block(None, now + 151) is None
+
+
+def test_held_vol_ignores_coins_on_live_implied():
+    now = time.time()
+    m, iv = _race(now, implied_fallback_realized=False, held_vol_check=True, held_vol_window_s=60.0,
+                  held_vol_ratio=2.0, held_vol_hold_s=30.0)
+    _fill(iv, COINS, now, s=0.7e-4)
+    _vol_bars(m, "ETH", now, 0.7 * 5 * math.sqrt(10))
+    m._price(now, None)
+    assert m.vol_src["ETH"] == "implied" and "ETH" not in m.held_vol_ratio
+    assert m.quote_block(None, now) is None
 
 
 def test_pricer_rate_override():

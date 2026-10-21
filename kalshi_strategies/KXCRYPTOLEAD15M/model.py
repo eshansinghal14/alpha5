@@ -111,6 +111,12 @@ class CoinRaceModel:
         self._dirty = True
         self.basis_bp: dict[str, float] = {}
         self.priced_on: dict[str, str] = {}
+        # held_vol pull (see _held_vol_check): monotonic until, and the last ratios.
+        self._held_vol_until = 0.0
+        self._held_vol_coin: str | None = None
+        self._held_vol_logged = False
+        self._held_check_sec: int | None = None
+        self.held_vol_ratio: dict[str, float] = {}
         self._basis_cache: dict[str, tuple] = {}
         self.vol_bp: dict[str, float] = {}
         self.vol_src: dict[str, str] = {}
@@ -235,6 +241,45 @@ class CoinRaceModel:
                 diffs.append(math.log(m / v))
         return float(np.mean(diffs)) if len(diffs) >= BASIS_MIN_S else None
 
+    def _realized_rate(self, coin: str, window_s: float) -> float | None:
+        """Per-second variance of `coin` over the last window_s, from 10s returns
+        on the 1s bars (single coins' vol_burst estimator), or None if short."""
+        bars = self.bus.feeds[coin].tail(int(window_s) + 12)
+        lp = {int(b.ts_s): math.log(b.mid) for b in bars if b.mid and b.mid > 0}
+        if not lp:
+            return None
+        newest = max(lp)
+        r = [lp[s] - lp[s - 10] for s in lp if s > newest - window_s and s - 10 in lp]
+        if len(r) < 0.8 * window_s:
+            return None
+        return float(np.mean(np.square(r))) / 10.0
+
+    def _held_vol_check(self, now_s: float, rates: dict):
+        """Pull the race while any coin's held implied vol disagrees with its
+        realized vol by more than held_vol_ratio. Once per second."""
+        p = self.cfg.pricing
+        sec = int(now_s)
+        if not p.held_vol_check or sec == self._held_check_sec:
+            return
+        self._held_check_sec = sec
+        self.held_vol_ratio = {}
+        for c in COINS:
+            if self.vol_src.get(c) != "held" or not rates.get(c):
+                continue
+            rv = self._realized_rate(c, p.held_vol_window_s)
+            if rv is None:
+                continue
+            ratio = math.sqrt(rv / rates[c])
+            self.held_vol_ratio[c] = ratio
+            if ratio >= p.held_vol_ratio or ratio <= 1.0 / p.held_vol_ratio:
+                self._held_vol_until = time.monotonic() + p.held_vol_hold_s
+                self._held_vol_coin = c
+                if not self._held_vol_logged:
+                    print(f"[{self.event_ticker}] held_vol: {c} realized/held {ratio:.2f} -> pulling", flush=True)
+                    self._held_vol_logged = True
+        if time.monotonic() >= self._held_vol_until:
+            self._held_vol_logged = False
+
     def _implied(self):
         """The session's ImpliedRates (on the SpotFeed), or None without one."""
         return None if self.spot is None else getattr(self.spot, "implied_rates", None)
@@ -350,6 +395,7 @@ class CoinRaceModel:
             held = iv.held_age(now_s, p)
             self.vol_src = {c: ("realized" if c in short else "held" if held[c] is not None else "implied")
                             for c in COINS}
+            self._held_vol_check(now_s, rates)
             rate = np.array([rates[c] for c in COINS])
             self.vol_bp = {c: math.sqrt(rates[c]) * 1e4 for c in COINS}
         # Correlation fitted to the race mids (corr_fit.py), on the unshifted fair.
@@ -404,7 +450,8 @@ class CoinRaceModel:
                                                               if p.vol_source == "implied" else "realized"),
                                                   "corr_mult": g, "spot_mid": m_spot,
                                                   "perp_gap_bp": p_gap, "perp_n": p_n, "perp_inc_bp": p_inc,
-                                                  "priced_on": self.priced_on.get(c, "spot")})
+                                                  "priced_on": self.priced_on.get(c, "spot"),
+                                                  "held_vol_ratio": self.held_vol_ratio.get(c)})
         return out
 
     # --- FairModel ----------------------------------------------------------
@@ -464,6 +511,8 @@ class CoinRaceModel:
         # comparison, so one coin's move reprices all five markets.
         if self.spot is not None and time.monotonic() < self.spot.burst_until:
             return "spot_burst"
+        if time.monotonic() < self._held_vol_until:
+            return "held_vol"
         return None
 
     def _thin_venues(self, in_mid: dict[str, list[str]]) -> str | None:
@@ -511,6 +560,8 @@ class CoinRaceModel:
             "vol_source": self.cfg.pricing.vol_source,
             "vol_bp": {c: round(v, 4) for c, v in self.vol_bp.items()},
             "vol_src_by_coin": dict(self.vol_src),
+            "held_vol": {"active": time.monotonic() < self._held_vol_until, "coin": self._held_vol_coin,
+                         "ratio": {c: round(v, 2) for c, v in self.held_vol_ratio.items()}},
             "corr_fit": (None if self._corr_fit() is None else self._corr_fit().snapshot(self.cfg.pricing)),
             "implied_vol": (None if self._implied() is None
                             else self._implied().snapshot(time.time(), self.cfg.pricing)),

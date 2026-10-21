@@ -117,15 +117,28 @@ class CryptoPricingParams:
     corr_fit_min_tau_s: float = param("No fit with fewer than this many seconds left (the end average "
                                       "dominates; the shift freezes there too).", min=0, step=30)
     implied_fallback_realized: bool = param(
-        "With vol_source implied: a coin with no implied estimate (its 15M mid near 0.5 or pinned, or "
-        "the event just opened) prices on the HAR rate instead, so the race isn't withheld. 10-19 02:47 "
-        "UTC: ETH and HYPE 15M mids at 0.55/0.48 left them at 19 of 20 readings and withheld every fair. "
-        "Off = withhold (no_implied_vol) while any coin lacks one.")
+        "With vol_source implied: a coin with no implied or held estimate prices on the HAR rate instead of "
+        "withholding the race. 10-20 16:00-22:00 UTC: seconds with any coin on HAR were 34% of the time and "
+        "-$71 of -$84 settled (-$35/h vs -$10 implied, +$10 held); the HAR rate ran 20-44% under the next "
+        "implied reading on every coin. Off = withhold (no_implied_vol).")
     implied_hold_s: float = param(
         "A coin's last implied estimate is held this long after its 15M mid stops giving readings, before "
-        "the HAR fallback (or withholding). 180: live journals 10-18 23:25..10-19 03:30 UTC, a 3-min hold was "
-        "3-9% off the later estimate vs HAR's 8-15%; past ~5 min holding lost to HAR for most coins. 0 = no hold.",
-        min=0, step=30)
+        "the HAR fallback (or withholding). Gaps are mostly the next event's open (15M mid ~0.5 says nothing "
+        "about vol) and its last minutes (mid pinned). 10-20 16:00-22:00 UTC, vs the next live reading: "
+        "holding 180-600s old was |ln| 0.23-0.28 off vs HAR's 0.32-0.34; 97% of HAR seconds had a reading "
+        "under 600s old. 10-18/19 found holding past ~5 min worse than HAR, hence held_vol_* guards it. "
+        "0 = no hold.", min=0, step=30)
+    held_vol_check: bool = param(
+        "While a coin prices on a HELD implied vol, compare its realized spot vol over held_vol_window_s "
+        "(10s returns on our 1s bars) with the held value; outside [1/held_vol_ratio, held_vol_ratio] the "
+        "whole race pulls quotes (held_vol) for held_vol_hold_s. A held value can't see vol move; this does.")
+    held_vol_window_s: float = param("Realized-vol window for held_vol_check (s).", min=20, step=10)
+    held_vol_ratio: float = param(
+        "Pull when realized / held is above this or below its inverse. 2: the single-coin vol_burst "
+        "calibration (ETH 10-11..18 had a >=2x minute 3.4% of the time). The low side is uncalibrated.",
+        min=1.1, step=0.1)
+    held_vol_hold_s: float = param("A held_vol pull lasts this long after the last tripping second.",
+                                   min=0, step=5)
     implied_ema_s: float = param(
         "Time constant (s) of each coin's implied-vol EMA. 120: KXETH15M 10-18 22:39-23:10 replay, theo-mid "
         "+0.60c at 900s -> -0.12c at 120s.", min=10, step=10)

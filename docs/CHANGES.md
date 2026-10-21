@@ -21,6 +21,28 @@ days), redone on every dashboard restart (18 restarts on 10-20).
 - Tunnel command gets `ServerAliveInterval=15` so idle drops don't
   silently kill the dashboard's websocket.
 
+## 2026-10-21 — Race: no HAR vol fallback; longer implied hold, guarded
+
+Race 10-20 16:00-22:00 UTC (25 events, 336 real maker fills): seconds with
+any coin on the HAR fallback were 34% of the time and -$71 of -$84 settled
+(-$35/h vs -$10/h all-implied, +$10/h held); the only class where Kalshi's
+mid beat our fair on Brier (+0.0052) and |fair - mid| 4.1c vs 2.7c. The
+HAR rate ran 20-44% under the next live implied reading on every coin, and
+switching to it cut vol to 0.70-0.90x. Fallback happens at each event's open
+(15M mids ~0.5 carry no vol) and close (pinned), so the last reading is
+usually 180-600s old: 87% of HAR seconds.
+
+- `pricing.implied_fallback_realized` false: no implied or held vol ->
+  fairs withheld (`no_implied_vol`), quotes pulled.
+- `pricing.implied_hold_s` 180 -> 600. Holding 180-600s old was |ln| 0.23-0.28
+  off the next reading vs HAR's 0.32-0.34. Not 900: only 3% more coverage,
+  thinnest evidence, and 10-18/19 found long holds worse than HAR.
+- New `pricing.held_vol_*` (dashboard): while a coin is on a held vol, its
+  realized vol over 60s (10s returns, 1s bars) outside [0.5x, 2x] the held
+  value pulls the race (`held_vol` quote block) for 30s. The 2x is the
+  single-coin vol_burst calibration; 0.5x is uncalibrated. Decision rows log
+  `x_held_vol_ratio`; summary has `held_vol`.
+
 ## 2026-10-20 — One write bucket per shard; HYPE priced on Binance's lead
 
 - **Write budget.** Shard 2 was sliced per process: race 300/s (100%), the
