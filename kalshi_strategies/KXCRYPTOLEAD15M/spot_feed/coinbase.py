@@ -55,13 +55,20 @@ WS_URL = "wss://advanced-trade-ws.coinbase.com"
 # (matches), which drive the held through-the-touch print and on_print.
 EX_WS_URL = "wss://ws-feed.exchange.coinbase.com"
 # Book from the Exchange feed's level2_batch (top 50 levels) while it is
-# synced, Advanced Trade level2 as the fallback; plus its ticker. Same 5 min
-# test: touch-change delay p50/p90 BTC 45/186ms on Advanced Trade vs 15/41ms
-# here, SOL 24/54 vs 24/52, HYPE 31/54 vs 29/56. False = book on Advanced Trade.
-# Off: live 10-20 05:29-05:45 UTC the race's signal age went p50 10 -> 24ms and
-# decisions over the 30ms limit 14% -> 40%; level2_batch's ~50ms batching shows
-# up as book age, which the oldest-coin signal age takes in full.
-EX_BOOK = False
+# synced, Advanced Trade level2 as the fallback; plus its ticker. Advanced
+# Trade level2 is batched too (~50ms) and later: same best-price change, us-east-2
+# 10-21 17:51-18:22 UTC, ~19k changes, Exchange first on 75%, p50 20ms sooner
+# (BTC 21, ETH 24, XRP 20, HYPE 14, SOL 11); research/latency/cb_book_probe.py.
+# The 10-20 trial that turned this off read Exchange's batch age as queueing
+# (see EXB_BATCH_S), which Advanced Trade's send-time stamp never showed.
+EX_BOOK = True
+# Exchange l2update `time` is the batch's content time, so (wall - time) above
+# its rolling minimum is batch age plus our queueing; Advanced Trade's message
+# `timestamp` is its send time (a flat ~7ms before receipt), so only queueing
+# shows there. Excess up to this much is batching, not counted as queueing, so
+# both books are aged alike. 10-21 probe: Exchange time -> receipt p10 8ms,
+# p99 63-70ms, batches every ~60ms.
+EXB_BATCH_S = 0.06
 RECONNECT_DELAY_S = 1.0
 # The heartbeats channel sends one message per second on the connection,
 # so a silent socket is dead well before this.
@@ -247,9 +254,8 @@ class CoinbaseAdapter(VenueAdapter):
         # buffers. See _data_age.
         # One window per feed: the Exchange feed's offsets run ~55ms lower, and
         # a shared minimum would age every Advanced Trade book by that much.
-        # The Exchange book ("exb", level2_batch, ~50ms batches) gets its own too:
-        # against the matches minimum its batching read as up to ~60ms of
-        # queueing (p99, 10-20 smoke test) and would trip the 30ms signal-age limit.
+        # The Exchange book ("exb", level2_batch) gets its own too: against the
+        # matches minimum its batching read as up to ~60ms of queueing.
         self._offsets: dict[str, collections.deque[tuple[float, float]]] = {
             "at": collections.deque(), "ex": collections.deque(), "exb": collections.deque()}
         # Last view handed out per coin; its receive_ts is advanced in place
@@ -347,7 +353,8 @@ class CoinbaseAdapter(VenueAdapter):
                         if coin is None:
                             continue
                         exch_ts = _parse_iso_ts(d["time"]) if d.get("time") else None
-                        as_of = mono - self._data_age(exch_ts, mono, "exb" if ty == "l2update" else "ex")
+                        as_of = mono - (self._data_age(exch_ts, mono, "exb", EXB_BATCH_S) if ty == "l2update"
+                                        else self._data_age(exch_ts, mono, "ex"))
                         if ty == "match":
                             await self._ex_match(coin, d, as_of, exch_ts, on_update)
                         elif ty == "snapshot":
@@ -534,14 +541,16 @@ class CoinbaseAdapter(VenueAdapter):
                 pb.is_resyncing = True
             await asyncio.sleep(RECONNECT_DELAY_S)
 
-    def _data_age(self, exch_ts: float | None, mono_now: float, feed: str = "at") -> float:
+    def _data_age(self, exch_ts: float | None, mono_now: float, feed: str = "at",
+                  allow: float = 0.0) -> float:
         """Seconds this message has spent queued on our side: received but
         not yet processed. `ws.recv()` hands back frames websockets already
         buffered, so after an event-loop stall a backlog all reads as
         "just received" if we stamp it with time.monotonic() -- which is
         why the 2026-10-08 ...1300 stalls (2-9s with no processing) didn't
         trip the staleness kill switch. Coinbase's own message timestamp
-        doesn't lie about that. Returns 0 when it is unavailable."""
+        doesn't lie about that. `allow`: excess over the minimum that is the
+    feed's own batching, not ours. Returns 0 when exch_ts is unavailable."""
         if exch_ts is None:
             return 0.0
         off = time.time() - exch_ts
@@ -551,7 +560,7 @@ class CoinbaseAdapter(VenueAdapter):
         while q and q[-1][1] >= off:      # monotonic deque -> O(1) running min
             q.pop()
         q.append((mono_now, off))
-        return max(0.0, off - q[0][1])
+        return max(0.0, off - q[0][1] - allow)
 
     async def _handle_event(self, event: dict, as_of: float, exch_ts: float | None,
                             seq: int | None,

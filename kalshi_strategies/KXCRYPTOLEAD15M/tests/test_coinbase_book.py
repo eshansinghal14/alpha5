@@ -237,6 +237,16 @@ def test_exchange_feed_offsets_dont_age_the_book_feed():
     assert ad._data_age(now - 0.070, 1.0, "at") == 0.0           # its own minimum, not the Exchange one
 
 
+def test_exchange_batch_age_is_not_counted_as_queueing():
+    import time as _t
+    from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed.coinbase import EXB_BATCH_S
+    ad = CoinbaseAdapter(coins=["SOL"])
+    now = _t.time()
+    ad._data_age(now - 0.008, 1.0, "exb", EXB_BATCH_S)
+    assert ad._data_age(now - 0.060, 1.0, "exb", EXB_BATCH_S) == 0.0           # one batch old: not ours
+    assert ad._data_age(now - 0.168, 1.0, "exb", EXB_BATCH_S) == pytest.approx(0.1, abs=2e-3)
+
+
 def test_custom_max_levels_param():
     pb = _ProductBook()
     pb.apply_snapshot(bids=[(100.0 - 0.01 * i, 1.0) for i in range(20)],

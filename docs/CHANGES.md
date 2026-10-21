@@ -3,6 +3,25 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-21 — Coinbase book from the Exchange feed again
+
+- `coinbase.EX_BOOK = True`. Clean c7g in the live box's subnet (us-east-2c),
+  10-21 17:51-18:22 UTC, every feed on its own process
+  (`research/latency/cb_book_probe.py`), ~19k matched best-price changes:
+  Exchange `level2_batch` showed the change first 75% of the time, p50 20ms
+  sooner (BTC 21, ETH 24, XRP 20, HYPE 14, SOL 11ms). Book age on arrival p50
+  (newest update time -> receipt) Advanced Trade 32-42ms vs Exchange 16-28ms.
+  Advanced Trade `level2` is batched as well (~50ms per coin), just later.
+  Two sockets on the same feed: Exchange p10/p90 +-33ms, Advanced Trade +-74.
+- Why the 10-20 trial read worse: Advanced Trade's message `timestamp` is its
+  send time (~7ms before receipt, flat), so its 32-42ms book age never showed;
+  Exchange's `time` is content time, so its batch age read as our queueing and
+  aged the book. New `EXB_BATCH_S` (60ms) of excess on the Exchange book is
+  not counted as queueing, so both books are aged on queueing alone.
+- Rechecked: Exchange `level2` / `full` / `level3` still refuse anonymous
+  subscribes ("now require authentication"). Exchange `matches` still ~60ms
+  ahead of Advanced Trade `market_trades`. Both tickers lag both books.
+
 ## 2026-10-21 — Race: held_vol high side only, held_vol_edge, quote_markets (HYPE off)
 
 Race real edge fills 10-21 00:31-02:48 UTC (10 events, 113 fills): the
