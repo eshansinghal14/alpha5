@@ -87,8 +87,9 @@ class HubConfig:
                                   min=1, step=1, apply=APPLY_NEXT_EVENT)
     hold_sample_s: float = param("One baseline sample per contract per this (the backtest's grid step).",
                                  min=0.1, step=0.5, apply=APPLY_NEXT_EVENT)
-    combined_max_loss_usd: float = param(
+    combined_max_loss_usd: float | None = param(
         "Worst-case settlement loss allowed across ALL S&P positions together (they settle on the "
         "same close). Past it, every side that would add to that worst case is blocked; sides that "
-        "reduce it stay open.", min=0, step=10)
+        "reduce it stay open. null = off: only each series' own risk.max_loss_usd applies (the worst "
+        "case is still computed and reported).", min=0, step=10)
     risk_check_s: float = param("How often the combined risk is recomputed.", min=0.1, step=0.5)

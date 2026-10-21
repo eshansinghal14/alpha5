@@ -72,8 +72,10 @@ def worst_case(legs: list[Leg]) -> tuple[float, float | None]:
 
 
 def blocked_sides(legs: list[Leg], markets: dict[str, tuple[float | None, float | None, str | None]],
-                  limit_usd: float, prices: dict[str, float]) -> dict[str, str]:
-    """When the combined worst case is at or past -limit_usd: every
+                  limit_usd: float | None, prices: dict[str, float]) -> dict[str, str]:
+    """Nothing when limit_usd is None (the combined limit is off).
+
+    When the combined worst case is at or past -limit_usd: every
     "TICKER:yes" / "TICKER:no" side in `markets` (ticker -> floor, cap,
     strike_type) whose next contract would make it worse, mapped to the
     reason. Sides that improve the worst case stay open so the book can be
@@ -81,6 +83,8 @@ def blocked_sides(legs: list[Leg], markets: dict[str, tuple[float | None, float 
 
     A contract is priced at `prices[ticker]` (the fair, 0.5 if missing): a
     yes costs p, a no costs 1 - p."""
+    if limit_usd is None:
+        return {}
     worst, at = worst_case(legs)
     if worst > -limit_usd:
         return {}

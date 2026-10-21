@@ -8,7 +8,7 @@
     "hold_settle_s": 0.3,
     "hold_min_samples": 5,
     "hold_sample_s": 2.0,
-    "combined_max_loss_usd": 120.0,
+    "combined_max_loss_usd": null,
     "risk_check_s": 1.0
   },
   "KXINXU": {
@@ -45,8 +45,9 @@
       "fair_suspect_hold_s": 30.0,
       "fair_lag_max": 0.02,
       "fair_lag_window_s": 1.0,
-      "fair_lag_markets": 2,
-      "fair_lag_hold_s": 3.0
+      "fair_lag_markets": 3,
+      "fair_lag_hold_s": 3.0,
+      "fair_lag_fair_move_max": 0.005
     },
     "runtime": {
       "quote_fill_poll_s": 1.0,
@@ -118,7 +119,8 @@
       "fair_lag_max": null,
       "fair_lag_window_s": 1.0,
       "fair_lag_markets": null,
-      "fair_lag_hold_s": 3.0
+      "fair_lag_hold_s": 3.0,
+      "fair_lag_fair_move_max": null
     },
     "runtime": {
       "quote_fill_poll_s": 1.0,

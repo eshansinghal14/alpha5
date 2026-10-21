@@ -9,6 +9,12 @@ and when `markets` or more priced markets lag the same way at once the side
 is blocked on every market (one underlying moved; the fair froze for all of
 them). Blocks last `hold_s` after the last trigger.
 
+Only a fair that held still counts (|fair move| <= fair_lag_fair_move_max):
+a fair that moved while Kalshi didn't isn't frozen, and without this check
+the guard blocked the side our fair had just moved toward. KXINXU 10-21: the
+median trigger had our fair moving 2.3c, and the mid kept going the feared
+way within 10s only 16% of the time (26% reverted).
+
 Why: KXINXU 2026-10-20 11:12:18-22 ET, SPX sold off, Kalshi bids fell 15c in
 4s while the hub's fairs froze (most option quotes were held as blown-out
 spreads), signal age stayed fresh, and nine 5-lot YES bids filled at
@@ -45,7 +51,8 @@ class FairLagGuard:
         if now_s - t0 < w - 1e-9 or not (PRICED_LO <= fair <= PRICED_HI):
             self._lag.pop(ticker, None)
             return
-        lag = (mid - mid0) - (fair - fair0)
+        flat = p.fair_lag_fair_move_max
+        lag = 0.0 if flat is not None and abs(fair - fair0) > flat else (mid - mid0) - (fair - fair0)
         self._lag[ticker] = (now_s, lag)
         lim, hold = p.fair_lag_max, p.fair_lag_hold_s
         if lag < -lim:

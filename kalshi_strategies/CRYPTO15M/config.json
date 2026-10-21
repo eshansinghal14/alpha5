@@ -34,7 +34,8 @@
       "fair_lag_max": null,
       "fair_lag_window_s": 1.0,
       "fair_lag_markets": null,
-      "fair_lag_hold_s": 3.0
+      "fair_lag_hold_s": 3.0,
+      "fair_lag_fair_move_max": null
     },
     "runtime": {
       "quote_fill_poll_s": 1.0,
@@ -185,7 +186,8 @@
       "fair_lag_max": null,
       "fair_lag_window_s": 1.0,
       "fair_lag_markets": null,
-      "fair_lag_hold_s": 3.0
+      "fair_lag_hold_s": 3.0,
+      "fair_lag_fair_move_max": null
     },
     "runtime": {
       "quote_fill_poll_s": 1.0,
@@ -336,7 +338,8 @@
       "fair_lag_max": null,
       "fair_lag_window_s": 1.0,
       "fair_lag_markets": null,
-      "fair_lag_hold_s": 3.0
+      "fair_lag_hold_s": 3.0,
+      "fair_lag_fair_move_max": null
     },
     "runtime": {
       "quote_fill_poll_s": 1.0,
@@ -487,7 +490,8 @@
       "fair_lag_max": null,
       "fair_lag_window_s": 1.0,
       "fair_lag_markets": null,
-      "fair_lag_hold_s": 3.0
+      "fair_lag_hold_s": 3.0,
+      "fair_lag_fair_move_max": null
     },
     "runtime": {
       "quote_fill_poll_s": 1.0,
@@ -638,7 +642,8 @@
       "fair_lag_max": null,
       "fair_lag_window_s": 1.0,
       "fair_lag_markets": null,
-      "fair_lag_hold_s": 3.0
+      "fair_lag_hold_s": 3.0,
+      "fair_lag_fair_move_max": null
     },
     "runtime": {
       "quote_fill_poll_s": 1.0,

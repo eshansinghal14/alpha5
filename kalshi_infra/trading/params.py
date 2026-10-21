@@ -149,6 +149,12 @@ class RiskParams:
         "every market. null = each market only blocks itself.", min=1, step=1)
     fair_lag_hold_s: float = param("Keep a fair-lag block this long after its last trigger.",
                                    min=0, max=120, step=0.5)
+    # 0.005: KXINXU replay 10-20/21 (with fair_lag_markets 3) cut blocked
+    # side-time 4.1-5.8% -> 1.1-1.7%, and the prints it still blocks marked
+    # out -0.7 to -1.6c at 60s for the resting side (was +1.0c).
+    fair_lag_fair_move_max: float | None = param(
+        "A market only counts as lagging if our fair moved at most this much over fair_lag_window_s "
+        "(a frozen fair). null = any fair move counts.", min=0, max=0.2, step=0.001)
 
 
 @section

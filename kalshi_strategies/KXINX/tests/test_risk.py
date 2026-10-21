@@ -48,6 +48,11 @@ def test_blocks_only_sides_that_worsen():
     assert all("combined_risk" in r for r in blocks.values())
 
 
+def test_limit_off_blocks_nothing():
+    legs = [Leg("U", 200, 0, 180.0, 7800, None, "greater_or_equal")]       # -180 worst case
+    assert risk.blocked_sides(legs, {"U": (7800, None, "greater_or_equal")}, None, {}) == {}
+
+
 def test_under_limit_blocks_nothing():
     legs = [Leg("U", 2, 0, 1.0, 7800, None, "greater_or_equal")]
     assert risk.blocked_sides(legs, {"U": (7800, None, "greater_or_equal")}, 100.0, {}) == {}

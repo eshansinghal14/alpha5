@@ -25,7 +25,8 @@ def immediate_takes(monkeypatch):
 
 
 GUARD_OFF = dict(max_fair_band=None, max_fair_outside_touch=None, fair_suspect_hold_s=0.0,
-                 fair_lag_max=None, fair_lag_window_s=1.0, fair_lag_markets=None, fair_lag_hold_s=3.0)
+                 fair_lag_max=None, fair_lag_window_s=1.0, fair_lag_markets=None, fair_lag_hold_s=3.0,
+                 fair_lag_fair_move_max=None)
 
 
 def risk(**r):
@@ -489,6 +490,30 @@ def test_fair_lag_clears_after_hold():
     for _ in range(40):                                  # 4s steady after the drop
         step(q, ctx, {"A": Fair(0.64, 0.63, 0.65), "B": Fair(0.51, 0.50, 0.52)}, dt=0.1)
     assert q.debug_log[-1]["block_bid"] is None
+
+
+def test_fair_lag_moving_fair_is_not_frozen():
+    """Our fair rises 3c in 1s while Kalshi stays put: not a stale fair, so
+    with fair_lag_fair_move_max set nothing is blocked (before, the NO side
+    was blocked: lag = 0 - 0.03)."""
+    q, ctx = Quoter(cfg(risk_kw=dict(LAG, fair_lag_fair_move_max=0.005)), Model(), FREE, close_time=None), Ctx()
+    ctx.books["A"] = Book("A", 0.49, 0.51)
+    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)})
+    for i in range(1, 11):
+        step(q, ctx, {"A": Fair(round(0.50 + 0.003 * i, 3), 0.49, 0.54)}, dt=0.1)
+    assert "fair_lag" not in q.block_counts
+    q2, ctx2 = Quoter(cfg(risk_kw=LAG), Model(), FREE, close_time=None), Ctx()
+    ctx2.books["A"] = Book("A", 0.49, 0.51)
+    step(q2, ctx2, {"A": Fair(0.50, 0.49, 0.51)})
+    for i in range(1, 11):
+        step(q2, ctx2, {"A": Fair(round(0.50 + 0.003 * i, 3), 0.49, 0.54)}, dt=0.1)
+    assert q2.block_counts.get("fair_lag", 0) > 0           # the old behaviour
+
+
+def test_fair_lag_frozen_fair_still_blocks_with_flat_check():
+    q, ctx = Quoter(cfg(risk_kw=dict(LAG, fair_lag_fair_move_max=0.005)), Model(), FREE, close_time=None), Ctx()
+    _freeze(q, ctx, ["A", "B"], [0.63, 0.50], 0.05, [0.64, 0.51])
+    assert q.debug_log[-1]["block_bid"] == "fair_lag"
 
 
 def test_fair_lag_off_when_null():
