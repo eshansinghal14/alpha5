@@ -255,8 +255,9 @@ class CoinRaceModel:
         return float(np.mean(np.square(r))) / 10.0
 
     def _held_vol_check(self, now_s: float, rates: dict):
-        """Pull the race while any coin's held implied vol disagrees with its
-        realized vol by more than held_vol_ratio. Once per second."""
+        """Pull the race while any coin's realized vol runs held_vol_ratio
+        above its held implied vol (or held_vol_min_ratio below, if set).
+        Once per second."""
         p = self.cfg.pricing
         sec = int(now_s)
         if not p.held_vol_check or sec == self._held_check_sec:
@@ -271,7 +272,8 @@ class CoinRaceModel:
                 continue
             ratio = math.sqrt(rv / rates[c])
             self.held_vol_ratio[c] = ratio
-            if ratio >= p.held_vol_ratio or ratio <= 1.0 / p.held_vol_ratio:
+            low = p.held_vol_min_ratio
+            if ratio >= p.held_vol_ratio or (low is not None and ratio <= low):
                 self._held_vol_until = time.monotonic() + p.held_vol_hold_s
                 self._held_vol_coin = c
                 if not self._held_vol_logged:
@@ -439,9 +441,11 @@ class CoinRaceModel:
             m_spot = self.bus.mid_nowcast(c)
             _, p_gap, p_n = pnc.nowcast(c, mono, m_spot) if pnc is not None else (None, None, 0)
             _, p_inc = pnc.increment(c, mono, m_spot) if pnc is not None else (None, None)
+            held = p.vol_source == "implied" and self.vol_src.get(c) == "held"
             # Not clipped to [0, 1]: the band is an edge distance, and clipping
             # would erase the edge on tail coins (fair 0.002, band 0.015).
             out[self.ticker_of[c]] = Fair(prob=prob, lo=prob - k * tv, hi=prob + k * tv,
+                                          edge_add=p.held_vol_edge if held else 0.0,
                                           extras={"coin": c, "theo_vol": tv, "tau": self.result.tau,
                                                   "phase": self.result.phase, "cf_basis_bp": self.basis_bp[c],
                                                   "cf_end_n": snap.end_n[c],
@@ -513,6 +517,9 @@ class CoinRaceModel:
             return "spot_burst"
         if time.monotonic() < self._held_vol_until:
             return "held_vol"
+        allowed = self.cfg.pricing.quote_markets
+        if ticker is not None and allowed is not None and coin_from_market_ticker(ticker) not in allowed:
+            return "market_off"
         return None
 
     def _thin_venues(self, in_mid: dict[str, list[str]]) -> str | None:

@@ -79,6 +79,12 @@
     "perp_priced_markets": [
       "HYPE"
     ],
+    "quote_markets": [
+      "BTC",
+      "ETH",
+      "SOL",
+      "XRP"
+    ],
     "soft_stale_s": 3.0,
     "hard_stale_s": 15.0,
     "recovery_s": 5.0,
@@ -141,7 +147,9 @@
     "held_vol_check": true,
     "held_vol_window_s": 60.0,
     "held_vol_ratio": 2.0,
+    "held_vol_min_ratio": null,
     "held_vol_hold_s": 30.0,
+    "held_vol_edge": 0.01,
     "implied_ema_s": 120.0,
     "implied_min_obs": 20.0,
     "implied_mid_min": 0.15,

@@ -69,6 +69,11 @@ class CryptoPricingParams:
         "(0.25-2s ahead), covering 0.50-0.73 of it; on SOL 28-56% and 0.20-0.46, so SOL stays on spot. "
         "Coinbase HYPE prints ~9/min vs Binance's ~900/min. The start TWAP and CF basis stay on spot. "
         "null = every coin.")
+    quote_markets: list[str] | None = param(
+        "Markets that rest quotes (edge and LIP, LIP exit included), by coin. null = every market. A market "
+        "left out is still priced (the race is joint) and keeps any position to settlement. HYPE left out "
+        "10-21: its edge fills were -$250 of the race's -$79 over 10-19 04:15..10-20 15:51 UTC and -$27 of "
+        "+$8.5 over 10-21 00:31-02:48.")
     soft_stale_s: float = param("Feed health: a coin older than this is DEGRADED (priced off last value).",
                                 min=0.1, step=0.5)
     hard_stale_s: float = param("A coin older than this is DOWN: the joint is unknowable, all fairs withheld.",
@@ -130,15 +135,24 @@ class CryptoPricingParams:
         "0 = no hold.", min=0, step=30)
     held_vol_check: bool = param(
         "While a coin prices on a HELD implied vol, compare its realized spot vol over held_vol_window_s "
-        "(10s returns on our 1s bars) with the held value; outside [1/held_vol_ratio, held_vol_ratio] the "
-        "whole race pulls quotes (held_vol) for held_vol_hold_s. A held value can't see vol move; this does.")
+        "(10s returns on our 1s bars) with the held value; at or above held_vol_ratio (or at or below "
+        "held_vol_min_ratio) the whole race pulls quotes (held_vol) for held_vol_hold_s. A held value can't "
+        "see vol move; this does.")
     held_vol_window_s: float = param("Realized-vol window for held_vol_check (s).", min=20, step=10)
     held_vol_ratio: float = param(
-        "Pull when realized / held is above this or below its inverse. 2: the single-coin vol_burst "
-        "calibration (ETH 10-11..18 had a >=2x minute 3.4% of the time). The low side is uncalibrated.",
-        min=1.1, step=0.1)
+        "Pull when realized / held reaches this. 2: the single-coin vol_burst calibration (ETH 10-11..18 "
+        "had a >=2x minute 3.4% of the time).", min=1.1, step=0.1)
+    held_vol_min_ratio: float | None = param(
+        "Also pull when realized / held falls to this. null = off. Uncalibrated: 10-21 00:31-02:48 UTC at "
+        "0.5 it pulled the race 25% of the time (held rows median 0.65x, never above 2x) while held-vol "
+        "fills still ran -8.9c/lot at 10s (22 fills).", min=0.05, max=0.95, step=0.05)
     held_vol_hold_s: float = param("A held_vol pull lasts this long after the last tripping second.",
                                    min=0, step=5)
+    held_vol_edge: float = param(
+        "Extra $ edge on a coin's market (quotes and takes) while that coin prices on a held implied vol. "
+        "Real edge fills 10-19..10-21 02:58 UTC on held vol: +0.84c/lot at 10s (+-0.93, 303 fills) vs "
+        "-0.05c on live implied, but -8.9c on 10-21 00:31-02:48 (22 fills) -- a hedge, not a fitted cost.",
+        min=0, max=0.2, step=0.005)
     implied_ema_s: float = param(
         "Time constant (s) of each coin's implied-vol EMA. 120: KXETH15M 10-18 22:39-23:10 replay, theo-mid "
         "+0.60c at 900s -> -0.12c at 120s.", min=10, step=10)

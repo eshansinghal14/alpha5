@@ -20,6 +20,9 @@ class Fair:
     # Free-form per-market values the model wants on the decision log /
     # dashboard (e.g. theo_vol, coin). Keys are prefixed "x_" when logged.
     extras: dict = dataclasses.field(default_factory=dict)
+    # Extra $ edge the model wants on this market right now (takes and
+    # quotes), added to constant_edge. E.g. the race's held_vol_edge.
+    edge_add: float = 0.0
 
 
 @dataclasses.dataclass(frozen=True)

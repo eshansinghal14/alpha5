@@ -13,7 +13,8 @@ Per market and side, every decision is:
     lean    = lean_dollars * ratio
               ratio = effective position / max_position, signed toward the side that GROWS it;
               negative on the reducing side, where the edge then floors at 0
-    const   = constant_edge, x sqrt(constant_edge_ref_s / time left) inside the last ref seconds
+    const   = constant_edge, x sqrt(constant_edge_ref_s / time left) inside the last ref seconds,
+              + the model's Fair.edge_add
     take    : prob - (const + ci + lean + taker_fee) >= ask
     quote   : prob - (const + quoting_edge + ci + lean + maker_fee) -> edge limit
 
@@ -383,7 +384,7 @@ class Quoter:
 
         fee_bid = self.fees.taker(market_ask) if market_ask is not None else 0.0
         fee_ask = self.fees.taker(market_bid) if market_bid is not None else 0.0
-        const = self._constant_edge(now)
+        const = self._constant_edge(now) + fair.edge_add
         # Floored at 0 before the fee: a negative lean may bring a side to fair, never past it.
         bid_edge = max(const + ci_bid + lean_bid, 0.0) + fee_bid
         ask_edge = max(const + ci_ask + lean_ask, 0.0) + fee_ask

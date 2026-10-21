@@ -163,6 +163,18 @@ def test_constant_edge_scales_sqrt_inside_ref_only():
     assert _const_at(180, 60) == pytest.approx(0.03 * 3 ** 0.5)
 
 
+def test_fair_edge_add_widens_takes_and_quotes():
+    q, ctx = Quoter(cfg(constant_edge=0.03), Model(), FREE, close_time=None), Ctx()
+    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51, edge_add=0.02)}, Book("A", 0.30, 0.70))
+    r = q.debug_log[-1]
+    assert r["constant_edge"] == pytest.approx(0.05)
+    assert r["bid_edge"] == pytest.approx(0.05 + 0.01) and r["ask_edge"] == pytest.approx(0.05 + 0.01)
+    assert r["quote_bid_reservation"] == pytest.approx(0.44)      # 0.50 - 0.06
+    q, ctx = Quoter(cfg(), Model(), FREE, close_time=None), Ctx()
+    step(q, ctx, {"A": Fair(0.60, 0.59, 0.61, edge_add=0.04)}, Book("A", 0.40, 0.55))
+    assert takes(ctx) == []                       # 0.60 - (0.01 + 0.04 + 0.01) = 0.54 < 0.55
+
+
 def test_kalshi_taker_fee_is_charged_into_the_edge():
     q, ctx = Quoter(cfg(), Model(), KALSHI, close_time=None), Ctx()
     step(q, ctx, {"A": Fair(0.60, 0.59, 0.61)}, Book("A", 0.40, 0.58))

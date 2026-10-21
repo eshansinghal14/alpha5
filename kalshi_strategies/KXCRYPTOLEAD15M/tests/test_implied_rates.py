@@ -177,6 +177,46 @@ def test_held_vol_pulls_when_realized_runs_away_from_the_held_value():
     assert 0.5 < m.held_vol_ratio["ETH"] < 2.0 and m.quote_block(None, now + 151) is None
 
 
+def _held_eth(now, bp_ratio, **kw):
+    """ETH on a held 0.7bp/sqrt(s) vol with realized at bp_ratio x that."""
+    m, iv = _race(now, implied_fallback_realized=False, implied_hold_s=600.0, implied_ema_s=120.0,
+                  held_vol_check=True, held_vol_window_s=60.0, held_vol_ratio=2.0, held_vol_hold_s=30.0, **kw)
+    _fill(iv, COINS, now, s=0.7e-4)
+    m._price(now, None)
+    _vol_bars(m, "ETH", now, 0.7 * bp_ratio * math.sqrt(10))
+    out = m._price(now + 150, None)
+    assert m.vol_src["ETH"] == "held", m.vol_src
+    return m, out
+
+
+def test_held_vol_low_side_only_with_min_ratio():
+    now = time.time()
+    m, _ = _held_eth(now, 0.3, held_vol_min_ratio=None)
+    assert m.held_vol_ratio["ETH"] < 0.5 and m.quote_block(None, now + 150) is None
+    m, _ = _held_eth(now, 0.3, held_vol_min_ratio=0.5)
+    assert m.quote_block(None, now + 150) == "held_vol"
+
+
+def test_held_vol_edge_only_on_the_held_coin():
+    now = time.time()
+    m, out = _held_eth(now, 1.0, held_vol_edge=0.01)
+    assert m.quote_block(None, now + 150) is None
+    held = {c for c in COINS if m.vol_src[c] == "held"}
+    for c in COINS:
+        assert out[m.ticker_of[c]].edge_add == (0.01 if c in held else 0.0), (c, m.vol_src)
+    assert out[m.ticker_of["ETH"]].edge_add == 0.01
+
+
+def test_quote_markets_blocks_only_unlisted_markets():
+    now = time.time()
+    m, _ = _race(now, quote_markets=["BTC", "ETH", "SOL", "XRP"])
+    assert m.quote_block(m.ticker_of["HYPE"], now) == "market_off"
+    assert all(m.quote_block(m.ticker_of[c], now) is None for c in ("BTC", "ETH", "SOL", "XRP"))
+    assert m.quote_block(None, now) is None       # the pull hook asks for the event: no pull
+    m, _ = _race(now, quote_markets=None)
+    assert m.quote_block(m.ticker_of["HYPE"], now) is None
+
+
 def test_held_vol_ignores_coins_on_live_implied():
     now = time.time()
     m, iv = _race(now, implied_fallback_realized=False, held_vol_check=True, held_vol_window_s=60.0,

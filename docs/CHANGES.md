@@ -3,6 +3,27 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-21 — Race: held_vol high side only, held_vol_edge, quote_markets (HYPE off)
+
+Race real edge fills 10-21 00:31-02:48 UTC (10 events, 113 fills): the
+held_vol pull blocked quoting 25% of armed time, all of it on the 0.5x
+floor (held rows median realized/held 0.65x, never above 2x), while fills
+on a held vol still ran -8.9c/lot at 10s (22 fills) and HYPE lost -$27 of
++$8.5.
+
+- `pricing.held_vol_min_ratio` (dashboard, null = off): the low-side pull
+  is now its own optional field; `held_vol_ratio` is the high side only.
+  Set to null.
+- `pricing.held_vol_edge` (dashboard): extra $ edge on a coin's market,
+  takes and quotes, while that coin prices on a held vol (`Fair.edge_add`,
+  added to the applied `constant_edge`). Set to 0.01. Held-vol fills
+  10-19..10-21 were +0.84c/lot at 10s (+-0.93, 303 fills) against -0.05c on
+  live implied, so this is a hedge for the bad stretch, not a fitted cost.
+- `pricing.quote_markets` (dashboard checkboxes, null = all): markets left
+  out rest no quotes (edge, LIP, LIP exit; `market_off` block) but are
+  still priced. Set to BTC, ETH, SOL, XRP. HYPE edge fills: -$250 of the
+  race's -$79 on 10-19 04:15..10-20 15:51, -$27 of +$8.5 on 10-21.
+
 ## 2026-10-20 — Dashboard performance data in its own process
 
 The dashboard on EC2 sat at ~33% CPU and 2 GB RSS (2.5 GB peak) with the
