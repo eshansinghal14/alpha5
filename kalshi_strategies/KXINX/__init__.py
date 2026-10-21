@@ -12,6 +12,7 @@ import datetime
 import pandas as pd
 
 from kalshi_infra.runtime.series import Series, Service
+from kalshi_strategies.KXINX import sessions
 from kalshi_strategies.KXINX.config import CONFIG_PATH, HUB_KEY, SpxConfig
 
 _ET = "America/New_York"
@@ -36,14 +37,18 @@ def _pick_event(events, cfg):
 
 
 def _trade_from(ev, cfg) -> pd.Timestamp | None:
-    """pricing.event_open_et on the close day, not Kalshi's open_time: the
-    next KXINXU event opens at the prior session's close, hours before the
-    0DTE chain it is priced off exists."""
+    """With pricing.trade_overnight, the Cboe overnight session that leads
+    into the close day (20:15 ET the prior weekday); otherwise
+    pricing.event_open_et on the close day. Never before Kalshi's open_time:
+    KXINXDUD's next event opens at 20:00 ET, KXINXU's at 16:00 ET."""
     if ev.close_time is None:
         return ev.open_time
-    hh, mm = (int(x) for x in cfg.pricing.event_open_et.split(":"))
     day = ev.close_time.tz_convert(_ET).date()
-    start = pd.Timestamp(datetime.datetime.combine(day, datetime.time(hh, mm)), tz=_ET).tz_convert("UTC")
+    if cfg.pricing.trade_overnight:
+        start = pd.Timestamp(sessions.gth_open(day)).tz_convert("UTC")
+    else:
+        hh, mm = (int(x) for x in cfg.pricing.event_open_et.split(":"))
+        start = pd.Timestamp(datetime.datetime.combine(day, datetime.time(hh, mm)), tz=_ET).tz_convert("UTC")
     return start if ev.open_time is None else max(start, ev.open_time)
 
 

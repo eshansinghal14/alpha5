@@ -21,6 +21,7 @@ from kalshi_infra import ib_functions as ibf
 from kalshi_infra.config import load
 from kalshi_infra.kalshi.markets import EventInfo
 from kalshi_infra.trading.fair import Fair
+from kalshi_strategies.KXINX import sessions
 from kalshi_strategies.KXINX.config import CONFIG_PATH, HUB_KEY, HubConfig
 from kalshi_strategies.KXINX.hub import HOST, LINE_LIMIT, MARKET_FIELDS
 
@@ -219,6 +220,12 @@ class SpxEventModel:
 
     def side_block(self, ticker, side, fair, now_s):
         return self._blocks.get(f"{ticker}:{side}")
+
+    def quote_block(self, ticker, now_s):
+        """No quoting while SPXW options aren't (yet) quoting: the hub keeps
+        re-sending the last fit across the 09:25-09:30 handover, so signal
+        age alone doesn't catch it."""
+        return sessions.options_gap(datetime.datetime.fromtimestamp(now_s, tz=datetime.timezone.utc))
 
     def summary_extras(self) -> dict:
         st = self._status

@@ -18,9 +18,10 @@ services:
       TIME_ZONE: America/New_York
       TZ: America/New_York
       # A restart (not a logoff) needs no fresh 2FA for a week, so this keeps
-      # the session alive without a phone tap every day. 23:45 ET is after
-      # the 16:00 close and before the next 09:00 open.
-      AUTO_RESTART_TIME: "11:45 PM"
+      # the session alive without a phone tap every day. 17:00 ET: after the
+      # 16:15 close and before the 20:15 Cboe overnight session the S&P
+      # series now trade (23:45 was mid-session).
+      AUTO_RESTART_TIME: "05:00 PM"
       # IBKR voids the restart token at its weekly reset (Sunday 01:00 ET), so
       # once a week a full login with a push is unavoidable. A cold restart
       # Sunday 22:00 ET makes that push arrive then, before the week's first

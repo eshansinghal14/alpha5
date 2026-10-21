@@ -70,6 +70,7 @@
     "pricing": {
       "event_suffix": "H1600",
       "event_open_et": "09:00",
+      "trade_overnight": false,
       "rescope_check_s": 10.0,
       "round_decimals": 3,
       "noise_jump": 0.02,
@@ -141,6 +142,7 @@
     "pricing": {
       "event_suffix": "H1600",
       "event_open_et": "09:00",
+      "trade_overnight": true,
       "rescope_check_s": 10.0,
       "round_decimals": 3,
       "noise_jump": 0.02,

@@ -21,7 +21,13 @@ class SpxPricingParams:
         "horizon.", apply=APPLY_NEXT_EVENT)
     event_open_et: str = param(
         "HH:MM ET before which a new event is not opened (SPXW 0DTE isn't listed earlier and IB "
-        "qualification fails).", apply=APPLY_NEXT_EVENT)
+        "qualification fails). Ignored with trade_overnight.", apply=APPLY_NEXT_EVENT)
+    trade_overnight: bool = param(
+        "Start each event at the Cboe overnight session that leads into its close day (20:15 ET the "
+        "prior weekday) and price off that day's SPXW expiry all night. Quotes are pulled across the "
+        "09:25-09:30 ET handover and the overnight session's first 2 minutes (KXINX/sessions.py). IB streamed "
+        "the next-day chain from 20:15 ET on 2026-10-20 (~110 ticks/s, 26 lines).",
+        apply=APPLY_NEXT_EVENT)
     scope_margin_buckets: int = param(
         "Buckets subscribed beyond max_markets on each side, so the traded set can drift without "
         "leaving the priced region (2026-10-08: KXINX 7 buckets = 48 IB lines, KXINXU 13 = 30). "

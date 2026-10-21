@@ -29,9 +29,11 @@ DOWN_RESTART_S = 600
 MIN_RESTART_GAP_S = 900
 COMPOSE_DIR = "/opt/alpha5/deploy/ibgateway"
 ET = ZoneInfo("America/New_York")
-# Only restart from 07:30 to 16:15 ET on weekdays, so a gateway left down
-# overnight doesn't send a push every 15 minutes while you sleep.
-ACTIVE = (datetime.time(7, 30), datetime.time(16, 15))
+# Restart only while SPXW quotes (Cboe overnight 20:15 ET through the 16:15
+# close, Sunday evening to Friday), so a gateway down in the evening break or
+# at the weekend doesn't send a push every 15 minutes. These are the break's
+# bounds: inside them is NOT active.
+ACTIVE = (datetime.time(16, 15), datetime.time(20, 15))
 
 
 def log(msg: str):
@@ -55,9 +57,14 @@ async def api_ok() -> bool:
             pass
 
 
-def active_now() -> bool:
-    now = datetime.datetime.now(ET)
-    return now.weekday() < 5 and ACTIVE[0] <= now.time() <= ACTIVE[1]
+def active_now(now: datetime.datetime | None = None) -> bool:
+    now = now or datetime.datetime.now(ET)
+    wd, t = now.weekday(), now.time()
+    if ACTIVE[0] <= t < ACTIVE[1]:
+        return False
+    if t >= ACTIVE[1]:                       # evening: leads into the next day's session
+        return wd in (6, 0, 1, 2, 3)         # Sun-Thu
+    return wd < 5                            # overnight/day: Mon-Fri
 
 
 def main():
