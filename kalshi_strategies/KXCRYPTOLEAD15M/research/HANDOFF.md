@@ -17,6 +17,18 @@ Change details with measurements are in `docs/CHANGES.md` (2026-10-19/20 entries
   origin has the new sha** (twice a pull ran before GitHub had the push and
   restarted old code), then restart units. Restart `alpha5-dashboard` too when
   a config key is added (it rejects unknown keys).
+- **A pull that adds a config key needs a restart of EVERY unit whose config
+  has it**, not just the one being worked on: shared sections (`risk`,
+  `quoting`, `lip` in `kalshi_infra/trading/params.py`) are in every
+  series' config.json, so that's `alpha5-crypto`, `alpha5-spx` and
+  `alpha5-dashboard` (plus `alpha5-crypto15m*` if running). A process on
+  older code rejects the WHOLE file on the next config poll and silently
+  keeps running on its last good config, ignoring every dashboard edit.
+  10-21: `274fb7f` (`risk.fair_lag_fair_move_max`) was pulled 18:55 UTC, only
+  `alpha5-spx` restarted; the race ignored edits for ~1.5h until 20:33.
+  Check after a deploy: no `REJECTED config change` in
+  `data/live/*.out.log`, and `config_status.error` null in each series'
+  `summary.json`.
 - Analysis on the box: `/opt/alpha5/deploy/review_py.sh script.py` (1 GiB cap;
   full-day decision journals OOM it — read only the windows needed).
   py-spy installed at `/tmp/pyspy/bin/py-spy` (lost on reboot).
