@@ -228,6 +228,22 @@ def test_held_vol_ignores_coins_on_live_implied():
     assert m.quote_block(None, now) is None
 
 
+def test_shadow_vols_anchor_har_to_the_last_implied_reading_and_never_price():
+    now = time.time()
+    m, iv = _race(now, implied_fallback_realized=False, implied_hold_s=300.0, implied_ema_s=120.0)
+    _fill(iv, COINS, now, s=0.7e-4)
+    out = m._price(now, None)
+    e = out[m.ticker_of["ETH"]].extras
+    assert e["implied_age_s"] == 0.0 and abs(e["anch_vol_bp"] - 0.7) < 1e-6      # anchored = implied at the anchor
+    assert e["har_vol_bp"] > 0 and abs(e["vol_bp"] - 0.7) < 1e-6                  # still priced on implied
+    out = m._price(now + 150, None)                                                # readings stopped: held
+    e = out[m.ticker_of["ETH"]].extras
+    assert m.vol_src["ETH"] == "held" and e["implied_age_s"] == 150.0
+    har_now, har_then = e["har_vol_bp"], math.sqrt(iv.har_anchor["ETH"][1]) * 1e4
+    assert abs(e["anch_vol_bp"] - 0.7 * har_now / har_then) < 1e-6
+    assert abs(e["vol_bp"] - 0.7) < 1e-6                                           # price unchanged by the shadow
+
+
 def test_pricer_rate_override():
     from kalshi_strategies.KXCRYPTOLEAD15M.cov_forecaster import ConstantCovForecaster
     from kalshi_strategies.KXCRYPTOLEAD15M.pricer import CoinRacePricer

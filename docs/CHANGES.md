@@ -90,6 +90,17 @@ days), redone on every dashboard restart (18 restarts on 10-20).
 - Tunnel command gets `ServerAliveInterval=15` so idle drops don't
   silently kill the dashboard's websocket.
 
+## 2026-10-21 — Race: stale-vol replacements logged in shadow
+
+Decision rows carry `x_har_vol_bp` (raw HAR rate), `x_anch_vol_bp` (last
+live implied x HAR now / HAR at that reading) and `x_implied_age_s`, per
+coin, once a second (`model._shadow_vols`). Nothing prices on them. After a
+day, `research/stale_vol_score.py` scores hold vs HAR vs anchored HAR against
+the next live implied reading by age, and the |fair - mid| distance trigger
+on held fills. Question: can either replace the 300s hold cap. The raw HAR
+fallback ran 20-44% low on 10-20 (spot realized ~0.65x implied on 10-21), so
+the anchored form is the candidate.
+
 ## 2026-10-21 — Race: implied_hold_s 600 -> 300
 
 Race 10-21 00:35-06:00 UTC (hold 600, no HAR fallback, 5.4h priced, 266

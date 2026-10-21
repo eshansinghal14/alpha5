@@ -124,6 +124,8 @@ class CoinRaceModel:
         self._held_vol_logged = False
         self._held_check_sec: int | None = None
         self.held_vol_ratio: dict[str, float] = {}
+        self._shadow_sec: int | None = None
+        self.shadow_vol: dict[str, dict] = {}
         self._basis_cache: dict[str, tuple] = {}
         self.vol_bp: dict[str, float] = {}
         self.vol_src: dict[str, str] = {}
@@ -289,6 +291,30 @@ class CoinRaceModel:
         if time.monotonic() >= self._held_vol_until:
             self._held_vol_logged = False
 
+    def _shadow_vols(self, now_s: float, tau: float, iv, rates: dict):
+        """Shadow only, never priced on: per coin, the raw HAR vol, an anchored
+        HAR vol (last live implied x HAR now / HAR at that reading) and the age
+        of that reading, logged so stale-vol replacements can be scored against
+        the next live implied value. Anchors live on `iv` (session lifetime), so
+        they carry across events like the held value. Once per second."""
+        sec = int(now_s)
+        if sec == self._shadow_sec:
+            return
+        self._shadow_sec = sec
+        har = self.pricer._rates_corr(max(tau, 1.0), now_s)[0]
+        anchors = iv.__dict__.setdefault("har_anchor", {})        # coin -> (implied rate, HAR rate, t)
+        out = {}
+        for i, c in enumerate(COINS):
+            h = float(har[i])
+            if self.vol_src.get(c) == "implied" and rates.get(c):
+                anchors[c] = (rates[c], h, now_s)
+            a = anchors.get(c)
+            anch = a[0] * h / a[1] if a is not None and a[1] > 0 else None
+            out[c] = {"har_vol_bp": math.sqrt(h) * 1e4 if h > 0 else None,
+                      "anch_vol_bp": math.sqrt(anch) * 1e4 if anch else None,
+                      "implied_age_s": None if a is None else now_s - a[2]}
+        self.shadow_vol = out
+
     def _implied(self):
         """The session's ImpliedRates (on the SpotFeed), or None without one."""
         return None if self.spot is None else getattr(self.spot, "implied_rates", None)
@@ -405,6 +431,7 @@ class CoinRaceModel:
             self.vol_src = {c: ("realized" if c in short else "held" if held[c] is not None else "implied")
                             for c in COINS}
             self._held_vol_check(now_s, rates)
+            self._shadow_vols(now_s, tau, iv, rates)
             rate = np.array([rates[c] for c in COINS])
             self.vol_bp = {c: math.sqrt(rates[c]) * 1e4 for c in COINS}
         # Correlation fitted to the race mids (corr_fit.py), on the unshifted fair.
@@ -463,7 +490,8 @@ class CoinRaceModel:
                                                   "corr_mult": g, "spot_mid": m_spot,
                                                   "perp_gap_bp": p_gap, "perp_n": p_n, "perp_inc_bp": p_inc,
                                                   "priced_on": self.priced_on.get(c, "spot"),
-                                                  "held_vol_ratio": self.held_vol_ratio.get(c)})
+                                                  "held_vol_ratio": self.held_vol_ratio.get(c),
+                                                  **self.shadow_vol.get(c, {})})
         return out
 
     # --- FairModel ----------------------------------------------------------
