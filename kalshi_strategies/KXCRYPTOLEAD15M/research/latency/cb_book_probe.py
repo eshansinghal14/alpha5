@@ -34,6 +34,9 @@ FEEDS = {
     "ex_l2b_b": (EX_URL, _ex("level2_batch")),
     "ex_ticker": (EX_URL, _ex("ticker")),
     "ex_matches": (EX_URL, _ex("matches")),
+    # The live adapter's Exchange connection, one socket: ordering between
+    # its ticker and level2_batch messages is what the adapter sees.
+    "ex_live": (EX_URL, _ex("matches", "heartbeat", "level2_batch", "ticker")),
 }
 
 
@@ -328,8 +331,144 @@ def analyze(outdir):
     pd.concat({f"{a}|{b}": r for (a, b), r in res.items()}).to_parquet(os.path.join(outdir, "lead.parquet"))
 
 
+def analyze_live(outdir):
+    """The ex_live socket alone: ticker vs level2_batch on one connection.
+      1. ticker touch first vs book first, and by how long (same coin, side, price)
+      2. l2update `time` vs the ticker time of the touch it first shows
+      3. how far book content trails the connection's newest exchange time
+         (bounds how long an unchanged book can be called current)
+      4. newest-of(ticker, book) touch vs the book alone, by exchange time."""
+    import orjson, numpy as np, pandas as pd
+    pd.set_option("display.width", 250)
+    q = lambda s: pd.Series({"n": len(s), "p50": s.median(), "p90": s.quantile(.9), "p99": s.quantile(.99),
+                             "p999": s.quantile(.999), "max": s.max()})
+    books, last_b, last_t = {}, {}, {}
+    rows_b, rows_t, lag, clock = [], [], [], -1.0
+    for recv, m in _lines(os.path.join(outdir, "ex_live.txt")):
+        if recv is None:
+            books.clear(); last_b.clear(); clock = -1.0
+            continue
+        d = orjson.loads(m)
+        ty = d.get("type")
+        ets = _iso(d.get("time"))
+        if ty in ("snapshot", "l2update"):
+            coin = d["product_id"].split("-")[0]
+            bk = books.setdefault(coin, _Book())
+            if ty == "snapshot":
+                bk.b.clear(); bk.a.clear(); bk.synced = True
+                for p, s in d["bids"]:
+                    bk.set("b", float(p), float(s))
+                for p, s in d["asks"]:
+                    bk.set("a", float(p), float(s))
+            else:
+                for s, p, z in d["changes"]:
+                    bk.set("b" if s == "buy" else "a", float(p), float(z))
+                if clock > 0:
+                    lag.append((coin, (clock - ets) * 1e3))
+            if bk.synced:
+                tb, ta = bk.touch()
+                pb, pa = last_b.get(coin, (None, None))
+                for side, new, old in (("b", tb, pb), ("a", ta, pa)):
+                    if new != old and new is not None:
+                        rows_b.append((coin, side, recv, ets, new))
+                last_b[coin] = (tb, ta)
+        elif ty == "ticker":
+            coin = d["product_id"].split("-")[0]
+            try:
+                tb, ta = float(d["best_bid"]), float(d["best_ask"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            pb, pa = last_t.get(coin, (None, None))
+            for side, new, old in (("b", tb, pb), ("a", ta, pa)):
+                if new != old:
+                    rows_t.append((coin, side, recv, ets, new))
+            last_t[coin] = (tb, ta)
+        if ets is not None:
+            clock = max(clock, ets)
+    B = pd.DataFrame(rows_b, columns=["coin", "side", "recv", "ets", "price"]).sort_values("recv")
+    T = pd.DataFrame(rows_t, columns=["coin", "side", "recv", "ets", "price"]).sort_values("recv")
+    print(f"book touch changes {len(B)}, ticker touch changes {len(T)}")
+
+    # 1. each book touch change: was the ticker there first?
+    Tm = T.rename(columns={"recv": "recv_t", "ets": "ets_t"})
+    r = pd.merge_asof(B, Tm, left_on="recv", right_on="recv_t", by=["coin", "side", "price"],
+                      direction="backward", tolerance=1.0)
+    r["lead_ms"] = (r.recv - r.recv_t) * 1e3
+    r["first"] = np.where(r.lead_ms.notna() & (r.lead_ms > 0), "ticker", "book")
+    print("\n=== 1. every book best-price change: ticker showed it first (within 1s)? ===")
+    g = r.groupby("coin")
+    t1 = pd.DataFrame({"n": g.size(), "ticker_first_%": g["first"].apply(lambda s: 100 * (s == "ticker").mean())})
+    lead = r[r["first"] == "ticker"].groupby("coin").lead_ms.apply(q).unstack()
+    print(t1.join(lead.add_prefix("lead_")).round(1).to_string())
+    a = r[r["first"] == "ticker"].lead_ms
+    print(f"ALL: ticker first {100 * (r['first'] == 'ticker').mean():.1f}% of {len(r)}; lead p50 {a.median():.1f}ms "
+          f"p90 {a.quantile(.9):.1f}ms")
+    # ticker changes the book never showed within 1s (intermediate touches inside one batch)
+    Bm = B.rename(columns={"recv": "recv_b", "ets": "ets_b"})
+    u = pd.merge_asof(T, Bm, left_on="recv", right_on="recv_b", by=["coin", "side", "price"],
+                      direction="forward", tolerance=1.0)
+    print(f"ticker touches the book showed later: {100 * u.recv_b.notna().mean():.1f}% of {len(u)}; "
+          f"book already had it: see 1")
+
+    # 2. book message time vs ticker time of the same touch
+    m2 = u.dropna(subset=["recv_b"])
+    print("\n=== 2. l2update `time` - ticker `time`, same touch, book later (ms): >= 0 means `time` "
+          "is at or after the change ===")
+    print(q((m2.ets_b - m2.ets) * 1e3).round(1).to_string())
+    print(f"share < 0: {100 * ((m2.ets_b - m2.ets) < 0).mean():.2f}%  share < -5ms: "
+          f"{100 * ((m2.ets_b - m2.ets) < -0.005).mean():.2f}%")
+
+    # 3. content lag behind the connection clock
+    L = pd.DataFrame(lag, columns=["coin", "ms"])
+    print("\n=== 3. connection's newest exchange time - l2update time, on arrival (ms) ===")
+    print(L.groupby("coin").ms.apply(q).unstack().round(1).to_string())
+    print("ALL", q(L.ms).round(1).to_dict())
+
+    # 4. exchange-time age of the touch: book alone vs newest of book/ticker, sampled every 10ms
+    print("\n=== 4. touch information age (now - exchange time of newest touch info), 10ms grid (ms) ===")
+    t0, t1_ = B.recv.min() + 5, B.recv.max()
+    grid = np.arange(t0, t1_, 0.01)
+    out = []
+    for coin in sorted(B.coin.unique()):
+        bb = B[B.coin == coin].drop_duplicates("recv", keep="last")
+        tt = T[T.coin == coin].drop_duplicates("recv", keep="last")
+        ib = pd.Series(bb.ets.values, index=bb.recv.values).cummax()
+        it = pd.Series(tt.ets.values, index=tt.recv.values).cummax()
+        gb = ib.reindex(grid, method="ffill").values
+        gt = it.reindex(grid, method="ffill").values if len(tt) else np.full(len(grid), np.nan)
+        both = np.fmax(gb, gt)
+        out.append(dict(coin=coin, book_p50=np.nanmedian(grid - gb) * 1e3, both_p50=np.nanmedian(grid - both) * 1e3,
+                        book_p90=np.nanpercentile(grid - gb, 90) * 1e3, both_p90=np.nanpercentile(grid - both, 90) * 1e3,
+                        newer_from_ticker_pct=100 * np.nanmean(gt > gb)))
+    print("(time since the last touch CHANGE, so quiet coins read old; compare columns, not levels)")
+    print(pd.DataFrame(out).set_index("coin").round(1).to_string())
+
+    # 5. does sharing the socket with level2_batch delay matches / ticker?
+    def stream(fname, want):
+        out = []
+        for recv, m in _lines(os.path.join(outdir, fname)):
+            if recv is None or f'"{want}"' not in m:
+                continue
+            d = orjson.loads(m)
+            if d.get("type") == want:
+                out.append((d["product_id"].split("-")[0], str(d.get("trade_id") or d.get("sequence")), recv,
+                            _iso(d["time"])))
+        return pd.DataFrame(out, columns=["coin", "key", "recv", "ets"])
+    print("\n=== 5. same message on the shared live socket vs its own socket: live receipt - own (ms) ===")
+    for want, own in (("match", "ex_matches.txt"), ("ticker", "ex_ticker.txt")):
+        a, b = stream("ex_live.txt", want), stream(own, want)
+        if want == "ticker":
+            a["key"], b["key"] = a.ets.astype(str), b.ets.astype(str)
+        j = a.merge(b, on=["coin", "key"], suffixes=("_live", "_own")).drop_duplicates(["coin", "key"])
+        print(want, q((j.recv_live - j.recv_own) * 1e3).round(1).to_dict())
+        print(f"  exchange time -> receipt p50: live {np.median(j.recv_live - j.ets_live) * 1e3:.1f}ms, "
+              f"own socket {np.median(j.recv_own - j.ets_own) * 1e3:.1f}ms")
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "rec":
         record(float(sys.argv[2]), sys.argv[3])
+    elif sys.argv[1] == "live":
+        analyze_live(sys.argv[2])
     else:
         analyze(sys.argv[2])

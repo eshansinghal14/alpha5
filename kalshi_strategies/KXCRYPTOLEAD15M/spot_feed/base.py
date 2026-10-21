@@ -50,6 +50,9 @@ class VenueBook:
     # A newer trade printed outside the bid/ask above, so the book is behind
     # the matching engine; mid() reports this price until the book catches up.
     trade_px: float | None = None
+    # Exchange time (epoch s) this view is known complete up to, where the
+    # venue lets us say (Coinbase); None elsewhere.
+    data_ts: float | None = None
 
     def best_bid(self) -> float | None:
         return self.bids[0].price if self.bids else None

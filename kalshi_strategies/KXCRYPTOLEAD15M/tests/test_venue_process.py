@@ -258,4 +258,10 @@ def test_median_uses_listed_venues_and_drops_stale_ones():
     assert bus.mid_nowcast("BTC") == pytest.approx(101.0)
     bus.touch("bitstamp", "BTC", now)                # live connection, unchanged book
     bus.observe(_vb("coinbase", 100.0, now))
-    assert bus.mid_nowcast("BTC") == pytest.approx(102.0)
+    # Back in the median (102), which the Coinbase-led mid reaches through its
+    # smoothed offset (composite.LEAD_OFFSET_TAU_S), not in one step.
+    assert 101.0 <= bus.mid_nowcast("BTC") < 102.0
+    for v in ("kraken", "bitstamp"):
+        bus.touch(v, "BTC", now + 20.0)
+    bus.observe(_vb("coinbase", 100.0, now + 20.0))
+    assert bus.mid_nowcast("BTC") == pytest.approx(102.0, abs=1e-3)

@@ -69,6 +69,14 @@ EX_BOOK = True
 # both books are aged alike. 10-21 probe: Exchange time -> receipt p10 8ms,
 # p99 63-70ms, batches every ~60ms.
 EXB_BATCH_S = 0.06
+# How far a coin's l2update `time` can trail the newest exchange time already
+# seen on the book connection: a coin with no newer message is taken as
+# complete up to (connection clock - this). 10-21 20:04-20:24 UTC probe
+# (cb_book_probe.py live, section 3): p99 44ms, p99.9 55ms, max 131ms.
+EX_CLOCK_LAG_S = 0.06
+# Same for the Advanced Trade fallback book, on its update event_times. Not
+# measured; set wide since that book is only used while Exchange is down.
+AT_CLOCK_LAG_S = 0.1
 RECONNECT_DELAY_S = 1.0
 # The heartbeats channel sends one message per second on the connection,
 # so a silent socket is dead well before this.
@@ -111,7 +119,8 @@ class _ProductBook:
     books; this adapter just reports what the venue said."""
 
     __slots__ = ("bids", "asks", "last_receive_ts", "last_exchange_ts",
-                 "last_seq", "is_resyncing", "last_wire_ts", "trade_px", "trade_dir", "trade_ts")
+                 "last_seq", "is_resyncing", "last_wire_ts", "trade_px", "trade_dir", "trade_ts",
+                 "content_ts", "ovr", "ovr_mono", "data_ts")
 
     def __init__(self):
         # Price-sorted dicts: best bid = bids.peekitem(-1), best ask =
@@ -133,14 +142,51 @@ class _ProductBook:
         self.trade_px: float | None = None
         self.trade_dir: int = 0
         self.trade_ts: float = 0.0
+        # Exchange time (epoch s) of the newest change applied to the levels.
+        self.content_ts: float | None = None
+        # A touch newer than the levels (ticker): (exch_ts, bid, bid_sz, ask,
+        # ask_sz), and when it was set (monotonic). Cleared by the first book
+        # change at or after its time.
+        self.ovr: tuple | None = None
+        self.ovr_mono: float = 0.0
+        # Exchange time (epoch s) the emitted view is known complete up to:
+        # what the signal age is measured from (see CoinbaseAdapter._known).
+        self.data_ts: float | None = None
 
     def clear(self):
         self.bids.clear()
         self.asks.clear()
         self.is_resyncing = True
         self.trade_px = None
+        self.content_ts = None
+        self.ovr = None
+        self.data_ts = None
+
+    def book_time(self, ts: float | None):
+        """The levels now include every change up to exchange time `ts`."""
+        if ts is None:
+            return
+        if self.content_ts is None or ts > self.content_ts:
+            self.content_ts = ts
+        if self.ovr is not None and ts >= self.ovr[0]:
+            self.ovr = None
+
+    def set_override(self, ts: float, bid: float, bid_sz: float, ask: float, ask_sz: float, now: float):
+        self.ovr = (ts, bid, bid_sz, ask, ask_sz)
+        self.ovr_mono = now
+
+    def live_override(self) -> tuple | None:
+        """The ticker touch while it is newer than the levels. Expires after
+        TRADE_HOLD_S in case no later book change ever arrives."""
+        o = self.ovr
+        if o is not None and time.monotonic() - self.ovr_mono > TRADE_HOLD_S:
+            self.ovr = o = None
+        return o
 
     def _touch(self) -> tuple[float | None, float | None]:
+        o = self.live_override()
+        if o is not None:
+            return o[1], o[3]
         return (self.bids.peekitem(-1)[0] if self.bids else None,
                 self.asks.peekitem(0)[0] if self.asks else None)
 
@@ -187,6 +233,11 @@ class _ProductBook:
         bids_sorted = [(p, self.bids[p]) for p in
                        self.bids.islice(max(0, nb - max_levels), nb, reverse=True)]
         asks_sorted = [(p, self.asks[p]) for p in self.asks.islice(0, max_levels)]
+        o = self.live_override()
+        if o is not None:
+            _, tb, tbs, ta, tas = o
+            bids_sorted = [(tb, tbs)] + [x for x in bids_sorted if x[0] < tb]
+            asks_sorted = [(ta, tas)] + [x for x in asks_sorted if x[0] > ta]
         # Self-heal phantom crossed levels. Coinbase `level2` sends
         # ABSOLUTE sizes and explicit new_quantity=0 removals; if we miss
         # even one removal (a dropped frame on a seq gap), a stale level
@@ -232,6 +283,7 @@ class _ProductBook:
             is_resyncing=self.is_resyncing,
             seq=self.last_seq,
             trade_px=self.trade_px,
+            data_ts=self.data_ts,
         )
 
 
@@ -257,7 +309,8 @@ class CoinbaseAdapter(VenueAdapter):
         # The Exchange book ("exb", level2_batch) gets its own too: against the
         # matches minimum its batching read as up to ~60ms of queueing.
         self._offsets: dict[str, collections.deque[tuple[float, float]]] = {
-            "at": collections.deque(), "ex": collections.deque(), "exb": collections.deque()}
+            "at": collections.deque(), "ex": collections.deque(), "exb": collections.deque(),
+            "ext": collections.deque()}
         # Last view handed out per coin; its receive_ts is advanced in place
         # by _mark_fresh, since the composite holds on to these objects.
         self._views: dict[str, VenueBook] = {}
@@ -275,6 +328,32 @@ class CoinbaseAdapter(VenueAdapter):
         # Advanced Trade book, which keeps running as the fallback.
         self._ex_books: dict[str, _ProductBook] = {c: _ProductBook() for c in self.coins}
         self.ex_book_live = False
+        # Newest exchange time seen on each book connection (epoch s).
+        self._ex_clock = 0.0
+        self._at_clock = 0.0
+
+    def _known_ts(self, coin: str, pb: _ProductBook) -> float | None:
+        """Exchange time `pb` is known complete up to: its newest applied
+        change, a newer ticker touch, or its connection's clock less the
+        most a pending update for it can trail that clock."""
+        if self._ex_books.get(coin) is pb:
+            clock, lag = self._ex_clock, EX_CLOCK_LAG_S
+        else:
+            clock, lag = self._at_clock, AT_CLOCK_LAG_S
+        o = pb.live_override()
+        vals = [v for v in (pb.content_ts, o[0] if o is not None else None,
+                            clock - lag if clock > 0 else None) if v is not None]
+        return max(vals) if vals else None
+
+    def _refresh_known(self, books: dict):
+        """Advance data_ts on every synced book and the view handed out for it."""
+        for coin, pb in books.items():
+            if pb.is_resyncing:
+                continue
+            pb.data_ts = self._known_ts(coin, pb)
+            vb = self._views.get(coin)
+            if vb is not None and self._src(coin) is pb:
+                vb.data_ts = pb.data_ts
 
     def _src(self, coin: str) -> _ProductBook:
         """The book views are built from: Exchange when usable, else Advanced Trade."""
@@ -318,71 +397,101 @@ class CoinbaseAdapter(VenueAdapter):
         return self.latest(coin)
 
     async def run(self, on_update: Callable[[VenueBook], Awaitable[None] | None]):
-        await asyncio.gather(self._run_at(on_update), self._run_ex(on_update))
+        tasks = [self._run_at(on_update), self._run_ex_trades(on_update)]
+        if EX_BOOK:
+            tasks.append(self._run_ex_book(on_update))
+        await asyncio.gather(*tasks)
 
-    async def _run_ex(self, on_update):
-        """Exchange feed: matches (every print), ticker (touch after each
-        match) and level2_batch (top-50 book, the view source while synced).
-        A print or ticker touch newer than the book is held, as before."""
+    async def _ex_socket(self, channels, on_msg, on_up, on_down):
         product_ids = [COINBASE_PRODUCTS[c] for c in self.coins]
-        channels = ["matches", "heartbeat"] + (["level2_batch", "ticker"] if EX_BOOK else [])
+        name = " + ".join(channels)
         while True:
             try:
                 async with websockets.connect(EX_WS_URL, open_timeout=15, ping_interval=20,
                                               ping_timeout=15, max_size=MAX_FRAME_SIZE) as ws:
                     await ws.send(json.dumps({"type": "subscribe", "product_ids": product_ids,
                                               "channels": channels}))
-                    print(f"[spot/coinbase] exchange feed: {' + '.join(channels)} to {product_ids}")
+                    print(f"[spot/coinbase] exchange feed: {name} to {product_ids}")
                     while True:
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=RECV_TIMEOUT_S)
                         except asyncio.TimeoutError:
-                            print("[spot/coinbase] exchange feed recv timeout -- reconnecting")
+                            print(f"[spot/coinbase] exchange {name} recv timeout -- reconnecting")
                             break
                         d = json.loads(raw)
                         ty = d.get("type")
                         if ty == "subscriptions":
-                            self.ex_live = True
-                            self.ex_book_live = EX_BOOK
+                            on_up()
                             continue
                         if ty == "error":
                             print(f"[spot/coinbase] exchange feed error: {d.get('message')} {d.get('reason')}")
                             break
-                        mono = time.monotonic()
                         coin = self._coin_by_product.get(d.get("product_id"))
                         if coin is None:
                             continue
                         exch_ts = _parse_iso_ts(d["time"]) if d.get("time") else None
-                        as_of = mono - (self._data_age(exch_ts, mono, "exb", EXB_BATCH_S) if ty == "l2update"
-                                        else self._data_age(exch_ts, mono, "ex"))
-                        if ty == "match":
-                            await self._ex_match(coin, d, as_of, exch_ts, on_update)
-                        elif ty == "snapshot":
-                            self._ex_snapshot(coin, d, mono)
-                        elif ty == "l2update":
-                            await self._ex_l2update(coin, d, as_of, exch_ts, on_update)
-                        elif ty == "ticker":
-                            await self._ex_ticker(coin, d, as_of, on_update)
-                        if ty in ("heartbeat", "l2update", "ticker", "match"):
-                            # One in-order connection: any message proves every synced
-                            # Exchange book current (see _mark_fresh).
-                            self._mark_books_fresh(self._ex_books, as_of if ty != "heartbeat" else mono, True)
+                        await on_msg(ty, coin, d, exch_ts, time.monotonic())
             except (OSError, websockets.ConnectionClosed) as e:
-                print(f"[spot/coinbase] exchange feed connection error ({e!r}); retrying in {RECONNECT_DELAY_S}s")
+                print(f"[spot/coinbase] exchange {name} connection error ({e!r}); retrying in {RECONNECT_DELAY_S}s")
             except Exception as e:
-                print(f"[spot/coinbase] exchange feed unexpected error: {e!r}; reconnecting")
+                print(f"[spot/coinbase] exchange {name} unexpected error: {e!r}; reconnecting")
+            on_down()
+            await asyncio.sleep(RECONNECT_DELAY_S)
+
+    async def _run_ex_trades(self, on_update):
+        """Exchange `matches` on its own socket: sharing one with level2_batch
+        delayed each print p50 1.9ms / p99 18ms (10-21 20:04-20:24 UTC probe)."""
+        async def on_msg(ty, coin, d, exch_ts, mono):
+            if ty == "match":
+                await self._ex_match(coin, d, mono - self._data_age(exch_ts, mono, "ex"), exch_ts, on_update)
+
+        def up():
+            self.ex_live = True
+
+        def down():
             self.ex_live = False
+        await self._ex_socket(["matches", "heartbeat"], on_msg, up, down)
+
+    async def _run_ex_book(self, on_update):
+        """level2_batch (top-50 book, the view source while synced) and ticker
+        (the touch after each match) on one in-order socket, so their exchange
+        times are comparable: whichever is newer sets the touch."""
+        async def on_msg(ty, coin, d, exch_ts, mono):
+            if exch_ts is not None and exch_ts > self._ex_clock:
+                self._ex_clock = exch_ts
+            as_of = mono
+            if ty == "snapshot":
+                self._ex_snapshot(coin, d, mono, exch_ts)
+            elif ty == "l2update":
+                as_of = mono - self._data_age(exch_ts, mono, "exb", EXB_BATCH_S)
+                await self._ex_l2update(coin, d, as_of, exch_ts, on_update)
+            elif ty == "ticker":
+                as_of = mono - self._data_age(exch_ts, mono, "ext")
+                await self._ex_ticker(coin, d, as_of, exch_ts, on_update)
+            elif ty != "heartbeat":
+                return
+            # One in-order connection: any message proves every synced
+            # Exchange book current (see _mark_fresh).
+            self._mark_books_fresh(self._ex_books, as_of, True)
+            self._refresh_known(self._ex_books)
+
+        def up():
+            self.ex_book_live = True
+
+        def down():
             self.ex_book_live = False
+            self._ex_clock = 0.0
             for eb in self._ex_books.values():
                 eb.clear()
                 eb.last_receive_ts = 0.0
-            await asyncio.sleep(RECONNECT_DELAY_S)
+        await self._ex_socket(["heartbeat", "level2_batch", "ticker"], on_msg, up, down)
 
-    def _ex_snapshot(self, coin, d, mono):
+    def _ex_snapshot(self, coin, d, mono, exch_ts=None):
         eb = self._ex_books[coin]
         eb.clear()
         eb.apply_snapshot([(float(p), float(q)) for p, q in d.get("bids", [])],
                           [(float(p), float(q)) for p, q in d.get("asks", [])])
+        eb.book_time(exch_ts)
         eb.last_receive_ts = mono
 
     async def _ex_l2update(self, coin, d, as_of, exch_ts, on_update):
@@ -391,22 +500,37 @@ class CoinbaseAdapter(VenueAdapter):
             return
         for side, p, q in d.get("changes", []):
             eb.apply_change("bid" if side == "buy" else "ask", float(p), float(q))
+        # A batch at or after a ticker's time already includes that touch
+        # (never earlier in 2,422 matched touches, 10-21 probe), so it ends the override.
+        eb.book_time(exch_ts)
         eb.settle_trade(as_of)
         eb.last_exchange_ts = exch_ts
         eb.last_receive_ts = as_of
         if self._src(coin) is eb:
             await self._emit(coin, on_update)
 
-    async def _ex_ticker(self, coin, d, as_of, on_update):
-        """The touch right after a match, sent before level2_batch's next
-        batch: its mid is held like a through-the-touch print until the book
-        reaches it (only when it lies outside the book's touch)."""
+    async def _ex_ticker(self, coin, d, as_of, exch_ts, on_update):
+        """The touch right after a match. It sets the book's best bid/ask while
+        it is newer than the last level2_batch change applied: it showed a
+        best-price change first on 16% of the book's changes (p50 43ms sooner),
+        and 70% of its touches never appear in a batch at all (10-21 probe)."""
+        eb = self._ex_books[coin]
+        if eb.is_resyncing or exch_ts is None or (eb.content_ts is not None and exch_ts <= eb.content_ts):
+            return
         try:
             bb, ba = float(d["best_bid"]), float(d["best_ask"])
         except (KeyError, TypeError, ValueError):
             return
-        if 0 < bb < ba:
-            await self._held(coin, 0.5 * (bb + ba), as_of, on_update)
+        if not 0 < bb < ba:
+            return
+        bs = float(d.get("best_bid_size") or eb.bids.get(bb) or 1e-9)
+        asz = float(d.get("best_ask_size") or eb.asks.get(ba) or 1e-9)
+        before = eb._touch()
+        eb.set_override(exch_ts, bb, bs, ba, asz, time.monotonic())
+        eb.settle_trade(as_of)
+        eb.last_exchange_ts = exch_ts
+        if self._src(coin) is eb and eb._touch() != before:
+            await self._emit(coin, on_update)
 
     def _new_trade(self, coin: str, tid) -> bool:
         k = (coin, str(tid))
@@ -442,6 +566,7 @@ class CoinbaseAdapter(VenueAdapter):
 
     async def _emit(self, coin, on_update):
         pb = self._src(coin)
+        pb.data_ts = self._known_ts(coin, pb)
         vb = pb.to_venue_book(self.venue, COINBASE_PRODUCTS[coin], coin, max_levels=PER_MSG_LEVELS)
         self._views[coin] = vb
         result = on_update(vb)
@@ -529,6 +654,7 @@ class CoinbaseAdapter(VenueAdapter):
                             for event in d.get("events", []) or []:
                                 await self._handle_trades(event, as_of, on_update, exch_ts)
                         self._mark_fresh(as_of)
+                        self._refresh_known(self._books)
             except (OSError, websockets.ConnectionClosed) as e:
                 print(f"[spot/coinbase] connection error ({e!r}); retrying in {RECONNECT_DELAY_S}s")
             except Exception as e:
@@ -539,6 +665,7 @@ class CoinbaseAdapter(VenueAdapter):
                 print(f"[spot/coinbase] unexpected error: {e!r}; reconnecting")
             for pb in self._books.values():
                 pb.is_resyncing = True
+            self._at_clock = 0.0
             await asyncio.sleep(RECONNECT_DELAY_S)
 
     def _data_age(self, exch_ts: float | None, mono_now: float, feed: str = "at",
@@ -584,6 +711,15 @@ class CoinbaseAdapter(VenueAdapter):
                                 float(change["new_quantity"]))
         else:
             return
+        # The message `timestamp` is send time; content time is the newest
+        # update's event_time (32-42ms older at p50, 10-21 probe). Same ISO
+        # format throughout, so the string max is the time max.
+        ets = [u.get("event_time") for u in event.get("updates", []) if u.get("event_time")]
+        if ets:
+            et = _parse_iso_ts(max(ets))
+            pb.book_time(et)
+            if et is not None and et > self._at_clock:
+                self._at_clock = et
         pb.settle_trade(as_of)
         pb.last_exchange_ts = exch_ts
         # receive_ts is the monotonic time the data was FRESH at our edge:

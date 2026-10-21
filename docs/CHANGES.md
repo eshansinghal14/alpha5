@@ -3,6 +3,35 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-21 — Coinbase ticker touch, exchange-time signal age, Coinbase-led median
+
+Probe on the live adapter's Exchange socket, us-east-2c 10-21 20:04-20:24 UTC
+(`cb_book_probe.py live`):
+- `ticker` showed a best-price change before `level2_batch` on 16% of the
+  book's changes (SOL 27, XRP 20, BTC 18, HYPE 13, ETH 12%), p50 43ms sooner;
+  70% of ticker touches never appear in a batch. A batch that later shows a
+  ticker's touch was never stamped earlier than the ticker (0 of 2,422).
+- l2update `time` trails the connection's newest exchange time by up to p99
+  44ms / p99.9 55ms.
+- `matches` sharing the book socket arrived p50 1.9ms / p99 18ms later.
+
+Changes:
+- Exchange `matches` on its own socket; `level2_batch` + `ticker` on another.
+- A ticker newer (by exchange time) than the book's last applied change sets
+  the view's best bid/ask, dropping levels it has passed, until a batch at or
+  after its time lands (`_ProductBook.set_override`, at most `TRADE_HOLD_S`).
+- `VenueBook.data_ts`: exchange time the Coinbase view is known complete up
+  to (newest applied change, newer ticker, or the connection clock less
+  `EX_CLOCK_LAG_S` 60ms). `CoinRaceModel.signal_age_exch_s` = wall now minus
+  that time for the oldest coin under the current fair. Logged on every
+  decision row (`signal_age_alt_s`); the gate stays on the receipt age
+  (`model.SIGNAL_AGE_CLOCK`) until the limits are re-set from it.
+- BTC/ETH/XRP pricing mid = Coinbase mid x exp(smoothed ln(median /
+  Coinbase), tau `LEAD_OFFSET_TAU_S` 2s): a move Coinbase shows first moves
+  the mid in full. Other venues reach us p50 25-166ms after their exchange
+  time (recorder 10-21 14:00-21:00 UTC; Kraken 53-56ms, probe 20:50 UTC).
+  1s bars keep the plain median.
+
 ## 2026-10-21 — Coinbase book from the Exchange feed again
 
 - `coinbase.EX_BOOK = True`. Clean c7g in the live box's subnet (us-east-2c),

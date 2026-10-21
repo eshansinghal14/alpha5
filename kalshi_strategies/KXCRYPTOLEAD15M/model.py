@@ -44,6 +44,10 @@ BASIS_MIN_S = 10
 # problem. Long enough to skip a venue's own reconnect (bullish/kraken resync
 # in a few seconds, recorder 2026-10-19).
 THIN_VENUES_S = 60.0
+# Which age gates quoting: "receipt" (receive time less our queueing, the
+# limits in config.json were set on it) or "exchange" (signal_age_exch_s).
+# Both are logged on every decision row; switch once the limits are re-set.
+SIGNAL_AGE_CLOCK = "receipt"
 
 
 def load_composite_bars(coin: str, start_s: float, end_s: float, root: Path = DATA_ROOT) -> list[CompositeBar]:
@@ -105,6 +109,9 @@ class CoinRaceModel:
         self.withheld_reason: str | None = "warming"
         self._last_delta_s = 0.0
         self._newest_mono = 0.0     # oldest coin's newest book under the current fair
+        # Same, as the exchange time the oldest coin's Coinbase book was
+        # complete up to when the current fair was computed (epoch s).
+        self._priced_data_ts: float | None = None
         self._down: list[str] = list(COINS)
         self._wake = None
         # A mid has moved since the last _price, so the fair lags its inputs.
@@ -430,6 +437,7 @@ class CoinRaceModel:
         if compute_delta:
             self._last_delta_s = now_s
         self._newest_mono = min(newest)
+        self._priced_data_ts = self._oldest_data_ts(books)
         self._dirty = False
         self.withheld_reason = None
         k = p.ci_vol_multiplier
@@ -474,6 +482,17 @@ class CoinRaceModel:
         return self._price(now_s, False)
 
     def signal_age_s(self):
+        if SIGNAL_AGE_CLOCK == "exchange":
+            return self.signal_age_exch_s()
+        return self.signal_age_recv_s()
+
+    def signal_age_alt_s(self):
+        """The clock not gating (decision rows log it as signal_age_alt_s)."""
+        if SIGNAL_AGE_CLOCK == "exchange":
+            return self.signal_age_recv_s()
+        return self.signal_age_exch_s()
+
+    def signal_age_recv_s(self):
         """Age of the oldest input under the current fair: the oldest coin's
         venue book, or the CF feed if it has gone quiet (pricing on a frozen
         start/basis/end average is exactly the stale case). While no mid has
@@ -491,6 +510,36 @@ class CoinRaceModel:
             if min(live) > 0:
                 return max(time.monotonic() - min(live), self._cf_excess(cf_age))
         return max(time.monotonic() - self._newest_mono, self._cf_excess(cf_age))
+
+    @staticmethod
+    def _oldest_data_ts(books) -> float | None:
+        """Over coins, the exchange time each coin's book is known complete up
+        to (Coinbase: VenueBook.data_ts), the oldest of them. Other venues
+        carry no such time and lag Coinbase anyway (composite.LEAD_VENUE)."""
+        out = []
+        for c in COINS:
+            ts = [vb.data_ts for vb in books.get(c, []) if vb.data_ts is not None and not vb.is_resyncing]
+            if not ts:
+                return None
+            out.append(max(ts))
+        return min(out)
+
+    def signal_age_exch_s(self):
+        """Wall now minus the Coinbase exchange time the current fairs reflect:
+        network, Coinbase's batching, our queueing and time since the reprice,
+        all in. While no mid has moved since the reprice the fair is still
+        exact, so it follows the books' live completeness instead."""
+        if self.result is None:
+            return None
+        ts = self._priced_data_ts
+        if not self._dirty:
+            live = self._oldest_data_ts(self.bus.venue_books_per_coin())
+            if live is not None:
+                ts = live if ts is None else max(ts, live)
+        if ts is None:
+            return None
+        cf_age = self.cf.age_s()
+        return max(time.time() - ts, self._cf_excess(cf_age) if cf_age is not None else 0.0)
 
     @staticmethod
     def _cf_excess(cf_age: float) -> float:

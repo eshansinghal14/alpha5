@@ -215,18 +215,70 @@ def test_views_come_from_the_exchange_book_while_synced_then_fall_back(monkeypat
     assert views[-1].best_bid() == 99.1
 
 
-def test_ticker_touch_outside_the_book_is_held_until_the_book_reaches_it(monkeypatch):
+def _tick(ad, coin, bid, ask, ets, views, bsz="1", asz="1"):
     import asyncio, time as _t
+    asyncio.run(ad._ex_ticker(coin, {"best_bid": bid, "best_ask": ask, "best_bid_size": bsz, "best_ask_size": asz},
+                              _t.monotonic(), ets, views.append))
+
+
+def _l2(ad, coin, changes, ets, views):
+    import asyncio, time as _t
+    asyncio.run(ad._ex_l2update(coin, {"changes": changes}, _t.monotonic(), ets, views.append))
+
+
+def test_ticker_newer_than_the_book_sets_its_touch(monkeypatch):
+    """A one-sided touch change (bid stays, ask lifted) moves the view's ask,
+    not just a held mid; levels the ticker has passed are dropped."""
     from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed import coinbase as cbm
     monkeypatch.setattr(cbm, "EX_BOOK", True)
     ad = CoinbaseAdapter(coins=["SOL"])
     views = []
-    _ex_ready(ad)
-    asyncio.run(ad._ex_ticker("SOL", {"best_bid": "100.20", "best_ask": "100.30"}, _t.monotonic(), views.append))
-    assert views and views[-1].mid() == pytest.approx(100.25)  # above the book's ask: held
-    asyncio.run(ad._ex_l2update("SOL", {"changes": [["sell", "100.1", "0"], ["sell", "100.3", "5"],
-                                                    ["buy", "100.2", "5"]]}, _t.monotonic(), None, views.append))
-    assert views[-1].trade_px is None and views[-1].mid() == pytest.approx(100.25)
+    _ex_ready(ad, bid=100.0, ask=100.1)
+    _l2(ad, "SOL", [["sell", "100.2", "3"]], 1000.0, views)
+    _tick(ad, "SOL", "100.00", "100.20", 1000.05, views, asz="3")
+    vb = views[-1]
+    assert vb.best_bid() == 100.0 and vb.best_ask() == 100.2       # 100.1 was taken out
+    assert [l.price for l in vb.asks][:2] == [100.2]
+
+
+def test_older_ticker_never_overrides_a_newer_book(monkeypatch):
+    from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed import coinbase as cbm
+    monkeypatch.setattr(cbm, "EX_BOOK", True)
+    ad = CoinbaseAdapter(coins=["SOL"])
+    views = []
+    _ex_ready(ad, bid=100.0, ask=100.1)
+    _l2(ad, "SOL", [["buy", "100.05", "2"]], 1000.10, views)
+    n = len(views)
+    _tick(ad, "SOL", "99.90", "100.10", 1000.05, views)            # older than the batch: ignored
+    assert len(views) == n and ad.latest("SOL").best_bid() == 100.05
+
+
+def test_book_change_at_or_after_the_ticker_takes_the_touch_back(monkeypatch):
+    from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed import coinbase as cbm
+    monkeypatch.setattr(cbm, "EX_BOOK", True)
+    ad = CoinbaseAdapter(coins=["SOL"])
+    views = []
+    _ex_ready(ad, bid=100.0, ask=100.1)
+    _tick(ad, "SOL", "100.00", "100.30", 1000.05, views)
+    assert views[-1].best_ask() == 100.3
+    _l2(ad, "SOL", [["sell", "100.1", "0"], ["sell", "100.25", "4"]], 1000.06, views)
+    assert views[-1].best_ask() == 100.25                          # the book is newer now
+
+
+def test_data_ts_is_newest_of_book_ticker_and_connection_clock(monkeypatch):
+    from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed import coinbase as cbm
+    monkeypatch.setattr(cbm, "EX_BOOK", True)
+    ad = CoinbaseAdapter(coins=["SOL", "BTC"])
+    views = []
+    _ex_ready(ad, "SOL")
+    _ex_ready(ad, "BTC")
+    _l2(ad, "SOL", [["buy", "100.0", "3"]], 1000.0, views)
+    assert views[-1].data_ts == 1000.0
+    _tick(ad, "SOL", "100.00", "100.20", 1000.04, views)
+    assert views[-1].data_ts == 1000.04
+    ad._ex_clock = 1000.5                     # a later BTC batch: SOL had nothing newer to send
+    ad._refresh_known(ad._ex_books)
+    assert ad.latest("SOL").data_ts == pytest.approx(1000.5 - cbm.EX_CLOCK_LAG_S)
 
 
 def test_exchange_feed_offsets_dont_age_the_book_feed():
@@ -245,6 +297,27 @@ def test_exchange_batch_age_is_not_counted_as_queueing():
     ad._data_age(now - 0.008, 1.0, "exb", EXB_BATCH_S)
     assert ad._data_age(now - 0.060, 1.0, "exb", EXB_BATCH_S) == 0.0           # one batch old: not ours
     assert ad._data_age(now - 0.168, 1.0, "exb", EXB_BATCH_S) == pytest.approx(0.1, abs=2e-3)
+
+
+def test_coinbase_move_is_followed_in_full_while_other_venues_lag():
+    """BTC median over coinbase + 2 venues: a Coinbase jump the others haven't
+    shown moves the pricing mid by the whole jump, not by the median's share."""
+    import time as _t
+    from kalshi_strategies.KXCRYPTOLEAD15M.composite import CompositeFeed
+    from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed.base import VenueBook, OrderBookLevel
+
+    def book(v, mid, t):
+        return VenueBook(venue=v, product="BTC-USD", coin="BTC", bids=(OrderBookLevel(mid - 0.5, 1),),
+                         asks=(OrderBookLevel(mid + 0.5, 1),), receive_ts=t)
+    f = CompositeFeed("BTC", persist=False)
+    t = _t.monotonic()
+    f.observe(book("kraken", 100_010.0, t))
+    f.observe(book("bitstamp", 100_020.0, t))
+    f.observe(book("coinbase", 100_000.0, t))
+    base = f.mid_nowcast()
+    assert base == pytest.approx(100_010.0)                     # offset starts at the median's level
+    f.observe(book("coinbase", 100_100.0, t + 0.05))            # +100 on Coinbase only
+    assert f.mid_nowcast() - base == pytest.approx(100.0, rel=0.03)
 
 
 def test_custom_max_levels_param():

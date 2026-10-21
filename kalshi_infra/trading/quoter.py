@@ -258,6 +258,10 @@ class Quoter:
         # quote rests there anyway (real_trading_cutoff_s).
         return q.constant_edge * math.sqrt(ref / max(left, 1.0))
 
+    def _alt_signal_age(self) -> float | None:
+        fn = getattr(self.model, "signal_age_alt_s", None)
+        return fn() if fn is not None else None
+
     def signal_stale(self) -> bool:
         """Fair inputs older than max_signal_age_s. Quotes return the moment
         the age is back under the limit: the old fresh_recovery_s hold was 83%
@@ -1076,6 +1080,8 @@ class Quoter:
             # The age the stale gate just saw, so a tighter max_signal_age_s
             # can be costed from history instead of guessed.
             "signal_age_s": self._last_signal_age,
+            # The other clock while a model runs two (KXCRYPTOLEAD15M receipt vs exchange).
+            "signal_age_alt_s": self._alt_signal_age(),
             "bid_edge": v.get("bid_edge"), "ask_edge": v.get("ask_edge"),
             "lean_bid": v.get("lean_bid"), "lean_ask": v.get("lean_ask"),
             "lean_dollars": self.cfg.quoting.lean_dollars,

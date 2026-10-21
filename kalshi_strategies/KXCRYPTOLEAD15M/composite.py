@@ -22,6 +22,7 @@ from __future__ import annotations
 import collections
 import dataclasses
 import itertools
+import math
 import os
 import time
 from pathlib import Path
@@ -62,6 +63,16 @@ class CompositeBar:
 
 
 DATA_ROOT = Path(_DATA_ROOT) / "kalshi_crypto" / "composite"
+
+# Multi-venue coins price on Coinbase's mid plus a slow offset to the venue
+# median, so a move Coinbase shows first is followed in full instead of being
+# outvoted by venues that haven't caught up. Other venues' books reach us
+# p50 25-166ms after their exchange time and Bitstamp/Bullish only snapshot
+# every 0.2-0.5s (recorder 10-21 14:00-21:00 UTC), against ~10ms for
+# Coinbase. Time constant of that offset (s); not calibrated beyond being
+# well past the slowest venue's lag.
+LEAD_OFFSET_TAU_S = 2.0
+LEAD_VENUE = "coinbase"
 
 
 def bar_filename(coin: str, hour: pd.Timestamp) -> str:
@@ -122,6 +133,26 @@ class CompositeFeed:
         if self._persist:
             self._persist_dir.mkdir(parents=True, exist_ok=True)
         self._pending_disk: list[CompositeBar] = []
+        # ln(median / Coinbase mid), smoothed; and when it was last advanced.
+        self._lead_off: float | None = None
+        self._lead_t = 0.0
+
+    def _lead_mid(self, live: list[VenueBook], median: float, now: float) -> float:
+        """Coinbase's mid shifted onto the venue median's level by the smoothed
+        offset. The plain median when Coinbase isn't among the live books."""
+        cb = next((b for b in live if b.venue == LEAD_VENUE), None)
+        cm = cb.mid() if cb is not None else None
+        if cm is None or cm <= 0 or median <= 0:
+            self._lead_off = None
+            return median
+        gap = math.log(median / cm)
+        if self._lead_off is None:
+            self._lead_off = gap
+        else:
+            w = 1.0 - math.exp(-max(0.0, now - self._lead_t) / LEAD_OFFSET_TAU_S)
+            self._lead_off += w * (gap - self._lead_off)
+        self._lead_t = now
+        return cm * math.exp(self._lead_off)
 
     def observe(self, vb: VenueBook):
         """One update from any contributing venue. Updates stored venue
@@ -145,6 +176,8 @@ class CompositeFeed:
         mids = [b.mid() for b in live]
         if mids:
             m = float(np.median(mids))
+            if len(mids) > 1:
+                m = self._lead_mid(live, m, vb.receive_ts)
             # A held through-the-touch print (Coinbase trade_px) is newer than
             # any book, so it still wins while it holds.
             if self.depth_priced and not any(b.trade_px is not None for b in live):
@@ -216,7 +249,10 @@ class CompositeFeed:
         # A depth-priced coin's bars carry the replica as their mid, so the
         # basis and vol are fitted on the same series the fair is priced on.
         bar_mid = res.price if self.depth_priced and not res.is_fallback else res.fallback_median_mid
-        self._nowcast = dataclasses.replace(res, fallback_median_mid=bar_mid)
+        # Bars keep the plain median (the settlement-like series the basis is
+        # fitted on); the pricing mid stays the per-message one from observe(),
+        # or a lead move would snap back to the median once a second.
+        self._nowcast = dataclasses.replace(res, fallback_median_mid=self._mid if self._mid is not None else bar_mid)
         bar = CompositeBar(
             coin=self.coin, ts_s=float(second_s), price=res.price,
             utilized_depth=res.utilized_depth,
