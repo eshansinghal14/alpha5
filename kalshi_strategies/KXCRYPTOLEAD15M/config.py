@@ -132,6 +132,9 @@ class CryptoPricingParams:
         "about vol) and its last minutes (mid pinned). 10-20 16:00-22:00 UTC, vs the next live reading: "
         "holding 180-600s old was |ln| 0.23-0.28 off vs HAR's 0.32-0.34; 97% of HAR seconds had a reading "
         "under 600s old. 10-18/19 found holding past ~5 min worse than HAR, hence held_vol_* guards it. "
+        "300 (10-21 00:35-06:00 UTC at 600, no HAR fallback): with the oldest held coin 300-600s old the race "
+        "was 8.9% of priced time and 4% of lots, but those fills ran -5.2/-8.0/-17.2c/lot at 1/10/60s "
+        "(t -2.2 to -2.5, 9 fills) and settled -$34 (-$70/h) vs +$18-20/h at under 300s or implied. "
         "0 = no hold.", min=0, step=30)
     held_vol_check: bool = param(
         "While a coin prices on a HELD implied vol, compare its realized spot vol over held_vol_window_s "

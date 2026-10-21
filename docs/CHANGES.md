@@ -42,6 +42,22 @@ days), redone on every dashboard restart (18 restarts on 10-20).
 - Tunnel command gets `ServerAliveInterval=15` so idle drops don't
   silently kill the dashboard's websocket.
 
+## 2026-10-21 — Race: implied_hold_s 600 -> 300
+
+Race 10-21 00:35-06:00 UTC (hold 600, no HAR fallback, 5.4h priced, 266
+real maker fills). Seconds classed by the oldest held coin's age:
+
+| class | priced time | lots | mo1 / mo10 / mo60 c/lot | settled $/h |
+|---|---|---|---|---|
+| all implied | 55% | 1624 | -0.1 / +0.9 / +3.9 | +19.9 |
+| held <= 300s | 36% | 1257 | -1.6 / -2.4 / +3.3 | +18.4 |
+| held 300-600s | 8.9% | 119 | -5.2 / -8.0 / -17.2 (t -2.2..-2.5) | -70.1 |
+
+The 300-600s band was 4% of lots and -$34 settled, so it goes. Only 9
+fills; on Brier it priced no worse than Kalshi's mid (-0.0035, 13 events),
+so the loss is in the fills, not a visibly wrong fair. Re-check after a
+day at 300: time withheld (`no_implied_vol`) and the <=300s class.
+
 ## 2026-10-21 — Race: no HAR vol fallback; longer implied hold, guarded
 
 Race 10-20 16:00-22:00 UTC (25 events, 336 real maker fills): seconds with
