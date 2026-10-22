@@ -38,6 +38,11 @@ MAX_H = max(HORIZONS.values())
 # bbo only records touch changes, so the mid in force at a fill can be this
 # old in a quiet market.
 LOOKBACK = pd.Timedelta("10min")
+# Touches wider than this aren't marked against: the last narrower mid is
+# used instead. A sweep empties the book and its mid is no price anyone could
+# trade at: KXINXU 10-22 11:40:36, ten YES fills marked +11 to +18c at 10s
+# off 0.17/0.88 books. Above KXINXDUD's normal overnight 10c spread.
+MAX_MARK_SPREAD = 0.15
 CHUNK = pd.Timedelta("30min")
 # Crypto results were final ~3 min after close (2026-10-11).
 SETTLE_WAIT = pd.Timedelta("4min")
@@ -52,7 +57,12 @@ _FILL_KEY = ["exchange_order_id", "trade_id", "time", "price", "size"]
 THEO_TOL = pd.Timedelta("5min")
 # Bump when Perf's accumulated state changes shape: a pickle from another
 # version is discarded and the journals are rescanned.
-STATE_VERSION = 1
+STATE_VERSION = 2
+
+
+def _markable_mid(bid: pd.Series, ask: pd.Series) -> pd.Series:
+    """Mid, NaN where the touch is one-sided or wider than MAX_MARK_SPREAD."""
+    return ((bid + ask) / 2).where(ask - bid <= MAX_MARK_SPREAD + 1e-9)
 
 
 @functools.lru_cache(maxsize=4096)
@@ -308,8 +318,10 @@ class Perf:
             if c not in b:
                 b[c] = np.nan
         b = b[(b.time >= lo) & (b.time <= hi)].sort_values("time")
-        b["mid"] = (b.bid + b.ask) / 2
-        return b[["time", "ticker", "mid"]]
+        b["mid"] = _markable_mid(b.bid, b.ask)
+        # Dropped rather than kept as NaN, so the as-of lookup falls back to
+        # the last markable mid instead of returning nothing.
+        return b.loc[b.mid.notna(), ["time", "ticker", "mid"]]
 
     def _theo(self, lo, hi, tickers) -> pd.DataFrame:
         """(time, ticker, theo) from the decisions journal; theo is NaN on
@@ -397,7 +409,8 @@ class Perf:
                     except Exception:
                         continue
                     x = x.sort_values("time")
-                    self._last_mid.update(((x.bid + x.ask) / 2).groupby(x.ticker).last().dropna().to_dict())
+                    m = _markable_mid(x.bid, x.ask)
+                    self._last_mid.update(m.groupby(x.ticker).last().dropna().to_dict())
             d = self._done
             if d.empty:
                 return d.assign(**{"role": pd.Series(dtype=object)}) if len(d.columns) else d

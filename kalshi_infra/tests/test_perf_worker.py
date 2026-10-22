@@ -55,6 +55,24 @@ def test_saved_state_resumes_without_rereading_parts(tmp_path, monkeypatch):
     assert len(q.refresh()) == 2
 
 
+def test_markout_skips_a_swept_book(tmp_path, monkeypatch):
+    """10-22 11:40 KXINXU shape: bought YES at 0.45 on a 0.44/0.46 book, then
+    the book empties to 0.17/0.88 (mid 0.525). The 10s markout must use the
+    last normal mid (0.45 -> 0c), not the empty book's (+7.5c)."""
+    monkeypatch.setattr(perf, "LIVE_ROOT", str(tmp_path))
+    _no_settle(monkeypatch)
+    j = jr.DayJournal("S", DAY, out_root=str(tmp_path))
+    j._buf["bbo"].extend([
+        {"time": _t(0), "ticker": "E-A", "bid": 0.44, "ask": 0.46, "bid_depth": 1.0, "ask_depth": 1.0},
+        {"time": _t(10.5), "ticker": "E-A", "bid": 0.17, "ask": 0.88, "bid_depth": 1.0, "ask_depth": 1.0},
+        {"time": _t(100), "ticker": "E-A", "bid": 0.17, "ask": 0.88, "bid_depth": 1.0, "ask_depth": 1.0}])
+    j._buf["fills"].append(_fill(10, "X1"))
+    jr.write(j.capture())
+    f = perf.Perf("S").refresh()
+    assert len(f) == 1
+    assert abs(f.mo10.iloc[0]) < 1e-9 and abs(f.mo60.iloc[0]) < 1e-9
+
+
 def test_load_falls_back_to_fresh_on_version_or_series_mismatch(tmp_path, monkeypatch):
     monkeypatch.setattr(perf, "LIVE_ROOT", str(tmp_path))
     path = str(tmp_path / "state.pkl")
