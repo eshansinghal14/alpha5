@@ -299,6 +299,25 @@ def test_exchange_batch_age_is_not_counted_as_queueing():
     assert ad._data_age(now - 0.168, 1.0, "exb", EXB_BATCH_S) == pytest.approx(0.1, abs=2e-3)
 
 
+def test_batch_that_moves_no_touch_is_not_re_emitted(monkeypatch):
+    from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed import coinbase as cbm
+    monkeypatch.setattr(cbm, "EX_BOOK", True)
+    ad = CoinbaseAdapter(coins=["SOL", "HYPE"])
+    views = []
+    _ex_ready(ad, "SOL", bid=100.0, ask=100.1)
+    _l2(ad, "SOL", [["buy", "99.9", "3"]], 1000.0, views)          # first view
+    n = len(views)
+    _l2(ad, "SOL", [["buy", "99.8", "3"]], 1000.06, views)         # depth only
+    assert len(views) == n
+    _l2(ad, "SOL", [["buy", "100.05", "1"]], 1000.12, views)       # best bid moved
+    assert len(views) == n + 1 and views[-1].best_bid() == 100.05
+    _ex_ready(ad, "HYPE", bid=40.0, ask=40.1)                       # depth-priced: every batch
+    _l2(ad, "HYPE", [["buy", "39.9", "3"]], 1000.0, views)
+    m = len(views)
+    _l2(ad, "HYPE", [["buy", "39.8", "3"]], 1000.06, views)
+    assert len(views) == m + 1
+
+
 def test_coinbase_move_is_followed_in_full_while_other_venues_lag():
     """BTC median over coinbase + 2 venues: a Coinbase jump the others haven't
     shown moves the pricing mid by the whole jump, not by the median's share."""

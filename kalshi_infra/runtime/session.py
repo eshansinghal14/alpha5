@@ -121,6 +121,32 @@ def _decision_key(row: dict) -> tuple:
     return tuple(row.get(k) for k in _DECISION_FIELDS) + (None if g is None else round(g, 1),)
 
 
+def coalesce_latest(fn):
+    """`push(key, item)`: run fn(item) once per key with its newest item, after
+    the callbacks already queued on the loop. A Kalshi delta burst arrives as
+    frames websockets has already buffered and recv() hands them over without
+    yielding, so each market gets one quoter pass for the burst instead of one
+    per delta: book dispatches were 21.5% of the race loop (py-spy 10-22 02:23
+    UTC, ~63 Kalshi deltas/s). Inline when there is no running loop (tests)."""
+    pending: dict = {}
+
+    def flush():
+        items = list(pending.values())
+        pending.clear()
+        for it in items:
+            fn(it)
+
+    def push(key, item):
+        if not pending:
+            try:
+                asyncio.get_running_loop().call_soon(flush)
+            except RuntimeError:
+                fn(item)
+                return
+        pending[key] = item
+    return push
+
+
 class StopAll(Exception):
     """The run is over: a stop-all was requested (dashboard, balance watchdog)."""
 
@@ -419,13 +445,15 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
     # --- Kalshi ---
     model_on_book = getattr(model, "on_book", None)   # optional: models that read the Kalshi book
 
+    dispatch_book = coalesce_latest(lambda book: engine.dispatch(book, pd.Timestamp.now(tz="UTC")))
+
     def on_quote(book):
         writer.bbo(book)
         writer.depth(book)
         engine.update_book(book)
         if model_on_book is not None:
             model_on_book(book)
-        engine.dispatch(book, pd.Timestamp.now(tz="UTC"))
+        dispatch_book(book.ticker, book)
 
     def on_trade(ticker, trade):
         now = pd.Timestamp.now(tz="UTC")

@@ -43,7 +43,9 @@ import websockets
 from sortedcontainers import SortedDict
 
 from .base import VenueBook, VenueAdapter, OrderBookLevel
-from ..series import COINBASE_PRODUCTS
+from ..series import COINBASE_PRODUCTS, DEPTH_PRICED
+
+EMIT_REFRESH_S = 0.5
 
 WS_URL = "wss://advanced-trade-ws.coinbase.com"
 # Coinbase Exchange public feed: same matching engine, delivered sooner. Same
@@ -331,6 +333,8 @@ class CoinbaseAdapter(VenueAdapter):
         # Newest exchange time seen on each book connection (epoch s).
         self._ex_clock = 0.0
         self._at_clock = 0.0
+        # coin -> (touch key, monotonic, source book) of the last view emitted.
+        self._last_emit: dict[str, tuple] = {}
 
     def _known_ts(self, coin: str, pb: _ProductBook) -> float | None:
         """Exchange time `pb` is known complete up to: its newest applied
@@ -567,6 +571,18 @@ class CoinbaseAdapter(VenueAdapter):
     async def _emit(self, coin, on_update):
         pb = self._src(coin)
         pb.data_ts = self._known_ts(coin, pb)
+        # Touch-priced coins only read the mid off a view, so a batch that moved
+        # no best price and no held print is skipped (the held view's freshness
+        # and data_ts advance in place). Building and pricing the view was 72%
+        # of the Exchange book socket's loop time (py-spy 10-22 02:23 UTC).
+        # Depth levels refresh at least every EMIT_REFRESH_S for the 1s bars.
+        key = (*pb._touch(), pb.trade_px, pb.is_resyncing)
+        now = time.monotonic()
+        last = self._last_emit.get(coin)
+        if (coin not in DEPTH_PRICED and last is not None and last[0] == key and last[2] is pb
+                and now - last[1] < EMIT_REFRESH_S):
+            return
+        self._last_emit[coin] = (key, now, pb)
         vb = pb.to_venue_book(self.venue, COINBASE_PRODUCTS[coin], coin, max_levels=PER_MSG_LEVELS)
         self._views[coin] = vb
         result = on_update(vb)

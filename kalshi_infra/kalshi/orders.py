@@ -377,6 +377,11 @@ class KalshiOrderClient:
         # the default 10, urllib3 opens and discards a fresh TLS connection
         # (~105ms vs ~34ms warm, see execution.MEASURED_SEND_S).
         self._cancel_session.mount("https://", requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=16))
+        # No proxy/netrc/CA env lookups per request (a netrc stat on every
+        # write: 2% of the race process's samples, py-spy 10-21 21:45 UTC).
+        # Nothing in the environment sets them.
+        for s in (self._session, self._cancel_session):
+            s.trust_env = False
         self._key = auth.load_private_key()
         self._lock = threading.Lock()
         self.budget = budget if budget is not None else WriteBudget(tokens_per_s)
