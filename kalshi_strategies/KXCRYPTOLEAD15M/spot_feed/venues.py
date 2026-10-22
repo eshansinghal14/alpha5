@@ -585,9 +585,16 @@ class OkxPerpAdapter(_PerpSignal):
                "HYPE": "HYPE-USDT-SWAP"}
     # Coins per contract (public/instruments ctVal, 2026-10-11); OKX sizes are in contracts.
     CT_VAL = {"BTC": 0.01, "ETH": 0.1, "SOL": 1.0, "XRP": 100.0, "HYPE": 0.1}
+    # Each channel on its own socket: trades sharing one with bbo-tbt arrived
+    # p50 12-13ms later than on a socket of their own (box, 10-22 02:15 UTC,
+    # same trade ids, 2 sockets each).
+    CHANNELS = ("bbo-tbt",)
+
+    async def run(self, on_update: OnUpdate):
+        await asyncio.gather(super().run(on_update), _OkxTrades(self).run(on_update))
 
     async def _subscribe(self, ws):
-        args = [{"channel": ch, "instId": self.symbols[c]} for c in self.coins for ch in ("bbo-tbt", "trades")]
+        args = [{"channel": ch, "instId": self.symbols[c]} for c in self.coins for ch in self.CHANNELS]
         await ws.send(json.dumps({"op": "subscribe", "args": args}))
         asyncio.ensure_future(self._ping(ws))
 
@@ -620,6 +627,22 @@ class OkxPerpAdapter(_PerpSignal):
             for t in msg["data"]:
                 self._print(coin, t["px"], float(t["sz"]) * k, t["tradeId"],
                             "BUY" if t["side"] == "buy" else "SELL", as_of, int(t["ts"]) / 1e3)
+
+
+class _OkxTrades(OkxPerpAdapter):
+    """OKX `trades` on a second connection, printing through the parent's
+    on_print. Owns no books the parent prices on."""
+    CHANNELS = ("trades",)
+
+    def __init__(self, parent: OkxPerpAdapter):
+        super().__init__(parent.coins)
+        self._parent = parent
+
+    async def run(self, on_update: OnUpdate):
+        await _Venue.run(self, on_update)
+
+    def _print(self, *a):
+        self._parent._print(*a)
 
 
 # Venues that are signals only: never in a median, never priced. Hyperliquid
