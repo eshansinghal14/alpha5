@@ -81,6 +81,99 @@ def test_cancel_does_not_wait_behind_a_full_default_executor():
     asyncio.run(main())
 
 
+class ArmClient(SlowClient):
+    """Arm reads and the disarm sweep's listing, each a slow REST call."""
+
+    def __init__(self, resting=()):
+        super().__init__()
+        self.resting = list(resting)
+        self.lists = 0
+
+    def exchange_index(self, ev):
+        time.sleep(0.05)
+        return 2
+
+    def balance(self, exchange_index=None):
+        time.sleep(0.05)
+        return 100.0
+
+    def positions(self, ev):
+        time.sleep(0.05)
+        return {}
+
+    def fills(self, ev, max_pages=20, min_ts=None):
+        time.sleep(0.2)
+        return []
+
+    def resting_orders(self, ev):
+        self.lists += 1
+        time.sleep(0.05)
+        out, self.resting = self.resting, []
+        return out
+
+
+async def _max_lag(stop, out):
+    while not stop.is_set():
+        t0 = time.perf_counter()
+        await asyncio.sleep(0.005)
+        out.append(time.perf_counter() - t0 - 0.005)
+
+
+def test_arm_and_disarm_do_not_block_the_loop():
+    """Arm reads (~0.35s here) and the disarm sweep (>=1s of pass sleeps) ran
+    on the loop and stalled every feed; now neither holds it past a tick."""
+    async def main():
+        eng, _, _ = setup()
+        client = ArmClient(resting=[("x1", "A")])
+        eng.order_client = client
+        lags, stop = [], asyncio.Event()
+        probe = asyncio.create_task(_max_lag(stop, lags))
+        assert await eng.arm_async() is True and eng.live_trading
+        fair(eng)
+        await _settle(eng, 0.15)
+        assert len(client.creates) == 2
+        eng.disarm_nowait()
+        assert not eng.live_trading and eng.sweep_in_flight()
+        assert await eng.arm_async() is None          # refused while the sweep runs
+        await eng.wait_sweep()
+        stop.set(); await probe
+        assert not eng.sweep_in_flight() and client.lists >= 2
+        assert "x1" in client.cancels
+        assert max(lags) < 0.1, max(lags)
+
+    asyncio.run(main())
+
+
+def test_arm_abandoned_if_no_longer_wanted():
+    async def main():
+        eng, _, _ = setup()
+        eng.order_client = ArmClient()
+        assert await eng.arm_async(still_wanted=lambda: False) is None
+        assert not eng.live_trading
+
+    asyncio.run(main())
+
+
+def test_disarm_sweep_keeps_quotes_placed_after_it():
+    """The sweep's forget drops only what the disarm pulled; the new shadow
+    session's quotes survive it."""
+    async def main():
+        eng, _, client = setup(real=True)
+        eng.order_client = ArmClient()
+        fair(eng)
+        await _settle(eng, 0.15)
+        eng.disarm_nowait()
+        await _settle(eng, 0.1)                        # the pulled quotes' cancels land
+        fair(eng, 0.55)                                # shadow quotes while the sweep runs
+        await _settle(eng, 0.1)
+        shadow = set(eng.om.quotes)
+        assert eng.sweep_in_flight()
+        await eng.wait_sweep()
+        assert shadow and shadow <= set(eng.om.quotes)
+
+    asyncio.run(main())
+
+
 def test_shadow_ladder_under_loop_lands_after_send_latency():
     async def main():
         eng, _, _ = setup()

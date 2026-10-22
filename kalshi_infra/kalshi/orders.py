@@ -311,7 +311,15 @@ class SharedWriteBudget(WriteBudget):
             return out
 
     def tokens_now(self) -> float:
-        return self._update(lambda t: (t, t))
+        """Read without the file lock. The order manager reads this dozens of
+        times per pump on the loop, and each flock released the GIL and waited
+        to win it back: 150-500ms loop stalls while armed (py-spy, race
+        10-22 00:14-00:17 UTC). Advisory only -- take() still locks -- so a
+        torn read just costs one refused or deferred write."""
+        tokens, last = self._SIZE.unpack(self._mm[:])
+        now = time.monotonic()
+        elapsed = max(0.0, now - last) if last <= now else 0.0
+        return min(self.capacity, tokens + elapsed * self.rate)
 
     def take(self, cost: float, force: bool = False) -> bool:
         return self._update(lambda t: (t, False) if t < cost and not force else (t - cost, True))

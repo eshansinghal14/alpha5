@@ -80,6 +80,20 @@ def test_shared_bucket_refills_and_empties(tmp_path):
     assert 0.2 < b2.tokens_now() < 0.6                                       # refilled at 1/s
 
 
+def test_shared_bucket_read_takes_no_file_lock(tmp_path, monkeypatch):
+    """tokens_now runs dozens of times per pump on the loop; a flock there
+    released the GIL each call (150-500ms loop stalls while armed)."""
+    from kalshi_infra.kalshi import orders
+    b = orders.SharedWriteBudget(10.0, 2, path=str(tmp_path / "b.bucket"))
+    assert b.take(4.0)
+    calls = []
+    monkeypatch.setattr(orders, "_flock", lambda fd, on: calls.append(on))
+    t = b.tokens_now()
+    assert calls == [] and 0 < t < b.capacity
+    b.take(1.0)
+    assert calls == [True, False]
+
+
 def test_per_series_cap_limits_creates_never_cancels():
     from kalshi_infra.kalshi.orders import WriteBudget
     c = KalshiOrderClient.__new__(KalshiOrderClient)

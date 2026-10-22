@@ -1054,6 +1054,13 @@ class OrderManager:
         self.lip.clear()
         self._cancel_q.clear()
 
+    def forget(self, order_ids):
+        """Drop these quotes once a sweep has cleared them off the exchange,
+        leaving everything placed since (and the desired sets) alone."""
+        for oid in order_ids:
+            self.quotes.pop(oid, None)
+            self._cancel_q.pop(oid, None)
+
     def summary(self) -> dict:
         states: dict[str, int] = {}
         for q in self.quotes.values():

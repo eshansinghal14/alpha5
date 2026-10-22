@@ -284,6 +284,7 @@ class LiveEngine:
         self.n_real_in_flight = 0
         self.last_reconcile: str | None = None
         self.balance_at_arm: float | None = None
+        self._sweep = None          # disarm_nowait's exchange sweep, while it runs
         self.reconcile_mismatches: list[str] = []
 
         # --- quotes: owned by the OrderManager (see order_manager.py) ---
@@ -561,30 +562,81 @@ class LiveEngine:
         is the one failure here with no cheap recovery -- the strategy sizes
         every decision off ctx.position(ticker).
 
-        Blocking (it makes REST calls). Called from the config-watch loop on
-        a human toggle, not from the hot path, and deliberately kept inline
-        rather than run on an executor: reconcile rewrites the Portfolio,
-        which the strategy reads on every dispatch, so a few hundred
-        milliseconds of event-loop stall is the cheaper hazard.
+        Blocking (REST calls, and the disarm sweep sleeps between passes).
+        The live session uses arm_async / disarm_nowait instead, which keep
+        that off the event loop; this is for tests and shutdown.
         """
         if not enabled:
-            was_live = self.live_trading
+            was_live = self._disarm()
             if was_live:
-                print("[live] REAL TRADING DISABLED -- pulling every resting quote off Kalshi. "
-                      "Any real POSITION already on the book stays there; nothing is flattened.")
-                # Pull BEFORE flipping the flag: the manager's cancels go to
-                # Kalshi only while live_trading is on. pull_all clears the
-                # desired sets, so the pump has nothing to create meanwhile.
-                self.pull_quotes()
-            self.live_trading = False
-            if was_live:
-                # Blocking, and a full sweep rather than just our own map: an
-                # order left over from a crashed process is invisible to the
-                # map and is exactly what "stop trading" is supposed to mean.
                 self.cancel_resting()
             return False
         if self.live_trading:
             return True
+        if not self._arm_precheck():
+            return False
+        try:
+            reads = self.arm_reads()
+        except Exception:
+            print("[live] REFUSING to enable real trading -- could not read balance/positions/fills from Kalshi:")
+            traceback.print_exc()
+            return False
+        return self.arm_apply(reads)
+
+    def _disarm(self) -> bool:
+        """Pull every quote and flip to shadow. Returns whether it was live;
+        the caller still owes the exchange sweep."""
+        was_live = self.live_trading
+        if was_live:
+            print("[live] REAL TRADING DISABLED -- pulling every resting quote off Kalshi. "
+                  "Any real POSITION already on the book stays there; nothing is flattened.")
+            # Pull BEFORE flipping the flag: the manager's cancels go to
+            # Kalshi only while live_trading is on. pull_all clears the
+            # desired sets, so the pump has nothing to create meanwhile.
+            self.pull_quotes()
+        self.live_trading = False
+        return was_live
+
+    def disarm_nowait(self):
+        """Disarm with the exchange sweep on a worker thread. The sweep sat on
+        the loop at every T-60 cutoff (>=1s of sleeps plus a list/cancel per
+        pass), stalling every feed in the process. Arming is refused until it
+        finishes (sweep_in_flight), or it would cancel the new session's orders."""
+        if not self._disarm():
+            return
+        if self.order_client is None or self.event_ticker is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.cancel_resting()
+            return
+        # Only what the disarm pulled: shadow quotes placed while the sweep
+        # runs belong to the new shadow session.
+        ids = list(self.om.quotes)
+        fut = loop.run_in_executor(_cancel_pool(), self._sweep_blocking)
+        self._sweep = fut
+
+        def done(f):
+            self._sweep = None
+            try:
+                self.failed_cancels += f.result()
+            except Exception:
+                traceback.print_exc()
+            self.om.forget(ids)
+        fut.add_done_callback(done)
+
+    def sweep_in_flight(self) -> bool:
+        return self._sweep is not None
+
+    async def wait_sweep(self, timeout: float = SWEEP_MAX_S + 5.0):
+        if self._sweep is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(self._sweep), timeout)
+            except Exception:
+                print(f"[live] WARN: disarm sweep on {self.event_ticker} did not finish -- CHECK KALSHI BY HAND.")
+
+    def _arm_precheck(self) -> bool:
         if self.order_client is None:
             print("[live] WARN: cannot enable real trading -- no order client configured.")
             return False
@@ -595,18 +647,50 @@ class LiveEngine:
             print(f"[live] REFUSING to enable real trading -- session is halted ({self.halt_reason}). "
                   f"Restart the process to resume.")
             return False
-        # Both reads happen BEFORE the reset, so a dead auth path or an empty
-        # account refuses the arm without having thrown away the shadow
-        # session's record first.
+        return True
+
+    def arm_reads(self) -> tuple:
+        """Worker-thread safe: REST only, touches no engine state. Raises on
+        any failed read. (shard, balance, positions, fills)."""
+        shard = self.order_client.exchange_index(self.event_ticker)
+        balance = self.order_client.balance(exchange_index=shard)
+        real_positions = self.order_client.positions(self.event_ticker)
+        past_fills = self.order_client.fills(self.event_ticker)
+        return shard, balance, real_positions, past_fills
+
+    async def arm_async(self, still_wanted=None) -> bool | None:
+        """set_live_trading(True) with the REST reads on an executor thread
+        instead of the loop: `fills` pages the whole account history (0.7s of
+        loop stall on 10-22 00:15 UTC). True = armed, False = refused or a read
+        failed, None = abandoned (a sweep is running, or `still_wanted()` went
+        False while the reads were out)."""
+        if self.live_trading:
+            return True
+        if self.sweep_in_flight():
+            return None
+        if not self._arm_precheck():
+            return False
         try:
-            shard = self.order_client.exchange_index(self.event_ticker)
-            balance = self.order_client.balance(exchange_index=shard)
-            real_positions = self.order_client.positions(self.event_ticker)
-            past_fills = self.order_client.fills(self.event_ticker)
+            reads = await asyncio.get_running_loop().run_in_executor(None, self.arm_reads)
         except Exception:
             print("[live] REFUSING to enable real trading -- could not read balance/positions/fills from Kalshi:")
             traceback.print_exc()
             return False
+        if self.live_trading:
+            return True
+        if (still_wanted is not None and not still_wanted()) or self.sweep_in_flight():
+            print("[live] arm abandoned: no longer wanted by the time Kalshi answered")
+            return None
+        if not self._arm_precheck():
+            return False
+        return self.arm_apply(reads)
+
+    def arm_apply(self, reads: tuple) -> bool:
+        """Loop side of arming: reset, seed and reconcile from arm_reads'
+        result, then go live. The reads come BEFORE the reset, so a dead auth
+        path or an empty account refuses the arm without having thrown away
+        the shadow session's record first."""
+        shard, balance, real_positions, past_fills = reads
         if balance <= 0:
             print(f"[live] REFUSING to enable real trading -- balance on exchange shard {shard} "
                   f"(where {self.event_ticker} trades) is ${balance:.2f}. Move funds to that shard "
@@ -1557,13 +1641,22 @@ class LiveEngine:
         """BLOCKING sweep: cancel every order this account still has resting
         in our event, whether or not we know about it -- a crashed
         predecessor, a cancel that errored, an order whose response never came
-        back. Used when disarming and when shutting the event down."""
+        back. Used when shutting the event down; disarming uses disarm_nowait."""
         if self.order_client is None or self.event_ticker is None:
             return
+        self.failed_cancels += self._sweep_blocking()
+        # Everything is off the book; ids stay in _exchange_to_quote so a fill
+        # that raced the cancel still books.
+        self.om.forget_all()
+
+    def _sweep_blocking(self) -> int:
+        """List-and-cancel passes until two come back empty. Worker-thread
+        safe: REST and the order client only, no engine state. Returns the
+        number of cancels that errored."""
         # Several passes: a POST in flight when the sweep starts lands after a
         # single listing, and Kalshi's order list lags a fresh create slightly.
         deadline = time.monotonic() + SWEEP_MAX_S
-        empty_passes = 0
+        empty_passes = failed = 0
         while empty_passes < 2 and time.monotonic() < deadline:
             try:
                 resting = self.order_client.resting_orders(self.event_ticker)
@@ -1583,15 +1676,13 @@ class LiveEngine:
                         self.order_client.allow_now("cancel", force=True, reason="sweep")
                         self.order_client.cancel(exchange_id, ticker)
                     except Exception as exc:
-                        self.failed_cancels += 1
+                        failed += 1
                         print(f"[live] ERROR cancelling resting order {exchange_id}: {exc!r}")
             time.sleep(SWEEP_PASS_S)
         if empty_passes < 2:
             print(f"[live] WARN: resting orders may remain on {self.event_ticker} after "
                   f"{SWEEP_MAX_S:.0f}s of sweeping -- CHECK KALSHI BY HAND.")
-        # Everything is off the book; ids stay in _exchange_to_quote so a fill
-        # that raced the cancel still books.
-        self.om.forget_all()
+        return failed
 
     def _unresolved(self, order: Order, reason: str):
         """Record a non-fill WITH its cause. A bare count can't distinguish

@@ -370,9 +370,28 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
     # What the dashboard asked for, kept apart from what the engine is doing:
     # the cutoff disarm is temporary, and returning the engine's state made
     # the next event start in shadow until the switch was toggled off and on.
-    arm = {"want": live_trading, "retry_at": 0.0}
+    arm = {"want": live_trading, "retry_at": 0.0, "task": None}
+
+    def arm_ok() -> bool:
+        return (arm["want"] and not outside_trading_time()
+                and not engine.halted and engine.real_lock is None)
+
+    async def _arm():
+        try:
+            if await engine.arm_async(still_wanted=arm_ok) is False:
+                arm["retry_at"] = time.monotonic() + RETRY_S
+                _log(S, f"arm failed; retrying in {RETRY_S:.0f}s (disarm from the dashboard to stop)")
+        except Exception:
+            arm["retry_at"] = time.monotonic() + RETRY_S
+            _log(S, "ERROR arming:")
+            traceback.print_exc()
+        finally:
+            arm["task"] = None
 
     def reconcile_arm():
+        """Arm/disarm without blocking the loop: the REST reads and the
+        exchange sweep run on worker threads (see LiveEngine.arm_async and
+        disarm_nowait)."""
         if engine.live_trading and (not arm["want"] or outside_trading_time()):
             if arm["want"] and inside_real_cutoff():
                 _log(S, f"real trading OFF: within {cfg.trading_time.real_trading_cutoff_s:g}s of close; "
@@ -381,12 +400,10 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
                 _log(S, f"real trading OFF: within {cfg.trading_time.real_trading_delay_s:g}s of open; "
                         f"paper continues, arms once the delay passes")
             _snap_real()
-            engine.set_live_trading(False)
-        elif (arm["want"] and not engine.live_trading and not outside_trading_time()
-              and not engine.halted and engine.real_lock is None and time.monotonic() >= arm["retry_at"]):
-            if not engine.set_live_trading(True):
-                arm["retry_at"] = time.monotonic() + RETRY_S
-                _log(S, f"arm failed; retrying in {RETRY_S:.0f}s (disarm from the dashboard to stop)")
+            engine.disarm_nowait()
+        elif (arm_ok() and not engine.live_trading and arm["task"] is None
+              and not engine.sweep_in_flight() and time.monotonic() >= arm["retry_at"]):
+            arm["task"] = asyncio.get_running_loop().create_task(_arm())
 
     reconcile_arm()
 
@@ -573,7 +590,7 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
                     _log(S, f"LOSS LIMIT: {engine.halt_reason} -- real trading OFF for {S} until restart; "
                             f"shadow resumes next event, other series unaffected")
                     _snap_real()
-                    engine.set_live_trading(False)
+                    engine.disarm_nowait()
                 elif stopper is not None and (reason := stopper.poll()) is not None:
                     _stop(reason)
                 blocked = engine.blocked_reason()
@@ -643,6 +660,10 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
     finally:
         for t in tasks:
             t.cancel()
+        if arm["task"] is not None:
+            arm["task"].cancel()
+        # A cutoff disarm's sweep must finish before the event is let go.
+        await engine.wait_sweep()
         # Pull quotes BEFORE awaiting cancellation: a quote resting after we
         # stop pricing keeps filling unwatched.
         if engine.live_trading:
