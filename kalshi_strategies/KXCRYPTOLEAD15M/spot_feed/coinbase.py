@@ -73,9 +73,12 @@ EX_BOOK = True
 EXB_BATCH_S = 0.06
 # How far a coin's l2update `time` can trail the newest exchange time already
 # seen on the book connection: a coin with no newer message is taken as
-# complete up to (connection clock - this). 10-21 20:04-20:24 UTC probe
-# (cb_book_probe.py live, section 3): p99 44ms, p99.9 55ms, max 131ms.
-EX_CLOCK_LAG_S = 0.06
+# complete up to (connection clock - this). Per coin p99 from the 10-21
+# 20:04-20:24 UTC probe (cb_book_probe.py live, section 3; all coins p99.9
+# 55ms, max 131ms). This is Coinbase's batching, not ours: a quiet coin's
+# book can't be known current to better than this without unbatched level2.
+EX_CLOCK_LAG_S = {"BTC": 0.037, "ETH": 0.038, "SOL": 0.048, "XRP": 0.045, "HYPE": 0.047}
+EX_CLOCK_LAG_DEFAULT_S = 0.05
 # Same for the Advanced Trade fallback book, on its update event_times. Not
 # measured; set wide since that book is only used while Exchange is down.
 AT_CLOCK_LAG_S = 0.1
@@ -341,7 +344,7 @@ class CoinbaseAdapter(VenueAdapter):
         change, a newer ticker touch, or its connection's clock less the
         most a pending update for it can trail that clock."""
         if self._ex_books.get(coin) is pb:
-            clock, lag = self._ex_clock, EX_CLOCK_LAG_S
+            clock, lag = self._ex_clock, EX_CLOCK_LAG_S.get(coin, EX_CLOCK_LAG_DEFAULT_S)
         else:
             clock, lag = self._at_clock, AT_CLOCK_LAG_S
         o = pb.live_override()

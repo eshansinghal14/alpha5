@@ -136,12 +136,16 @@ class CompositeFeed:
         # ln(median / Coinbase mid), smoothed; and when it was last advanced.
         self._lead_off: float | None = None
         self._lead_t = 0.0
+        self.shadow_cb_mid: float | None = None
+        self.shadow_med_mid: float | None = None
 
     def _lead_mid(self, live: list[VenueBook], median: float, now: float) -> float:
         """Coinbase's mid shifted onto the venue median's level by the smoothed
         offset. The plain median when Coinbase isn't among the live books."""
         cb = next((b for b in live if b.venue == LEAD_VENUE), None)
         cm = cb.mid() if cb is not None else None
+        # Shadow: both candidates at the same instant, for decision rows.
+        self.shadow_cb_mid, self.shadow_med_mid = cm, median
         if cm is None or cm <= 0 or median <= 0:
             self._lead_off = None
             return median

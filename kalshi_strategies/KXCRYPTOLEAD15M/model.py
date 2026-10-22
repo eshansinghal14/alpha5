@@ -488,6 +488,8 @@ class CoinRaceModel:
                                                   "vol_src": (self.vol_src.get(c, "implied")
                                                               if p.vol_source == "implied" else "realized"),
                                                   "corr_mult": g, "spot_mid": m_spot,
+                                                  "cb_mid": self.bus.feeds[c].shadow_cb_mid,
+                                                  "med_mid": self.bus.feeds[c].shadow_med_mid,
                                                   "perp_gap_bp": p_gap, "perp_n": p_n, "perp_inc_bp": p_inc,
                                                   "priced_on": self.priced_on.get(c, "spot"),
                                                   "held_vol_ratio": self.held_vol_ratio.get(c),

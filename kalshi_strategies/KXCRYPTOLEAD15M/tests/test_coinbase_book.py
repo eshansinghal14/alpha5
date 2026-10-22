@@ -278,7 +278,7 @@ def test_data_ts_is_newest_of_book_ticker_and_connection_clock(monkeypatch):
     assert views[-1].data_ts == 1000.04
     ad._ex_clock = 1000.5                     # a later BTC batch: SOL had nothing newer to send
     ad._refresh_known(ad._ex_books)
-    assert ad.latest("SOL").data_ts == pytest.approx(1000.5 - cbm.EX_CLOCK_LAG_S)
+    assert ad.latest("SOL").data_ts == pytest.approx(1000.5 - cbm.EX_CLOCK_LAG_S["SOL"])
 
 
 def test_exchange_feed_offsets_dont_age_the_book_feed():
