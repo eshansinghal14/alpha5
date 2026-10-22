@@ -1,4 +1,4 @@
-"""Strategy performance panel: cumulative PnL with 1s/10s markout over a
+"""Strategy performance panel: cumulative PnL with 1s/10s/60s markout over a
 chosen window, and the summary numbers beside it. Data is what
 kalshi_viz.perf_worker last wrote; a page render never computes it."""
 from __future__ import annotations
@@ -14,7 +14,7 @@ from kalshi_viz import perf
 WINDOWS = {"1h": pd.Timedelta(hours=1), "6h": pd.Timedelta(hours=6), "24h": pd.Timedelta(hours=24),
            "7d": pd.Timedelta(days=7), "All": None}
 COLORS = {"PnL (settled; open at mid)": "#1e88e5", "1s markout": "#fb8c00", "10s markout": "#e53935",
-          "LIP reward": "#43a047", "PnL incl. LIP": "#8e24aa"}
+          "60s markout": "#6d4c41", "LIP reward": "#43a047", "PnL incl. LIP": "#8e24aa"}
 SOLID = ("PnL (settled; open at mid)", "PnL incl. LIP")
 
 

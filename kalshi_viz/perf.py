@@ -663,8 +663,8 @@ def summarize_edge(df: pd.DataFrame, prints: pd.DataFrame, since: pd.Timestamp |
 
 
 def curves(df: pd.DataFrame, since: pd.Timestamp | None = None, lip: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Long frame (time, line, usd): cumulative PnL and 1s/10s markout $ by
-    fill time; with `lip`, also cumulative LIP reward and PnL incl. LIP."""
+    """Long frame (time, line, usd): cumulative PnL and 1s/10s/60s markout $
+    by fill time; with `lip`, also cumulative LIP reward and PnL incl. LIP."""
     d = window(df, since)
     L = window(lip, since) if lip is not None and len(lip) else None
     # A series with no real fills has a column-less empty frame.
@@ -675,7 +675,8 @@ def curves(df: pd.DataFrame, since: pd.Timestamp | None = None, lip: pd.DataFram
     out = []
     if len(d):
         d = d.sort_values("time")
-        lines = {"PnL (settled; open at mid)": d.pnl_c, "1s markout": d.mo1, "10s markout": d.mo10}
+        lines = {"PnL (settled; open at mid)": d.pnl_c, "1s markout": d.mo1, "10s markout": d.mo10,
+                 "60s markout": d.mo60}
         for name, c in lines.items():
             v = (c.fillna(0) * d["size"] / 100).cumsum()
             out.append(pd.DataFrame({"time": [start] + list(d.time), "line": name, "usd": [0.0] + list(v)}))

@@ -65,7 +65,7 @@ def test_no_lip_rows_without_lip_fills():
 
 def test_curves_add_lip_lines_only_with_lip():
     d = _fills()
-    assert set(perf.curves(d).line) == {"PnL (settled; open at mid)", "1s markout", "10s markout"}
+    assert set(perf.curves(d).line) == {"PnL (settled; open at mid)", "1s markout", "10s markout", "60s markout"}
     lip = pd.DataFrame({"time": [pd.Timestamp("2026-10-15 13:10", tz="UTC")], "ticker": ["E-BTC"], "event": ["E"], "usd": [0.4]})
     c = perf.curves(d, lip=lip)
     assert {"LIP reward", "PnL incl. LIP"} <= set(c.line)
