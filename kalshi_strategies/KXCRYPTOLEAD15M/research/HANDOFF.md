@@ -149,8 +149,7 @@ expect cancel overhead near the 0-in-flight figure (~4ms p50).
 1. **Deploy and re-measure the cancel lane** (above). If `after_ack` races
    remain the bulk, the next lever is fewer creates that are cancelled on
    arrival (52% of creates are cancelled within 100ms of their ack).
-2. **Ed25519 key** (user action: generate in Kalshi settings, point
-   `KALSHI_PRIVATE_KEY_PATH` at it). Saves ~1.3ms of GIL per write.
+2. ~~Ed25519 key~~ done 10-22 15:35 UTC (see CHANGES.md).
 3. **Price what's left:** widen early-event (first 1-5 min) or delay real
    trading (`trading_time.real_trading_delay_s`); revert race order_lots
    15 -> 10; cut HYPE in the race.

@@ -3,6 +3,25 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-22 — Ed25519 API key; old projects removed
+
+- Every Kalshi REST/WS call signs with an Ed25519 key since 15:35 UTC. Sign
+  cost 0.10ms vs ~1ms RSA-PSS, which held the GIL: `sign` went from 9.8% of
+  the race process's samples to 1.0% (py-spy, 10-22 02:23 vs 15:40 UTC).
+  First 3 min live: 3,352 creates / 3,355 cancels acked ok, create RTT p50
+  5.7ms, ack back on the loop p50 1.1ms (was 15ms p50 on 10-22 02:00 UTC).
+- Keys live in `kalshi_infra/secrets/` (gitignored): `kalshi-ed25519.pem`
+  (in use) and `kalshi-rsa.pem`. `keys.py` keeps the RSA id and path as
+  `KALSHI_API_KEY_RSA` / `KALSHI_PRIVATE_KEY_PATH_RSA`; on the box,
+  `secrets/keys.py.rsa-rollback` is the pre-switch keys.py.
+- Removed `kalshi_btc_hedge/`, `kalshi_vol_trading/` and the KXHIGHLAX vol
+  pipeline in `kalshi_infra` (black_scholes, regen/generate/repair caches,
+  backfills, station temps, debug/scratch scripts) plus
+  `kalshi_backtest/strategies/crossing_arb` and its example. Temperature
+  series dropped from `ws_raw_ob_collector`, which now signs through
+  `kalshi.auth`. Weather data deleted (predexon/kalshi_trades/kalshi_ws
+  KXHIGH*/KXLOWT*, kalshi_1min_historical, station_temps; ~5 GB local).
+
 ## 2026-10-21 — Coinbase ticker touch, exchange-time signal age, Coinbase-led median
 
 Probe on the live adapter's Exchange socket, us-east-2c 10-21 20:04-20:24 UTC
