@@ -427,6 +427,55 @@ def test_post_only_reject_is_not_an_order_error():
     assert eng.om.live() == []
 
 
+def _paused_reject(order):
+    import requests
+
+    class Resp:
+        status_code = 409
+        text = '{"error":{"code":"trading_is_paused","message":"trading is paused"}}'
+
+        def json(self):
+            import json
+            return json.loads(self.text)
+
+    raise requests.HTTPError("409 Conflict for https://x: " + Resp.text, response=Resp())
+
+
+def test_market_paused_is_not_an_order_error(monkeypatch):
+    """KXINXDUD 10-22 03:00: five 409 trading_is_paused tripped the breaker.
+    Now: no breaker, the market is held, and retried after the hold."""
+    from kalshi_infra.trading import engine as eng_mod
+    eng, _, client = setup(real=True, quote_levels_behind=0)
+    real_place = client.place_resting
+    client.place_resting = _paused_reject
+    for _ in range(8):                          # more than MAX_CONSECUTIVE_ORDER_ERRORS
+        fair(eng)
+    assert eng.consecutive_order_errors == 0 and eng.blocked_reason() is None
+    assert eng.market_paused("A") and eng.om.live() == []
+    n = len(client.creates)
+    fair(eng)
+    assert len(client.creates) == n               # held: nothing sent during the pause
+    client.place_resting = real_place
+    clock = [eng_mod.time.monotonic() + eng_mod.MARKET_PAUSE_RETRY_S + 1]
+    monkeypatch.setattr(eng_mod.time, "monotonic", lambda: clock[0])
+    assert not eng.market_paused("A")
+    fair(eng)
+    assert len(client.creates) > n                 # reopened: quoting again
+
+
+def test_error_code_reads_kalshi_body():
+    import requests
+    from kalshi_infra.kalshi.orders import error_code, is_market_paused
+    try:
+        _paused_reject(None)
+    except requests.HTTPError as e:
+        assert error_code(e) == "trading_is_paused" and is_market_paused(e)
+    bare = requests.HTTPError('409 Conflict for https://x: {"error":{"code":"trading_is_paused"}}')
+    assert error_code(bare) == "trading_is_paused"           # no response object: parsed from the text
+    assert error_code(RuntimeError("boom")) is None
+    assert not is_market_paused(requests.HTTPError('400 for x: {"error":{"code":"insufficient_balance"}}'))
+
+
 def test_post_only_match_is_specific():
     import requests
     from kalshi_infra.kalshi.orders import is_post_only_reject

@@ -57,7 +57,8 @@ import pandas as pd
 from kalshi_backtest.book import BookView
 from kalshi_backtest.core import Order, Portfolio, Trade
 from kalshi_backtest.data import STALE_THRESHOLD_S as MAX_BOOK_AGE_S
-from kalshi_infra.kalshi.orders import WRITE_HEADROOM, http_status, is_post_only_reject
+from kalshi_infra.kalshi.orders import (WRITE_HEADROOM, error_code, http_status, is_market_paused,
+                                        is_post_only_reject)
 from kalshi_infra.trading import order_manager as om
 from kalshi_backtest.execution import (MEASURED_SEND_S, QueueTracker, resolve_marketable,
                                        resolve_resting)
@@ -72,6 +73,10 @@ SHADOW_SEND_S = MEASURED_SEND_S
 # Consecutive REAL order errors before halting. Five in a row is auth,
 # balance or market state, not a moved touch.
 MAX_CONSECUTIVE_ORDER_ERRORS = 5
+# A market Kalshi has paused (orders.PAUSE_CODES) gets no new orders this
+# long; the next one after it is the probe that finds out if it reopened.
+# Short enough that a minute-long pause costs about a minute of quoting.
+MARKET_PAUSE_RETRY_S = 60.0
 # Consecutive position audits (5s apart) a market must disagree on before the
 # audit halts. A real accounting gap persists; a fill racing the read doesn't.
 AUDIT_STRIKES = 2
@@ -149,12 +154,12 @@ class LiveContext:
         """Publish the edge quotes wanted on one side (order_manager.Desired,
         or None for none). Cancels it implies go out at once; creates are sent
         by the manager's pump, nearest the touch first."""
-        self._engine.om.set_desired(ticker, side, desired)
+        self._engine.om.set_desired(ticker, side, None if self._engine.market_paused(ticker) else desired)
 
     def set_lip_quote(self, ticker: str, side: str, target):
         """Publish the LIP quote wanted on one side (order_manager.LipTarget,
         or None). Lowest priority after the edge ladder."""
-        self._engine.om.set_lip(ticker, side, target)
+        self._engine.om.set_lip(ticker, side, None if self._engine.market_paused(ticker) else target)
 
     def lip_quote(self, ticker: str, side: str):
         """Our live LIP quote on one side as (price, remaining), or None."""
@@ -242,6 +247,9 @@ class LiveEngine:
         # --- trading guards (see blocked_reason) ---
         self.close_time = close_time
         self.consecutive_order_errors = 0
+        # ticker -> time.monotonic() until which Kalshi has trading paused on
+        # it (see _note_market_paused). Not an error: doesn't feed the breaker.
+        self.paused_until: dict[str, float] = {}
         # Set by the session via set_clocks; until then staleness is unknown
         # and the guard is inert, so tests / synchronous callers aren't
         # silently blocked.
@@ -345,6 +353,24 @@ class LiveEngine:
 
     def next_order_id(self) -> int:
         return next(self._order_id_seq)
+
+    def market_paused(self, ticker: str) -> bool:
+        return time.monotonic() < self.paused_until.get(ticker, 0.0)
+
+    def _note_market_paused(self, order, exc):
+        """Kalshi refused `order` because the market is paused: hold new
+        orders there for MARKET_PAUSE_RETRY_S and pull what's resting, without
+        counting it toward the order-error breaker."""
+        t = order.ticker
+        first = not self.market_paused(t)
+        self.paused_until[t] = time.monotonic() + MARKET_PAUSE_RETRY_S
+        self.blocked_counts["market_paused"] = self.blocked_counts.get("market_paused", 0) + 1
+        if first:
+            print(f"[live] {t}: Kalshi says {error_code(exc)} -- no new orders on it for "
+                  f"{MARKET_PAUSE_RETRY_S:.0f}s, then retried (not an order error)")
+            for side in ("yes", "no"):
+                self.om.set_desired(t, side, None)
+                self.om.set_lip(t, side, None)
 
     # -----------------------------------------------------------------
     # Trading guards
@@ -960,7 +986,7 @@ class LiveEngine:
         now = pd.Timestamp.now(tz="UTC")
         if order.order_id < self._min_valid_order_id:
             return   # decided in a session that has since been reset
-        blocked = self.blocked_reason()
+        blocked = self.blocked_reason() or ("market_paused" if self.market_paused(order.ticker) else None)
         if blocked is not None:
             self.blocked_counts[blocked] = self.blocked_counts.get(blocked, 0) + 1
             self._unresolved(order, blocked)
@@ -1075,6 +1101,10 @@ class LiveEngine:
         if exc is not None and http_status(exc) == 429:
             self.order_client.note_rate_limited("take")
             self._unresolved(order, "rate_limited_429")
+            return
+        if exc is not None and is_market_paused(exc):
+            self._unresolved(order, "market_paused")
+            self._note_market_paused(order, exc)
             return
         if exc is not None:
             self.real_order_errors += 1
@@ -1237,7 +1267,8 @@ class LiveEngine:
         def done(res):
             resp, exc, rtt = res
             self._oev("amend_ack", q, new_price=price, rtt_s=rtt,
-                      status="ok" if exc is None else f"err:{http_status(exc)}")
+                      status="ok" if exc is None else f"err:{http_status(exc)}",
+                      error_code=None if exc is None else error_code(exc))
             if exc is None:
                 order.price = price
                 order.size = filled + remaining
@@ -1332,11 +1363,17 @@ class LiveEngine:
     def _on_real_quote_timed(self, order: Order, res: tuple):
         result, rtt, pickup, t_done = res
         ack, exc = result
+        if exc is not None and http_status(exc) not in (None, 429):
+            # Every refused create with Kalshi's code: KXINXU 10-22 had five
+            # isolated 400s that reached no log line, so the cause was unknown.
+            print(f"[live] create refused {order.ticker} {order.side} {order.size}@{order.price}: "
+                  f"{http_status(exc)} {error_code(exc)}")
         self._oev("create_ack", order_id=order.order_id, ticker=order.ticker, side=order.side, price=order.price,
                   role=getattr(order, "role", None), rtt_s=rtt, pickup_s=pickup,
                   done_wait_s=time.perf_counter() - t_done,
                   exchange_id=None if ack is None else ack.exchange_order_id,
-                  status="ok" if exc is None else f"err:{http_status(exc)}")
+                  status="ok" if exc is None else f"err:{http_status(exc)}",
+                  error_code=None if exc is None else error_code(exc))
         self._on_real_quote_result(order, result)
 
     def _on_real_quote_result(self, order: Order, result: tuple):
@@ -1378,6 +1415,11 @@ class LiveEngine:
             self.n_post_only_rejects += 1
             self.om.on_create_failed(order.order_id, rejected=True)
             self._unresolved(order, "post_only_reject")
+            return
+        if exc is not None and is_market_paused(exc):
+            self.om.on_create_failed(order.order_id, rejected=True)
+            self._unresolved(order, "market_paused")
+            self._note_market_paused(order, exc)
             return
         if exc is not None:
             self.real_order_errors += 1
@@ -1483,7 +1525,8 @@ class LiveEngine:
         q = self.om.quotes.get(order_id)
         self._oev("cancel_ack", q, order_id=order_id, reason=reason, rtt_s=rtt, pickup_s=pickup,
                   done_wait_s=done_wait,
-                  status=("ok" if ok else "gone") if exc is None else f"err:{http_status(exc)}")
+                  status=("ok" if ok else "gone") if exc is None else f"err:{http_status(exc)}",
+                  error_code=None if exc is None else error_code(exc))
         if exc is not None:
             if http_status(exc) == 429:
                 # Throttled, not refused: re-queue; it goes again as the

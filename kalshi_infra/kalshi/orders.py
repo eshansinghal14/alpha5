@@ -96,6 +96,32 @@ def http_status(exc) -> int | None:
     return getattr(resp, "status_code", None)
 
 
+def error_code(exc) -> str | None:
+    """Kalshi's error code from a rejected request ("trading_is_paused",
+    "insufficient_balance", ...), or None if the body has none."""
+    try:
+        body = exc.response.json()
+    except Exception:
+        try:
+            import json
+            text = str(exc)
+            body = json.loads(text[text.index("{"):])
+        except Exception:
+            return None
+    err = body.get("error") if isinstance(body, dict) else None
+    return err.get("code") if isinstance(err, dict) else None
+
+
+# Kalshi refusing orders on a market for now -- the market, not our request.
+# KXINXDUD 2026-10-22 03:00:05 ET: five 409 trading_is_paused in 3s tripped the
+# order-error breaker, and it stayed off ~10h after Kalshi reopened.
+PAUSE_CODES = ("trading_is_paused", "market_closed", "market_not_open")
+
+
+def is_market_paused(exc) -> bool:
+    return error_code(exc) in PAUSE_CODES
+
+
 def is_post_only_reject(exc) -> bool:
     """A resting create refused because it would have crossed (post_only).
     Matched on Kalshi's error body: the exact code isn't documented, so any
