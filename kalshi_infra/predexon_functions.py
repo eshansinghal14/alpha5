@@ -113,7 +113,7 @@ def get_event_markets(event_ticker: str, cache_dir: str = None) -> list[dict]:
 
     This also fixes a real cross-process rate-limit bug: predexon_get's own
     throttle (_rate_lock/_MIN_CALL_INTERVAL, module-level) is a per-PROCESS
-    lock, so parallelizing across multiple OS processes (e.g. regen_cache.py's
+    lock, so parallelizing across multiple OS processes (e.g. a
     ProcessPoolExecutor) doesn't coordinate between them at all -- N processes
     each independently self-throttle to ~1 req/sec, so N processes hitting
     this endpoint collectively land at ~N req/sec, well past Predexon's real
@@ -249,13 +249,9 @@ def load_predexon_long_df(event_ticker: str, cache_dir: str = None) -> pd.DataFr
 
     Market list (which tickers exist) and strike_type ('between'/'greater'/
     'less') come from Predexon's own listing (get_event_markets), not Kalshi's
-    -- see _parse_strike_from_ticker's docstring for why. strike_type is what
-    lets black_scholes.fit_normal_to_bucket_bid_ask evaluate each market's own
-    correct model probability formula (a range bucket's is a *difference* of
-    two Gaussian CDFs; a tail's is a single one) instead of the cumulative-SF
-    shortcut, which turned out to have real correctness gaps (an unbounded
-    sf_hi under unpriced strike gaps, and no clean way to fold in a lower-tail
-    market's opposite-signed contribution).
+    -- see _parse_strike_from_ticker's docstring for why. strike_type says
+    whether a market is a range bucket (a difference of two CDFs) or a tail
+    (a single one).
 
     NOTE: floor_strike is no longer a unique row-grouping key by itself -- a
     range bucket and the lower-tail market can share the same floor (e.g.
@@ -312,7 +308,7 @@ def load_predexon_long_df(event_ticker: str, cache_dir: str = None) -> pd.DataFr
 
 def load_kalshi_backup_long_df(event_ticker: str, cache_dir: str = None) -> pd.DataFrame:
     """
-    Backup BBO source for black_scholes.compute_implied_spot_timeseries: Kalshi's
+    Backup BBO source when Predexon's ticks are stale: Kalshi's
     own official 1-minute candlesticks for every market in the event, long-form
     (ticker, time, bid, ask). Coarser than Predexon's sub-second ticks, but
     authoritative -- used only when Predexon's feed for a given ticker has gone
@@ -428,7 +424,7 @@ def load_kalshi_trades_long_df(event_ticker: str, cache_dir: str = None) -> pd.D
 
 if __name__ == "__main__":
     import sys
-    event_tickers = sys.argv[1:] or ["KXHIGHLAX-26JUL27"]
+    event_tickers = sys.argv[1:]
     for et in event_tickers:
         print(f"=== {et} ===")
         fetch_event_orderbooks(et)

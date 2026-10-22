@@ -1,6 +1,7 @@
-﻿# Copy the two gitignored secrets to the server over SSH, and the last few
-# hours of crypto data the live process warms up from (vol forecaster: 4 h of
-# composite bars; burst calibration: 2 h of prints). Never through git.
+﻿# Copy the gitignored secrets (keys.py and kalshi_infra/secrets/) to the server
+# over SSH, and the last few hours of crypto data the live process warms up
+# from (vol forecaster: 4 h of composite bars; burst calibration: 2 h of
+# prints). Never through git.
 #   powershell -File deploy\push_secrets.ps1 -Target ubuntu@<ip> -Key <path-to.pem>
 param(
     [Parameter(Mandatory = $true)][string]$Target,
@@ -14,10 +15,10 @@ function Check($what) { if ($LASTEXITCODE -ne 0) { throw "$what failed (exit $LA
 $app = "/opt/alpha5"
 $ssh = @("-i", $Key, "-o", "StrictHostKeyChecking=accept-new")
 
-& ssh @ssh $Target "mkdir -p $app/kalshi_btc_hedge $app/data/kalshi_crypto/composite $app/data/kalshi_crypto/prints"
+& ssh @ssh $Target "mkdir -p -m 700 $app/kalshi_infra/secrets; mkdir -p $app/data/kalshi_crypto/composite $app/data/kalshi_crypto/prints"
 & scp @ssh "$root\kalshi_infra\keys.py" "${Target}:$app/kalshi_infra/keys.py"; Check 'copy keys.py'
-& scp @ssh "$root\kalshi_btc_hedge\eshan-ws-key.txt" "${Target}:$app/kalshi_btc_hedge/eshan-ws-key.txt"; Check 'copy private key'
-& ssh @ssh $Target "chmod 600 $app/kalshi_infra/keys.py $app/kalshi_btc_hedge/eshan-ws-key.txt"; Check 'chmod secrets'
+& scp @ssh @(Get-ChildItem "$root\kalshi_infra\secrets\*" -File).FullName "${Target}:$app/kalshi_infra/secrets/"; Check 'copy private keys'
+& ssh @ssh $Target "chmod 600 $app/kalshi_infra/keys.py $app/kalshi_infra/secrets/*"; Check 'chmod secrets'
 # IB Gateway login (S&P only). Skipped if you haven't created it.
 $ibEnv = "$root\deploy\ibgateway\ib.env"
 if (Test-Path $ibEnv) {

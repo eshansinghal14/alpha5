@@ -219,9 +219,8 @@ class Backtest:
         strategy_fn(ctx): called on every visible market update (a
         touch-changing quote or a trade print, once delayed by wire_s) and
         on any external_events you pass in (delayed by signal_s instead --
-        a separate feed with its own latency plus pricing cost, e.g.
-        crossing_arb's station-temperature crossing signal or the SPXW/ES
-        option-implied probability). Call ctx.buy(...) to act; positions/
+        a separate feed with its own latency plus pricing cost, e.g. the
+        SPXW/ES option-implied probability). Call ctx.buy(...) to act; positions/
         PnL/fees are tracked automatically, and settlement is applied at
         the end from event_data.results.
 

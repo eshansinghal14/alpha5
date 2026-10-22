@@ -85,6 +85,5 @@ def summary(result: BacktestResult) -> dict:
 
 
 def summarize_many(results: list[BacktestResult]) -> pd.DataFrame:
-    """One row per event -- for running crossing_arb (or any strategy) across
-    many days and comparing aggregate PnL/fill-rate."""
+    """One row per event, for comparing a strategy's PnL/fill-rate across days."""
     return pd.DataFrame([summary(r) for r in results])

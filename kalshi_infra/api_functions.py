@@ -1,6 +1,7 @@
 """
-Kalshi API functions for vol trading analysis.
-Handles auth, market discovery, orderbook midpoints, and historical candlestick data.
+Kalshi REST helpers: authenticated/public GET with 429 backoff, market
+discovery, orderbook midpoints, historical candles, and the series lists the
+raw orderbook collector sweeps.
 """
 import datetime
 import time
@@ -12,30 +13,13 @@ from kalshi_infra.kalshi import auth
 from kalshi_infra.keys import KALSHI_API_KEY as API_KEY
 
 BASE_URL = "https://api.elections.kalshi.com"
-SERIES_TICKER = "KXHIGHLAX"
-
-# Every active daily highest/lowest temperature series with "sufficient"
-# volume -- surveyed directly against today's open-event volume_fp, summed
-# per series: every KXHIGH*/KXLOW* daily-temp series cleared >=10,000
-# contracts of cumulative volume, vs. a sharp drop-off to ~8,500 for the
-# next-highest excluded series (a handful of legacy/retired tickers, e.g.
-# bare "HIGHAUS" vs. "KXHIGHAUS", showed 0 open markets and were dropped
-# outright). Used by ws_raw_ob_collector.py.
-HIGH_LOW_TEMP_SERIES_TICKERS = [
-    # highest temperature (17)
-    "KXHIGHLAX", "KXHIGHNY", "KXHIGHMIA", "KXHIGHCHI", "KXHIGHTPHX", "KXHIGHTDAL",
-    "KXHIGHTSFO", "KXHIGHTBOS", "KXHIGHAUS", "KXHIGHTATL", "KXHIGHTHOU", "KXHIGHDEN",
-    "KXHIGHTSEA", "KXHIGHPHIL", "KXHIGHTLV", "KXHIGHTNOLA", "KXHIGHTOKC",
-    # lowest temperature (5)
-    "KXLOWTNYC", "KXLOWTOKC", "KXLOWTAUS", "KXLOWTMIN", "KXLOWTLAX",
-]
 
 # Every series on Kalshi with frequency == "fifteen_min", confirmed directly
 # against /trade-api/v2/series with no category filter (13,029 series
 # total, 19 matched) -- so this is exhaustive as of the check date, not a
 # hand-picked subset. All but KXINX15M/KXNDQ15M were confirmed to actually
-# produce strike-range markets (floor_strike populated once a market opens,
-# same shape as HIGH_LOW_TEMP_SERIES_TICKERS); KXINX15M/KXNDQ15M exist as
+# produce strike-range markets (floor_strike populated once a market opens);
+# KXINX15M/KXNDQ15M exist as
 # series but currently have zero markets in any status -- kept in anyway
 # since register_markets() just no-ops on an empty result, so they'll pick
 # up automatically if/when Kalshi activates them. Used by
@@ -67,7 +51,7 @@ SP500_SERIES_TICKERS = ["KXINX"]
 # out to be dead/retired duplicates with zero markets ever, in any status
 # (confirmed directly, not assumed) -- e.g. bare KXSOL/KXTON/KXNEAR/KXZEC/
 # KXRIPPLE/KXZECH/KXZECD/KXTONH/KXTOND/KXNEARH/KXNEARD all had 0 markets
-# ever, same "legacy ticker" pattern noted on HIGH_LOW_TEMP_SERIES_TICKERS.
+# ever (legacy tickers kept listed after a rename).
 # Also excluded KXDOGE/KXDOGED specifically: alive, but strike_type="custom"
 # with floor_strike always None (verbal strikes via yes_sub_title instead),
 # a fundamentally different shape the collector can't use regardless of
@@ -110,14 +94,6 @@ def kalshi_get(path: str, params: dict = None, auth: bool = False, max_retries: 
 # ---------------------------------------------------------------------------
 # Market discovery
 # ---------------------------------------------------------------------------
-
-def event_ticker_from_date(date: datetime.date, series_ticker: str = SERIES_TICKER) -> str:
-    """Convert a date to an event ticker for the given series, e.g.
-    (2026-08-01, "KXHIGHLAX") → KXHIGHLAX-26AUG01. Defaults to SERIES_TICKER
-    (KXHIGHLAX) so every existing single-series caller keeps working
-    unchanged."""
-    return f"{series_ticker}-{date.strftime('%y%b%d').upper()}"
-
 
 def get_event_markets(event_ticker: str) -> pd.DataFrame:
     """
@@ -187,28 +163,6 @@ def compute_midpoint(orderbook: dict) -> float | None:
         return (best_bid_cents + best_ask_cents) / 200.0
 
 
-def get_snapshot_midpoints(event_ticker: str) -> pd.DataFrame:
-    """
-    Snapshot of current midpoints for every market in an event.
-    Returns DataFrame: ticker, floor_strike, midpoint (in [0,1]).
-    """
-    markets = get_event_markets(event_ticker)
-    rows = []
-    for _, row in markets.iterrows():
-        try:
-            ob = get_orderbook(row["ticker"])
-            mid = compute_midpoint(ob)
-            rows.append({
-                "ticker": row["ticker"],
-                "floor_strike": row["floor_strike"],
-                "cap_strike": row.get("cap_strike"),
-                "midpoint": mid,
-            })
-        except Exception as e:
-            print(f"  [warn] {row['ticker']}: {e}")
-    return pd.DataFrame(rows)
-
-
 # ---------------------------------------------------------------------------
 # Historical candlestick data
 # ---------------------------------------------------------------------------
@@ -228,10 +182,8 @@ def get_candlesticks(ticker: str, start_ts: int, end_ts: int, period_interval: i
 
     Returns DataFrame with columns: time (UTC), bid, ask, mid, volume,
     bid_high, ask_low. mid is a simple mid (no depth info available from
-    candles for a WAP). bid/ask are the raw candle CLOSE prices, meant for
-    black_scholes.fit_normal_to_bucket_bid_ask (fits within each market's
-    [bid, ask] band rather than to the single mid point estimate) -- don't
-    repurpose those two for "did price touch X this minute" checks, since a
+    candles for a WAP). bid/ask are the raw candle CLOSE prices -- don't
+    use them for "did price touch X this minute" checks, since a
     price can touch and revert within one candle without it showing in the
     close (confirmed directly: a case where a resting 99c bid should have
     been reachable earlier than the close-based columns showed). Use
@@ -301,7 +253,7 @@ def get_market_trades(ticker: str) -> pd.DataFrame:
     Unlike get_candlesticks, there is NO historical-namespaced fallback for
     trades -- both /trade-api/v2/historical/markets/trades and the
     per-ticker variant 404. The regular endpoint has a real rolling
-    retention window, confirmed directly by date-bisecting KXHIGHLAX
+    retention window, confirmed directly by date-bisecting daily
     markets: 2026-05-20 returns 0 trades (even with explicit min_ts/max_ts
     spanning that day), 2026-05-25 onward returns real trade data -- so
     this silently returns an empty DataFrame for markets outside roughly

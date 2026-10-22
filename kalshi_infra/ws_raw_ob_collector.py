@@ -19,7 +19,6 @@ Usage:
 """
 
 import asyncio
-import base64
 import ctypes
 import datetime
 import gc
@@ -38,26 +37,18 @@ import pandas as pd
 import pyarrow as pa
 import websockets
 from botocore.exceptions import ClientError
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
 
 from kalshi_infra.api_functions import (
-    API_KEY,
     FIFTEEN_MIN_SERIES_TICKERS,
-    HIGH_LOW_TEMP_SERIES_TICKERS,
     HOURLY_SERIES_TICKERS,
     SP500_SERIES_TICKERS,
     kalshi_get,
 )
-from kalshi_infra.kalshi.auth import private_key_path
+from kalshi_infra.kalshi import auth
 
-SERIES_TICKERS = (
-    HIGH_LOW_TEMP_SERIES_TICKERS + FIFTEEN_MIN_SERIES_TICKERS + HOURLY_SERIES_TICKERS + SP500_SERIES_TICKERS
-)
+SERIES_TICKERS = FIFTEEN_MIN_SERIES_TICKERS + HOURLY_SERIES_TICKERS + SP500_SERIES_TICKERS
 
 WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
-WS_KEY_PATH = private_key_path()
 OUT_DIR_ROOT = os.path.join(os.path.dirname(__file__), "..", "data", "kalshi_ws")
 LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
 
@@ -215,20 +206,7 @@ DAILY_CHUNK_INTERVAL_S = 60 * 60
 # ---------------------------------------------------------------------------
 
 def _ws_auth_headers():
-    with open(WS_KEY_PATH, "rb") as f:
-        key = serialization.load_pem_private_key(f.read(), password=None, backend=default_backend())
-    ts = str(int(datetime.datetime.now().timestamp() * 1000))
-    msg = (ts + "GET" + "/trade-api/ws/v2").encode()
-    sig = key.sign(
-        msg,
-        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
-        hashes.SHA256(),
-    )
-    return [
-        ("KALSHI-ACCESS-KEY", API_KEY),
-        ("KALSHI-ACCESS-SIGNATURE", base64.b64encode(sig).decode()),
-        ("KALSHI-ACCESS-TIMESTAMP", ts),
-    ]
+    return auth.ws_headers()
 
 
 def _get_open_markets() -> list[dict]:
