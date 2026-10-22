@@ -152,6 +152,18 @@ class RiskParams:
     # 0.005: KXINXU replay 10-20/21 (with fair_lag_markets 3) cut blocked
     # side-time 4.1-5.8% -> 1.1-1.7%, and the prints it still blocks marked
     # out -0.7 to -1.6c at 60s for the resting side (was +1.0c).
+    # Fair-jump hold (trading/fair_jump.py). KXINXU replay 10-16/19/20 at
+    # 2c / 0.5s / 3s: 98 lots blocked at -9.0c/lot at 60s ($8.74 avoided),
+    # 2.5% of side-time held. Off for KXINXDUD: its post-jump fills marked
+    # out +2 to +3.5c.
+    fair_jump_max: float | None = param(
+        "Hold a market when our fair moves at least this much within fair_jump_window_s: pull the "
+        "side the jump exposes and quote the other off the pre-jump fair. null = off.",
+        min=0.005, max=0.5, step=0.005)
+    fair_jump_window_s: float = param("Window for fair_jump_max.", min=0.1, max=10, step=0.1)
+    fair_jump_hold_s: float = param(
+        "How long a hold lasts after the last qualifying move (extended while the fair keeps "
+        "jumping).", min=0, max=60, step=0.5)
     fair_lag_fair_move_max: float | None = param(
         "A market only counts as lagging if our fair moved at most this much over fair_lag_window_s "
         "(a frozen fair). null = any fair move counts.", min=0, max=0.2, step=0.001)

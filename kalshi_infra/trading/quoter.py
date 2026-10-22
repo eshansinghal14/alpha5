@@ -47,6 +47,7 @@ import pandas as pd
 
 from kalshi_infra.kalshi.venue import MAX_PRICE, MIN_PRICE, TICK
 from kalshi_infra.trading.fair import Fair, FairUpdate
+from kalshi_infra.trading.fair_jump import FairJumpGuard
 from kalshi_infra.trading.fair_lag import FairLagGuard
 from kalshi_infra.trading.lip import LipTracker, levels_with_ours, others_ladder, remaining_cap_usd, reward_rate
 from kalshi_infra.trading.order_manager import Desired, LipTarget
@@ -137,6 +138,7 @@ class Quoter:
         # Per ticker: epoch seconds until which its fair is held as suspect.
         self._suspect_until: dict[str, float] = {}
         self._lag = FairLagGuard()
+        self._jump = FairJumpGuard()
         # Per (ticker, side): own-side price our top edge quote was alone at
         # (see _front_hold).
         self._front: dict[tuple[str, str], float] = {}
@@ -280,6 +282,7 @@ class Quoter:
         book = ctx.book(ticker)
         if book is not None and book.bid is not None and book.ask is not None:
             self._lag.observe(ticker, now_s, (book.bid + book.ask) / 2, fair.prob, r)
+        self._jump.observe(ticker, now_s, fair.prob, r)
         bad = r.max_fair_band is not None and fair.hi - fair.lo > r.max_fair_band
         lim = r.max_fair_outside_touch
         if not bad and lim is not None and book is not None:
@@ -404,6 +407,13 @@ class Quoter:
                 block_bid = "fair_lag"
             if not block_ask and self._lag.blocked(ticker, "no", now_s):
                 block_ask = "fair_lag"
+        jump = self._jump.state(ticker, now_s)
+        if jump is not None:
+            # Up jump: our offer (NO bid) is the exposed side; down: the YES bid.
+            if jump[0] > 0 and not block_ask:
+                block_ask = "fair_jump"
+            elif jump[0] < 0 and not block_bid:
+                block_bid = "fair_jump"
         if block_bid:
             self._block(block_bid)
         if block_ask and block_ask != block_bid:
@@ -447,10 +457,19 @@ class Quoter:
         # priced at the pre-fee reservation.
         q_base_bid = max(const + q.quoting_edge + ci_bid + lean_bid, 0.0)
         q_base_ask = max(const + q.quoting_edge + ci_ask + lean_ask, 0.0)
-        mfee_bid = self.fees.maker(prob - q_base_bid)
-        mfee_ask = self.fees.maker(prob + q_base_ask)
-        qres_bid = prob - (q_base_bid + mfee_bid)
-        qres_ask = prob + (q_base_ask + mfee_ask)
+        # During a jump hold the chase side quotes off the pre-jump fair, and
+        # only ever more conservatively than the new one would.
+        p_bid = p_ask = prob
+        if jump is not None:
+            anchor = min(max(jump[1], FAIR_CLIP_EPS), 1.0 - FAIR_CLIP_EPS)
+            if jump[0] > 0:
+                p_bid = min(prob, anchor)
+            else:
+                p_ask = max(prob, anchor)
+        mfee_bid = self.fees.maker(p_bid - q_base_bid)
+        mfee_ask = self.fees.maker(p_ask + q_base_ask)
+        qres_bid = p_bid - (q_base_bid + mfee_bid)
+        qres_ask = p_ask + (q_base_ask + mfee_ask)
 
         quoting = q.enable_quoting
         qblock = getattr(self.model, "quote_block", None)

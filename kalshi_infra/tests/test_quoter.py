@@ -26,7 +26,7 @@ def immediate_takes(monkeypatch):
 
 GUARD_OFF = dict(max_fair_band=None, max_fair_outside_touch=None, fair_suspect_hold_s=0.0,
                  fair_lag_max=None, fair_lag_window_s=1.0, fair_lag_markets=None, fair_lag_hold_s=3.0,
-                 fair_lag_fair_move_max=None)
+                 fair_lag_fair_move_max=None, fair_jump_max=None, fair_jump_window_s=0.5, fair_jump_hold_s=3.0)
 
 
 def risk(**r):
@@ -514,6 +514,56 @@ def test_fair_lag_frozen_fair_still_blocks_with_flat_check():
     q, ctx = Quoter(cfg(risk_kw=dict(LAG, fair_lag_fair_move_max=0.005)), Model(), FREE, close_time=None), Ctx()
     _freeze(q, ctx, ["A", "B"], [0.63, 0.50], 0.05, [0.64, 0.51])
     assert q.debug_log[-1]["block_bid"] == "fair_lag"
+
+
+JUMP = dict(fair_jump_max=0.02, fair_jump_window_s=0.5, fair_jump_hold_s=3.0)
+
+
+def _jump_up(q, ctx):
+    """Fair 0.50 for 1s, then 0.53 inside 0.3s; Kalshi stays 0.45/0.55."""
+    ctx.books["A"] = Book("A", 0.45, 0.55)
+    for _ in range(10):
+        step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, dt=0.1)
+    for p in (0.51, 0.52, 0.53):
+        step(q, ctx, {"A": Fair(p, p - 0.01, p + 0.01)}, dt=0.1)
+
+
+def test_fair_jump_pulls_the_exposed_side_and_does_not_chase():
+    q, ctx = Quoter(cfg(risk_kw=JUMP, enable_taking=False), Model(), FREE, close_time=None), Ctx()
+    _jump_up(q, ctx)
+    r = q.debug_log[-1]
+    assert r["block_ask"] == "fair_jump" and r["block_bid"] is None
+    assert not ladder(ctx, "no")                     # offer pulled
+    # The bid is still priced off the pre-jump 0.50, not the new 0.53.
+    assert r["quote_bid_reservation"] <= 0.50 - 0.01 + 1e-9
+
+
+def test_fair_jump_releases_after_hold_and_extends_while_moving():
+    q, ctx = Quoter(cfg(risk_kw=JUMP, enable_taking=False), Model(), FREE, close_time=None), Ctx()
+    _jump_up(q, ctx)
+    for p in (0.55, 0.57):                           # keeps jumping: hold extends
+        step(q, ctx, {"A": Fair(p, p - 0.01, p + 0.01)}, dt=0.3)
+    step(q, ctx, {"A": Fair(0.57, 0.56, 0.58)}, dt=2.0)
+    assert q.debug_log[-1]["block_ask"] == "fair_jump"
+    for _ in range(4):                               # 4s steady after the last move
+        step(q, ctx, {"A": Fair(0.57, 0.56, 0.58)}, dt=1.0)
+    r = q.debug_log[-1]
+    assert r["block_ask"] is None and ladder(ctx, "no")
+
+
+def test_fair_jump_small_moves_do_nothing():
+    q, ctx = Quoter(cfg(risk_kw=JUMP, enable_taking=False), Model(), FREE, close_time=None), Ctx()
+    ctx.books["A"] = Book("A", 0.45, 0.55)
+    for i in range(30):
+        p = 0.50 + 0.005 * ((-1) ** i)
+        step(q, ctx, {"A": Fair(p, p - 0.01, p + 0.01)}, dt=0.1)
+    assert "fair_jump" not in q.block_counts
+
+
+def test_fair_jump_off_when_null():
+    q, ctx = Quoter(cfg(enable_taking=False), Model(), FREE, close_time=None), Ctx()
+    _jump_up(q, ctx)
+    assert "fair_jump" not in q.block_counts
 
 
 def test_fair_lag_off_when_null():

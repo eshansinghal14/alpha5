@@ -35,7 +35,10 @@
       "fair_lag_window_s": 1.0,
       "fair_lag_markets": null,
       "fair_lag_hold_s": 3.0,
-      "fair_lag_fair_move_max": null
+      "fair_lag_fair_move_max": null,
+      "fair_jump_max": null,
+      "fair_jump_window_s": 0.5,
+      "fair_jump_hold_s": 3.0
     },
     "runtime": {
       "quote_fill_poll_s": 1.0,
@@ -187,7 +190,10 @@
       "fair_lag_window_s": 1.0,
       "fair_lag_markets": null,
       "fair_lag_hold_s": 3.0,
-      "fair_lag_fair_move_max": null
+      "fair_lag_fair_move_max": null,
+      "fair_jump_max": null,
+      "fair_jump_window_s": 0.5,
+      "fair_jump_hold_s": 3.0
     },
     "runtime": {
       "quote_fill_poll_s": 1.0,
@@ -339,7 +345,10 @@
       "fair_lag_window_s": 1.0,
       "fair_lag_markets": null,
       "fair_lag_hold_s": 3.0,
-      "fair_lag_fair_move_max": null
+      "fair_lag_fair_move_max": null,
+      "fair_jump_max": null,
+      "fair_jump_window_s": 0.5,
+      "fair_jump_hold_s": 3.0
     },
     "runtime": {
       "quote_fill_poll_s": 1.0,
@@ -491,7 +500,10 @@
       "fair_lag_window_s": 1.0,
       "fair_lag_markets": null,
       "fair_lag_hold_s": 3.0,
-      "fair_lag_fair_move_max": null
+      "fair_lag_fair_move_max": null,
+      "fair_jump_max": null,
+      "fair_jump_window_s": 0.5,
+      "fair_jump_hold_s": 3.0
     },
     "runtime": {
       "quote_fill_poll_s": 1.0,
@@ -643,7 +655,10 @@
       "fair_lag_window_s": 1.0,
       "fair_lag_markets": null,
       "fair_lag_hold_s": 3.0,
-      "fair_lag_fair_move_max": null
+      "fair_lag_fair_move_max": null,
+      "fair_jump_max": null,
+      "fair_jump_window_s": 0.5,
+      "fair_jump_hold_s": 3.0
     },
     "runtime": {
       "quote_fill_poll_s": 1.0,
