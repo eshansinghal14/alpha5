@@ -1,5 +1,7 @@
-"""ARBS config: every value lives in config.json (edited from the dashboard,
-hot-reloaded within runtime.control_poll_s)."""
+"""ARBS config: every value lives in config.json, hot-reloaded within
+runtime.control_poll_s. Only the strategy knobs are on the dashboard form;
+plumbing (poll rates, write budget, requote pacing) is editable=False and
+changed in config.json by hand."""
 from __future__ import annotations
 
 import os
@@ -24,11 +26,13 @@ class TradingParams:
                                         step=1)
     max_dollars: float = param("Most dollars in the strategy: cost paid on held baskets plus what resting "
                                "quotes would commit if filled and completed.", min=0.0, step=50.0)
-    requote_min_ticks: int = param("Move a resting quote only when the wanted price differs by this many "
-                                   "ticks (a price past the edge limit always moves).", min=1, max=50, step=1)
-    requote_cooldown_s: float = param("Least time between voluntary moves of one quote.", min=0.0, step=0.5)
     take_cooldown_s: float = param("Least time between takes on one basket (our IOCs consume the book before "
                                    "the feed shows it).", min=0.0, step=0.5)
+    requote_min_ticks: int = param("Move a resting quote only when the wanted price differs by this many "
+                                   "ticks (a price past the edge limit always moves).", min=1, max=50, step=1,
+                                   editable=False)
+    requote_cooldown_s: float = param("Least time between voluntary moves of one quote.", min=0.0, step=0.5,
+                                      editable=False)
 
 
 @section
@@ -36,9 +40,10 @@ class CompletionParams:
     max_loss_per_bundle: float = param("A broken basket is finished at any price that loses at most this much "
                                        "per bundle ($). Each missing leg's IOC limit is its cap_j.",
                                        min=0.0, max=1.0, step=0.01)
-    retry_s: float = param("Seconds between completion attempts while a basket is broken.", min=0.1, step=0.5)
+    retry_s: float = param("Seconds between completion attempts while a basket is broken.", min=0.1, step=0.5,
+                           editable=False)
     max_broken_baskets: int = param("No new takes or quotes while this many baskets are broken.", min=1,
-                                    max=1000, step=1)
+                                    max=1000, step=1, editable=False)
 
 
 @section
@@ -46,28 +51,31 @@ class WatchParams:
     max_quoted_baskets: int = param("Quote only this many baskets: the top of the ranking (payout minus "
                                     "the cost of taking every leg). Bounds write-token spend.", min=0, max=1000,
                                     step=1)
-    rank_interval_s: float = param("Seconds between re-rankings.", min=0.5, step=0.5)
+    rank_interval_s: float = param("Seconds between re-rankings.", min=0.5, step=0.5, editable=False)
     eval_interval_s: float = param("Seconds between passes over baskets whose books changed.", min=0.01,
-                                   max=5.0, step=0.01)
+                                   max=5.0, step=0.01, editable=False)
     exclude: list[str] = param("basket_id, relationship_id or cluster names never traded. Open positions "
-                               "in them are still completed and settled.")
+                               "in them are still completed and settled.", editable=False)
 
 
 @section
 class RuntimeParams:
-    control_poll_s: float = param("Config and arm-request poll.", min=0.1, step=0.1)
+    control_poll_s: float = param("Config and arm-request poll.", min=0.1, step=0.1, editable=False)
     max_write_tokens_per_s: float | None = param("Cap on this strategy's write spend per shard, on top of the "
-                                                 "shard's shared bucket. Empty = none.", min=1.0, step=10.0)
+                                                 "shard's shared bucket. Empty = none.", min=1.0, step=10.0,
+                                                 editable=False)
     write_reserve_tokens: float = param("Quotes are only placed or moved with this many tokens left over, kept "
-                                        "for completions and cancels.", min=0.0, step=10.0)
+                                        "for completions and cancels.", min=0.0, step=10.0, editable=False)
     audit_s: float = param("Seconds between position audits against Kalshi (and resting-order checks).",
-                           min=5.0, step=5.0)
-    fill_poll_s: float = param("REST backstop for quote fills the websocket missed.", min=1.0, step=1.0)
-    meta_refresh_s: float = param("Seconds between market status / settlement reads.", min=30.0, step=30.0)
+                           min=5.0, step=5.0, editable=False)
+    fill_poll_s: float = param("REST backstop for quote fills the websocket missed.", min=1.0, step=1.0,
+                               editable=False)
+    meta_refresh_s: float = param("Seconds between market status / settlement reads.", min=30.0, step=30.0,
+                                  editable=False)
     max_order_errors: int = param("Consecutive order errors that stop new takes and quotes until a clean "
-                                  "response.", min=1, max=100, step=1)
+                                  "response.", min=1, max=100, step=1, editable=False)
     feed_down_pull_s: float = param("Pull every quote once the Kalshi websocket has been down this long.",
-                                    min=0.0, step=1.0)
+                                    min=0.0, step=1.0, editable=False)
 
 
 @section
