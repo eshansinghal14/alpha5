@@ -528,8 +528,6 @@ class ArbsRunner:
                 if size >= 1:
                     plan = pricing.quote_leg(vs, j, b.payout, edge_dollars(b.payout, t.min_edge + t.quote_edge_add),
                                              size)
-                if plan is not None and too_deep(plan.price, vs[j].bid, t.max_ticks_behind):
-                    plan = None
             if plan is None:
                 if q is not None:
                     acts.append(self.cancel_quote(q, "no_edge" if want else "not_hot"))
@@ -1043,14 +1041,6 @@ class ArbsRunner:
             atomic_write_json(os.path.join(day_dir(self.S, f"{_utc():%Y-%m-%d}"), "summary.json"), self.summary(),
                               indent=None)
             self.pool.shutdown(wait=False)
-
-
-def too_deep(price: float, bid: float | None, max_ticks_behind: int) -> bool:
-    """A quote more than max_ticks_behind ticks under the leg's best bid
-    (others' orders only) fills only when the book is swept through it, which
-    is when the other legs have moved too: GOVPARTYFL-26-D buckets 10-24 rested
-    at 1c behind 12k at 3-4c. An empty bid side never counts as too deep."""
-    return bid is not None and price < bid - max_ticks_behind * pricing.TICK - _EPS
 
 
 def edge_dollars(payout: float, rate: float) -> float:

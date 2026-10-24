@@ -5,7 +5,6 @@
     "min_edge": 0.01,
     "quote_edge_add": 0.02,
     "quote_size": 5,
-    "max_ticks_behind": 0,
     "max_bundles_per_basket": 50,
     "max_dollars": 500.0,
     "requote_min_ticks": 1,
