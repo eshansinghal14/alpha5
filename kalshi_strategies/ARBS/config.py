@@ -26,8 +26,9 @@ class TradingParams:
                                         step=1)
     max_dollars: float = param("Most dollars in the strategy: cost paid on held baskets plus what resting "
                                "quotes would commit if filled and completed.", min=0.0, step=50.0)
-    take_cooldown_s: float = param("Least time between takes on one basket (our IOCs consume the book before "
-                                   "the feed shows it).", min=0.0, step=0.5)
+    take_cooldown_s: float = param("Least time between takes on one basket. A take buys only the touch of "
+                                   "every leg; this is how long to wait for a thin touch to refill at the same "
+                                   "price before taking again.", min=0.0, step=0.5)
     requote_min_ticks: int = param("Move a resting quote only when the wanted price differs by this many "
                                    "ticks (a price past the edge limit always moves).", min=1, max=50, step=1,
                                    editable=False)

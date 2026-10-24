@@ -85,11 +85,27 @@ class TakePlan:
 
 
 def take_plan(legs: list[LegView], payout: float, min_edge: float, max_size: int) -> TakePlan | None:
-    """Largest whole number of bundles whose last (most expensive) bundle
-    still clears min_edge at the levels the IOCs must reach. None if not even
-    one does."""
+    """Bundles to take now, every leg at its touch: as many as the thinnest
+    touch holds (capped at max_size), if the touch clears min_edge. None if it
+    doesn't.
+
+    Never walks a leg past its touch even when deeper levels would still clear
+    min_edge: a thin touch often refills at the same price, so the runner takes
+    it, waits take_cooldown_s and takes again. The one exception is a touch
+    under one contract, where the IOC may reach the level that completes one
+    bundle (whole bundles only)."""
+    if any(not lv.asks for lv in legs):
+        return None
+    touch = int(min(min(lv.asks[0][1] for lv in legs), max_size) + _EPS)
+    if touch >= 1:
+        lim = [lv.asks[0][0] for lv in legs]
+        e = payout - sum(taker_cost(p, lv.taker_rate) for p, lv in zip(lim, legs))
+        if e < min_edge - _EPS:
+            return None
+        return TakePlan(size=float(touch), limits=lim, edge=e,
+                        cost=touch * sum(taker_cost(p, lv.taker_rate) for p, lv in zip(lim, legs)))
     best = None
-    for n in range(1, int(max_size) + 1):
+    for n in range(1, min(1, int(max_size)) + 1):
         lim = [lv.ladder_price(n) for lv in legs]
         if any(p is None for p in lim):
             break

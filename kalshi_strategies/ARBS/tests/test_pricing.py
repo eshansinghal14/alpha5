@@ -34,6 +34,18 @@ def test_take_plan_capped_by_depth_and_max_size():
     assert pricing.take_plan(legs, 1.0, 0.01, 1).size == 1
 
 
+def test_take_plan_takes_only_the_touch_even_if_deeper_levels_clear_edge():
+    legs = [lv([(0.30, 4), (0.31, 100)]), lv([(0.30, 100)])]
+    p = pricing.take_plan(legs, 1.0, min_edge=0.01, max_size=50)
+    assert p.size == 4 and p.limits == [0.30, 0.30]
+
+
+def test_take_plan_touch_under_one_contract_may_reach_next_level():
+    legs = [lv([(0.30, 0.4), (0.31, 100)]), lv([(0.30, 100)])]
+    p = pricing.take_plan(legs, 1.0, min_edge=0.01, max_size=50)
+    assert p.size == 1 and p.limits == [0.31, 0.30]
+
+
 def test_max_price_within_includes_fee():
     p = pricing.max_price_within(0.50, T)
     assert tc(p) <= 0.50 and tc(round(p + 0.01, 2)) > 0.50
