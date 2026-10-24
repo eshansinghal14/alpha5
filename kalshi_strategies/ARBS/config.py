@@ -14,13 +14,18 @@ SPEC_PATH = os.path.join(os.path.dirname(__file__), "Kalshi arb baskets spec.jso
 
 @section
 class TradingParams:
-    enable_takes: bool = param("Take a whole basket (IOC on every leg) when it clears min_edge after fees.")
+    enable_takes: bool = param("Take a whole basket (IOC on every leg) when its return clears min_edge after fees.")
     enable_quoting: bool = param("Rest a bid on every leg of the hottest baskets that can clear the quote "
                                  "edge; a fill is completed at once by taking the other legs.")
-    min_edge: float = param("Required profit per bundle ($), after fees, for a take, and for a quote assuming "
-                            "it fills and the other legs are taken at today's asks.", min=0.0, max=0.5, step=0.005)
-    quote_edge_add: float = param("Extra edge per bundle ($) a quote must clear on top of min_edge: pays for "
-                                  "being filled just as the other legs move away.", min=0.0, max=0.5, step=0.005)
+    # A fraction of the bundle's dollar cost, not cents per bundle: a payout-2
+    # basket costs ~2x a payout-1 one, so a flat cent edge earned it half the
+    # return on capital (10-24 fills: 0.9% on SENATEME:TAL vs 1.1% on DEMDEM).
+    min_edge: float = param("Required profit as a fraction of what a bundle costs (0.015 = 1.5%), after fees, "
+                            "for a take, and for a quote assuming it fills and the other legs are taken at "
+                            "today's asks.", min=0.0, max=0.5, step=0.0025)
+    quote_edge_add: float = param("Extra return (fraction of bundle cost) a quote must clear on top of min_edge: "
+                                  "pays for being filled just as the other legs move away.", min=0.0, max=0.5,
+                                  step=0.0025)
     quote_size: int = param("Bundles per resting quote.", min=1, max=10000, step=1)
     max_bundles_per_basket: int = param("Most bundles held in one basket (complete or not).", min=0, max=100000,
                                         step=1)

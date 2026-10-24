@@ -4,9 +4,10 @@ Per pass over baskets whose books changed:
   1. a broken basket (legs uneven, after a quote fill or a partial take) is
      completed: IOCs on the missing legs, each limited by its cap_j
      (pricing.completion), retried every completion.retry_s;
-  2. a whole-basket take if payout - sum(ask + fee) >= min_edge;
+  2. a whole-basket take if (payout - sum(ask + fee)) / sum(ask + fee) >= min_edge
+     (a return on the bundle's cost, see edge_dollars);
   3. one resting quote per hot basket (top watch.max_quoted_baskets by that
-     same gap), priced so a fill completed at today's asks still makes
+     return), priced so a fill completed at today's asks still returns
      min_edge + quote_edge_add.
 
 Shadow (default) runs the same decisions against the live book: takes fill
@@ -494,10 +495,11 @@ class ArbsRunner:
         t = self.cfg.trading
         if t.enable_takes and now - self.last_take.get(b.basket_id, 0.0) >= t.take_cooldown_s:
             g = pricing.gap(vs, b.payout)
-            if g is not None and g >= t.min_edge:
+            need = edge_dollars(b.payout, t.min_edge)
+            if g is not None and g >= need - _EPS:
                 per = b.payout - g
                 n = int(min(self.room_bundles(b), max(0.0, self.room_dollars()) // max(per, 0.01)))
-                plan = pricing.take_plan(vs, b.payout, t.min_edge, n) if n >= 1 else None
+                plan = pricing.take_plan(vs, b.payout, need, n) if n >= 1 else None
                 if plan is not None:
                     if live_qs:
                         # Our own quotes are on legs we're about to take around.
@@ -524,7 +526,8 @@ class ArbsRunner:
             if want:
                 size = min(float(t.quote_size), self.room_bundles(b, j), float(self.quote_size_by_dollars(b)))
                 if size >= 1:
-                    plan = pricing.quote_leg(vs, j, b.payout, t.min_edge + t.quote_edge_add, size)
+                    plan = pricing.quote_leg(vs, j, b.payout, edge_dollars(b.payout, t.min_edge + t.quote_edge_add),
+                                             size)
             if plan is None:
                 if q is not None:
                     acts.append(self.cancel_quote(q, "no_edge" if want else "not_hot"))
@@ -803,10 +806,10 @@ class ArbsRunner:
                     g = None if vs is None else pricing.gap(vs, b.payout)
                     if g is None:
                         continue
-                    rows.append({"basket_id": b.basket_id, "type": b.type, "gap": round(g, 4),
-                                 "asks": [v.best_ask for v in vs], "legs": len(b.legs),
-                                 "depth": round(min(v.depth() for v in vs), 1)})
-                rows.sort(key=lambda r: -r["gap"])
+                    rows.append({"basket_id": b.basket_id, "type": b.type, "ret": round(edge_return(b.payout, g), 4),
+                                 "gap": round(g, 4), "payout": b.payout, "asks": [v.best_ask for v in vs],
+                                 "legs": len(b.legs), "depth": round(min(v.depth() for v in vs), 1)})
+                rows.sort(key=lambda r: -r["ret"])
                 self.ranking = rows
                 quotable = [r["basket_id"] for r in rows if self.baskets[r["basket_id"]].quoting_allowed(_utc())]
                 hot = quotable[:self.cfg.watch.max_quoted_baskets]
@@ -972,7 +975,8 @@ class ArbsRunner:
                              "completion": self.completion_note.get(bid)})
         settled = [r for r in led.settled]
         quotes = [{"basket_id": q.basket_id, "ticker": q.ticker, "side": q.side, "price": q.price,
-                   "size": q.size, "filled": q.filled, "edge": round(q.edge, 4), "max_price": q.max_price,
+                   "size": q.size, "filled": q.filled, "edge": round(q.edge, 4),
+                   "ret": round(edge_return(self.baskets[q.basket_id].payout, q.edge), 4), "max_price": q.max_price,
                    "age_s": round(time.time() - q.placed_at), "pending": q.pending, "order_id": q.exchange_id}
                   for q in self.quotes.values()]
         return {
@@ -1037,6 +1041,19 @@ class ArbsRunner:
             atomic_write_json(os.path.join(day_dir(self.S, f"{_utc():%Y-%m-%d}"), "summary.json"), self.summary(),
                               indent=None)
             self.pool.shutdown(wait=False)
+
+
+def edge_dollars(payout: float, rate: float) -> float:
+    """Dollar edge per bundle that returns `rate` on the bundle's cost. Cost
+    is payout - edge, so edge / (payout - edge) >= rate is edge >= rate *
+    payout / (1 + rate)."""
+    return rate * payout / (1.0 + rate)
+
+
+def edge_return(payout: float, edge: float) -> float:
+    """Edge as a fraction of what the bundle costs (payout - edge)."""
+    cost = payout - edge
+    return edge / cost if cost > _EPS else float("-inf") if edge <= 0 else float("inf")
 
 
 def _count(it) -> dict:

@@ -84,22 +84,30 @@ def _tables(s: dict):
         df = pd.DataFrame(h)
         df["held"] = df["held"].map(lambda d: ", ".join(f"{t.split('-', 1)[-1]} {q:g}" for t, q in d.items()))
         df["status"] = df["unhedged"].map(lambda u: "INCOMPLETE" if u else "complete")
-        st.dataframe(df[["basket_id", "type", "status", "bundles", "payout", "cost", "locked_pnl", "held"]]
+        df["return"] = (df["locked_pnl"].fillna(0) / df["cost"].where(df["cost"] > 0)).map(
+            lambda v: "" if pd.isna(v) else f"{v:.2%}")
+        st.dataframe(df[["basket_id", "type", "status", "bundles", "payout", "cost", "locked_pnl", "return", "held"]]
                      .sort_values("status", ascending=False), use_container_width=True, hide_index=True)
     else:
         st.caption("None.")
     st.markdown("##### Resting quotes")
     q = s.get("quotes") or []
     if q:
-        st.dataframe(pd.DataFrame(q)[["basket_id", "ticker", "side", "price", "max_price", "size", "filled",
-                                      "edge", "age_s", "pending"]], use_container_width=True, hide_index=True)
+        df = pd.DataFrame(q)
+        if "ret" in df:
+            df["return"] = df["ret"].map(lambda v: f"{v:.2%}")
+        cols = ["basket_id", "ticker", "side", "price", "max_price", "size", "filled", "edge", "return", "age_s",
+                "pending"]
+        st.dataframe(df[[c for c in cols if c in df]], use_container_width=True, hide_index=True)
     else:
         st.caption("None.")
-    with st.expander("Opportunity ranking (payout minus taking every leg, fees incl.)"):
+    with st.expander("Opportunity ranking (return on bundle cost of taking every leg now, fees incl.)"):
         r = s.get("ranking") or []
         if r:
             df = pd.DataFrame(r)
             df["hot"] = df["basket_id"].isin(set(s.get("hot") or []))
+            if "ret" in df:
+                df["ret"] = df["ret"].map(lambda v: f"{v:.2%}")
             st.dataframe(df, use_container_width=True, hide_index=True)
     with st.expander("Settled baskets"):
         st_ = s.get("settled") or []

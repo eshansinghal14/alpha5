@@ -91,7 +91,7 @@ def test_each_leg_priced_against_the_others_asks(arbs):
         await drain(r)
     asyncio.run(go())
     qa, qb = r.quotes[(b.basket_id, 0)], r.quotes[(b.basket_id, 1)]
-    req = r.cfg.trading.min_edge + r.cfg.trading.quote_edge_add
+    req = R.edge_dollars(b.payout, r.cfg.trading.min_edge + r.cfg.trading.quote_edge_add)
     assert qa.max_price + 0.55 + 0.0174 <= 1 - req + 1e-9
     assert qb.max_price + 0.65 + 0.0160 <= 1 - req + 1e-9
 
@@ -137,6 +137,31 @@ def test_quotes_on_every_leg_count_once_per_basket(arbs):
     qs = r.basket_quotes(b.basket_id)
     assert {q.leg for q in qs} == {0, 1} and all(q.size == 5 for q in qs)
     assert r.committed() == pytest.approx(5 * worst)
+
+
+def test_edge_is_a_return_on_bundle_cost():
+    # 1.5% on a payout-2 bundle needs about twice the dollar edge of payout-1.
+    assert R.edge_dollars(2.0, 0.015) == pytest.approx(2 * R.edge_dollars(1.0, 0.015))
+    e = R.edge_dollars(1.0, 0.015)
+    assert R.edge_return(1.0, e) == pytest.approx(0.015)
+
+
+def test_take_needs_return_not_cents(arbs):
+    r, b2 = arbs
+    b = dataclasses.replace(b2, payout=2.0, basket_id="t:b2")
+    r.all_baskets.append(b)
+    r.baskets[b.basket_id] = b
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, min_edge=0.015, enable_quoting=False)
+    # Asks 0.99 + 0.99 (+fees ~0.0014): edge ~1.86c, which clears 1.5c, but on a
+    # ~$1.98 bundle that is 0.94% < 1.5%.
+    book(r, "X-A", [], [(0.01, 10)])
+    book(r, "X-B", [], [(0.01, 10)])
+
+    async def go():
+        r.evaluate(b)
+        await drain(r)
+    asyncio.run(go())
+    assert b.basket_id not in r.shadow_ledger.baskets
 
 
 def test_dollar_cap_blocks_quote(arbs):
