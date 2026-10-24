@@ -67,8 +67,9 @@ def test_quote_fill_completes_the_other_leg(arbs):
     async def go():
         r.evaluate(b)
         await drain(r)
-        q = r.quotes[b.basket_id]
-        assert q.price + 0.55 + 0.0174 <= 1 - 0.03 + 1e-9 or q.ticker == "X-B"
+        qs = r.basket_quotes(b.basket_id)
+        assert {q.leg for q in qs} == {0, 1}          # every leg quoted at once
+        q = r.quotes[(b.basket_id, 0)]
         # A print through our quote fills it in shadow.
         r._on_trade(q.ticker, Trade(ticker=q.ticker, time=pd.Timestamp.now(tz="UTC"), price=q.price, size=5,
                                     taker_side="no" if q.side == "yes" else "yes"))
@@ -77,7 +78,22 @@ def test_quote_fill_completes_the_other_leg(arbs):
     asyncio.run(go())
     pos = r.shadow_ledger.baskets[b.basket_id]
     assert pos.bundles(b.tickers) == 5 and not pos.unhedged(b.tickers)
-    assert b.basket_id not in r.quotes
+    assert not r.basket_quotes(b.basket_id)          # the other leg's quote is pulled while completing
+
+
+def test_each_leg_priced_against_the_others_asks(arbs):
+    r, b = arbs
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])     # A ask 0.65
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])     # B ask 0.55
+
+    async def go():
+        r.evaluate(b)
+        await drain(r)
+    asyncio.run(go())
+    qa, qb = r.quotes[(b.basket_id, 0)], r.quotes[(b.basket_id, 1)]
+    req = r.cfg.trading.min_edge + r.cfg.trading.quote_edge_add
+    assert qa.max_price + 0.55 + 0.0174 <= 1 - req + 1e-9
+    assert qb.max_price + 0.65 + 0.0160 <= 1 - req + 1e-9
 
 
 def test_broken_basket_alerts_when_cap_below_ask(arbs):

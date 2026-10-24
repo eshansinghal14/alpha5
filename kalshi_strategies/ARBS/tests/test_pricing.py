@@ -58,13 +58,6 @@ def test_quote_none_when_other_leg_lacks_depth():
     assert pricing.quote_leg(legs, 0, 1.0, 0.0, 5) is None
 
 
-def test_best_quote_sticks_to_current_leg_within_margin():
-    legs = [lv([(0.60, 9)], bid=0.30), lv([(0.55, 9)], bid=0.30)]
-    a = pricing.best_quote(legs, 1.0, 0.02, 1)
-    other = 1 - a.leg
-    assert pricing.best_quote(legs, 1.0, 0.02, 1, current_leg=other, switch_margin=0.5).leg == other
-
-
 def test_completion_two_legs_limit_is_cap_j():
     # Bought 5 of leg 0 for $2.00 incl. fees; payout 1, max loss 0.05.
     legs = [lv([(0.50, 9)]), lv([(0.55, 9)])]

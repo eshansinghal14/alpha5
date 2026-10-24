@@ -1,6 +1,6 @@
 """Cross-market arbitrage on the baskets in `Kalshi arb baskets spec.json`:
 take a whole basket when it costs less than its guaranteed payout after
-fees, or rest a bid on one leg and take the rest the moment it fills.
+fees, or rest a bid on each leg and take the rest the moment one fills.
 
     python -m kalshi_strategies.run --series ARBS
 

@@ -139,26 +139,6 @@ def quote_leg(legs: list[LegView], j: int, payout: float, required_edge: float, 
                      edge=payout - others - maker_cost(price, lv.maker_rate), others_cost=others)
 
 
-def best_quote(legs: list[LegView], payout: float, required_edge: float, size: float,
-               current_leg: int | None = None, switch_margin: float = 0.02) -> QuotePlan | None:
-    """The leg to quote: the one whose edge-limited price sits highest above
-    its own best bid (most likely to be hit). Keeps `current_leg` unless
-    another beats it by switch_margin, so the quote doesn't hop legs on
-    every tick (each hop is a cancel plus a create)."""
-    plans = [p for j in range(len(legs)) if (p := quote_leg(legs, j, payout, required_edge, size)) is not None]
-    if not plans:
-        return None
-
-    def room(p: QuotePlan) -> float:
-        b = legs[p.leg].bid
-        return p.max_price - (b if b is not None else 0.0)
-    top = max(plans, key=room)
-    cur = next((p for p in plans if p.leg == current_leg), None)
-    if cur is not None and room(top) < room(cur) + switch_margin:
-        return cur
-    return top
-
-
 @dataclasses.dataclass
 class Completion:
     need: list[float]                 # contracts each leg still needs

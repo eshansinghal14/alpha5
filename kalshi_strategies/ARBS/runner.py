@@ -80,6 +80,10 @@ class Quote:
     def remaining(self) -> float:
         return max(0.0, self.size - self.filled)
 
+    @property
+    def key(self) -> tuple[str, int]:
+        return self.basket_id, self.leg
+
 
 @dataclasses.dataclass
 class Meta:
@@ -116,7 +120,7 @@ class ArbsRunner:
         self.gw = Gateway(self.pool)
         self.feed = MultiFeed(self.tickers, self._on_quote, self._on_trade, label=self.S,
                               on_fill=self._on_fill, on_error=lambda m: self.alert("warn", None, m))
-        self.quotes: dict[str, Quote] = {}               # basket_id -> its one quote
+        self.quotes: dict[tuple[str, int], Quote] = {}   # (basket_id, leg index) -> its quote
         self.busy: set[str] = set()
         self.dirty: set[str] = set(self.baskets)
         self.hot: list[str] = []
@@ -325,12 +329,16 @@ class ArbsRunner:
         self.n["quote_fills"] += 1
         self._book(q.basket_id, q.ticker, q.side, size, cost, "quote", source=source, order_id=q.exchange_id,
                    trade_id=trade_id)
-        if q.remaining <= _EPS and self.quotes.get(q.basket_id) is q:
+        if q.remaining <= _EPS and self.quotes.get(q.key) is q:
             self._retire(q)
 
+    def basket_quotes(self, basket_id: str) -> list[Quote]:
+        b = self.baskets[basket_id]
+        return [q for j in range(len(b.legs)) if (q := self.quotes.get((basket_id, j))) is not None]
+
     def _retire(self, q: Quote):
-        if self.quotes.get(q.basket_id) is q:
-            del self.quotes[q.basket_id]
+        if self.quotes.get(q.key) is q:
+            del self.quotes[q.key]
         if q.exchange_id and q.exchange_id in self.real_ledger.quote_ids:
             self.real_ledger.quote_ids[q.exchange_id]["retired_at"] = time.time()
 
@@ -346,7 +354,9 @@ class ArbsRunner:
             return True
         self.real_ledger.seen_trades.add(key)
         size, cost = float(f["size"]), float(f["price"]) * float(f["size"]) + float(f.get("fee") or 0.0)
-        q = self.quotes.get(info["basket_id"])
+        b = self.baskets.get(info["basket_id"])
+        leg = b.tickers.index(info["ticker"]) if b is not None and info["ticker"] in b.tickers else -1
+        q = self.quotes.get((info["basket_id"], leg))
         if q is not None and q.exchange_id == oid:
             self._quote_fill(q, size, cost, tid, source)
         else:
@@ -403,11 +413,16 @@ class ArbsRunner:
         held = sum(b.cost() for b in self.ledger.baskets.values())
         return held + sum(q.commit * q.remaining / q.size for q in self.quotes.values() if q.size)
 
-    def room_bundles(self, b: Basket, exclude_quote: bool = False) -> float:
+    def room_bundles(self, b: Basket, leg: int | None = None) -> float:
+        """Bundles the basket may still add. For a quote on `leg`, net of what
+        already rests on that leg; for a take (leg None), net of every quote."""
         pos = self.ledger.baskets.get(b.basket_id)
         held = max(pos.held(b.tickers)) if pos else 0.0
-        q = self.quotes.get(b.basket_id)
-        resting = 0.0 if exclude_quote or q is None else q.remaining
+        if leg is None:
+            resting = max((q.remaining for q in self.basket_quotes(b.basket_id)), default=0.0)
+        else:
+            q = self.quotes.get((b.basket_id, leg))
+            resting = 0.0 if q is None else q.remaining
         return max(0.0, self.cfg.trading.max_bundles_per_basket - held - resting)
 
     def room_dollars(self, exclude: Quote | None = None) -> float:
@@ -436,13 +451,16 @@ class ArbsRunner:
     def evaluate(self, b: Basket):
         now = time.time()
         pos = self.ledger.baskets.get(b.basket_id)
-        q = self.quotes.get(b.basket_id)
+        qs = self.basket_quotes(b.basket_id)
+        live_qs = [q for q in qs if not q.pending]
         if pos is not None and pos.unhedged(b.tickers):
-            if q is not None and not q.pending:
-                # Complete first, cancel alongside: the other legs' asks are what
-                # the fill was priced against, and they only get worse.
-                async def both(q=q):
-                    await asyncio.gather(self.cancel_quote(q, "filled"), self.complete(b))
+            if live_qs:
+                # Pull every leg's quote while completing: another leg filling
+                # now would buy what the completion IOCs are buying. Complete
+                # alongside, not after: the asks the fill was priced against
+                # only get worse.
+                async def both(qs=live_qs):
+                    await asyncio.gather(*(self.cancel_quote(q, "filled") for q in qs), self.complete(b))
                 self.spawn(both(), b.basket_id)
                 return
             if now - self.last_completion.get(b.basket_id, 0.0) >= self.cfg.completion.retry_s:
@@ -451,8 +469,8 @@ class ArbsRunner:
         vs = self.views(b) if self.tradeable(b) else None
         blocked = self.blocked()
         if vs is None or blocked or self.excluded(b):
-            if q is not None and not q.pending:
-                self.spawn(self.cancel_quote(q, blocked or ("excluded" if self.excluded(b) else "untradeable")),
+            if live_qs:
+                self.spawn(self.cancel_quotes(live_qs, blocked or ("excluded" if self.excluded(b) else "untradeable")),
                            b.basket_id)
             return
         t = self.cfg.trading
@@ -463,51 +481,61 @@ class ArbsRunner:
                 n = int(min(self.room_bundles(b), max(0.0, self.room_dollars()) // max(per, 0.01)))
                 plan = pricing.take_plan(vs, b.payout, t.min_edge, n) if n >= 1 else None
                 if plan is not None:
-                    if q is not None and not q.pending:
-                        # Our own quote is on a leg we're about to take around.
-                        self.spawn(self.cancel_quote(q, "take"), b.basket_id)
+                    if live_qs:
+                        # Our own quotes are on legs we're about to take around.
+                        self.spawn(self.cancel_quotes(live_qs, "take"), b.basket_id)
                         return
-                    if q is None:
+                    if not qs:
                         self.spawn(self.take(b, plan), b.basket_id)
                         return
-        self.manage_quote(b, vs, q, now)
+        self.manage_quotes(b, vs, now)
 
-    def manage_quote(self, b: Basket, vs, q: Quote | None, now: float):
+    def manage_quotes(self, b: Basket, vs, now: float):
+        """One quote per leg, each priced on its own: a fill on leg j is
+        completed by taking the others, so each leg's limit only depends on the
+        other legs' asks. Several legs filling together just leaves less to take."""
         t = self.cfg.trading
-        want = (t.enable_quoting and b.basket_id in self.hot and b.quoting_allowed(_utc()))
-        plan = None
-        if want:
-            size = min(float(t.quote_size), self.room_bundles(b, exclude_quote=True))
-            per_bundle = b.payout - t.min_edge
-            size = min(size, float(int(max(0.0, self.room_dollars(exclude=q)) // max(per_bundle, 0.01))))
-            if size >= 1:
-                plan = pricing.best_quote(vs, b.payout, t.min_edge + t.quote_edge_add, size,
-                                          current_leg=q.leg if q else None, switch_margin=t.leg_switch_margin)
-        if q is not None and q.pending:
-            return
-        if plan is None:
-            if q is not None:
-                self.spawn(self.cancel_quote(q, "no_edge" if want else "not_hot"), b.basket_id)
-            return
+        want = t.enable_quoting and b.basket_id in self.hot and b.quoting_allowed(_utc())
         reserve = self.cfg.runtime.write_reserve_tokens
-        leg = b.legs[plan.leg]
-        if q is None:
-            if self.live and not self.gw.can_afford(leg.ticker, "order", reserve):
-                return
-            self.spawn(self.place_quote(b, plan, size), b.basket_id)
-            return
-        if q.leg != plan.leg:
-            self.spawn(self.cancel_quote(q, "leg_switch"), b.basket_id)
-            return
-        past_limit = q.price > plan.max_price + _EPS
-        ticks = abs(round((plan.price - q.price) / pricing.TICK))
-        cooled = now - max(q.moved_at, q.placed_at) >= t.requote_cooldown_s
-        if past_limit or (ticks >= t.requote_min_ticks and cooled):
-            if self.live and not past_limit and not self.gw.can_afford(leg.ticker, "amend", reserve):
-                return
-            self.spawn(self.move_quote(q, plan), b.basket_id)
-        else:
-            q.edge, q.max_price = plan.edge, plan.max_price
+        acts = []
+        for j, leg in enumerate(b.legs):
+            q = self.quotes.get((b.basket_id, j))
+            if q is not None and q.pending:
+                continue
+            plan, size = None, 0.0
+            if want:
+                size = min(float(t.quote_size), self.room_bundles(b, j))
+                per_bundle = b.payout - t.min_edge
+                size = min(size, float(int(max(0.0, self.room_dollars(exclude=q)) // max(per_bundle, 0.01))))
+                if size >= 1:
+                    plan = pricing.quote_leg(vs, j, b.payout, t.min_edge + t.quote_edge_add, size)
+            if plan is None:
+                if q is not None:
+                    acts.append(self.cancel_quote(q, "no_edge" if want else "not_hot"))
+                continue
+            if q is None:
+                if self.live and not self.gw.can_afford(leg.ticker, "order", reserve):
+                    continue
+                # Placed (registered) synchronously so the next leg's sizing and
+                # dollar room see it.
+                acts.append(self.place_quote(b, plan, size))
+                continue
+            past_limit = q.price > plan.max_price + _EPS
+            ticks = abs(round((plan.price - q.price) / pricing.TICK))
+            cooled = now - max(q.moved_at, q.placed_at) >= t.requote_cooldown_s
+            if past_limit or (ticks >= t.requote_min_ticks and cooled):
+                if self.live and not past_limit and not self.gw.can_afford(leg.ticker, "amend", reserve):
+                    continue
+                acts.append(self.move_quote(q, plan))
+            else:
+                q.edge, q.max_price = plan.edge, plan.max_price
+        if acts:
+            async def run(acts=acts):
+                await asyncio.gather(*acts)
+            self.spawn(run(), b.basket_id)
+
+    async def cancel_quotes(self, qs: list[Quote], reason: str):
+        await asyncio.gather(*(self.cancel_quote(q, reason) for q in qs))
 
     # ------------------------------------------------------------------ orders
 
@@ -625,7 +653,7 @@ class ArbsRunner:
         q = Quote(basket_id=b.basket_id, leg=plan.leg, ticker=leg.ticker, side=leg.side, price=plan.price,
                   size=size, cid=str(uuid.uuid4()), edge=plan.edge, max_price=plan.max_price,
                   commit=size * (b.payout - plan.edge), placed_at=time.time())
-        self.quotes[b.basket_id] = q
+        self.quotes[q.key] = q
         self.n["quotes_placed"] += 1
         if not self.live:
             q.pending = False
@@ -634,17 +662,17 @@ class ArbsRunner:
             return
         ack, exc, sent = await self.gw.rest(q.ticker, q.side, q.price, size, q.cid)
         if not sent:
-            self.quotes.pop(b.basket_id, None)
+            self.quotes.pop(q.key, None)
             return
         if exc is not None:
             if is_post_only_reject(exc):
                 self.n["post_only_rejects"] += 1
-                self.quotes.pop(b.basket_id, None)
+                self.quotes.pop(q.key, None)
                 return
             if http_status(exc) is None:
                 await self._find_lost(q)
                 return
-            self.quotes.pop(b.basket_id, None)
+            self.quotes.pop(q.key, None)
             self._order_err(b.basket_id, f"quote {q.ticker}", exc)
             return
         self._order_ok()
@@ -677,7 +705,7 @@ class ArbsRunner:
             self.halt = f"lost quote on {q.ticker}"
             return
         if hit is None:
-            self.quotes.pop(q.basket_id, None)
+            self.quotes.pop(q.key, None)
             return
         self._register(q, hit[0])
         await self.cancel_quote(q, "lost_create")
@@ -704,7 +732,7 @@ class ArbsRunner:
             new_id = o.get("order_id")
             if new_id and new_id != q.exchange_id:
                 self._retire(q)
-                self.quotes[q.basket_id] = q
+                self.quotes[q.key] = q
                 self._register(q, new_id)
         q.price, q.edge, q.max_price = plan.price, plan.edge, plan.max_price
         q.commit = q.size * (b.payout - plan.edge)
@@ -804,6 +832,11 @@ class ArbsRunner:
         self.audit_diff = diff or None
         if not diff:
             self.audit_strikes = 0
+            if self.halt and self.halt.startswith("position audit"):
+                # Only this halt clears itself: it means "ledger unknown", and a
+                # clean audit is exactly the proof it isn't any more.
+                self.alert("info", None, f"cleared halt ({self.halt}): ledger matches Kalshi again")
+                self.halt = None
             return True
         self.audit_strikes += 1
         if self.audit_strikes >= 2 and not self.halt:
@@ -893,7 +926,8 @@ class ArbsRunner:
             want = trading.poll()
             if want is not None:
                 self.arm_want, retry_at = want, 0.0
-            if self.arm_want and not self.live and not self.halt and time.monotonic() >= retry_at:
+            if (self.arm_want and not self.live and time.monotonic() >= retry_at
+                    and (not self.halt or self.halt.startswith("position audit"))):
                 if not await self.arm():
                     retry_at = time.monotonic() + 30.0
             elif not self.arm_want and self.live:

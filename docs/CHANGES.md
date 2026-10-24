@@ -7,9 +7,12 @@ Reverse chronological. One section per material change. Entries before
 
 - `kalshi_strategies/ARBS`: 789 baskets / 407 markets / 71 events from
   `Kalshi arb baskets spec.json`. Take a whole basket when payout minus
-  sum(ask + taker fee) >= `trading.min_edge`; or rest one leg of the top
-  `watch.max_quoted_baskets` baskets (ranked by that same gap) priced to
-  clear `min_edge + quote_edge_add` if completed at today's asks. A fill, or
+  sum(ask + taker fee) >= `trading.min_edge`; or rest a bid on every leg of
+  the top `watch.max_quoted_baskets` baskets (ranked by that same gap), each
+  priced to clear `min_edge + quote_edge_add` if completed at the other legs'
+  asks. A fill on one leg pulls the basket's other quotes while completing.
+- Position-audit halt clears itself on a clean audit; positions bought by
+  hand are booked into a basket with `python -m kalshi_strategies.ARBS.adopt`. A fill, or
   an uneven take, is completed by IOCs limited by cap_j (see
   `pricing.completion`), retried every `completion.retry_s`; a leg that
   can't be bought within `completion.max_loss_per_bundle` is a dashboard

@@ -13,8 +13,8 @@ SPEC_PATH = os.path.join(os.path.dirname(__file__), "Kalshi arb baskets spec.jso
 @section
 class TradingParams:
     enable_takes: bool = param("Take a whole basket (IOC on every leg) when it clears min_edge after fees.")
-    enable_quoting: bool = param("Rest a bid on one leg of the hottest baskets; a fill is completed at once "
-                                 "by taking the other legs.")
+    enable_quoting: bool = param("Rest a bid on every leg of the hottest baskets that can clear the quote "
+                                 "edge; a fill is completed at once by taking the other legs.")
     min_edge: float = param("Required profit per bundle ($), after fees, for a take, and for a quote assuming "
                             "it fills and the other legs are taken at today's asks.", min=0.0, max=0.5, step=0.005)
     quote_edge_add: float = param("Extra edge per bundle ($) a quote must clear on top of min_edge: pays for "
@@ -29,8 +29,6 @@ class TradingParams:
     requote_cooldown_s: float = param("Least time between voluntary moves of one quote.", min=0.0, step=0.5)
     take_cooldown_s: float = param("Least time between takes on one basket (our IOCs consume the book before "
                                    "the feed shows it).", min=0.0, step=0.5)
-    leg_switch_margin: float = param("Move a quote to another leg only if that leg's edge-limited price sits "
-                                     "this much ($) further above its bid.", min=0.0, step=0.005)
 
 
 @section

@@ -9,8 +9,7 @@
     "max_dollars": 500.0,
     "requote_min_ticks": 1,
     "requote_cooldown_s": 2.0,
-    "take_cooldown_s": 1.0,
-    "leg_switch_margin": 0.02
+    "take_cooldown_s": 1.0
   },
   "completion": {
     "max_loss_per_bundle": 0.05,
