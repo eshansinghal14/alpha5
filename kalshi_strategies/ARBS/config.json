@@ -25,7 +25,7 @@
   "runtime": {
     "control_poll_s": 1.0,
     "max_write_tokens_per_s": 50.0,
-    "write_reserve_tokens": 60.0,
+    "write_reserve_tokens": 20.0,
     "audit_s": 30.0,
     "fill_poll_s": 5.0,
     "meta_refresh_s": 300.0,

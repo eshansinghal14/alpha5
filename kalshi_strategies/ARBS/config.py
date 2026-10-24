@@ -64,6 +64,9 @@ class RuntimeParams:
     max_write_tokens_per_s: float | None = param("Cap on this strategy's write spend per shard, on top of the "
                                                  "shard's shared bucket. Empty = none.", min=1.0, step=10.0,
                                                  editable=False)
+    # Must stay below max_write_tokens_per_s - 10: the capped bucket holds one
+    # second of its rate, so a larger reserve blocks every quote (60 vs a cap of
+    # 50 placed no live quote 10-24 21:30 UTC).
     write_reserve_tokens: float = param("Quotes are only placed or moved with this many tokens left over, kept "
                                         "for completions and cancels.", min=0.0, step=10.0, editable=False)
     audit_s: float = param("Seconds between position audits against Kalshi (and resting-order checks).",
