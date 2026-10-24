@@ -69,7 +69,6 @@ class Quote:
     cid: str
     edge: float
     max_price: float
-    commit: float               # dollars if filled and completed
     filled: float = 0.0
     exchange_id: str | None = None
     placed_at: float = 0.0
@@ -409,9 +408,24 @@ class ArbsRunner:
 
     # ------------------------------------------------------------------ limits
 
+    def worst_bundle_cost(self, b: Basket) -> float:
+        """Most one bundle can cost once a quote fills and is completed: the
+        completion's cap_j allows up to payout + max_loss_per_bundle."""
+        return b.payout + self.cfg.completion.max_loss_per_bundle
+
+    def quote_commit(self, basket_id: str) -> float:
+        """Dollars a basket's resting quotes can cost, counted ONCE per basket:
+        a fill on one leg pulls the others and completes, several legs filling
+        leaves less to take, so the basket never needs more than its largest
+        quote's bundles."""
+        qs = self.basket_quotes(basket_id)
+        if not qs:
+            return 0.0
+        return max(q.remaining for q in qs) * self.worst_bundle_cost(self.baskets[basket_id])
+
     def committed(self) -> float:
         held = sum(b.cost() for b in self.ledger.baskets.values())
-        return held + sum(q.commit * q.remaining / q.size for q in self.quotes.values() if q.size)
+        return held + sum(self.quote_commit(bid) for bid in {q.basket_id for q in self.quotes.values()})
 
     def room_bundles(self, b: Basket, leg: int | None = None) -> float:
         """Bundles the basket may still add. For a quote on `leg`, net of what
@@ -425,11 +439,15 @@ class ArbsRunner:
             resting = 0.0 if q is None else q.remaining
         return max(0.0, self.cfg.trading.max_bundles_per_basket - held - resting)
 
-    def room_dollars(self, exclude: Quote | None = None) -> float:
-        c = self.committed()
-        if exclude is not None and exclude.size:
-            c -= exclude.commit * exclude.remaining / exclude.size
-        return self.cfg.trading.max_dollars - c
+    def room_dollars(self) -> float:
+        return self.cfg.trading.max_dollars - self.committed()
+
+    def quote_size_by_dollars(self, b: Basket) -> int:
+        """Largest quote size any leg of `b` may have under max_dollars. The
+        basket's own quotes are added back, since a leg at or below the
+        basket's largest quote adds nothing to what it can cost."""
+        budget = self.room_dollars() + self.quote_commit(b.basket_id)
+        return int(max(0.0, budget) // max(self.worst_bundle_cost(b), 0.01))
 
     # ------------------------------------------------------------------ eval
 
@@ -504,9 +522,7 @@ class ArbsRunner:
                 continue
             plan, size = None, 0.0
             if want:
-                size = min(float(t.quote_size), self.room_bundles(b, j))
-                per_bundle = b.payout - t.min_edge
-                size = min(size, float(int(max(0.0, self.room_dollars(exclude=q)) // max(per_bundle, 0.01))))
+                size = min(float(t.quote_size), self.room_bundles(b, j), float(self.quote_size_by_dollars(b)))
                 if size >= 1:
                     plan = pricing.quote_leg(vs, j, b.payout, t.min_edge + t.quote_edge_add, size)
             if plan is None:
@@ -516,9 +532,9 @@ class ArbsRunner:
             if q is None:
                 if self.live and not self.gw.can_afford(leg.ticker, "order", reserve):
                     continue
-                # Placed (registered) synchronously so the next leg's sizing and
-                # dollar room see it.
-                acts.append(self.place_quote(b, plan, size))
+                # Registered now, not when the coroutine runs, so the next
+                # basket's dollar room in this same pass already counts it.
+                acts.append(self.place_quote(self.new_quote(b, plan, size)))
                 continue
             past_limit = q.price > plan.max_price + _EPS
             ticks = abs(round((plan.price - q.price) / pricing.TICK))
@@ -648,22 +664,28 @@ class ArbsRunner:
             self.completion_note.pop(b.basket_id, None)
             self.journal({"kind": "completed", "basket_id": b.basket_id})
 
-    async def place_quote(self, b: Basket, plan: pricing.QuotePlan, size: float):
+    def new_quote(self, b: Basket, plan: pricing.QuotePlan, size: float) -> Quote:
         leg = b.legs[plan.leg]
         q = Quote(basket_id=b.basket_id, leg=plan.leg, ticker=leg.ticker, side=leg.side, price=plan.price,
                   size=size, cid=str(uuid.uuid4()), edge=plan.edge, max_price=plan.max_price,
-                  commit=size * (b.payout - plan.edge), placed_at=time.time())
+                  placed_at=time.time())
         self.quotes[q.key] = q
-        self.n["quotes_placed"] += 1
+        return q
+
+    async def place_quote(self, q: Quote):
+        b = self.baskets[q.basket_id]
+        size = q.size
         if not self.live:
             q.pending = False
+            self.n["quotes_placed"] += 1
             self.journal({"kind": "quote", "basket_id": b.basket_id, "ticker": q.ticker, "side": q.side,
-                          "price": q.price, "size": size, "edge": round(plan.edge, 4)})
+                          "price": q.price, "size": size, "edge": round(q.edge, 4)})
             return
         ack, exc, sent = await self.gw.rest(q.ticker, q.side, q.price, size, q.cid)
         if not sent:
             self.quotes.pop(q.key, None)
             return
+        self.n["quotes_placed"] += 1
         if exc is not None:
             if is_post_only_reject(exc):
                 self.n["post_only_rejects"] += 1
@@ -683,7 +705,7 @@ class ArbsRunner:
         elif ack.fill is not None and ack.fill.size > 0:
             self._quote_fill(q, ack.fill.size, ack.fill.price * ack.fill.size + ack.fill.fee, None, "create")
         self.journal({"kind": "quote", "basket_id": b.basket_id, "ticker": q.ticker, "side": q.side,
-                      "price": q.price, "size": size, "edge": round(plan.edge, 4), "order_id": q.exchange_id})
+                          "price": q.price, "size": size, "edge": round(q.edge, 4), "order_id": q.exchange_id})
 
     def _register(self, q: Quote, oid: str | None):
         q.exchange_id, q.pending = oid, False
@@ -735,7 +757,6 @@ class ArbsRunner:
                 self.quotes[q.key] = q
                 self._register(q, new_id)
         q.price, q.edge, q.max_price = plan.price, plan.edge, plan.max_price
-        q.commit = q.size * (b.payout - plan.edge)
         self.journal({"kind": "move", "basket_id": q.basket_id, "ticker": q.ticker, "from": old, "to": plan.price})
 
     async def cancel_quote(self, q: Quote, reason: str):

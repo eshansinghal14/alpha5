@@ -122,6 +122,23 @@ def test_settlement_books_pnl(arbs):
     assert r.shadow_ledger.settled[-1]["pnl"] == pytest.approx(0.2)
 
 
+def test_quotes_on_every_leg_count_once_per_basket(arbs):
+    r, b = arbs
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    worst = b.payout + r.cfg.completion.max_loss_per_bundle
+    # Room for exactly one basket's quotes at quote_size 5, not two.
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, max_dollars=5 * worst + 0.01)
+
+    async def go():
+        r.evaluate(b)
+        await drain(r)
+    asyncio.run(go())
+    qs = r.basket_quotes(b.basket_id)
+    assert {q.leg for q in qs} == {0, 1} and all(q.size == 5 for q in qs)
+    assert r.committed() == pytest.approx(5 * worst)
+
+
 def test_dollar_cap_blocks_quote(arbs):
     r, b = arbs
     r.cfg.trading = dataclasses.replace(r.cfg.trading, max_dollars=0.5)

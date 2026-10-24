@@ -24,8 +24,9 @@ class TradingParams:
     quote_size: int = param("Bundles per resting quote.", min=1, max=10000, step=1)
     max_bundles_per_basket: int = param("Most bundles held in one basket (complete or not).", min=0, max=100000,
                                         step=1)
-    max_dollars: float = param("Most dollars in the strategy: cost paid on held baskets plus what resting "
-                               "quotes would commit if filled and completed.", min=0.0, step=50.0)
+    max_dollars: float = param("Most dollars in the strategy: cost paid on held baskets, plus per quoted "
+                               "basket its largest resting quote x (payout + max_loss_per_bundle), the most it "
+                               "can cost filled and completed however many legs fill.", min=0.0, step=50.0)
     take_cooldown_s: float = param("Least time between takes on one basket. A take buys only the touch of "
                                    "every leg; this is how long to wait for a thin touch to refill at the same "
                                    "price before taking again.", min=0.0, step=0.5)
