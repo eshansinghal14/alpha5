@@ -68,7 +68,9 @@ def main() -> None:
         names = args.series
     else:
         from kalshi_strategies.run import registry
-        names = sorted(registry())
+        # Runner strategies (ARBS) keep their own PnL; perf's markouts and
+        # ticker-dated settlement lookup assume the standard session journal.
+        names = sorted(t for t, s in registry().items() if s.runner is None)
     # One thread per series: a cold catch-up (minutes on the race's history)
     # must not hold back every other series' panel.
     threads = [threading.Thread(target=run_series, args=(s, args.every_s), daemon=True, name=f"perf-{s}")

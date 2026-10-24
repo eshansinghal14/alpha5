@@ -242,7 +242,11 @@ class ServiceKeeper:
 
 def launch_many(units: list[list[str]], args) -> int:
     from kalshi_infra.kalshi.markets import series_shard
-    shares = write_shares(units, series_shard)
+    reg = registry()
+    # A runner strategy's ticker isn't a Kalshi series (no shard to look up);
+    # it pins every write to its markets' shards, so the share doesn't apply.
+    own = [u for u in units if reg[u[0]].runner is not None]
+    shares = {**write_shares([u for u in units if u not in own], series_shard), **{u[0]: 1.0 for u in own}}
     procs = []
     for unit in units:
         s = ", ".join(unit)
@@ -343,9 +347,14 @@ async def _run_unit(series, args):
     """Every series of one process on one event loop (a write group shares
     its bucket and quote queue only within a process)."""
     from kalshi_infra.runtime.session import session_loop
-    await asyncio.gather(*(session_loop(s, live_trading=args.live_trading, carry_arm=not args.no_carry_arm,
-                                        event_ticker=args.event_ticker,
-                                        resume_arm_s=args.resume_arm_h * 3600 or None) for s in series))
+    resume = args.resume_arm_h * 3600 or None
+
+    def one(s):
+        if s.runner is not None:
+            return s.runner(s, live_trading=args.live_trading, resume_arm_s=resume)
+        return session_loop(s, live_trading=args.live_trading, carry_arm=not args.no_carry_arm,
+                            event_ticker=args.event_ticker, resume_arm_s=resume)
+    await asyncio.gather(*(one(s) for s in series))
 
 
 if __name__ == "__main__":

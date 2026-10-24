@@ -1,0 +1,36 @@
+{
+  "trading": {
+    "enable_takes": true,
+    "enable_quoting": true,
+    "min_edge": 0.01,
+    "quote_edge_add": 0.02,
+    "quote_size": 5,
+    "max_bundles_per_basket": 50,
+    "max_dollars": 500.0,
+    "requote_min_ticks": 1,
+    "requote_cooldown_s": 2.0,
+    "take_cooldown_s": 1.0,
+    "leg_switch_margin": 0.02
+  },
+  "completion": {
+    "max_loss_per_bundle": 0.05,
+    "retry_s": 2.0,
+    "max_broken_baskets": 3
+  },
+  "watch": {
+    "max_quoted_baskets": 20,
+    "rank_interval_s": 5.0,
+    "eval_interval_s": 0.05,
+    "exclude": []
+  },
+  "runtime": {
+    "control_poll_s": 1.0,
+    "max_write_tokens_per_s": 50.0,
+    "write_reserve_tokens": 60.0,
+    "audit_s": 30.0,
+    "fill_poll_s": 5.0,
+    "meta_refresh_s": 300.0,
+    "max_order_errors": 5,
+    "feed_down_pull_s": 5.0
+  }
+}

@@ -904,6 +904,27 @@ class KalshiOrderClient:
         out.sort(key=lambda f: f["time"] or "")
         return out
 
+    def positions_all(self, max_pages: int = 20) -> dict[str, float]:
+        """Signed YES position (negative = long NO) for every market the
+        account holds, paged. One read for a strategy spread over many events."""
+        out, cursor = {}, None
+        for _ in range(max_pages):
+            params = {"limit": 1000, "count_filter": "position"}
+            if cursor:
+                params["cursor"] = cursor
+            resp = self._session.get(BASE_URL + POSITIONS_PATH, headers=self._headers("GET", POSITIONS_PATH),
+                                     params=params, timeout=self.timeout_s)
+            resp.raise_for_status()
+            data = resp.json()
+            batch = data.get("market_positions", [])
+            for p in batch:
+                if p.get("ticker"):
+                    out[p["ticker"]] = float(p.get("position_fp", p.get("position", 0)) or 0)
+            cursor = data.get("cursor")
+            if not cursor or not batch:
+                break
+        return out
+
     def positions(self, event_ticker: str) -> dict[str, dict]:
         """Kalshi's own record of what we hold in `event_ticker`, keyed by
         market ticker. `position` is signed YES contracts (negative = long

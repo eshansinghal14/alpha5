@@ -1,0 +1,74 @@
+"""Basket spec loader (`Kalshi arb baskets spec.json`): every basket as a
+list of (ticker, side) legs and the payout it is guaranteed."""
+from __future__ import annotations
+
+import dataclasses
+import json
+
+import pandas as pd
+
+
+@dataclasses.dataclass(frozen=True)
+class Leg:
+    ticker: str
+    side: str          # "yes" | "no": the contract this leg BUYS
+
+
+@dataclasses.dataclass(frozen=True)
+class Basket:
+    basket_id: str
+    relationship_id: str
+    type: str
+    cluster: str
+    legs: tuple[Leg, ...]
+    # Worst-case payout per bundle. For `exact: false` baskets this is the
+    # lower of payout and payout_in_tie_or_rounding_case: GOVPARTYFL buy_all_yes
+    # pays 0 on a tie, so it is never an arb and must not be traded as one.
+    payout: float
+    quote_until: pd.Timestamp | None
+    resume_quoting: pd.Timestamp | None
+
+    @property
+    def tickers(self) -> list[str]:
+        return [l.ticker for l in self.legs]
+
+    def quoting_allowed(self, now: pd.Timestamp) -> bool:
+        """The spec's quote window: quoting stops at quote_until (election
+        night: legs reprice faster than a completion can follow) and comes back
+        only at resume_quoting. Takes are allowed throughout."""
+        if self.quote_until is None or now < self.quote_until:
+            return True
+        return self.resume_quoting is not None and now >= self.resume_quoting
+
+
+def _ts(v) -> pd.Timestamp | None:
+    return None if not v else pd.Timestamp(v)
+
+
+def load_spec(path: str, exclude: list[str] | None = None) -> list[Basket]:
+    """Baskets in file order. `exclude` drops any basket whose basket_id,
+    relationship_id or cluster equals one of its entries."""
+    with open(path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    ex = set(exclude or [])
+    out, seen = [], set()
+    for rel in doc["relationships"]:
+        for b in rel["baskets"]:
+            if {b["basket_id"], rel["relationship_id"], rel.get("cluster")} & ex:
+                continue
+            if b["basket_id"] in seen:
+                raise ValueError(f"basket {b['basket_id']} listed twice")
+            seen.add(b["basket_id"])
+            legs = tuple(Leg(l["ticker"], l["side"]) for l in b["legs"])
+            if any(l.side not in ("yes", "no") for l in legs):
+                raise ValueError(f"{b['basket_id']}: leg side must be yes/no")
+            if len({l.ticker for l in legs}) != len(legs):
+                raise ValueError(f"{b['basket_id']}: a ticker appears twice")
+            payout = float(b["payout"])
+            if b.get("exact") is False and b.get("payout_in_tie_or_rounding_case") is not None:
+                payout = min(payout, float(b["payout_in_tie_or_rounding_case"]))
+            out.append(Basket(basket_id=b["basket_id"], relationship_id=rel["relationship_id"],
+                              type=rel["type"], cluster=rel.get("cluster") or "", legs=legs, payout=payout,
+                              quote_until=_ts(rel.get("quote_until_utc")),
+                              resume_quoting=_ts(rel.get("resume_quoting_utc"))))
+    return out

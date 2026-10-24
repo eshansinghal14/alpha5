@@ -1,0 +1,23 @@
+[Unit]
+Description=alpha5 ARBS cross-market basket arbitrage, shadow unless armed
+After=network-online.target chrony.service
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/opt/alpha5
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+ExecStart=/opt/alpha5/.venv/bin/python -u -m kalshi_strategies.run --series ARBS --resume-arm-h 18
+# Below crypto (nice -5) and S&P: these books move on news, not milliseconds.
+Environment=ALPHA5_PRIORITY=normal
+Nice=5
+KillSignal=SIGINT
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/opt/alpha5/data/live/arbs.out.log
+StandardError=append:/opt/alpha5/data/live/arbs.err.log
+
+[Install]
+WantedBy=multi-user.target

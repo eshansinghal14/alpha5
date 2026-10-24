@@ -3,6 +3,31 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-24 — ARBS: cross-market basket arbitrage (shadow only so far)
+
+- `kalshi_strategies/ARBS`: 789 baskets / 407 markets / 71 events from
+  `Kalshi arb baskets spec.json`. Take a whole basket when payout minus
+  sum(ask + taker fee) >= `trading.min_edge`; or rest one leg of the top
+  `watch.max_quoted_baskets` baskets (ranked by that same gap) priced to
+  clear `min_edge + quote_edge_add` if completed at today's asks. A fill, or
+  an uneven take, is completed by IOCs limited by cap_j (see
+  `pricing.completion`), retried every `completion.retry_s`; a leg that
+  can't be bought within `completion.max_loss_per_bundle` is a dashboard
+  alert. `max_bundles_per_basket`, `max_dollars`.
+- Runs its own loop (`Series.runner`), not the one-event session: per-basket
+  ledger persisted to `data/live/ARBS/ledger.json` (Kalshi only knows net per
+  ticker), audited against an account-wide positions read; separate shadow
+  ledger. Settlement PnL is booked from market results on meta refresh.
+- Kalshi WS: a second orderbook subscribe on one connection joins sid 1 and
+  its `ok` ack takes a seq number (probe 2026-10-24), so ARBS checks seq on
+  every message per sid; an orderbook-only check read it as a gap and
+  reconnected forever with 50/407 books.
+- Shadow probe 2026-10-24 ~21:00 UTC: all 407 markets active, shard 0,
+  quadratic 0.07 taker / 0 maker; best gap +0.1c (two 3-leg identity
+  baskets), none near min_edge.
+- Dashboard: folders may set `DASHBOARD_PAGE`; perf_worker skips runner
+  strategies.
+
 ## 2026-10-22 — Ed25519 API key; old projects removed
 
 - Every Kalshi REST/WS call signs with an Ed25519 key since 15:35 UTC. Sign

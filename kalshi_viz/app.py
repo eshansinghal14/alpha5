@@ -248,7 +248,26 @@ def _last_summary(series: str) -> dict | None:
     return read_summary(series) or ((latest_summary(series) or (None, None))[1])
 
 
+@st.cache_resource
+def _custom_pages() -> dict:
+    """series -> render(series) for folders that draw their own page
+    (DASHBOARD_PAGE = "module:function")."""
+    import importlib
+    out = {}
+    for mod in folders().values():
+        spec = getattr(mod, "DASHBOARD_PAGE", None)
+        if spec:
+            m, fn = spec.split(":")
+            for s in mod.SERIES:
+                out[s] = getattr(importlib.import_module(m), fn)
+    return out
+
+
 def _render_page(series: str):
+    custom = _custom_pages().get(series)
+    if custom is not None:
+        custom(series, _stale)
+        return
     st.title(series)
     perf_panel.render(series, lip=has_lip(_last_summary(series)))
     _render_series(series, series)
