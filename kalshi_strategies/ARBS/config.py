@@ -27,6 +27,10 @@ class TradingParams:
                                   "pays for being filled just as the other legs move away.", min=0.0, max=0.5,
                                   step=0.0025)
     quote_size: int = param("Bundles per resting quote.", min=1, max=10000, step=1)
+    max_ticks_behind: int = param("Rest a leg only if its edge-limited price is at most this many ticks below "
+                                  "that leg's best bid (0 = join or improve the bid). Deeper quotes fill only "
+                                  "when the book is swept, i.e. when the other legs have moved against us.",
+                                  min=0, max=99, step=1)
     max_bundles_per_basket: int = param("Most bundles held in one basket (complete or not).", min=0, max=100000,
                                         step=1)
     max_dollars: float = param("Most dollars in the strategy: cost paid on held baskets, plus per quoted "

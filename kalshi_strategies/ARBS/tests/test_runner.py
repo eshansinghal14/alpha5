@@ -26,7 +26,8 @@ def arbs(tmp_path, monkeypatch):
     for t in r.tickers:
         r.meta[t] = R.Meta(ticker=t, event="X", status="active", shard=0, taker_rate=0.07, maker_rate=0.0)
     r.cfg.trading = dataclasses.replace(r.cfg.trading, min_edge=0.01, quote_edge_add=0.02, quote_size=5,
-                                        max_bundles_per_basket=50, max_dollars=1000.0, take_cooldown_s=0.0)
+                                        max_bundles_per_basket=50, max_dollars=1000.0, take_cooldown_s=0.0,
+                                        max_ticks_behind=99)
     r.hot = [b.basket_id]
     return r, b
 
@@ -137,6 +138,22 @@ def test_quotes_on_every_leg_count_once_per_basket(arbs):
     qs = r.basket_quotes(b.basket_id)
     assert {q.leg for q in qs} == {0, 1} and all(q.size == 5 for q in qs)
     assert r.committed() == pytest.approx(5 * worst)
+
+
+def test_deep_leg_not_quoted(arbs):
+    r, b = arbs
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, max_ticks_behind=0)
+    # Leg A's edge limit is far under its 0.50 bid; leg B's limit sits above its 0.10 bid.
+    book(r, "X-A", [(0.50, 10)], [(0.45, 10)])     # A ask 0.55
+    book(r, "X-B", [(0.10, 10)], [(0.40, 10)])     # B ask 0.60
+
+    async def go():
+        r.evaluate(b)
+        await drain(r)
+    asyncio.run(go())
+    legs = {q.leg for q in r.basket_quotes(b.basket_id)}
+    assert 0 not in legs and 1 in legs
+    assert R.too_deep(0.01, 0.04, 2) and not R.too_deep(0.02, 0.04, 2) and not R.too_deep(0.01, None, 0)
 
 
 def test_edge_is_a_return_on_bundle_cost():
