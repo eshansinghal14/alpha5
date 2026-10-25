@@ -119,7 +119,9 @@ def _tables(s: dict):
 
 
 def render(series: str, stale_fn):
-    st.title(series)
+    st.title("Arbitrage · risk-free")
+    st.caption("Whole baskets only: take every leg, or quote legs and complete the rest on a fill. "
+               f"Series {series}.")
 
     @st.fragment(run_every="2s")
     def body():

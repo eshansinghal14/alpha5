@@ -3,6 +3,24 @@
 Reverse chronological. One section per material change. Entries before
 2026-10-09 name paths that no longer exist (see the reorg entry).
 
+## 2026-10-25 — ARBS single-leg backtest; dashboard "risk-free" / "single-leg"
+
+- `kalshi_strategies/ARBS/single_leg/`: backtest of buying only a basket's
+  lagging leg (fair = payout - other legs' mids, lag rule "thinnest" or
+  "stale"), exit at a resting sell at fair, a stop off the entry bid, or a
+  max hold (sell, or complete into the full basket). One position per leg
+  across baskets. 1-minute candles from GET /markets/candlesticks, cached
+  in `data/arbs_single_leg/candles/` (batch cap is 10,000 candles counted as
+  tickers x minutes requested). `python -m kalshi_strategies.ARBS.single_leg.backtest --days 30`
+  writes `data/arbs_single_leg/result.json` + trades parquet and sweeps
+  entry edge, lag rule, stop, hold, completion and max spread.
+- Dashboard: Arbitrage section shows the live strategy as "risk-free" and
+  the backtest page as "single-leg" (folders can now add non-series pages,
+  EXTRA_PAGES, and sidebar labels, DASHBOARD_LABELS).
+- 3-day local run (10-22..25): default params 100 trades, -$3.29 per
+  contract-trade, 12% win; first cut stopped out 109/213 trades in 1 minute
+  because the stop was set off the ask, now off the bid.
+
 ## 2026-10-24 — ARBS: cross-market basket arbitrage (shadow only so far)
 
 - `kalshi_strategies/ARBS`: 789 baskets / 407 markets / 71 events from

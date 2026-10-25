@@ -13,6 +13,9 @@ from kalshi_strategies.ARBS.config import CONFIG_PATH, ArbsConfig
 
 DASHBOARD_GROUP = "Arbitrage"
 DASHBOARD_PAGE = "kalshi_viz.arbs_page:render"
+# The single-leg strategy is a backtest so far: a page, not a series.
+EXTRA_PAGES = {"ARBS_SINGLE_LEG": "kalshi_viz.single_leg_page:render"}
+DASHBOARD_LABELS = {"ARBS": "risk-free", "ARBS_SINGLE_LEG": "single-leg"}
 
 
 async def _runner(series, **kw):

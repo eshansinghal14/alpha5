@@ -59,14 +59,36 @@ OTHER_GROUP = "Other"
 
 @st.cache_resource
 def _groups() -> dict[str, list[str]]:
-    """Sidebar heading -> its series, one page each. A folder's
-    DASHBOARD_GROUP names its heading (folders sharing one are listed by
-    DASHBOARD_RANK, lower first); a folder without one goes under Other."""
+    """Sidebar heading -> its pages. A folder's DASHBOARD_GROUP names its
+    heading (folders sharing one are listed by DASHBOARD_RANK, lower first);
+    a folder without one goes under Other. A folder's EXTRA_PAGES (page id ->
+    "module:render") add pages that are not series (a backtest view)."""
     out: dict[str, list[str]] = {}
     for mod in sorted(folders().values(), key=lambda m: getattr(m, "DASHBOARD_RANK", 0)):
         g = getattr(mod, "DASHBOARD_GROUP", None) or OTHER_GROUP
         out.setdefault(g, []).extend(mod.SERIES)
+        out[g].extend(getattr(mod, "EXTRA_PAGES", {}))
     return dict(sorted(out.items(), key=lambda kv: (kv[0] == OTHER_GROUP, kv[0])))
+
+
+@st.cache_resource
+def _extra_pages() -> dict:
+    import importlib
+    out = {}
+    for mod in folders().values():
+        for page, spec in getattr(mod, "EXTRA_PAGES", {}).items():
+            m, fn = spec.split(":")
+            out[page] = getattr(importlib.import_module(m), fn)
+    return out
+
+
+@st.cache_resource
+def _labels() -> dict[str, str]:
+    """Page id -> sidebar button text (DASHBOARD_LABELS; default the id)."""
+    out = {}
+    for mod in folders().values():
+        out.update(getattr(mod, "DASHBOARD_LABELS", {}))
+    return out
 
 
 def _stale(page: str) -> bool:
@@ -410,17 +432,23 @@ def main():
         st.session_state[SERIES_KEY] = every[0]
     series = st.session_state[SERIES_KEY]
     live = {s for s in reg if read_summary(s) is not None}
+    labels = _labels()
     with st.sidebar:
         # One button per series under its heading: one radio can't carry headings,
         # and one radio per group would leave a selection showing in every group.
         for g, ms in groups.items():
             st.subheader(g)
             for s in ms:
-                st.button(s + ("  ●" if s in live else ""), key=f"nav_{s}", on_click=_pick, args=(s,),
-                          type="primary" if s == series else "secondary", use_container_width=True)
-        st.header("Config")
-        config_form.render(reg[series], _market_names(series))
-    _render_page(series)
+                st.button(labels.get(s, s) + ("  ●" if s in live else ""), key=f"nav_{s}", on_click=_pick,
+                          args=(s,), type="primary" if s == series else "secondary", use_container_width=True)
+        if series in reg:
+            st.header("Config")
+            config_form.render(reg[series], _market_names(series))
+    extra = _extra_pages().get(series)
+    if extra is not None:
+        extra(series, _stale)
+    else:
+        _render_page(series)
 
 
 main()
