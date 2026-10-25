@@ -164,7 +164,8 @@ def build_summary(*, series: str, event_ticker: str, engine, quoter, store, mode
                  "n_cancelled": engine.n_real_cancelled,
                  "n_failed_cancels": engine.failed_cancels, "balance_at_arm": engine.balance_at_arm,
                  "last_reconcile": engine.last_reconcile, "reconcile_mismatches": engine.reconcile_mismatches,
-                 "last_audit": engine.last_audit, "last_audit_diffs": engine.last_audit_diffs},
+                 "last_audit": engine.last_audit, "last_audit_diffs": engine.last_audit_diffs,
+                 "order_group": engine.og_summary() if hasattr(engine, "og_summary") else None},
         # Real write-token spend by "kind:reason" since the client was built
         # (one per event); see KalshiOrderClient.usage.
         "write_usage": engine.order_client.usage() if engine.order_client is not None else None,

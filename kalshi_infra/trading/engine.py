@@ -58,6 +58,7 @@ from kalshi_backtest.book import BookView
 from kalshi_backtest.core import Order, Portfolio, Trade
 from kalshi_backtest.data import STALE_THRESHOLD_S as MAX_BOOK_AGE_S
 from kalshi_infra.kalshi.orders import (WRITE_HEADROOM, error_code, http_status, is_market_paused,
+                                        is_order_group_reject,
                                         is_post_only_reject)
 from kalshi_infra.trading import order_manager as om
 from kalshi_backtest.execution import (MEASURED_SEND_S, QueueTracker, resolve_marketable,
@@ -293,6 +294,7 @@ class LiveEngine:
         self.last_reconcile: str | None = None
         self.balance_at_arm: float | None = None
         self._sweep = None          # disarm_nowait's exchange sweep, while it runs
+        self._og = None             # this session's Kalshi order group (see _og_open_blocking)
         self.reconcile_mismatches: list[str] = []
 
         # --- quotes: owned by the OrderManager (see order_manager.py) ---
@@ -621,6 +623,8 @@ class LiveEngine:
             # desired sets, so the pump has nothing to create meanwhile.
             self.pull_quotes()
         self.live_trading = False
+        if was_live:
+            self.og_close()
         return was_live
 
     def disarm_nowait(self):
@@ -682,7 +686,128 @@ class LiveEngine:
         balance = self.order_client.balance(exchange_index=shard)
         real_positions = self.order_client.positions(self.event_ticker)
         past_fills = self.order_client.fills(self.event_ticker)
+        self._og_open_blocking()
         return shard, balance, real_positions, past_fills
+
+    # -----------------------------------------------------------------
+    # Order group: Kalshi-side sweep stop
+    # -----------------------------------------------------------------
+    #
+    # One group per armed session of this event. Kalshi counts matched
+    # contracts across all its orders over a rolling 15 s and, once past the
+    # limit, cancels the rest inside the matching engine -- the only cancel that
+    # can land before the second leg of a sweep arriving 1-5 ms after the first.
+    # We see the trip as an order_group_reject on create (or infer it from our
+    # own fill count), wait order_group_reset_s, reset, and quote again.
+
+    def _og_open_blocking(self):
+        """Worker thread: create this session's group if configured. A failure
+        only means no group -- quoting is not blocked on it."""
+        limit = getattr(self.quoting, "order_group_limit", None)
+        if limit is None or self.order_client is None or not hasattr(self.order_client, "create_order_group"):
+            return
+        old = getattr(self.order_client, "order_group_id", None)
+        try:
+            gid = self.order_client.create_order_group(limit)
+        except Exception as exc:
+            print(f"[live] WARN: order group not created ({exc!r}); quoting without one")
+            return
+        self.order_client.order_group_id = gid
+        self._og = {"id": gid, "limit": float(limit), "fills": collections.deque(), "tripped_at": None,
+                    "resetting": False, "n_trips": 0, "n_resets": 0, "n_reset_errors": 0}
+        print(f"[live] order group {gid} created: Kalshi cancels every quote in {self.event_ticker} "
+              f"once more than {limit:g} contracts match in 15 s")
+        if old is not None and old != gid:
+            self._og_delete_blocking(old)
+
+    def _og_delete_blocking(self, gid):
+        try:
+            self.order_client.delete_order_group(gid)
+        except Exception as exc:
+            print(f"[live] WARN: order group {gid} not deleted ({exc!r})")
+
+    def og_close(self):
+        """Leave the group (disarm, event end). Its resting orders are already
+        being cancelled by our own sweep; deleting also cancels them Kalshi-side."""
+        og = getattr(self, "_og", None)
+        if og is None:
+            return
+        self._og = None
+        if getattr(self.order_client, "order_group_id", None) == og["id"]:
+            self.order_client.order_group_id = None
+        self._run_blocking(lambda: self._og_delete_blocking(og["id"]), lambda _: None, executor=_cancel_pool())
+
+    def og_tripped(self) -> bool:
+        og = getattr(self, "_og", None)
+        return og is not None and og["tripped_at"] is not None
+
+    def _og_on_fill(self, size: float, exch_ts: float | None):
+        """Track matched contracts like Kalshi does; past the limit the group
+        has tripped -- mark everything resting as gone-to-cancel on our side and
+        schedule the reset."""
+        og = getattr(self, "_og", None)
+        if og is None or not self.live_trading:
+            return
+        now = time.time()
+        t = exch_ts if exch_ts is not None else now
+        q = og["fills"]
+        q.append((t, size))
+        while q and q[0][0] < t - 15.0:
+            q.popleft()
+        total = sum(s for _, s in q)
+        if og["tripped_at"] is None and total > og["limit"] + 1e-9:
+            self._og_trip(f"{total:g} contracts matched in 15 s", t)
+
+    def _og_trip(self, why: str, exch_ts: float | None = None):
+        og = self._og
+        og["tripped_at"] = time.time()
+        og["n_trips"] += 1
+        self._oev("og_trip", reason=why, group=og["id"], exch_t=exch_ts)
+        print(f"[live] order group tripped ({why}): Kalshi cancelled every {self.event_ticker} quote; "
+              f"re-quoting in {self.quoting.order_group_reset_s:g}s")
+        # Kalshi has cancelled them; our own cancels just confirm (404 = gone).
+        self.om.pull_all("order_group")
+        self._og_schedule_reset()
+
+    def _og_schedule_reset(self):
+        og = self._og
+        if og is None or og["resetting"]:
+            return
+        og["resetting"] = True
+        delay = float(self.quoting.order_group_reset_s)
+        gid = og["id"]
+
+        def work():
+            time.sleep(delay)
+            try:
+                self.order_client.reset_order_group(gid)
+                return None
+            except Exception as exc:
+                return exc
+
+        def done(exc):
+            og2 = getattr(self, "_og", None)
+            if og2 is None or og2["id"] != gid:
+                return
+            og2["resetting"] = False
+            if exc is not None:
+                og2["n_reset_errors"] += 1
+                self._oev("og_reset", group=gid, status=f"err:{http_status(exc)}")
+                print(f"[live] WARN: order group reset failed ({exc!r}); retrying")
+                self._og_schedule_reset()
+                return
+            og2["tripped_at"] = None
+            og2["fills"].clear()
+            og2["n_resets"] += 1
+            self._oev("og_reset", group=gid, status="ok")
+        self._run_blocking(work, done, executor=_cancel_pool())
+
+    def og_summary(self) -> dict | None:
+        og = getattr(self, "_og", None)
+        if og is None:
+            return None
+        return {"id": og["id"], "limit": og["limit"], "tripped": og["tripped_at"] is not None,
+                "trips": og["n_trips"], "resets": og["n_resets"], "reset_errors": og["n_reset_errors"]}
 
     async def arm_async(self, still_wanted=None) -> bool | None:
         """set_live_trading(True) with the REST reads on an executor thread
@@ -1166,6 +1291,8 @@ class LiveEngine:
         the manager). Returns False if it may not be sent now."""
         if self.blocked_reason() is not None:
             return False
+        if self.live_trading and self.og_tripped():
+            return False
         book = self.books.get(q.ticker)
         if book is None or (pd.Timestamp.now(tz="UTC") - book.time).total_seconds() > MAX_BOOK_AGE_S:
             return False
@@ -1223,6 +1350,8 @@ class LiveEngine:
         of the new price's queue -- what Kalshi does; a pure size cut keeps
         its place. Returns False if it may not be sent now."""
         if self.blocked_reason() is not None:
+            return False
+        if self.live_trading and self.og_tripped():
             return False
         order = self._quote_orders.get(q.order_id)
         if order is None:
@@ -1421,6 +1550,14 @@ class LiveEngine:
             self._unresolved(order, "market_paused")
             self._note_market_paused(order, exc)
             return
+        if exc is not None and self._og is not None and is_order_group_reject(exc):
+            # Kalshi tripped the group before our own count did (a fill we
+            # haven't seen yet). Not an order error.
+            self.om.on_create_failed(order.order_id, rejected=False)
+            self._unresolved(order, "order_group_tripped")
+            if not self.og_tripped():
+                self._og_trip(f"create refused: {error_code(exc)}")
+            return
         if exc is not None:
             self.real_order_errors += 1
             self.consecutive_order_errors += 1
@@ -1590,8 +1727,11 @@ class LiveEngine:
                   state="gone" if q is None else q.state,
                   # Set when we had already decided to pull it: the fill raced our cancel.
                   cancel_reason=None if dec is None else dec[1],
-                  cancel_decided_t=None if dec is None else dec[0])
+                  cancel_decided_t=None if dec is None else dec[0],
+                  og_tripped=self.og_tripped())
         self.om.on_fill(order.order_id, size)
+        if getattr(order, "intent", None) == "quote":
+            self._og_on_fill(size, when.timestamp() if when is not None else None)
         print(f"[live] REAL QUOTE FILL {order.ticker} {order.side} {size:g} @ {price:.4f} "
               f"({liquidity}, fee ${fee:.4f})")
         return True

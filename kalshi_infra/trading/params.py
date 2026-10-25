@@ -95,6 +95,18 @@ class QuotingParams:
     requote_delay_s: float = param(
         "After our quote on a (market, side) is hit, that side adds no new levels this long "
         "(levels already up stay).", min=0, max=120, step=0.5)
+    # 10: one full order_lots fill doesn't trip it, the next contract does. Race
+    # fills 10-24/25: the 38 fills within 5 ms of a full fill in the same event
+    # were 47% bad at 1s (-$11.90 at 10s); nothing arrives 50 ms-1 s after one.
+    order_group_limit: float | None = param(
+        "Real mode: every quote joins one Kalshi order group per event. When more than this many "
+        "contracts match across the event in a rolling 15 s, Kalshi cancels every order in the "
+        "group inside the matching engine (faster than our own cancels can reach the next leg of a "
+        "multi-market sweep) and refuses new ones until we reset it. null = no group. Takes effect "
+        "at the next arm.", min=1, step=1.0)
+    order_group_reset_s: float = param(
+        "After our group trips, reset it and let quotes back this long after we see the fill.",
+        min=0, max=60, step=0.05)
 
 
 @section

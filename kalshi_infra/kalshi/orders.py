@@ -122,6 +122,19 @@ def is_market_paused(exc) -> bool:
     return error_code(exc) in PAUSE_CODES
 
 
+def is_order_group_reject(exc) -> bool:
+    """A create refused because its order group is triggered. The code isn't
+    documented, so any 4xx whose body mentions the order group counts."""
+    st = http_status(exc)
+    if st is None or not (400 <= st < 500) or st == 429:
+        return False
+    try:
+        body = (exc.response.text or "").lower()
+    except Exception:
+        body = str(exc).lower()
+    return "order_group" in body or "order group" in body
+
+
 def is_post_only_reject(exc) -> bool:
     """A resting create refused because it would have crossed (post_only).
     Matched on Kalshi's error body: the exact code isn't documented, so any
@@ -444,6 +457,34 @@ class KalshiOrderClient:
         except Exception:
             pass
 
+    # Kalshi order group every create joins (create_order_group), or None.
+    order_group_id: str | None = None
+
+    def create_order_group(self, contracts_limit: float) -> str:
+        """New order group on this client's shard: once more than
+        `contracts_limit` contracts match across its orders in a rolling 15 s,
+        Kalshi cancels all of them and refuses new ones until reset."""
+        path = "/trade-api/v2/portfolio/order_groups/create"
+        body = {"contracts_limit": int(contracts_limit), **self._shard_field()}
+        resp = self._session.post(BASE_URL + path, headers=self._headers("POST", path), json=body,
+                                  timeout=self.timeout_s)
+        _raise_with_body(resp)
+        return resp.json()["order_group_id"]
+
+    def reset_order_group(self, group_id: str) -> None:
+        path = f"/trade-api/v2/portfolio/order_groups/{group_id}/reset"
+        resp = self._session.put(BASE_URL + path, headers=self._headers("PUT", path), json={},
+                                 params=self._shard_field() or None, timeout=self.timeout_s)
+        _raise_with_body(resp)
+
+    def delete_order_group(self, group_id: str) -> None:
+        """Removes the group and cancels whatever still rests in it."""
+        path = f"/trade-api/v2/portfolio/order_groups/{group_id}"
+        resp = self._session.delete(BASE_URL + path, headers=self._headers("DELETE", path),
+                                    params=self._shard_field() or None, timeout=self.timeout_s)
+        if resp.status_code != 404:
+            _raise_with_body(resp)
+
     # Exchange shard every order write is pinned to, or None to auto-route.
     # Per GET /getting_started/rate_limits (2026-10-10): a single create,
     # amend or cancel with exchange_index >= 1 bills only that shard's write
@@ -633,6 +674,8 @@ class KalshiOrderClient:
         }
         if post_only:
             body["post_only"] = True
+        if self.order_group_id is not None:
+            body["order_group_id"] = self.order_group_id
         path = ORDERS_PATH
         resp = self._session.post(BASE_URL + path, headers=self._headers("POST", path),
                                   json=body, timeout=self.timeout_s)

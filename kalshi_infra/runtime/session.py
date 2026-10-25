@@ -698,6 +698,7 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
             try:
                 engine.pull_quotes()
                 engine.cancel_resting()
+                engine.og_close()
                 if engine.has_quote_history():
                     engine.apply_real_fills(engine.order_client.fills(
                         ev.event_ticker, min_ts=engine.fill_poll_min_ts()))
