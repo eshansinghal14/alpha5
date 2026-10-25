@@ -94,4 +94,5 @@ L = pd.DataFrame(leak, columns=["ms_after_trip", "ticker", "size"])
 print(f"\nfills within 200 ms AFTER a trip (legs the group did not stop): {len(L)}"
       + ("" if L.empty else f"; ms after trip p50 {L.ms_after_trip.median():.1f}; "
          f"within 5 ms {int((L.ms_after_trip <= 5).sum())}, 5-50 ms {int(L.ms_after_trip.between(5, 50).sum())}"))
-print(f"fills booked while our side believed the group tripped: {int(O[(O.event == 'fill') & (O.time >= t_on)].get('og_tripped', pd.Series(dtype=bool)).fillna(False).astype(bool).sum())}")
+ft = O[(O.event == "fill") & (O.time >= t_on)].og_tripped.astype(str).str.lower()
+print(f"fills booked while our side believed the group tripped: {int((ft == 'true').sum())} of {len(ft)}")
