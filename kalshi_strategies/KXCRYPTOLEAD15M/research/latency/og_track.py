@@ -18,14 +18,24 @@ S = sys.argv[2] if len(sys.argv) > 2 else "KXCRYPTOLEAD15M"
 NOW = pd.Timestamp.now(tz="UTC")
 days = sorted({(NOW - pd.Timedelta(hours=x)).strftime("%Y-%m-%d") for x in (0, H, 2 * H)})
 rows = []
+LO = (NOW - pd.Timedelta(hours=2 * H)).timestamp()
+WANT = ("time", "event", "reason", "status", "group", "exch_t", "ticker", "size", "og_tripped")
 for d in days:
     for f in glob.glob(f"/opt/alpha5/data/live/{S}/{d}/journal/orders/*.parquet"):
+        if os.path.getmtime(f) < LO:
+            continue
         try:
-            t = pq.read_table(f).to_pandas()
+            names = pq.read_schema(f).names
+            t = pq.read_table(f, columns=[c for c in WANT if c in names]).to_pandas()
         except Exception:
             continue
-        rows.append(t)
+        t = t[t.event.isin(["og_trip", "og_reset", "fill", "cancel_ack"])]
+        if not t.empty:
+            rows.append(t)
 O = pd.concat(rows, ignore_index=True)
+for c in WANT:
+    if c not in O:
+        O[c] = np.nan
 O["time"] = pd.to_datetime(O.time, utc=True)
 og = O[O.event.isin(["og_trip", "og_reset"])].sort_values("time")
 if og.empty:
@@ -33,11 +43,12 @@ if og.empty:
 t_on = og.time.min()
 print(f"order group rows since {t_on:%m-%d %H:%M:%S} UTC; window {H:g} h before that is the comparison")
 fl = []
-for d in days:
+for d in sorted({t_on.strftime("%Y-%m-%d"), NOW.strftime("%Y-%m-%d")}):
     perf._days = lambda x, dd=d: [dd]
-    df = perf.Perf(S).refresh(settle_all=True)
+    df = perf.Perf(S).refresh(settle_all=False)
     fl.append(df[df.liquidity == "maker"])
 F = pd.concat(fl).drop_duplicates(["time", "ticker", "price", "size"]).sort_values("time").reset_index(drop=True)
+F = F[F.time >= t_on - (NOW - t_on)]
 F["lots"] = F["size"]; F["event"] = F.ticker.str.rsplit("-", n=1).str[0]; F["coin"] = F.ticker.str.rsplit("-", n=1).str[1]
 F["t"] = F.time.astype("int64") / 1e9
 for c in ("mo1", "mo10"):
