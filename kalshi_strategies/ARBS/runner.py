@@ -107,6 +107,7 @@ class ArbsRunner:
         self.all_baskets = load_spec(SPEC_PATH)
         self.baskets: dict[str, Basket] = {b.basket_id: b for b in self.all_baskets}
         self.tickers = sorted({t for b in self.all_baskets for t in b.tickers})
+        self.flip = flips(self.all_baskets)
         self.by_ticker: dict[str, list[str]] = {}
         for b in self.all_baskets:
             for t in b.tickers:
@@ -323,6 +324,8 @@ class ArbsRunner:
         self.journal({"kind": "fill", "fill_kind": kind, "basket_id": basket_id, "ticker": ticker, "side": side,
                       "size": size, "cost": round(cost, 4), "price": round((cost / size) if size else 0, 4), **kw})
         self.dirty.add(basket_id)
+        if basket_id in self.flip:
+            self.dirty.add(self.flip[basket_id])
 
     def _quote_fill(self, q: Quote, size: float, cost: float, trade_id, source: str):
         q.filled += size
@@ -426,6 +429,13 @@ class ArbsRunner:
 
     def committed(self) -> float:
         held = sum(b.cost() for b in self.ledger.baskets.values())
+        # Kalshi credits $1 per YES/NO pair at once, so bundles held in both a
+        # basket and its flip are cash already back, not capital tied up.
+        for bid, fid in self.flip.items():
+            pa, pb = self.ledger.baskets.get(bid), self.ledger.baskets.get(fid)
+            if bid < fid and pa and pb:
+                b, f = self.baskets[bid], self.baskets[fid]
+                held -= min(pa.bundles(b.tickers), pb.bundles(f.tickers)) * len(b.legs)
         return held + sum(self.quote_commit(bid) for bid in {q.basket_id for q in self.quotes.values()})
 
     def room_bundles(self, b: Basket, leg: int | None = None) -> float:
@@ -439,6 +449,16 @@ class ArbsRunner:
             q = self.quotes.get((b.basket_id, leg))
             resting = 0.0 if q is None else q.remaining
         return max(0.0, self.cfg.trading.max_bundles_per_basket - held - resting)
+
+    def exit_room(self, b: Basket) -> int:
+        """Whole bundles of `b` that would only close bundles held in its flip."""
+        fid = self.flip.get(b.basket_id)
+        held = self.ledger.baskets.get(fid) if fid else None
+        if held is None:
+            return 0
+        pos = self.ledger.baskets.get(b.basket_id)
+        mine = max(pos.held(b.tickers)) if pos else 0.0
+        return int(max(0.0, held.bundles(self.baskets[fid].tickers) - mine) + _EPS)
 
     def room_dollars(self) -> float:
         return self.cfg.trading.max_dollars - self.committed()
@@ -496,18 +516,22 @@ class ArbsRunner:
         if t.enable_takes and now - self.last_take.get(b.basket_id, 0.0) >= t.take_cooldown_s:
             g = pricing.gap(vs, b.payout)
             need = edge_dollars(b.payout, t.min_edge)
-            if g is not None and g >= need - _EPS:
+            ex = self.exit_room(b)
+            plan = None
+            if ex >= 1 and g is not None and g >= t.exit_edge - _EPS:
+                plan = pricing.take_plan(vs, b.payout, t.exit_edge, ex)
+            if plan is None and g is not None and g >= need - _EPS:
                 per = b.payout - g
                 n = int(min(self.room_bundles(b), max(0.0, self.room_dollars()) // max(per, 0.01)))
                 plan = pricing.take_plan(vs, b.payout, need, n) if n >= 1 else None
-                if plan is not None:
-                    if live_qs:
-                        # Our own quotes are on legs we're about to take around.
-                        self.spawn(self.cancel_quotes(live_qs, "take"), b.basket_id)
-                        return
-                    if not qs:
-                        self.spawn(self.take(b, plan), b.basket_id)
-                        return
+            if plan is not None:
+                if live_qs:
+                    # Our own quotes are on legs we're about to take around.
+                    self.spawn(self.cancel_quotes(live_qs, "take"), b.basket_id)
+                    return
+                if not qs:
+                    self.spawn(self.take(b, plan), b.basket_id)
+                    return
         self.manage_quotes(b, vs, now)
 
     def manage_quotes(self, b: Basket, vs, now: float):
@@ -515,7 +539,8 @@ class ArbsRunner:
         completed by taking the others, so each leg's limit only depends on the
         other legs' asks. Several legs filling together just leaves less to take."""
         t = self.cfg.trading
-        want = t.enable_quoting and b.basket_id in self.hot and b.quoting_allowed(_utc())
+        ex = self.exit_room(b)
+        want = t.enable_quoting and (b.basket_id in self.hot or ex >= 1) and b.quoting_allowed(_utc())
         reserve = self.cfg.runtime.write_reserve_tokens
         acts = []
         for j, leg in enumerate(b.legs):
@@ -523,7 +548,11 @@ class ArbsRunner:
             if q is not None and q.pending:
                 continue
             plan, size = None, 0.0
-            if want:
+            if want and ex >= 1:
+                size = min(float(t.quote_size), float(ex))
+                if q is None or q.remaining <= size + _EPS:
+                    plan = pricing.quote_leg(vs, j, b.payout, t.exit_edge, size)
+            elif want:
                 size = min(float(t.quote_size), self.room_bundles(b, j), float(self.quote_size_by_dollars(b)))
                 if size >= 1:
                     plan = pricing.quote_leg(vs, j, b.payout, edge_dollars(b.payout, t.min_edge + t.quote_edge_add),
@@ -1042,6 +1071,19 @@ class ArbsRunner:
             atomic_write_json(os.path.join(day_dir(self.S, f"{_utc():%Y-%m-%d}"), "summary.json"), self.summary(),
                               indent=None)
             self.pool.shutdown(wait=False)
+
+
+def flips(baskets: list[Basket]) -> dict[str, str]:
+    """basket_id -> its flip's basket_id: the basket buying every leg's other
+    side. Only pairs whose payouts add to the leg count, so a bundle of each
+    nets to exactly what the pair pays; tie-case payouts (exact: false) don't."""
+    by_legs = {frozenset((l.ticker, l.side) for l in b.legs): b for b in baskets}
+    out = {}
+    for b in baskets:
+        f = by_legs.get(frozenset((l.ticker, "no" if l.side == "yes" else "yes") for l in b.legs))
+        if f is not None and abs(b.payout + f.payout - len(b.legs)) < _EPS:
+            out[b.basket_id] = f.basket_id
+    return out
 
 
 def edge_dollars(payout: float, rate: float) -> float:
