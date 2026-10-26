@@ -19,7 +19,6 @@ class LiveDay:
     summary: dict
     quote_df: pd.DataFrame
     fills_df: pd.DataFrame
-    pnl_df: pd.DataFrame
     fair_df: pd.DataFrame
 
 
@@ -61,24 +60,32 @@ def read_trading_mode(series: str) -> tuple[bool, pd.Timestamp] | None:
         return None
 
 
-_PARQUET_CACHE: dict[str, tuple[float, pd.DataFrame]] = {}
+_FRAME_CACHE: dict[str, tuple[tuple, pd.DataFrame]] = {}
 
 
-def _parquet(path: str) -> pd.DataFrame:
-    """Re-read only when the writer has replaced the file; every widget
-    interaction reruns the whole script."""
+def _frame(path: str, columns: list[str] | None, event_ticker: str | None,
+           since: pd.Timestamp | None) -> pd.DataFrame:
+    """The file's rows of the running event and session, read and filtered
+    once per write of the file: the writer replaces it every 3s and every
+    open tab reruns this every few seconds."""
     try:
         mtime = os.path.getmtime(path)
     except OSError:
         return pd.DataFrame()
-    hit = _PARQUET_CACHE.get(path)
-    if hit is not None and hit[0] == mtime:
+    key = (mtime, event_ticker, since)
+    hit = _FRAME_CACHE.get(path)
+    if hit is not None and hit[0] == key:
         return hit[1]
     try:
-        df = pd.read_parquet(path)
+        df = pd.read_parquet(path, columns=columns)
     except (OSError, ValueError):
-        return hit[1] if hit is not None else pd.DataFrame()
-    _PARQUET_CACHE[path] = (mtime, df)
+        # Columns missing from an older writer's file, or a read racing the replace.
+        try:
+            df = pd.read_parquet(path)
+        except (OSError, ValueError):
+            return hit[1] if hit is not None else pd.DataFrame()
+    df = _current(df, event_ticker, since)
+    _FRAME_CACHE[path] = (key, df)
     return df
 
 
@@ -90,9 +97,14 @@ def _current(df: pd.DataFrame, event_ticker: str | None, since: pd.Timestamp | N
         return df
     keep = pd.Series(True, index=df.index)
     if event_ticker and "ticker" in df.columns:
-        keep &= df["ticker"].astype(str).str.startswith(event_ticker + "-")
+        prefix = event_ticker + "-"
+        ours = [t for t in df["ticker"].unique() if str(t).startswith(prefix)]
+        keep &= df["ticker"].isin(ours)
     if since is not None and "time" in df.columns:
-        keep &= pd.to_datetime(df["time"], utc=True) >= since
+        t = df["time"]
+        if not isinstance(t.dtype, pd.DatetimeTZDtype):
+            t = pd.to_datetime(t, utc=True)
+        keep &= t >= since
     return df if keep.all() else df[keep]
 
 
@@ -100,7 +112,8 @@ def load_day(series: str, date: str | None = None) -> LiveDay | None:
     """The running session only: its event's markets, from session_started.
     None if no session has written today. The day journal is the record of
     everything else and is deliberately not read here (it reached 188MB by
-    midday on 2026-10-09)."""
+    midday on 2026-10-09). quote_df and fair_df carry only the columns the
+    page reads."""
     date = date or today()
     summary = read_summary(series, date)
     if summary is None:
@@ -108,13 +121,12 @@ def load_day(series: str, date: str | None = None) -> LiveDay | None:
     d = day_dir(series, date)
     ev = summary.get("event_ticker")
     since = pd.Timestamp(summary["session_started"]) if summary.get("session_started") else None
-    q = _current(_parquet(os.path.join(d, "quote_df.parquet")), ev, since)
-    f = _current(_parquet(os.path.join(d, "fills_df.parquet")), ev, since)
+    q = _frame(os.path.join(d, "quote_df.parquet"), ["time", "ticker", "atm_tradeable"], ev, since)
+    f = _frame(os.path.join(d, "fills_df.parquet"), None, ev, since)
     if not f.empty and "yes_equiv_price" not in f.columns:
         f = f.assign(yes_equiv_price=f["price"].where(f["side"] == "yes", 1.0 - f["price"]))
     return LiveDay(series=series, date=date, summary=summary, quote_df=q, fills_df=f,
-                   pnl_df=_current(_parquet(os.path.join(d, "pnl_df.parquet")), None, since),
-                   fair_df=_current(_parquet(os.path.join(d, "fair_df.parquet")), ev, since))
+                   fair_df=_frame(os.path.join(d, "fair_df.parquet"), ["time", "ticker", "prob"], ev, since))
 
 
 def stream_url(series: str, ticker: str) -> str:

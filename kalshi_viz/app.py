@@ -365,7 +365,8 @@ def _stable_order(series: str, day, markets: list[str]) -> list[str]:
     return order
 
 
-@st.fragment(run_every="2s")
+# The parquets it reads change every writer.HEAVY_INTERVAL_S (3s); the charts poll their own data.
+@st.fragment(run_every="3s")
 def _render_markets(series: str, page: str):
     if _stale(page):
         return
