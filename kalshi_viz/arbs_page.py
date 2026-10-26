@@ -6,7 +6,7 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-from kalshi_infra.runtime.control import request_trading_mode
+from kalshi_viz.arm import arm_control
 from kalshi_viz.data import latest_summary, read_summary, summary_age_s
 
 STALE_S = 15.0
@@ -22,14 +22,10 @@ def _toggle(series: str, s: dict, idle: bool):
         st.error("🟢 **REAL TRADING IS LIVE**")
     else:
         st.info("🔵 SHADOW -- live books, simulated fills (separate shadow ledger), no real orders.")
-    key = f"arm_{series}"
-    if key not in st.session_state:
-        st.session_state[key] = bool(s.get("arm_requested"))
-    st.checkbox("Send REAL orders to Kalshi (real money)", key=key,
-                on_change=lambda: request_trading_mode(series, st.session_state[key]),
-                help="Arming sweeps our resting orders, polls fills and refuses if the ledger disagrees with "
-                     "Kalshi's positions. Disarming pulls every quote. Positions are never flattened.")
-    if not idle and st.session_state[key] and not live:
+    shown = arm_control(series, bool(s.get("arm_requested")),
+                        help="Arming sweeps our resting orders, polls fills and refuses if the ledger disagrees "
+                             "with Kalshi's positions. Disarming pulls every quote. Positions are never flattened.")
+    if not idle and shown and not live:
         st.warning("Armed, not live yet: arming, halted, or the arm was refused (see alerts).")
 
 

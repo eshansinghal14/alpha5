@@ -21,10 +21,9 @@ import pandas as pd  # noqa: E402
 import streamlit as st  # noqa: E402
 import streamlit.components.v1 as components  # noqa: E402
 
-from kalshi_infra.runtime.control import request_trading_mode  # noqa: E402
 from kalshi_infra.trading.lip import payable_usd  # noqa: E402
 from kalshi_strategies.run import folders, registry  # noqa: E402
-from kalshi_viz import config_form, perf_panel  # noqa: E402
+from kalshi_viz import arm, config_form, perf_panel  # noqa: E402
 from kalshi_viz.data import (has_lip, latest_summary, load_day, read_summary, read_trading_mode,  # noqa: E402
                              stream_url, summary_age_s)
 from kalshi_viz.live_chart import IFRAME_HEIGHT, build_live_html  # noqa: E402
@@ -139,18 +138,11 @@ def _render_toggle(series: str, s: dict, idle: bool = False):
                  f"{r.get('n_orders', 0)} order(s).")
     else:
         st.info("🔵 SHADOW -- live data, simulated fills, no real orders.")
-    key = f"arm_{series}"
-    if key not in st.session_state:
-        st.session_state[key] = requested
-    st.checkbox("Send REAL orders to Kalshi (real money)", key=key,
-                on_change=lambda: request_trading_mode(series, st.session_state[key]),
-                help="Arms the running process (no restart). Arming starts a fresh session seeded from "
-                     "Kalshi's positions; disarming pulls every resting quote. Positions are never flattened.")
-    if idle:
-        pass
-    elif st.session_state[key] != requested:
-        st.warning("Waiting for the process to pick up the request.")
-    elif requested and not active:
+    shown = arm.arm_control(series, requested,
+                            help="Arms the running process (no restart). Arming starts a fresh session seeded "
+                                 "from Kalshi's positions; disarming pulls every resting quote. Positions are "
+                                 "never flattened.")
+    if not idle and shown and requested and not active:
         st.warning("Armed, but not sending real orders yet -- outside trading_time (the delay after open "
                    "or the cutoff before close), halted, or the arm failed (retried; see the process log).")
     if (s.get("real") or {}).get("n_errors"):

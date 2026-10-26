@@ -23,11 +23,11 @@ def trading_mode_path(series: str) -> str:
     return os.path.join(LIVE_ROOT, series, "trading_mode.json")
 
 
-def request_trading_mode(series: str, live_trading: bool):
-    """Dashboard side."""
+def request_trading_mode(series: str, live_trading: bool, *, source: str):
+    """Dashboard side. `source` names the writer in the process log."""
     atomic_write_json(trading_mode_path(series),
                       {"live_trading": bool(live_trading),
-                       "requested_at": pd.Timestamp.now(tz="UTC").isoformat()})
+                       "requested_at": pd.Timestamp.now(tz="UTC").isoformat(), "source": source})
 
 
 STOP_PATH = os.path.join(LIVE_ROOT, "STOP.json")
@@ -96,6 +96,7 @@ class TradingModeWatcher:
         # Seed to the existing mtime: only a click after startup arms.
         self._mtime = os.path.getmtime(self.path) if os.path.exists(self.path) else 0.0
         self.requested: bool | None = None
+        self.last: dict = {}
 
     def poll(self) -> bool | None:
         try:
@@ -106,9 +107,15 @@ class TradingModeWatcher:
             return None
         try:
             with open(self.path) as fh:
-                want = bool(json.load(fh).get("live_trading", False))
-        except (OSError, json.JSONDecodeError):
+                self.last = json.load(fh)
+            want = bool(self.last.get("live_trading", False))
+        except (OSError, json.JSONDecodeError, AttributeError):
             return None   # mid-write; retry next poll without advancing mtime
         self._mtime = m
         self.requested = want
         return want
+
+    def origin(self) -> str:
+        """When and by whom the last polled request was written."""
+        return (f"(written {self.last.get('requested_at', '?')} by "
+                f"{self.last.get('source', 'unknown writer')})")

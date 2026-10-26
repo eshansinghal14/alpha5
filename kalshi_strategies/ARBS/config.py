@@ -26,6 +26,11 @@ class TradingParams:
     quote_edge_add: float = param("Extra return (fraction of bundle cost) a quote must clear on top of min_edge: "
                                   "pays for being filled just as the other legs move away.", min=0.0, max=0.5,
                                   step=0.0025)
+    exit_edge: float = param("Required profit ($ per bundle, after fees) to take or quote a basket's flip "
+                             "(every leg's other side) up to the bundles held in it. Kalshi nets the pair to $1 "
+                             "a leg at once, so this closes a position early and frees its capital; no "
+                             "min_edge, max_dollars or max_bundles_per_basket check.", min=0.0, max=0.5,
+                             step=0.0025)
     quote_size: int = param("Bundles per resting quote.", min=1, max=10000, step=1)
     max_bundles_per_basket: int = param("Most bundles held in one basket (complete or not).", min=0, max=100000,
                                         step=1)

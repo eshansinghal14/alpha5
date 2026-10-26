@@ -175,3 +175,67 @@ def test_dollar_cap_blocks_quote(arbs):
         await drain(r)
     asyncio.run(go())
     assert b.basket_id not in r.quotes
+
+
+def _with_flip(r, b):
+    f = dataclasses.replace(b, basket_id="t:flip", legs=(Leg("X-A", "no"), Leg("X-B", "no")))
+    r.all_baskets.append(f)
+    r.baskets[f.basket_id] = f
+    for t in r.tickers:
+        r.by_ticker[t].append(f.basket_id)
+    r.flip = R.flips(r.all_baskets)
+    return f
+
+
+def test_flip_exits_held_bundles_at_exit_edge(arbs):
+    r, b = arbs
+    f = _with_flip(r, b)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, exit_edge=0.01, min_edge=0.05, max_dollars=0.0,
+                                        enable_quoting=False)
+    for t in b.tickers:
+        r.shadow_ledger.record(b.basket_id, b.tickers, t, "yes", 3, 1.35, time.time())
+    # NO asks 0.47 + 0.47 + fees 0.035: a 2.5c edge, above exit_edge, below min_edge.
+    book(r, "X-A", [(0.53, 10)], [(0.40, 10)])
+    book(r, "X-B", [(0.53, 10)], [(0.40, 10)])
+
+    async def go():
+        r.evaluate(f)
+        await drain(r)
+    asyncio.run(go())
+    pos = r.shadow_ledger.baskets[f.basket_id]
+    # Capped at the 3 held bundles though the touch holds 10 and max_dollars is 0.
+    assert pos.bundles(f.tickers) == 3
+    assert r.exit_room(f) == 0
+    # The netted pairs are cash back: 3 bundles x 2 legs x $1 off the held cost.
+    assert r.committed() == pytest.approx(r.shadow_ledger.baskets[b.basket_id].cost() + pos.cost() - 6.0)
+
+
+def test_flip_without_held_bundles_needs_min_edge(arbs):
+    r, b = arbs
+    f = _with_flip(r, b)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, exit_edge=0.01, min_edge=0.05, enable_quoting=False)
+    book(r, "X-A", [(0.53, 10)], [(0.40, 10)])
+    book(r, "X-B", [(0.53, 10)], [(0.40, 10)])
+
+    async def go():
+        r.evaluate(f)
+        await drain(r)
+    asyncio.run(go())
+    assert f.basket_id not in r.shadow_ledger.baskets
+
+
+def test_flip_quoted_for_exit_when_not_hot(arbs):
+    r, b = arbs
+    f = _with_flip(r, b)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, exit_edge=0.01, min_edge=0.05, max_dollars=0.0)
+    for t in b.tickers:
+        r.shadow_ledger.record(b.basket_id, b.tickers, t, "yes", 3, 1.35, time.time())
+    book(r, "X-A", [(0.50, 10)], [(0.30, 10)])     # NO asks 0.50 + 0.52: no take
+    book(r, "X-B", [(0.48, 10)], [(0.30, 10)])
+
+    async def go():
+        r.evaluate(f)
+        await drain(r)
+    asyncio.run(go())
+    qs = r.basket_quotes(f.basket_id)
+    assert {q.leg for q in qs} == {0, 1} and all(q.size == 3 for q in qs)

@@ -4,6 +4,7 @@
     "enable_quoting": true,
     "min_edge": 0.01,
     "quote_edge_add": 0.02,
+    "exit_edge": 0.01,
     "quote_size": 5,
     "max_bundles_per_basket": 50,
     "max_dollars": 500.0,

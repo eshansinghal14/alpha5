@@ -83,7 +83,7 @@ def trip(client: KalshiOrderClient, total: float, floor: float):
     request_stop_all(reason)
     for series in os.listdir(LIVE_ROOT):
         if os.path.exists(os.path.join(LIVE_ROOT, series, "trading_mode.json")):
-            request_trading_mode(series, False)
+            request_trading_mode(series, False, source="balance watchdog")
 
     deadline = time.time() + STOP_GRACE_S
     while time.time() < deadline and session_pids():

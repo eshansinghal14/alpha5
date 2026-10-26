@@ -516,7 +516,7 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
                         _log(S, "arm request held: inside real_trading_delay_s, arms once it passes")
                 reconcile_arm()
                 if want is not None:
-                    _log(S, f"trading mode requested live={want}, in effect live={engine.live_trading}")
+                    _log(S, f"trading mode requested live={want} {trading.origin()}, in effect live={engine.live_trading}")
             except Exception:
                 _log(S, "WARN: control poll failed:")
                 traceback.print_exc()

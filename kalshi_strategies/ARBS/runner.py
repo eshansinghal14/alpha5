@@ -950,6 +950,7 @@ class ArbsRunner:
             want = trading.poll()
             if want is not None:
                 self.arm_want, retry_at = want, 0.0
+                _log(f"trading mode requested live={want} {trading.origin()}")
             if (self.arm_want and not self.live and time.monotonic() >= retry_at
                     and (not self.halt or self.halt.startswith("position audit"))):
                 if not await self.arm():
