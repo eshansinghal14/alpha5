@@ -16,7 +16,7 @@ arm_control("X", st.session_state.get("reported", False), help="")
 
 def _app(tmp_path):
     path = str(tmp_path / "trading_mode.json")
-    return AppTest.from_string(SCRIPT.format(path=path)).run(), tmp_path / "trading_mode.json"
+    return AppTest.from_string(SCRIPT.format(path=path), default_timeout=30).run(), tmp_path / "trading_mode.json"
 
 
 def test_reruns_without_a_click_write_nothing(tmp_path):

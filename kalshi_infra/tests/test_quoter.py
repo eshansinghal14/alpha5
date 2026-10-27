@@ -166,7 +166,7 @@ def test_constant_edge_scales_sqrt_inside_ref_only():
 
 
 def test_fair_edge_add_widens_takes_and_quotes():
-    q, ctx = Quoter(cfg(constant_edge=0.03), Model(), FREE, close_time=None), Ctx()
+    q, ctx = Quoter(cfg(constant_edge=0.03, lean_dollars=0.0), Model(), FREE, close_time=None), Ctx()
     step(q, ctx, {"A": Fair(0.50, 0.49, 0.51, edge_add=0.02)}, Book("A", 0.30, 0.70))
     r = q.debug_log[-1]
     assert r["constant_edge"] == pytest.approx(0.05)
@@ -228,7 +228,7 @@ def test_quote_levels_behind_is_slack_not_extra_levels():
 
 
 def test_edge_limit_is_first_tick_outside_the_reservation():
-    q, ctx = Quoter(cfg(), Model(), FREE, close_time=None), Ctx()
+    q, ctx = Quoter(cfg(lean_dollars=0.0), Model(), FREE, close_time=None), Ctx()
     step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, Book("A", 0.40, 0.60))
     # quote reservation 0.50 - (0.01 + 0.01) = 0.48 -> best acceptable yes bid 0.48
     assert ctx.desired[("A", "yes")].edge_limit == pytest.approx(0.48)
@@ -602,6 +602,19 @@ def test_every_live_level_counts_toward_lean():
     step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, Book("A", 0.40, 0.60))
     r = q.debug_log[-1]
     assert r["eff_yes"] == 3.0 and r["lean_bid"] == pytest.approx(0.02)
+
+
+def test_resting_quote_does_not_move_its_own_edge_limit():
+    """A quote priced with nothing resting must still pass the edge check once
+    it rests: its own size is in the lean either way."""
+    q, ctx = Quoter(cfg(order_lots=10.0, max_position=40.0, lean_dollars=0.05), Model(), FREE, close_time=None), Ctx()
+    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, Book("A", 0.30, 0.70))
+    before = ctx.desired[("A", "yes")]
+    ctx.ours[("A", "yes")] = [(before.prices[0], 10.0)]
+    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, dt=0.01)
+    after = ctx.desired[("A", "yes")]
+    assert after.edge_limit == pytest.approx(before.edge_limit)
+    assert before.prices[0] <= after.edge_limit + 1e-9
 
 
 def test_room_counts_fills_not_resting_quotes():
@@ -1528,5 +1541,6 @@ def test_reducing_quote_moves_up_to_the_touch_at_the_cap():
     q, ctx = Quoter(cfg(constant_edge=0.03), Model(), FREE, close_time=None), Ctx()
     _short(ctx, 10)
     step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, Book("A", 0.47, 0.60))
-    # Edge 0.03 + 0.01 - 0.02 = 0.02 below fair: 0.48, also the one-tick-inside cap on the 0.47 bid.
-    assert ladder(ctx, "yes") == [0.48]
+    # The bid prices in its own lot (short 9 once it fills): lean -0.018, edge
+    # 0.03 + 0.01 - 0.018 = 0.022 below fair -> 0.47, joining the 0.47 touch.
+    assert ladder(ctx, "yes") == [0.47]

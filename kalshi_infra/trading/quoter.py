@@ -455,8 +455,15 @@ class Quoter:
         # Quotes: the take edge minus the taker fee, plus quoting_edge on top
         # (a resting quote is picked off by whoever is faster). Maker fee,
         # priced at the pre-fee reservation.
-        q_base_bid = max(const + q.quoting_edge + ci_bid + lean_bid, 0.0)
-        q_base_ask = max(const + q.quoting_edge + ci_ask + lean_ask, 0.0)
+        # A quote's lean counts its own size whether or not it rests yet.
+        # Counted only once sent, it raised its side's edge by order_lots /
+        # max_position x lean_dollars (1.25c on the race) and failed its own
+        # check: cancelled and re-sent at the same price ~12/s, resting only
+        # 65-73% of the time it was wanted (race 2026-10-27 06-07 UTC).
+        qlean_bid = q.lean_dollars * _ratio(net + inflight_yes + max(resting_yes, q.order_lots))
+        qlean_ask = q.lean_dollars * -_ratio(net - inflight_no - max(resting_no, q.order_lots))
+        q_base_bid = max(const + q.quoting_edge + ci_bid + qlean_bid, 0.0)
+        q_base_ask = max(const + q.quoting_edge + ci_ask + qlean_ask, 0.0)
         # During a jump hold the chase side quotes off the pre-jump fair, and
         # only ever more conservatively than the new one would.
         p_bid = p_ask = prob
