@@ -21,7 +21,7 @@ Environment=CRYPTO15M_PERSIST=0
 # Write budget: shard 2's whole bucket, shared with alpha5-crypto and
 # alpha5-crypto15m-btc (orders.shard_budget); per-series cap
 # quoting.max_write_tokens_per_s.
-ExecStart=/opt/alpha5/.venv/bin/python -u -m kalshi_strategies.run --only KXETH15M KXSOL15M KXXRP15M KXHYPE15M --resume-arm-h 18
+ExecStart=/opt/alpha5/.venv/bin/python -u -m kalshi_strategies.run --only KXETH15M KXSOL15M KXXRP15M KXHYPE15M --resume-arm
 KillSignal=SIGINT
 TimeoutStopSec=90
 Restart=on-failure

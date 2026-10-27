@@ -1106,9 +1106,9 @@ def _count(it) -> dict:
     return out
 
 
-async def run_arbs(series, *, live_trading: bool, resume_arm_s: float | None = None):
-    if not live_trading and resume_arm_s:
-        why = resumable_arm(series.ticker, resume_arm_s)
+async def run_arbs(series, *, live_trading: bool, resume_arm: bool = False):
+    if not live_trading and resume_arm:
+        why = resumable_arm(series.ticker)
         if why is not None:
             _log(f"resuming REAL TRADING after restart: {why}")
             live_trading = True

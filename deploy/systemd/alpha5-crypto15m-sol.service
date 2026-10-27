@@ -19,7 +19,7 @@ Environment=CRYPTO15M_PERSIST=0
 # Same shard (2) as alpha5-crypto, which has no way to see this process's
 # writes: capped at 20% of the 300/s budget (60/s). ETH used ~10/s live.
 Environment=KALSHI_WRITE_SHARE=0.2
-ExecStart=/opt/alpha5/.venv/bin/python -u -m kalshi_strategies.run --only KXSOL15M --resume-arm-h 18
+ExecStart=/opt/alpha5/.venv/bin/python -u -m kalshi_strategies.run --only KXSOL15M --resume-arm
 KillSignal=SIGINT
 TimeoutStopSec=90
 Restart=on-failure

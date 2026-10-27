@@ -56,14 +56,13 @@ class StopWatcher:
             return None
 
 
-def resumable_arm(series: str, max_age_s: float) -> str | None:
+def resumable_arm(series: str) -> str | None:
     """Why a restarted process may re-arm `series`, or None if it may not.
 
-    Only an arm request made in the last `max_age_s`, and only if no
-    STOP.json (stop-all, loss halt, balance watchdog) was written after it:
-    a deliberate stop must never be undone by a restart. Restarts that
-    dropped armed S&P to shadow for 7+ min each happened twice on
-    2026-10-15."""
+    Only if the last request was an arm and no STOP.json (stop-all, balance
+    watchdog) was written after it: a deliberate stop must never be undone by
+    a restart. No age limit: an 18h one left an arm held since the previous
+    day in shadow after any restart, with nothing logged."""
     try:
         with open(trading_mode_path(series)) as fh:
             tm = json.load(fh)
@@ -76,8 +75,6 @@ def resumable_arm(series: str, max_age_s: float) -> str | None:
     except (KeyError, ValueError):
         return None
     age = (pd.Timestamp.now(tz="UTC") - at).total_seconds()
-    if age > max_age_s:
-        return None
     try:
         with open(STOP_PATH) as fh:
             stop_at = pd.Timestamp(json.load(fh)["requested_at"])

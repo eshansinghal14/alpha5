@@ -68,7 +68,7 @@ class Series:
     write_priority: int = 0
     # A strategy that doesn't fit one-event-at-a-time (ARBS trades baskets
     # across ~70 events) supplies its own loop:
-    # `await runner(series, live_trading=..., resume_arm_s=...)`. `ticker` is
+    # `await runner(series, live_trading=..., resume_arm=...)`. `ticker` is
     # then only the data/live folder and dashboard page name, and pick_event /
     # build_model are never called.
     runner: Callable[..., Awaitable[None]] | None = None

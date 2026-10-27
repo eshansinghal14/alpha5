@@ -258,8 +258,8 @@ def launch_many(units: list[list[str]], args) -> int:
             cmd.append("--live-trading")
         if args.no_carry_arm:
             cmd.append("--no-carry-arm")
-        if args.resume_arm_h:
-            cmd += ["--resume-arm-h", str(args.resume_arm_h)]
+        if args.resume_arm:
+            cmd.append("--resume-arm")
         p = _popen(cmd, _child_env({WRITE_SHARE_ENV: f"{share:.6f}"}))
         procs.append((s, p))
         print(f"[run] started {s} (pid {p.pid})", flush=True)
@@ -309,10 +309,9 @@ def main(argv=None):
                     help="Arm REAL orders at start. Default shadow; can be armed from the dashboard.")
     ap.add_argument("--no-carry-arm", action="store_true",
                     help="Drop back to shadow at each event rollover.")
-    ap.add_argument("--resume-arm-h", type=float, default=0.0, metavar="HOURS",
-                    help="After a restart, start armed if the dashboard's last request was an arm made within "
-                         "this many hours and no STOP (stop-all, loss halt, balance watchdog) came after it. "
-                         "0 = always start in shadow.")
+    ap.add_argument("--resume-arm", action="store_true",
+                    help="After a restart, start armed if the dashboard's last request was an arm and no STOP "
+                         "(stop-all, balance watchdog) came after it. Default: always start in shadow.")
     ap.add_argument("--no-services", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
     series_list, services = resolve(ap, args.series, args.only, fmap)
@@ -347,13 +346,13 @@ async def _run_unit(series, args):
     """Every series of one process on one event loop (a write group shares
     its bucket and quote queue only within a process)."""
     from kalshi_infra.runtime.session import session_loop
-    resume = args.resume_arm_h * 3600 or None
+    resume = args.resume_arm
 
     def one(s):
         if s.runner is not None:
-            return s.runner(s, live_trading=args.live_trading, resume_arm_s=resume)
+            return s.runner(s, live_trading=args.live_trading, resume_arm=resume)
         return session_loop(s, live_trading=args.live_trading, carry_arm=not args.no_carry_arm,
-                            event_ticker=args.event_ticker, resume_arm_s=resume)
+                            event_ticker=args.event_ticker, resume_arm=resume)
     await asyncio.gather(*(one(s) for s in series))
 
 

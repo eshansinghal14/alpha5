@@ -131,7 +131,7 @@ def _render_toggle(series: str, s: dict, idle: bool = False):
         st.info("⏸ No event running. "
                 + ("**REAL TRADING is requested** -- the next event arms when it starts trading."
                    if requested else "The next event starts in SHADOW unless you arm it here.")
-                + " A process restarted after the click starts disarmed.")
+                + " A restart keeps the last arm/disarm request.")
     elif active:
         r = s.get("real") or {}
         st.error(f"🟢 **REAL TRADING IS LIVE** -- {r.get('n_fills', 0)} real fill(s) from "

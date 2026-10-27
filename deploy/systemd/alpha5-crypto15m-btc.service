@@ -16,7 +16,7 @@ Nice=0
 Environment=CRYPTO15M_PERSIST=0
 # Write budget: shard 2's whole bucket, shared with alpha5-crypto and
 # alpha5-crypto15m (orders.shard_budget).
-ExecStart=/opt/alpha5/.venv/bin/python -u -m kalshi_strategies.run --only KXBTC15M --resume-arm-h 18
+ExecStart=/opt/alpha5/.venv/bin/python -u -m kalshi_strategies.run --only KXBTC15M --resume-arm
 KillSignal=SIGINT
 TimeoutStopSec=90
 Restart=on-failure

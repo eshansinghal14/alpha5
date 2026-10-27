@@ -152,12 +152,12 @@ class StopAll(Exception):
 
 
 async def session_loop(series: Series, *, live_trading: bool, carry_arm: bool,
-                       event_ticker: str | None = None, resume_arm_s: float | None = None):
-    """`event_ticker` names a one-off event (no rollover). `resume_arm_s`:
-    start armed if the dashboard's last request was an arm made within this
-    many seconds and nothing stopped trading since (control.resumable_arm)."""
-    if not live_trading and resume_arm_s:
-        why = resumable_arm(series.ticker, resume_arm_s)
+                       event_ticker: str | None = None, resume_arm: bool = False):
+    """`event_ticker` names a one-off event (no rollover). `resume_arm`:
+    start armed if the dashboard's last request was an arm and nothing
+    stopped trading since (control.resumable_arm)."""
+    if not live_trading and resume_arm:
+        why = resumable_arm(series.ticker)
         if why is not None:
             _log(series.ticker, f"resuming REAL TRADING after restart: {why}")
             live_trading = True
