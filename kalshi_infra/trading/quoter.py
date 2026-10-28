@@ -1011,6 +1011,9 @@ class Quoter:
         top = self._top_price(ticker, side, res, market_bid, market_ask, ladder)
         if top is None:
             return Desired([], q.order_lots, edge_limit, room, ahead, max_levels=1, behind=behind)
+        if q.min_quote_price is not None and top < q.min_quote_price - 1e-9:
+            self._block("min_quote_price")
+            return Desired([], q.order_lots, None, 0.0)
         cap = q.skip_quote_depth_ahead
         others = self._others_bids(ticker, side, ladder) if cap is not None else None
         prices = []

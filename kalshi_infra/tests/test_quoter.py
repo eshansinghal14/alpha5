@@ -37,7 +37,7 @@ def cfg(risk_kw=None, **q):
     base = dict(order_lots=1.0, max_position=10.0, constant_edge=0.01, constant_edge_ref_s=None, edge_fraction=1.0,
                 lean_dollars=0.02, max_markets=None, atm_hysteresis=0,
                 enable_taking=True, enable_quoting=True, quoting_edge=0.0, max_improve_ticks=1, quote_levels_behind=0,
-                skip_quote_depth_ahead=None, quote_keep_inside=0.0, quote_ahead_grace_s=1.0,
+                skip_quote_depth_ahead=None, min_quote_price=None, quote_keep_inside=0.0, quote_ahead_grace_s=1.0,
                 cancels_token=20.0, requote_delay_s=1.0, max_write_tokens_per_s=None,
                 order_group_limit=None, order_group_reset_s=0.2)
     base.update(q)
@@ -306,6 +306,17 @@ def test_skip_depth_ahead_drops_deep_levels_not_the_touch():
                     close_time=None), Ctx()
     step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, lb({0.40: 300.0, 0.39: 200.0}, {0.40: 100.0}, 0.40, 0.60))
     assert ladder(ctx, "yes") == [0.41]
+
+
+def test_min_quote_price_blocks_buying_the_cheap_side_only():
+    """Fair 0.05, book 0.03/0.07: the YES bid would be 0.04 (< 0.06) and is
+    withdrawn; the NO side (a YES offer above the cheap price) still quotes."""
+    q, ctx = Quoter(cfg(min_quote_price=0.06), Model(), FREE, close_time=None), Ctx()
+    step(q, ctx, {"A": Fair(0.05, 0.049, 0.051)}, Book("A", 0.03, 0.07))
+    d = ctx.desired[("A", "yes")]
+    assert d.prices == [] and d.edge_limit is None
+    assert q.block_counts.get("min_quote_price") == 1
+    assert ladder(ctx, "no") == [0.93]
 
 
 def test_touch_improvement_raises_the_top():

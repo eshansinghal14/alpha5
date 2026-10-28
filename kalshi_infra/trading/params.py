@@ -71,6 +71,11 @@ class QuotingParams:
         "only spends write budget, and the queue in front moving would add and drop it over and over. "
         "A level already resting is never cancelled for going deep. null disables.",
         min=0, step=10.0)
+    min_quote_price: float | None = param(
+        "Don't rest a quote whose own-side price is below this: no bidding YES under p or NO under p "
+        "(a YES offer above 1 - p). Selling the cheap side is untouched. A resting quote is cancelled "
+        "once its side's best price drops under it. null disables.",
+        min=0.01, max=0.5, step=0.01)
     quote_ahead_grace_s: float = param(
         "How long a resting quote may sit more than max_improve_ticks above others' best (e.g. "
         "after the bid it improved on was pulled) before it's moved down to the ladder with one "
