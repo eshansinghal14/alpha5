@@ -221,6 +221,10 @@ class SpxEventModel:
     def side_block(self, ticker, side, fair, now_s):
         return self._blocks.get(f"{ticker}:{side}")
 
+    def delta_levels(self) -> dict[str, float]:
+        return {m["ticker"]: float(m["floor_strike"]) for m in self.markets
+                if m.get("strike_type") in ("greater", "greater_or_equal") and m.get("floor_strike") is not None}
+
     def quote_block(self, ticker, now_s):
         """No quoting while SPXW options aren't (yet) quoting: the hub keeps
         re-sending the last fit across the 09:25-09:30 handover, so signal

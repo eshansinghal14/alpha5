@@ -54,6 +54,8 @@ class FairModel(Protocol):
 
     # Optional: quote_block(ticker, now_s) -> str | None. Pulls resting quotes
     # (edge and LIP) without touching takes; the quoter calls it only if present.
+    # Optional: delta_levels() -> {ticker: level} for markets paying when the
+    # underlying ends >= level. Needed for quoting.max_book_delta.
     # Optional: on_book(book) -> None. Every Kalshi BBO update, before the
     # engine acts on it; the session calls it only if present.
     # Optional: attach_engine(engine) -> None. Called once per event after the

@@ -143,6 +143,7 @@ class Quoter:
         # (see _front_hold).
         self._front: dict[tuple[str, str], float] = {}
         self._now_s = 0.0
+        self._levels: dict[str, float] | None = None
 
     # ------------------------------------------------------------------
     # Engine interface
@@ -222,6 +223,27 @@ class Quoter:
         recent = [(t, s) for t, s in recent if t > cutoff]
         self._sent[key] = recent
         return sum(s for _, s in recent)
+
+    def _book_delta(self, ctx, now: pd.Timestamp) -> tuple[float, dict[str, float]] | None:
+        """(book delta, {ticker: density}) in $ per point of the underlying,
+        or None when the model gives no levels. Density is -dP/dlevel by
+        central difference over the markets that have a fair."""
+        if self._levels is None:
+            fn = getattr(self.model, "delta_levels", None)
+            self._levels = fn() if fn is not None else {}
+        pts = sorted((k, t) for t, k in self._levels.items() if self.fairs.get(t) is not None)
+        if len(pts) < 2:
+            return None
+        ks = [k for k, _ in pts]
+        ps = [self.fairs[t].prob for _, t in pts]
+        dens, book = {}, 0.0
+        for i, (k, t) in enumerate(pts):
+            lo, hi = max(i - 1, 0), min(i + 1, len(pts) - 1)
+            dens[t] = max((ps[lo] - ps[hi]) / (ks[hi] - ks[lo]), 0.0)
+            pos = ctx.position(t)
+            net = pos.yes_qty - pos.no_qty + self._inflight(t, "yes", now) - self._inflight(t, "no", now)
+            book += net * dens[t]
+        return book, dens
 
     def _refresh_ours(self, ctx, ticker: str):
         """Our live quotes (risk) and the subset Kalshi's book shows (netting
@@ -414,6 +436,15 @@ class Quoter:
                 block_ask = "fair_jump"
             elif jump[0] < 0 and not block_bid:
                 block_bid = "fair_jump"
+        if q.max_book_delta is not None and not (block_bid and block_ask):
+            bd = self._book_delta(ctx, now)
+            if bd is not None:
+                book, dens = bd
+                step_d = q.order_lots * dens.get(ticker, 0.0)
+                if not block_bid and step_d > 0 and book + step_d > q.max_book_delta:
+                    block_bid = "book_delta"
+                if not block_ask and step_d > 0 and book - step_d < -q.max_book_delta:
+                    block_ask = "book_delta"
         if block_bid:
             self._block(block_bid)
         if block_ask and block_ask != block_bid:

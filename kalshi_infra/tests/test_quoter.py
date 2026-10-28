@@ -37,7 +37,7 @@ def cfg(risk_kw=None, **q):
     base = dict(order_lots=1.0, max_position=10.0, constant_edge=0.01, constant_edge_ref_s=None, edge_fraction=1.0,
                 lean_dollars=0.02, max_markets=None, atm_hysteresis=0,
                 enable_taking=True, enable_quoting=True, quoting_edge=0.0, max_improve_ticks=1, quote_levels_behind=0,
-                skip_quote_depth_ahead=None, min_quote_price=None, quote_keep_inside=0.0, quote_ahead_grace_s=1.0,
+                skip_quote_depth_ahead=None, min_quote_price=None, max_book_delta=None, quote_keep_inside=0.0, quote_ahead_grace_s=1.0,
                 cancels_token=20.0, requote_delay_s=1.0, max_write_tokens_per_s=None,
                 order_group_limit=None, order_group_reset_s=0.2)
     base.update(q)
@@ -317,6 +317,37 @@ def test_min_quote_price_blocks_buying_the_cheap_side_only():
     assert d.prices == [] and d.edge_limit is None
     assert q.block_counts.get("min_quote_price") == 1
     assert ladder(ctx, "no") == [0.93]
+
+
+class LevelModel(Model):
+    def delta_levels(self):
+        return {"A": 100.0, "B": 105.0, "C": 110.0}
+
+
+def book_delta_quoter(cap, model=None):
+    """Levels 100/105/110 at fairs 0.8/0.5/0.2: density 0.06/pt everywhere.
+    Long 10 YES on B: book delta 0.6, one more lot on any side moves it 0.06."""
+    q, ctx = Quoter(cfg(max_book_delta=cap, max_position=100.0), model or LevelModel(), FREE, close_time=None), Ctx()
+    o = Order(1, "B", "yes", "limit", 0.5, 10.0, ctx.time, "quote")
+    ctx.portfolio.record_fill(o, 0.5, 10.0, ctx.time, "maker", fee=0.0)
+    for t in "ABC":
+        ctx.books[t] = Book(t, 0.30, 0.70)
+    step(q, ctx, {"A": Fair(0.8, 0.79, 0.81), "B": Fair(0.5, 0.49, 0.51), "C": Fair(0.2, 0.19, 0.21)})
+    return q, ctx
+
+
+def test_book_delta_blocks_only_the_side_that_grows_it():
+    q, ctx = book_delta_quoter(0.62)
+    for t in "ABC":
+        assert ctx.desired[(t, "yes")].edge_limit is None
+        assert ladder(ctx, "no", t)
+    assert q.block_counts.get("book_delta") == 3
+
+
+def test_book_delta_off_when_null_or_without_levels():
+    for q, ctx in (book_delta_quoter(None), book_delta_quoter(0.62, Model())):
+        assert all(ctx.desired[(t, "yes")].edge_limit is not None for t in "ABC")
+        assert "book_delta" not in q.block_counts
 
 
 def test_touch_improvement_raises_the_top():

@@ -76,6 +76,13 @@ class QuotingParams:
         "(a YES offer above 1 - p). Selling the cheap side is untouched. A resting quote is cancelled "
         "once its side's best price drops under it. null disables.",
         min=0.01, max=0.5, step=0.01)
+    max_book_delta: float | None = param(
+        "Cap on the book's $ per point of the underlying: sum over markets of (fills + in-flight takes) "
+        "x -dP/dlevel, the density read off neighbouring fairs. A side whose order_lots would push it "
+        "past the cap is blocked (quotes and takes); a side that shrinks it never is. Needs the model's "
+        "delta_levels(); markets without one count 0. Resting quotes aren't counted, so a sweep across "
+        "strikes can still overshoot. null disables.",
+        min=0.05, step=0.05)
     quote_ahead_grace_s: float = param(
         "How long a resting quote may sit more than max_improve_ticks above others' best (e.g. "
         "after the bid it improved on was pulled) before it's moved down to the ladder with one "
