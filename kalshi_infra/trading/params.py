@@ -71,11 +71,6 @@ class QuotingParams:
         "only spends write budget, and the queue in front moving would add and drop it over and over. "
         "A level already resting is never cancelled for going deep. null disables.",
         min=0, step=10.0)
-    min_quote_price: float | None = param(
-        "Don't rest a quote whose own-side price is below this: no bidding YES under p or NO under p "
-        "(a YES offer above 1 - p). Selling the cheap side is untouched. A resting quote is cancelled "
-        "once its side's best price drops under it. null disables.",
-        min=0.01, max=0.5, step=0.01)
     max_book_delta: float | None = param(
         "Cap on the book's $ per point of the underlying: sum over markets of (fills + in-flight takes) "
         "x -dP/dlevel, the density read off neighbouring fairs. A side whose order_lots would push it "
