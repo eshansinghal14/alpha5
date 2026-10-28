@@ -23,8 +23,11 @@ class L2Book:
     rows. yes_bids/no_bids are {price: qty} ladders; a "no" resting order at
     price q is a YES ask at (1 - q) with the same qty (see module docstring)."""
 
-    def __init__(self, ticker: str):
+    def __init__(self, ticker: str, price_dp: int = 2):
         self.ticker = ticker
+        # 2 merges the 0.1c levels of tapered_deci_cent markets (tails below
+        # 10c / above 90c) into whole cents; a caller that prices them passes 4.
+        self.price_dp = price_dp
         self.yes_bids: dict[float, float] = {}
         self.no_bids: dict[float, float] = {}
         # When each side was last fully resynced from a snapshot (not just
@@ -48,13 +51,13 @@ class L2Book:
         book.clear()
         for price, qty in levels:
             if qty > 0:
-                book[round(float(price), 2)] = float(qty)
+                book[round(float(price), self.price_dp)] = float(qty)
         if time is not None:
             self.last_snapshot_time[side] = time
 
     def apply_delta(self, side: str, price: float, delta: float):
         book = self.yes_bids if side == "yes" else self.no_bids
-        price = round(float(price), 2)
+        price = round(float(price), self.price_dp)
         new_qty = book.get(price, 0.0) + delta
         if new_qty <= 1e-9:
             book.pop(price, None)
@@ -66,14 +69,14 @@ class L2Book:
 
     def best_ask(self) -> float | None:
         # best (cheapest) YES ask == the highest-priced resting NO order, converted
-        return round(1.0 - max(self.no_bids), 2) if self.no_bids else None
+        return round(1.0 - max(self.no_bids), self.price_dp) if self.no_bids else None
 
     def depth_at(self, side: str, price: float) -> float:
         """Resting size at an exact price, in that SIDE's own price terms
         (e.g. side='no', price=0.99 means the no-bid queue at 99c on the no
         side -- no conversion). 0.0 if nothing rests there (a known, not
         missing, answer -- this is full L2 data)."""
-        price = round(float(price), 2)
+        price = round(float(price), self.price_dp)
         book = self.yes_bids if side == "yes" else self.no_bids
         return book.get(price, 0.0)
 
@@ -107,7 +110,7 @@ class L2Book:
         return Quote(
             ticker=self.ticker, time=time, bid=bid, ask=ask,
             bid_depth=self.yes_bids.get(bid) if bid is not None else None,
-            ask_depth=self.no_bids.get(round(1.0 - ask, 2)) if ask is not None else None,
+            ask_depth=self.no_bids.get(round(1.0 - ask, self.price_dp)) if ask is not None else None,
             source="kalshi_ws", fidelity="l2",
         )
 

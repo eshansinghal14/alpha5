@@ -95,6 +95,7 @@ class Meta:
     shard: int | None = None
     taker_rate: float | None = None
     maker_rate: float | None = None
+    ticks: pricing.Ticks = pricing.CENT
 
 
 class ArbsRunner:
@@ -122,6 +123,11 @@ class ArbsRunner:
         self.feed = MultiFeed(self.tickers, self._on_quote, self._on_trade, label=self.S,
                               on_fill=self._on_fill, on_error=lambda m: self.alert("warn", None, m))
         self.quotes: dict[tuple[str, int], Quote] = {}   # (basket_id, leg index) -> its quote
+        # (ticker, side) -> contracts our IOCs in flight are buying. Held from
+        # the decision, not the send: baskets sharing a leg are evaluated in
+        # one pass, and each sized against the same touch (10-28 16:24, the
+        # TXSENR P2 and P4 ladders each came up one leg short).
+        self.inflight: dict[tuple[str, str], float] = {}
         self.busy: set[str] = set()
         self.dirty: set[str] = set(self.baskets)
         self.hot: list[str] = []
@@ -228,6 +234,7 @@ class ArbsRunner:
             if mt.status != m.get("status") and mt.status != "unknown":
                 self.journal({"kind": "status", "ticker": t, "from": mt.status, "to": m.get("status")})
             mt.status, mt.result = m.get("status") or "", m.get("result") or ""
+            mt.ticks = pricing.Ticks.from_market(m.get("price_ranges"))
             self.meta[t] = mt
             events.setdefault(mt.event, []).append(mt)
         for et, ms in events.items():
@@ -270,7 +277,7 @@ class ArbsRunner:
         out: dict[float, float] = {}
         for q in self.quotes.values():
             if q.ticker == ticker and q.side == side and q.remaining > 0:
-                out[round(q.price, 2)] = out.get(round(q.price, 2), 0.0) + q.remaining
+                out[round(q.price, 4)] = out.get(round(q.price, 4), 0.0) + q.remaining
         return out
 
     def leg_view(self, ticker: str, side: str) -> pricing.LegView | None:
@@ -293,9 +300,30 @@ class ArbsRunner:
         if yb and nb and max(yb) + max(nb) > 1.0 + _EPS:
             return None
         opp, mine = (nb, yb) if side == "yes" else (yb, nb)
-        asks = sorted((round(1.0 - p, 2), q) for p, q in opp.items() if q > _EPS)
+        asks = sorted((round(1.0 - p, 4), q) for p, q in opp.items() if q > _EPS)
+        held = self.inflight.get((ticker, side), 0.0)
+        while held > _EPS and asks:
+            p, q = asks[0]
+            if q <= held + _EPS:
+                held -= q
+                asks.pop(0)
+            else:
+                asks[0], held = (p, q - held), 0.0
         return pricing.LegView(asks=asks, bid=max(mine) if mine else None,
-                               taker_rate=m.taker_rate, maker_rate=m.maker_rate)
+                               taker_rate=m.taker_rate, maker_rate=m.maker_rate, ticks=m.ticks)
+
+    def hold(self, legs: list[tuple[str, str, float]]) -> list[tuple[str, str, float]]:
+        for t, s, n in legs:
+            self.inflight[(t, s)] = self.inflight.get((t, s), 0.0) + n
+        return legs
+
+    def release(self, legs: list[tuple[str, str, float]]):
+        for t, s, n in legs:
+            left = self.inflight.get((t, s), 0.0) - n
+            if left > _EPS:
+                self.inflight[(t, s)] = left
+            else:
+                self.inflight.pop((t, s), None)
 
     def views(self, b: Basket) -> list[pricing.LegView] | None:
         vs = [self.leg_view(l.ticker, l.side) for l in b.legs]
@@ -530,7 +558,8 @@ class ArbsRunner:
                     self.spawn(self.cancel_quotes(live_qs, "take"), b.basket_id)
                     return
                 if not qs:
-                    self.spawn(self.take(b, plan), b.basket_id)
+                    held = self.hold([(l.ticker, l.side, plan.size) for l in b.legs])
+                    self.spawn(self.take(b, plan, held), b.basket_id)
                     return
         self.manage_quotes(b, vs, now)
 
@@ -569,7 +598,7 @@ class ArbsRunner:
                 acts.append(self.place_quote(self.new_quote(b, plan, size)))
                 continue
             past_limit = q.price > plan.max_price + _EPS
-            ticks = abs(round((plan.price - q.price) / pricing.TICK))
+            ticks = vs[j].ticks.steps(plan.price, q.price)
             cooled = now - max(q.moved_at, q.placed_at) >= t.requote_cooldown_s
             if past_limit or (ticks >= t.requote_min_ticks and cooled):
                 if self.live and not past_limit and not self.gw.can_afford(leg.ticker, "amend", reserve):
@@ -607,13 +636,22 @@ class ArbsRunner:
         if exc is None:
             self._order_ok()
             if fill is not None and fill.price > limit + 0.01 + _EPS:
-                self.halt = f"{ticker} IOC filled at {fill.price:.4f} above limit {limit:.2f} (units?)"
+                self.halt = f"{ticker} IOC filled at {fill.price:.4f} above limit {limit:.4f} (units?)"
                 self.alert("error", None, self.halt)
         return fill, exc
 
-    async def take(self, b: Basket, plan: pricing.TakePlan):
+    async def take(self, b: Basket, plan: pricing.TakePlan, held: list):
+        try:
+            await self._take(b, plan, held)
+        finally:
+            self.release(held)
+
+    async def _take(self, b: Basket, plan: pricing.TakePlan, held: list):
         self.last_take[b.basket_id] = time.time()
+        # Our own hold off the views: the shadow IOC fills against them.
+        self.release(held)
         vs = self.views(b)
+        self.hold(held)
         if vs is None:
             return
         if self.live:
@@ -684,8 +722,12 @@ class ArbsRunner:
         legs = [(j, b.legs[j]) for j in range(len(b.legs)) if plan.limits[j] is not None]
         self.journal({"kind": "complete", "basket_id": b.basket_id, "need": missing,
                       "limits": {l.ticker: plan.limits[j] for j, l in legs}})
-        res = await asyncio.gather(*(self._ioc(l.ticker, l.side, plan.limits[j], plan.need[j], "complete", vs[j])
-                                     for j, l in legs))
+        held = self.hold([(l.ticker, l.side, plan.need[j]) for j, l in legs])
+        try:
+            res = await asyncio.gather(*(self._ioc(l.ticker, l.side, plan.limits[j], plan.need[j], "complete",
+                                                   vs[j]) for j, l in legs))
+        finally:
+            self.release(held)
         for (j, l), (fill, exc) in zip(legs, res):
             if exc is not None:
                 self._ioc_exc(b, l.ticker, exc, "completion")

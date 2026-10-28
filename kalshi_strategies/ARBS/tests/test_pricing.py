@@ -98,3 +98,19 @@ def test_completion_shallow_book_prices_deepest_level():
     legs = [lv([(0.50, 9)]), lv([(0.30, 2)])]
     c = pricing.completion(1.0, 0.05, 5, [5, 0], 2.50, legs)
     assert c.limits[1] is not None and c.limits[1] >= 0.30
+
+
+def test_tapered_grid():
+    from kalshi_strategies.ARBS.pricing import Ticks, max_price_within, quote_leg
+    t = Ticks.from_market([{"start": "0.0000", "end": "0.1000", "step": "0.0010"},
+                           {"start": "0.1000", "end": "0.9000", "step": "0.0100"},
+                           {"start": "0.9000", "end": "1.0000", "step": "0.0010"}])
+    assert (t.lo, t.hi) == (0.001, 0.999)
+    assert t.floor(0.9147) == 0.914 and t.floor(0.555) == 0.55
+    assert t.up(0.099) == 0.1 and t.up(0.1) == 0.11 and t.down(0.1) == 0.099 and t.down(0.91) == 0.909
+    assert max_price_within(0.92, T, t) == 0.914
+    # Joins one 0.1c tick over a tail bid, under a tail ask.
+    a = LegView(asks=[(0.095, 5)], bid=0.08, taker_rate=T, maker_rate=0.0, ticks=t)
+    b = LegView(asks=[(0.50, 5)], bid=0.40, taker_rate=T, maker_rate=0.0)
+    q = quote_leg([a, b], 0, 1.0, 0.01, 1)
+    assert q.price == 0.081 and q.max_price == 0.094

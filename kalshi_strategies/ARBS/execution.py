@@ -36,6 +36,7 @@ class Gateway:
             if s not in self.clients:
                 c = KalshiOrderClient.from_account(shard=s)
                 c.cap_fn = cap_fn
+                c.price_dp = 4
                 self.clients[s] = c
 
     def client(self, ticker: str) -> KalshiOrderClient | None:
@@ -51,7 +52,7 @@ class Gateway:
 
     def _order(self, ticker, side, price, size, intent, cid=None) -> Order:
         o = Order(order_id=next(self._ids), ticker=ticker, side=side, order_type="limit",
-                  price=round(float(price), 2), size=float(size), decision_time=pd.Timestamp.now(tz="UTC"),
+                  price=round(float(price), 4), size=float(size), decision_time=pd.Timestamp.now(tz="UTC"),
                   intent=intent)
         o.client_order_id = cid or str(uuid.uuid4())
         return o
@@ -100,7 +101,7 @@ class Gateway:
             return None, None, False
         o = self._order(ticker, side, price, filled + remaining, "quote")
         try:
-            return await self.call(c.amend, exchange_id, o, remaining, filled, price=round(price, 2)), None, True
+            return await self.call(c.amend, exchange_id, o, remaining, filled, price=round(price, 4)), None, True
         except Exception as e:
             if http_status(e) == 429:
                 c.note_rate_limited("move")

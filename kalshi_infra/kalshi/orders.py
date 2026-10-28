@@ -403,6 +403,10 @@ class KalshiOrderClient:
     (LiveEngine runs them on an executor thread) -- a ~40ms POST on the loop
     stalls both feeds and every scheduled order resolution."""
 
+    # Decimals order prices are rounded to. 2 = whole cents; a caller pricing
+    # 0.1c ticks (tapered_deci_cent tails) sets 4.
+    price_dp = 2
+
     def __init__(self, tokens_per_s: float, timeout_s: float = ORDER_TIMEOUT_S,
                  budget: WriteBudget | None = None):
         """`tokens_per_s`: this process's share of the account's write budget
@@ -606,7 +610,7 @@ class KalshiOrderClient:
         yes_price = px if order.side == "yes" else 1.0 - px
         path = f"{ORDERS_PATH}/{exchange_order_id}/amend"
         body = {"ticker": order.ticker, "side": "bid" if order.side == "yes" else "ask",
-                "price": f"{round(yes_price, 2):.4f}", "count": f"{filled + new_size:.2f}",
+                "price": f"{round(yes_price, self.price_dp):.4f}", "count": f"{filled + new_size:.2f}",
                 **self._shard_field()}
         resp = self._session.post(BASE_URL + path, headers=self._headers("POST", path), json=body,
                                   timeout=self.timeout_s)
@@ -664,7 +668,7 @@ class KalshiOrderClient:
             "ticker": order.ticker,
             "side": "bid" if order.side == "yes" else "ask",
             "count": f"{order.size:.2f}",
-            "price": f"{round(yes_price, 2):.4f}",
+            "price": f"{round(yes_price, self.price_dp):.4f}",
             "self_trade_prevention_type": "taker_at_cross",
             # Kept on the order: a create that timed out on our side may still
             # rest at Kalshi, and this id is the only way to find it again.

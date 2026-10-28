@@ -69,7 +69,8 @@ class LiveKalshiFeed:
     """`on_quote(BookView)` / `on_trade(ticker, Trade)` fire synchronously
     on this coroutine's task."""
 
-    def __init__(self, tickers: list[str], on_quote, on_trade, *, label: str, on_fill=None, on_print=None):
+    def __init__(self, tickers: list[str], on_quote, on_trade, *, label: str, on_fill=None, on_print=None,
+                 price_dp: int = 2):
         """`on_fill(dict)` (optional): OUR fills from the authenticated `fill`
         channel, in KalshiOrderClient.fills' dict shape. Only fills on these
         tickers are delivered. `on_print(dict)` (optional): every public
@@ -80,7 +81,7 @@ class LiveKalshiFeed:
         self._on_fill = on_fill
         self._on_print = on_print
         self.n_fills = 0
-        self._books: dict[str, L2Book] = {t: L2Book(t) for t in self._tickers}
+        self._books: dict[str, L2Book] = {t: L2Book(t, price_dp) for t in self._tickers}
         self.label = label
         self.n_reconnects = 0
         self.n_seq_gaps = 0

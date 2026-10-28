@@ -11,10 +11,58 @@ import math
 
 from kalshi_infra.kalshi.fees import fee
 
-TICK = 0.01
-MIN_PRICE = 0.01
-MAX_PRICE = 0.99
 _EPS = 1e-9
+
+
+@dataclasses.dataclass(frozen=True)
+class Ticks:
+    """A market's price grid, from its `price_ranges`: (start, end, step)
+    covering 0..1. tapered_deci_cent markets step 0.1c below 10c and above
+    90c, 1c between. Prices are in one side's terms; the grid is symmetric,
+    so it holds for YES and NO alike."""
+    ranges: tuple[tuple[float, float, float], ...] = ((0.0, 1.0, 0.01),)
+
+    @classmethod
+    def from_market(cls, price_ranges: list[dict] | None) -> "Ticks":
+        if not price_ranges:
+            return cls()
+        return cls(tuple(sorted((float(r["start"]), float(r["end"]), float(r["step"])) for r in price_ranges)))
+
+    @property
+    def lo(self) -> float:
+        s, _, st = self.ranges[0]
+        return round(s + st, 4)
+
+    @property
+    def hi(self) -> float:
+        _, e, st = self.ranges[-1]
+        return round(e - st, 4)
+
+    def floor(self, p: float) -> float:
+        """Highest grid price <= p."""
+        for s, e, st in self.ranges:
+            if p < e - _EPS or (s, e, st) == self.ranges[-1]:
+                return round(s + math.floor((p - s) / st + 1e-6) * st, 4)
+        raise AssertionError
+
+    def down(self, p: float) -> float:
+        return self.floor(p - 1e-6)
+
+    def up(self, p: float) -> float:
+        for s, e, st in self.ranges:
+            if p < e - _EPS:
+                return round(min(e, s + (math.floor((p - s) / st + 1e-6) + 1) * st), 4)
+        return round(p, 4)
+
+    def steps(self, a: float, b: float) -> int:
+        """Grid steps between two grid prices."""
+        lo, hi, n = min(a, b), max(a, b), 0
+        while lo < hi - _EPS:
+            lo, n = self.up(lo), n + 1
+        return n
+
+
+CENT = Ticks()
 
 
 @dataclasses.dataclass
@@ -26,6 +74,7 @@ class LegView:
     bid: float | None
     taker_rate: float
     maker_rate: float
+    ticks: Ticks = CENT
 
     @property
     def best_ask(self) -> float | None:
@@ -53,15 +102,14 @@ def maker_cost(p: float, rate: float) -> float:
     return p + fee(p, 1.0, rate)
 
 
-def max_price_within(budget: float, rate: float) -> float | None:
-    """Highest tick price p with p + fee(p) <= budget, or None below the
-    minimum tick."""
-    p = min(MAX_PRICE, math.floor((budget + _EPS) / TICK) * TICK)
-    while p >= MIN_PRICE - _EPS:
-        p = round(p, 2)
+def max_price_within(budget: float, rate: float, ticks: Ticks = CENT) -> float | None:
+    """Highest grid price p with p + fee(p) <= budget, or None below the
+    lowest one."""
+    p = ticks.floor(min(ticks.hi, budget + _EPS))
+    while p >= ticks.lo - _EPS:
         if p + fee(p, 1.0, rate) <= budget + _EPS:
             return p
-        p -= TICK
+        p = ticks.down(p)
     return None
 
 
@@ -142,15 +190,15 @@ def quote_leg(legs: list[LegView], j: int, payout: float, required_edge: float, 
             return None
         others += taker_cost(p, lv.taker_rate)
     lv = legs[j]
-    cap = max_price_within(payout - required_edge - others, lv.maker_rate)
+    cap = max_price_within(payout - required_edge - others, lv.maker_rate, lv.ticks)
     if cap is None:
         return None
     if lv.best_ask is not None:
-        cap = min(cap, round(lv.best_ask - TICK, 2))
-    if cap < MIN_PRICE - _EPS:
+        cap = min(cap, lv.ticks.down(lv.best_ask))
+    if cap < lv.ticks.lo - _EPS:
         return None
-    price = cap if lv.bid is None else min(cap, round(lv.bid + TICK, 2))
-    price = round(max(price, MIN_PRICE), 2)
+    price = cap if lv.bid is None else min(cap, lv.ticks.up(lv.bid))
+    price = max(price, lv.ticks.lo)
     return QuotePlan(leg=j, price=price, max_price=cap,
                      edge=payout - others - maker_cost(price, lv.maker_rate), others_cost=others)
 
@@ -189,7 +237,7 @@ def completion(payout: float, max_loss: float, target: float, filled: list[float
             continue
         p = lv.ladder_price(r)
         if p is None:
-            p = lv.asks[-1][0] if lv.asks else MAX_PRICE
+            p = lv.asks[-1][0] if lv.asks else lv.ticks.hi
         unit.append(taker_cost(p, lv.taker_rate))
     budget = target * (payout + max_loss) - spent
     missing = [j for j, r in enumerate(need) if r > _EPS]
@@ -205,5 +253,6 @@ def completion(payout: float, max_loss: float, target: float, filled: list[float
             lv = legs[j]
             if not lv.asks:
                 continue
-            limits[j] = max_price_within(unit[j] + max(0.0, slack) / (len(missing) * need[j]), lv.taker_rate)
+            limits[j] = max_price_within(unit[j] + max(0.0, slack) / (len(missing) * need[j]), lv.taker_rate,
+                                         lv.ticks)
     return Completion(need=need, caps=caps, limits=limits, short=short)

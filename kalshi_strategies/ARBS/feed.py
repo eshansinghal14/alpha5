@@ -20,7 +20,7 @@ SUBSCRIBE_PACING_S = 0.2
 
 class MultiFeed(LiveKalshiFeed):
     def __init__(self, tickers, on_quote, on_trade, *, label, on_fill=None, on_error=None):
-        super().__init__(tickers, on_quote, on_trade, label=label, on_fill=on_fill)
+        super().__init__(tickers, on_quote, on_trade, label=label, on_fill=on_fill, price_dp=4)
         self._on_error = on_error
         self.n_errors = 0
         self.connected_at: float | None = None

@@ -239,3 +239,57 @@ def test_flip_quoted_for_exit_when_not_hot(arbs):
     asyncio.run(go())
     qs = r.basket_quotes(f.basket_id)
     assert {q.leg for q in qs} == {0, 1} and all(q.size == 3 for q in qs)
+
+
+TAPERED = [{"start": "0.0000", "end": "0.1000", "step": "0.0010"},
+           {"start": "0.1000", "end": "0.9000", "step": "0.0100"},
+           {"start": "0.9000", "end": "1.0000", "step": "0.0010"}]
+
+
+def test_sub_cent_ask_is_taken_at_its_price(arbs):
+    r, b = arbs
+    for t in r.tickers:
+        r.meta[t].ticks = R.pricing.Ticks.from_market(TAPERED)
+        r.feed._books[t].price_dp = 4
+    # YES A ask 0.914 (NO bid 0.086), YES B ask 0.05: rounding to cents read A
+    # as 0.91 and its IOC took nothing (TXSENR-P6, 10-28 14:01).
+    book(r, "X-A", [(0.90, 10)], [(0.086, 2)])
+    book(r, "X-B", [(0.04, 10)], [(0.95, 2)])
+    vs = r.views(b)
+    assert vs[0].best_ask == 0.914
+
+    async def go():
+        r.evaluate(b)
+        await drain(r)
+    asyncio.run(go())
+    pos = r.shadow_ledger.baskets[b.basket_id]
+    assert pos.bundles(b.tickers) == 2
+    assert pos.legs["X-A"].cost == pytest.approx(2 * 0.914 + R.kfees.fee(0.914, 2, 0.07))
+
+
+def test_baskets_sharing_a_leg_dont_take_the_same_touch(arbs):
+    r, b = arbs
+    c = dataclasses.replace(b, basket_id="t:c", legs=(Leg("X-A", "yes"), Leg("X-C", "yes")))
+    r.all_baskets.append(c)
+    r.baskets[c.basket_id] = c
+    r.tickers.append("X-C")
+    r.by_ticker["X-A"].append(c.basket_id)
+    r.by_ticker["X-C"] = [c.basket_id]
+    from kalshi_backtest.book import L2Book
+    r.feed._books["X-C"] = L2Book("X-C")
+    r.meta["X-C"] = R.Meta(ticker="X-C", event="X", status="active", shard=0, taker_rate=0.07, maker_rate=0.0)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, enable_quoting=False)
+    # One contract of YES A at 0.40 serves both baskets' touch.
+    book(r, "X-A", [(0.35, 10)], [(0.60, 1)])
+    book(r, "X-B", [(0.45, 10)], [(0.50, 10)])
+    book(r, "X-C", [(0.45, 10)], [(0.50, 10)])
+
+    async def go():
+        r.evaluate(b)
+        r.evaluate(c)            # same pass, before b's take has run
+        assert r.views(c)[0].asks == []
+        await drain(r)
+    asyncio.run(go())
+    assert r.shadow_ledger.baskets[b.basket_id].bundles(b.tickers) == 1
+    assert c.basket_id not in r.shadow_ledger.baskets
+    assert r.inflight == {}
