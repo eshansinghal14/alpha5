@@ -33,12 +33,12 @@ from kalshi_infra.kalshi import fees as kfees
 from kalshi_infra.kalshi.orders import RealFill, error_code, http_status, is_market_paused, is_post_only_reject
 from kalshi_infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
 from kalshi_infra.runtime.persist import LIVE_ROOT, day_dir
-from kalshi_strategies.ARBS import pricing
+from kalshi_strategies.ARBS import pricing, scanner
 from kalshi_strategies.ARBS.config import SPEC_PATH
 from kalshi_strategies.ARBS.execution import Gateway
 from kalshi_strategies.ARBS.feed import MultiFeed
 from kalshi_strategies.ARBS.ledger import Ledger
-from kalshi_strategies.ARBS.spec import Basket, load_spec
+from kalshi_strategies.ARBS.spec import Basket, load_spec, merge
 
 _EPS = 1e-9
 TRADEABLE = ("active", "open")
@@ -105,37 +105,40 @@ class ArbsRunner:
         self.cfg = self.store.config
         self.root = os.path.join(LIVE_ROOT, self.S)
         os.makedirs(self.root, exist_ok=True)
-        self.all_baskets = load_spec(SPEC_PATH)
-        self.baskets: dict[str, Basket] = {b.basket_id: b for b in self.all_baskets}
-        self.tickers = sorted({t for b in self.all_baskets for t in b.tickers})
-        self.flip = flips(self.all_baskets)
-        self.by_ticker: dict[str, list[str]] = {}
-        for b in self.all_baskets:
-            for t in b.tickers:
-                self.by_ticker.setdefault(t, []).append(b.basket_id)
         self.meta: dict[str, Meta] = {}
         self.real_ledger = Ledger(os.path.join(self.root, "ledger.json"))
         self.shadow_ledger = Ledger(os.path.join(self.root, "ledger_shadow.json"))
+        self.alerts: list[dict] = []
         self.live = False
+        self.journal_dir = os.path.join(self.root, "journal")
+        self.quotes: dict[tuple[str, int], Quote] = {}   # (basket_id, leg index) -> its quote
+        self.busy: set[str] = set()
+        self.baskets: dict[str, Basket] = {}
+        self.tickers: list[str] = []
+        self.dirty: set[str] = set()
+        self.hot: list[str] = []
+        self.ranking: list[dict] = []
+        with open(SPEC_PATH, encoding="utf-8") as fh:
+            self.hand_doc = json.load(fh)
+        self.hand = load_spec(SPEC_PATH)
+        self.scan_path = os.path.join(self.root, "scanned_spec.json")
+        self.review_path = os.path.join(self.root, "scan_review.json")
+        self.scan_status: dict = {}
+        self.review_seen: set[str] = set()
+        self.set_baskets(merge(self.hand, self.scanned()))
         self.arm_want = live_trading
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=16, thread_name_prefix="arbs")
         self.gw = Gateway(self.pool)
         self.feed = MultiFeed(self.tickers, self._on_quote, self._on_trade, label=self.S,
                               on_fill=self._on_fill, on_error=lambda m: self.alert("warn", None, m))
-        self.quotes: dict[tuple[str, int], Quote] = {}   # (basket_id, leg index) -> its quote
         # (ticker, side) -> contracts our IOCs in flight are buying. Held from
         # the decision, not the send: baskets sharing a leg are evaluated in
         # one pass, and each sized against the same touch (10-28 16:24, the
         # TXSENR P2 and P4 ladders each came up one leg short).
         self.inflight: dict[tuple[str, str], float] = {}
-        self.busy: set[str] = set()
-        self.dirty: set[str] = set(self.baskets)
-        self.hot: list[str] = []
-        self.ranking: list[dict] = []
         self.last_take: dict[str, float] = {}
         self.last_completion: dict[str, float] = {}
         self.completion_note: dict[str, dict] = {}
-        self.alerts: list[dict] = []
         self.order_errors = 0
         self.halt: str | None = None                     # until restart
         self.audit_strikes = 0
@@ -145,7 +148,6 @@ class ArbsRunner:
         self.n = {"takes": 0, "take_bundles": 0.0, "quotes_placed": 0, "quote_moves": 0, "quote_cancels": 0,
                   "quote_fills": 0, "completions": 0, "completion_short": 0, "post_only_rejects": 0}
         self.started = _utc()
-        self.journal_dir = os.path.join(self.root, "journal")
 
     # ------------------------------------------------------------------ util
 
@@ -212,6 +214,84 @@ class ArbsRunner:
         self.order_errors += 1
         self.alert("error", basket_id, f"{what} failed: {st} {code} {str(exc)[:200]}")
 
+    # ------------------------------------------------------------------ spec
+
+    def scanned(self) -> list[Basket]:
+        if not self.cfg.scan.enable or not os.path.exists(self.scan_path):
+            return []
+        try:
+            return load_spec(self.scan_path)
+        except Exception as e:
+            self.alert("warn", None, f"scanned spec unreadable ({e!r}); hand spec only")
+            return []
+
+    def set_baskets(self, baskets: list[Basket]) -> list[str]:
+        """Trade `baskets` from now on; returns the tickers new to us. A
+        basket dropped from the list is kept while it has a position, quote
+        or task: completion, settlement and cancels look it up by id."""
+        new = {b.basket_id: b for b in baskets}
+        keep = set(self.real_ledger.baskets) | set(self.shadow_ledger.baskets) | self.busy | \
+            {q.basket_id for q in self.quotes.values()}
+        for bid in keep:
+            if bid not in new and bid in self.baskets:
+                new[bid] = self.baskets[bid]
+        added = new.keys() - self.baskets.keys()
+        old = set(self.tickers)
+        self.all_baskets = list(new.values())
+        self.baskets = new
+        self.tickers = sorted({t for b in self.all_baskets for t in b.tickers})
+        self.flip = flips(self.all_baskets)
+        self.by_ticker: dict[str, list[str]] = {}
+        for b in self.all_baskets:
+            for t in b.tickers:
+                self.by_ticker.setdefault(t, []).append(b.basket_id)
+        self.dirty = {d for d in self.dirty if d in new} | added
+        self.hot = [h for h in self.hot if h in new]
+        self.ranking = [r for r in self.ranking if r["basket_id"] in new]
+        return [t for t in self.tickers if t not in old]
+
+    async def reload_spec(self):
+        loop = asyncio.get_running_loop()
+        new = self.set_baskets(merge(self.hand, self.scanned()))
+        if not new:
+            return
+        await loop.run_in_executor(self.pool, self.load_meta)
+        shards = {t: m.shard for t, m in self.meta.items() if m.shard is not None}
+        try:
+            await loop.run_in_executor(self.pool, self.gw.setup, shards,
+                                       lambda: self.cfg.runtime.max_write_tokens_per_s)
+        except Exception as e:
+            self.alert("error", None, f"order client setup failed ({e!r})")
+        self.feed.add(new)
+        _log(f"spec reloaded: {len(self.all_baskets)} baskets over {len(self.tickers)} markets (+{len(new)})")
+
+    async def scan_loop(self):
+        loop = asyncio.get_running_loop()
+        while True:
+            sc = self.cfg.scan
+            try:
+                if sc.enable:
+                    t0 = time.monotonic()
+                    held = set(self.real_ledger.baskets) | set(self.shadow_ledger.baskets)
+                    review = await loop.run_in_executor(
+                        self.pool, scanner.run, self.cfg, self.hand_doc, {t for b in self.hand for t in b.tickers},
+                        self.scan_path, self.review_path, held)
+                    await self.reload_spec()
+                    fresh = set(review["series"]) - self.review_seen
+                    if fresh:
+                        self.alert("warn", None, f"scan: {len(fresh)} series may be complete sets, e.g. "
+                                                 f"{', '.join(sorted(fresh)[:5])}; see scan_review.json")
+                        self.review_seen |= fresh
+                    self.scan_status = {"at": _utc().isoformat(), "secs": round(time.monotonic() - t0, 1),
+                                        "baskets": len(self.all_baskets) - len(self.hand),
+                                        "review": len(review["series"]), "error": None}
+                elif len(self.all_baskets) > len(self.hand):
+                    await self.reload_spec()
+            except Exception as e:
+                self.scan_status["error"] = repr(e)
+                self.alert("warn", None, f"scan failed ({e!r})")
+            await asyncio.sleep(sc.interval_s)
+
     # ------------------------------------------------------------------ meta
 
     def load_meta(self):
@@ -268,8 +348,9 @@ class ArbsRunner:
         return True
 
     def excluded(self, b: Basket) -> bool:
-        ex = set(self.cfg.watch.exclude)
-        return bool({b.basket_id, b.relationship_id, b.cluster} & ex)
+        if {b.basket_id, b.relationship_id, b.cluster} & set(self.cfg.watch.exclude):
+            return True
+        return b.settles is not None and b.settles > _utc() + pd.Timedelta(days=self.cfg.trading.days_till_expiry)
 
     # ------------------------------------------------------------------ books
 
@@ -509,8 +590,11 @@ class ArbsRunner:
                 if bid in self.busy:
                     self.dirty.add(bid)
                     continue
+                b = self.baskets.get(bid)
+                if b is None:
+                    continue
                 try:
-                    self.evaluate(self.baskets[bid])
+                    self.evaluate(b)
                 except Exception:
                     _log(f"eval error {bid}:")
                     traceback.print_exc()
@@ -1067,7 +1151,7 @@ class ArbsRunner:
             "holdings": holdings, "quotes": quotes, "hot": self.hot, "ranking": self.ranking[:60],
             "settled": settled[-200:], "alerts": self.alerts[-100:], "audit_diff": self.audit_diff,
             "order_errors": self.order_errors, "counts": self.n, "write_usage": self.gw.usage(),
-            "config_status": self.store.status(),
+            "config_status": self.store.status(), "scan": self.scan_status,
         }
 
     async def summary_loop(self):
@@ -1096,7 +1180,7 @@ class ArbsRunner:
         self.settle()
         trading, stopper, stop = TradingModeWatcher(self.S), StopWatcher(), asyncio.Event()
         coros = [self.feed.run(), self.eval_loop(), self.rank_loop(), self.meta_loop(), self.fill_poll_loop(),
-                 self.audit_loop(), self.guard_loop(), self.summary_loop(),
+                 self.audit_loop(), self.guard_loop(), self.summary_loop(), self.scan_loop(),
                  self.control_loop(trading, stopper, stop)]
         tasks = [asyncio.create_task(c) for c in coros]
         try:

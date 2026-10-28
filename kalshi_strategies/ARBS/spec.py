@@ -27,6 +27,7 @@ class Basket:
     payout: float
     quote_until: pd.Timestamp | None
     resume_quoting: pd.Timestamp | None
+    settles: pd.Timestamp | None = None
 
     @property
     def tickers(self) -> list[str]:
@@ -45,11 +46,22 @@ def _ts(v) -> pd.Timestamp | None:
     return None if not v else pd.Timestamp(v)
 
 
+def _settles(rel: dict) -> pd.Timestamp | None:
+    if rel.get("expected_settlement_utc"):
+        return pd.Timestamp(rel["expected_settlement_utc"])
+    if rel.get("expected_settlement_month"):
+        return pd.Period(rel["expected_settlement_month"], freq="M").end_time.tz_localize("UTC")
+    return None
+
+
 def load_spec(path: str, exclude: list[str] | None = None) -> list[Basket]:
     """Baskets in file order. `exclude` drops any basket whose basket_id,
     relationship_id or cluster equals one of its entries."""
     with open(path, encoding="utf-8") as fh:
-        doc = json.load(fh)
+        return parse_spec(json.load(fh), exclude)
+
+
+def parse_spec(doc: dict, exclude: list[str] | None = None) -> list[Basket]:
     ex = set(exclude or [])
     out, seen = [], set()
     for rel in doc["relationships"]:
@@ -70,5 +82,20 @@ def load_spec(path: str, exclude: list[str] | None = None) -> list[Basket]:
             out.append(Basket(basket_id=b["basket_id"], relationship_id=rel["relationship_id"],
                               type=rel["type"], cluster=rel.get("cluster") or "", legs=legs, payout=payout,
                               quote_until=_ts(rel.get("quote_until_utc")),
-                              resume_quoting=_ts(rel.get("resume_quoting_utc"))))
+                              resume_quoting=_ts(rel.get("resume_quoting_utc")), settles=_settles(rel)))
+    return out
+
+
+def merge(first: list[Basket], *more: list[Basket]) -> list[Basket]:
+    """Baskets of `first`, then those of `more` not already listed under the
+    same basket_id or the same legs (the scan re-finds hand-spec baskets)."""
+    out = list(first)
+    ids = {b.basket_id for b in out}
+    legs = {frozenset(b.legs) for b in out}
+    for bs in more:
+        for b in bs:
+            if b.basket_id not in ids and frozenset(b.legs) not in legs:
+                out.append(b)
+                ids.add(b.basket_id)
+                legs.add(frozenset(b.legs))
     return out

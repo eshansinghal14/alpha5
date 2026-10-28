@@ -293,3 +293,25 @@ def test_baskets_sharing_a_leg_dont_take_the_same_touch(arbs):
     assert r.shadow_ledger.baskets[b.basket_id].bundles(b.tickers) == 1
     assert c.basket_id not in r.shadow_ledger.baskets
     assert r.inflight == {}
+
+
+def test_reload_keeps_held_basket_and_adds_new_tickers(arbs):
+    r, b = arbs
+    r.shadow_ledger.record(b.basket_id, b.tickers, "X-A", "yes", 1.0, 0.4, time.time())
+    n = Basket(basket_id="n:b", relationship_id="n", type="mutually_exclusive_no", cluster="n",
+               legs=(Leg("Y-A", "no"), Leg("Y-B", "no")), payout=1.0, quote_until=None, resume_quoting=None)
+    assert r.set_baskets([n]) == ["Y-A", "Y-B"]
+    assert set(r.baskets) == {"t:b", "n:b"} and r.by_ticker["Y-A"] == ["n:b"] and "n:b" in r.dirty
+    r.shadow_ledger.baskets.clear()
+    r.set_baskets([n])
+    assert set(r.baskets) == {"n:b"} and "t:b" not in r.hot
+    r.feed.add(["Y-A", "Y-B"])
+    assert r.feed._new == ["Y-A", "Y-B"] and "Y-A" in r.feed.tickers
+
+
+def test_days_till_expiry_gates_new_trades(arbs):
+    r, b = arbs
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, days_till_expiry=30)
+    soon = dataclasses.replace(b, settles=pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=20))
+    late = dataclasses.replace(b, settles=pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=40))
+    assert not r.excluded(soon) and r.excluded(late) and not r.excluded(b)

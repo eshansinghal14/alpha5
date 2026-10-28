@@ -31,6 +31,10 @@ class TradingParams:
                              "a leg at once, so this closes a position early and frees its capital; no "
                              "min_edge, max_dollars or max_bundles_per_basket check.", min=0.0, max=0.5,
                              step=0.0025)
+    days_till_expiry: float = param("Trade only baskets whose markets are all expected to settle within this "
+                                    "many days (the hand spec's settlement month, else Kalshi's expected "
+                                    "expiration). The scan skips events past it. Open positions past it are still "
+                                    "completed and settled.", min=0.0, max=2000.0, step=1.0)
     quote_size: int = param("Bundles per resting quote.", min=1, max=10000, step=1)
     max_bundles_per_basket: int = param("Most bundles held in one basket (complete or not).", min=0, max=100000,
                                         step=1)
@@ -71,6 +75,23 @@ class WatchParams:
 
 
 @section
+class ScanParams:
+    enable: bool = param("Scan Kalshi every interval_s for MECNET / DIRECNET events and trade their baskets "
+                         "alongside the hand spec.")
+    max_markets: int = param("Most markets the scan adds (beyond the hand spec's), filled from the most traded "
+                             "events in the last 24h. Each is one more websocket subscription.", min=0, max=20000,
+                             step=100)
+    interval_s: float = param("Seconds between scans.", min=60.0, step=60.0, editable=False)
+    mecnet_max_legs: int = param("Largest MECNET subset listed (NO on the k likeliest markets, k = 2..this).",
+                                 min=2, max=50, step=1, editable=False)
+    ladder_span: int = param("DIRECNET strikes each strike is paired with, going up the ladder.", min=1, max=100,
+                             step=1, editable=False)
+    complete_set_series: list[str] = param("Series whose MECNET buckets were checked to cover every outcome "
+                                           "(candidates in data/live/ARBS/scan_review.json); they also trade "
+                                           "as complete sets.", editable=False)
+
+
+@section
 class RuntimeParams:
     control_poll_s: float = param("Config and arm-request poll.", min=0.1, step=0.1, editable=False)
     max_write_tokens_per_s: float | None = param("Cap on this strategy's write spend per shard, on top of the "
@@ -98,4 +119,5 @@ class ArbsConfig:
     trading: TradingParams
     completion: CompletionParams
     watch: WatchParams
+    scan: ScanParams
     runtime: RuntimeParams
