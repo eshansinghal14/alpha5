@@ -81,6 +81,10 @@ class ScanParams:
     max_markets: int = param("Most markets the scan adds (beyond the hand spec's), filled from the most traded "
                              "events in the last 24h. Each is one more websocket subscription.", min=0, max=20000,
                              step=100)
+    shards: list[int] = param("Exchange shards (event exchange_index) the scan takes events from. Kalshi "
+                              "holds collateral per shard: an order on one we haven't funded is rejected "
+                              "insufficient_shard_balance, and arming refuses a zero-balance shard.",
+                              editable=False)
     interval_s: float = param("Seconds between scans.", min=60.0, step=60.0, editable=False)
     mecnet_max_legs: int = param("Largest MECNET subset listed (NO on the k likeliest markets, k = 2..this).",
                                  min=2, max=50, step=1, editable=False)

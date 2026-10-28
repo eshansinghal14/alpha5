@@ -14,7 +14,7 @@ relationships in the hand spec's format, written to scanned_spec.json.
              strike is paired with the next scan.ladder_span above it (a
              200-strike KXBTCD ladder is 20k pairs otherwise).
 
-Events past trading.days_till_expiry are skipped, as are series in
+Events past trading.days_till_expiry or off scan.shards are skipped, as are series in
 watch.exclude and series another strategy trades (the position audit would
 read its contracts as ours). The most traded events are kept until
 scan.max_markets markets are listed.
@@ -157,7 +157,7 @@ def ladder(event: dict, markets: list[dict], span: int) -> list[dict]:
 
 
 def scan(events: list[dict], *, now: pd.Timestamp, days: float, max_markets: int, mecnet_max_legs: int,
-         ladder_span: int, complete_set_series: list[str], overrides: dict[str, str],
+         ladder_span: int, complete_set_series: list[str], overrides: dict[str, str], shards=(0,),
          skip_series: set[str] = frozenset(), known_tickers: set[str] = frozenset()) -> tuple[dict, dict]:
     """(spec doc, review doc). `known_tickers` (the hand spec's) don't count
     against max_markets."""
@@ -166,7 +166,7 @@ def scan(events: list[dict], *, now: pd.Timestamp, days: float, max_markets: int
     cands = []
     for e in events:
         crt = e.get("collateral_return_type")
-        if crt not in ("MECNET", "DIRECNET") or e.get("series_ticker") in skip_series:
+        if crt not in ("MECNET", "DIRECNET") or e.get("series_ticker") in skip_series                 or e.get("exchange_index") not in shards:
             continue
         ms = [m for m in e.get("markets") or []
               if m.get("status") == "active" and m.get("market_type", "binary") == "binary"]
@@ -230,7 +230,7 @@ def run(cfg, hand_doc: dict, known_tickers: set[str], spec_path: str, review_pat
     doc, review = scan(fetch_events(), now=pd.Timestamp.now(tz="UTC"), days=cfg.trading.days_till_expiry,
                        max_markets=cfg.scan.max_markets, mecnet_max_legs=cfg.scan.mecnet_max_legs,
                        ladder_span=cfg.scan.ladder_span, complete_set_series=cfg.scan.complete_set_series,
-                       skip_series=set(cfg.watch.exclude) | other_series(),
+                       shards=set(cfg.scan.shards), skip_series=set(cfg.watch.exclude) | other_series(),
                        overrides={s: v["expected_settlement_month"]
                                   for s, v in (hand_doc.get("settlement_basis_by_series") or {}).items()},
                        known_tickers=known_tickers)

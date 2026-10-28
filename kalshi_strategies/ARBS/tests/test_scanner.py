@@ -15,9 +15,9 @@ def mkt(ticker, yes=0.5, vol=10, **kw):
             "expected_expiration_time": "2026-11-15T00:00:00Z", **kw}
 
 
-def event(et, crt, markets, series=None):
+def event(et, crt, markets, series=None, shard=0):
     return {"event_ticker": et, "series_ticker": series or et.split("-")[0], "collateral_return_type": crt,
-            "markets": markets}
+            "exchange_index": shard, "markets": markets}
 
 
 def run(events, **kw):
@@ -87,10 +87,11 @@ def test_filters_and_market_budget():
     mine = event("KXINXU-1", "DIRECNET", [mkt("KXINXU-1-T1", strike_type="greater", floor_strike=1),
                                          mkt("KXINXU-1-T2", strike_type="greater", floor_strike=2)])
     big = event("BIG-1", "MECNET", [mkt("BIG-1-A", vol=500), mkt("BIG-1-B", vol=500)])
+    other = event("OS-1", "MECNET", [mkt("OS-1-A", vol=900), mkt("OS-1-B", vol=900)], shard=3)
     small = event("SM-1", "MECNET", [mkt("SM-1-A", vol=1), mkt("SM-1-B", vol=1), mkt("SM-1-C", vol=1)])
-    doc, _ = run([far, mine, small, big], max_markets=4, skip_series={"KXINXU"})
-    # FAR settles past 90 days, KXINXU belongs to another strategy, and SM's 3
-    # markets don't fit beside BIG's 2.
+    doc, _ = run([far, mine, other, small, big], max_markets=4, skip_series={"KXINXU"})
+    # FAR settles past 90 days, KXINXU belongs to another strategy, OS is on an
+    # unfunded shard, and SM's 3 markets don't fit beside BIG's 2.
     assert {b.relationship_id for b in parse_spec(doc)} == {"mecnet:BIG-1"}
     doc, _ = run([far, small, big], max_markets=4, known_tickers={"SM-1-A", "SM-1-B"})
     assert {b.relationship_id for b in parse_spec(doc)} == {"mecnet:BIG-1", "mecnet:SM-1"}
