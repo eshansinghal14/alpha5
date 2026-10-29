@@ -38,7 +38,7 @@ from kalshi_strategies.ARBS.config import SPEC_PATH
 from kalshi_strategies.ARBS.execution import Gateway
 from kalshi_strategies.ARBS.feed import MultiFeed
 from kalshi_strategies.ARBS.ledger import Ledger
-from kalshi_strategies.ARBS.spec import Basket, load_spec, merge
+from kalshi_strategies.ARBS.spec import Basket, load_spec, merge, parse_spec
 
 _EPS = 1e-9
 TRADEABLE = ("active", "open")
@@ -217,10 +217,17 @@ class ArbsRunner:
     # ------------------------------------------------------------------ spec
 
     def scanned(self) -> list[Basket]:
+        """Blocking (a full scan is ~25 MB). The part of the last scan to trade."""
         if not self.cfg.scan.enable or not os.path.exists(self.scan_path):
             return []
         try:
-            return load_spec(self.scan_path)
+            with open(self.scan_path, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            return parse_spec(scanner.select(
+                doc, now=_utc(), days=self.cfg.trading.days_till_expiry, max_markets=self.cfg.scan.max_markets,
+                known_tickers={t for b in self.hand for t in b.tickers},
+                held=set(self.real_ledger.baskets) | set(self.shadow_ledger.baskets),
+                exclude=set(self.cfg.watch.exclude)))
         except Exception as e:
             self.alert("warn", None, f"scanned spec unreadable ({e!r}); hand spec only")
             return []
@@ -252,7 +259,7 @@ class ArbsRunner:
 
     async def reload_spec(self):
         loop = asyncio.get_running_loop()
-        new = self.set_baskets(merge(self.hand, self.scanned()))
+        new = self.set_baskets(merge(self.hand, await loop.run_in_executor(self.pool, self.scanned)))
         if not new:
             return
         await loop.run_in_executor(self.pool, self.load_meta)
@@ -273,9 +280,8 @@ class ArbsRunner:
                 if sc.enable:
                     t0 = time.monotonic()
                     held = set(self.real_ledger.baskets) | set(self.shadow_ledger.baskets)
-                    review = await loop.run_in_executor(
-                        self.pool, scanner.run, self.cfg, self.hand_doc, {t for b in self.hand for t in b.tickers},
-                        self.scan_path, self.review_path, held)
+                    review = await loop.run_in_executor(self.pool, scanner.run, self.cfg, self.hand_doc,
+                                                        self.scan_path, self.review_path, held)
                     await self.reload_spec()
                     fresh = set(review["series"]) - self.review_seen
                     if fresh:

@@ -20,10 +20,13 @@ def event(et, crt, markets, series=None, shard=0):
             "exchange_index": shard, "markets": markets}
 
 
-def run(events, **kw):
-    args = dict(now=NOW, days=90, max_markets=1000, mecnet_max_legs=6, ladder_span=3, complete_set_series=[],
-                overrides={})
-    return scanner.scan(events, **{**args, **kw})
+def run(events, days=90, max_markets=1000, known_tickers=frozenset(), held=frozenset(), exclude=frozenset(),
+        **kw):
+    """scan then select, as the runner sees it."""
+    args = dict(now=NOW, mecnet_max_legs=6, ladder_span=3, complete_set_series=[], overrides={})
+    doc, review = scanner.scan(events, **{**args, **kw})
+    return scanner.select(doc, now=NOW, days=days, max_markets=max_markets, known_tickers=known_tickers,
+                          held=held, exclude=exclude), review
 
 
 def baskets(doc):
@@ -95,6 +98,18 @@ def test_filters_and_market_budget():
     assert {b.relationship_id for b in parse_spec(doc)} == {"mecnet:BIG-1"}
     doc, _ = run([far, small, big], max_markets=4, known_tickers={"SM-1-A", "SM-1-B"})
     assert {b.relationship_id for b in parse_spec(doc)} == {"mecnet:BIG-1", "mecnet:SM-1"}
+    doc, _ = run([far, small, big], max_markets=4, exclude={"BIG"})
+    assert {b.relationship_id for b in parse_spec(doc)} == {"mecnet:SM-1"}
+
+
+def test_scan_lists_everything_and_select_keeps_held():
+    far = event("FAR-1", "MECNET", [mkt("FAR-1-A"), mkt("FAR-1-B", expected_expiration_time="2027-06-01T00:00:00Z")])
+    big = event("BIG-1", "MECNET", [mkt("BIG-1-A", vol=500), mkt("BIG-1-B", vol=500)])
+    doc, _ = scanner.scan([far, big], now=NOW, mecnet_max_legs=6, ladder_span=3, complete_set_series=[],
+                          overrides={})
+    assert doc["n_markets"] == 4 and [r["volume_24h"] for r in doc["relationships"]] == [20.0, 1000.0]
+    got = scanner.select(doc, now=NOW, days=90, max_markets=0, held={"mecnet:FAR-1:no:A+B"})
+    assert [r["relationship_id"] for r in got["relationships"]] == ["mecnet:FAR-1"]
 
 
 def test_series_override_sets_settlement():
@@ -124,11 +139,11 @@ def test_run_carries_over_held_relationships(tmp_path, monkeypatch):
     monkeypatch.setattr(scanner, "other_series", lambda: set())
     monkeypatch.setattr(scanner, "fetch_events",
                         lambda: [event("EV-1", "MECNET", [mkt("EV-1-A"), mkt("EV-1-B")])])
-    scanner.run(cfg, {}, set(), spec, review)
+    scanner.run(cfg, {}, spec, review)
     monkeypatch.setattr(scanner, "fetch_events", lambda: [])
-    scanner.run(cfg, {}, set(), spec, review, held={"mecnet:EV-1:no:A+B"})
+    scanner.run(cfg, {}, spec, review, held={"mecnet:EV-1:no:A+B"})
     with open(spec) as fh:
         assert [r["relationship_id"] for r in json.load(fh)["relationships"]] == ["mecnet:EV-1"]
-    scanner.run(cfg, {}, set(), spec, review)
+    scanner.run(cfg, {}, spec, review)
     with open(spec) as fh:
         assert json.load(fh)["relationships"] == []

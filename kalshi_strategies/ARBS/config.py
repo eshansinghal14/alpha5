@@ -78,9 +78,9 @@ class WatchParams:
 class ScanParams:
     enable: bool = param("Scan Kalshi every interval_s for MECNET / DIRECNET events and trade their baskets "
                          "alongside the hand spec.")
-    max_markets: int = param("Most markets the scan adds (beyond the hand spec's), filled from the most traded "
-                             "events in the last 24h. Each is one more websocket subscription.", min=0, max=20000,
-                             step=100)
+    max_markets: int = param("Most scanned markets traded beyond the hand spec's: the scan lists every event, "
+                             "and the most traded in the last 24h are taken until this many. Each is one more "
+                             "websocket subscription.", min=0, max=20000, step=100)
     shards: list[int] = param("Exchange shards (event exchange_index) the scan takes events from. Kalshi "
                               "holds collateral per shard: an order on one we haven't funded is rejected "
                               "insufficient_shard_balance, and arming refuses a zero-balance shard.",
