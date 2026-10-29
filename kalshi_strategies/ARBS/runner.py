@@ -266,6 +266,9 @@ class ArbsRunner:
         self.quote_px: dict[str, list] = {}
         # basket_id -> prints that would have filled a quote on a basket we didn't quote.
         self.missed: dict[str, dict] = {}
+        # Misses count only once the hot list has filled after a start: until
+        # then every print looks like one (10-29 restarts, 9-92 s in).
+        self.hot_ready = False
         # Live order round trips, flushed with the liquidity log (orders_*.jsonl.gz).
         self.order_times: list[dict] = []
 
@@ -579,6 +582,8 @@ class ArbsRunner:
     def note_missed(self, ticker: str, side: str, trade):
         """A print through the price we'd have quoted on a basket outside the
         hot list: what the basket cap left on the table."""
+        if not self.hot_ready:
+            return
         hot = set(self.hot)
         for bid in self.by_ticker.get(ticker, ()):
             px = self.quote_px.get(bid)
@@ -1437,6 +1442,8 @@ class ArbsRunner:
                 self.ranking = rows
                 quotable = [r["basket_id"] for r in rows if self.may_quote(self.baskets[r["basket_id"]], now_ts)]
                 hot = quotable[:self.cfg.watch.max_quoted_baskets]
+                if len(hot) >= self.cfg.watch.max_quoted_baskets or _utc() - self.started > pd.Timedelta(minutes=2):
+                    self.hot_ready = True
                 if hot != self.hot:
                     self.dirty |= set(hot) ^ set(self.hot)
                     self.hot = hot

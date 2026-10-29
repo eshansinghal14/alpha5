@@ -724,7 +724,7 @@ def test_print_through_an_unquoted_basket_is_logged_as_missed(arbs):
     book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
     book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
     _eval(r, b)
-    r.hot = []
+    r.hot, r.hot_ready = [], True
     px = r.quote_px[b.basket_id][0][0]
     from kalshi_backtest.core import Trade
     r._on_trade("X-A", Trade(ticker="X-A", time=pd.Timestamp.now(tz="UTC"), price=px, size=3.0, taker_side="no"))
