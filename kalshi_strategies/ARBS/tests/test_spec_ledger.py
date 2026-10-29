@@ -33,8 +33,16 @@ def test_ledger_roundtrip_bundles_and_broken(tmp_path):
     assert led2.net_by_ticker() == {"A": 5, "B": -5}
 
 
-def test_quote_ids_pruned_after_a_day(tmp_path):
+def test_quote_ids_saved_apart_and_pruned_after_an_hour(tmp_path):
     led = Ledger(str(tmp_path / "l.json"))
-    led.quote_ids = {"x": {"retired_at": 0.0}, "y": {"retired_at": None}}
-    led.save(now=90000.0)
-    assert set(json.load(open(tmp_path / "l.json"))["quote_ids"]) == {"y"}
+    led.quote_ids = {"x": {"retired_at": 0.0}, "y": {"retired_at": None}, "z": {"retired_at": 4000.0}}
+    led.save_quote_ids(now=5000.0)
+    led.save()
+    assert set(json.load(open(tmp_path / "l_quote_ids.json"))) == {"y", "z"}
+    assert "quote_ids" not in json.load(open(tmp_path / "l.json"))
+    assert set(Ledger(str(tmp_path / "l.json")).quote_ids) == {"y", "z"}
+
+
+def test_quote_ids_read_from_an_old_ledger(tmp_path):
+    (tmp_path / "l.json").write_text(json.dumps({"baskets": {}, "quote_ids": {"o": {"retired_at": None}}}))
+    assert set(Ledger(str(tmp_path / "l.json")).quote_ids) == {"o"}

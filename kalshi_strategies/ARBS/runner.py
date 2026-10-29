@@ -297,10 +297,11 @@ class ArbsRunner:
         self.last_top: dict[str, tuple] = {}
         self.hot_churn: collections.deque = collections.deque()   # (time, entered, left) per hot-list change
         self.hot_cost = 0.0                       # estimated write tokens/s of quoting the hot list
-        # New quote ids are saved by ledger_flush_loop, not per placement: a
-        # synchronous ledger write per quote held the loop ~200 ms each and
-        # queued a live exit 7 s behind a burst of placements (FURIABB-2 10-29).
-        self.ledger_dirty = False
+        # Quote ids are saved by ledger_flush_loop, not per placement: a
+        # synchronous write per quote held the loop ~200 ms each and queued a
+        # live exit 7 s behind a burst of placements (FURIABB-2 10-29). Dirty
+        # at start so ids read from a pre-split ledger reach their own file.
+        self.ids_dirty = True
         self._horizon: tuple[float, pd.Timestamp] | None = None
         # Live order round trips, flushed with the liquidity log (orders_*.jsonl.gz).
         self.order_times: list[dict] = []
@@ -796,6 +797,7 @@ class ArbsRunner:
             del self.quotes[q.key]
         if q.exchange_id and q.exchange_id in self.real_ledger.quote_ids:
             self.real_ledger.quote_ids[q.exchange_id]["retired_at"] = time.time()
+            self.ids_dirty = True
 
     def apply_real_fill(self, f: dict, source: str) -> bool:
         """A Kalshi fill dict (ws or REST). Booked only if it is one of our
@@ -1387,7 +1389,7 @@ class ArbsRunner:
         if oid:
             self.real_ledger.quote_ids[oid] = {"basket_id": q.basket_id, "ticker": q.ticker, "side": q.side,
                                                "retired_at": None}
-            self.ledger_dirty = True
+            self.ids_dirty = True
         self._replay_orphans()
 
     async def _find_lost(self, q: Quote):
@@ -1472,6 +1474,7 @@ class ArbsRunner:
                     self.alert("error", None, f"sweep cancel {oid} on {ticker} failed ({exc!r})")
                 elif oid in self.real_ledger.quote_ids:
                     self.real_ledger.quote_ids[oid]["retired_at"] = time.time()
+                    self.ids_dirty = True
 
     # ------------------------------------------------------------------ ranking
 
@@ -1822,12 +1825,12 @@ class ArbsRunner:
     async def ledger_flush_loop(self):
         while True:
             await asyncio.sleep(1.0)
-            if self.ledger_dirty:
-                self.ledger_dirty = False
+            if self.ids_dirty:
+                self.ids_dirty = False
                 try:
-                    self.real_ledger.save(time.time())
+                    self.real_ledger.save_quote_ids(time.time())
                 except Exception as e:
-                    _log(f"WARN: ledger save failed ({e!r})")
+                    _log(f"WARN: quote id save failed ({e!r})")
 
     async def summary_loop(self):
         while True:
@@ -1874,7 +1877,7 @@ class ArbsRunner:
                 _log("WARN: shutdown cleanup failed -- CHECK KALSHI BY HAND for resting orders:")
                 traceback.print_exc()
             await asyncio.gather(*tasks, return_exceptions=True)
-            self.real_ledger.save(time.time())
+            self.real_ledger.save_quote_ids(time.time())
             atomic_write_json(os.path.join(day_dir(self.S, f"{_utc():%Y-%m-%d}"), "summary.json"), self.summary(),
                               indent=None)
             self.pool.shutdown(wait=False)

@@ -62,6 +62,10 @@ class BasketPos:
 class Ledger:
     def __init__(self, path: str | None):
         self.path = path
+        # Quote ids live in their own file, saved on a timer: kept in the
+        # ledger they made every fill's save ~40 ms (0.9 MB, 10-29), and nine
+        # fills in one burst booked 240 ms late.
+        self.ids_path = None if path is None else os.path.splitext(path)[0] + "_quote_ids.json"
         self.baskets: dict[str, BasketPos] = {}
         # exchange order id -> {basket_id, ticker, side, retired_at}: every
         # quote we placed, so a maker fill (websocket, REST backstop, or one
@@ -79,7 +83,10 @@ class Ledger:
         for bid, b in d.get("baskets", {}).items():
             self.baskets[bid] = BasketPos(legs={t: LegPos(**l) for t, l in b["legs"].items()},
                                           broken_since=b.get("broken_since"), spec=b.get("spec"))
-        self.quote_ids = d.get("quote_ids", {})
+        self.quote_ids = d.get("quote_ids", {})          # before the split
+        if os.path.exists(self.ids_path):
+            with open(self.ids_path, encoding="utf-8") as fh:
+                self.quote_ids = json.load(fh)
         self.last_fill_ts = d.get("last_fill_ts")
         self.seen_trades = set(d.get("seen_trades", []))
         self.settled = d.get("settled", [])
@@ -87,21 +94,23 @@ class Ledger:
     def save(self, now: float | None = None):
         if not self.path:
             return
-        if now is not None:
-            # A retired quote's late fills arrive within seconds. A day of ids
-            # made the file 7 MB (36k ids, 10-29), rewritten on every save.
-            self.quote_ids = {k: v for k, v in self.quote_ids.items()
-                              if v.get("retired_at") is None or now - v["retired_at"] < 3600}
         atomic_write_json(self.path, {
             "baskets": {bid: {"legs": {t: dataclasses.asdict(l) for t, l in b.legs.items()},
                               "broken_since": b.broken_since, "spec": b.spec}
                         for bid, b in self.baskets.items() if b.legs},
-            "quote_ids": self.quote_ids,
             "last_fill_ts": self.last_fill_ts,
             # Bounded: only dedupes quote fills replayed from the REST backstop.
             "seen_trades": sorted(self.seen_trades)[-20000:],
             "settled": self.settled,
         }, indent=None)
+
+    def save_quote_ids(self, now: float):
+        if not self.ids_path:
+            return
+        # A retired quote's late fills arrive within seconds; an hour is ample.
+        self.quote_ids = {k: v for k, v in self.quote_ids.items()
+                          if v.get("retired_at") is None or now - v["retired_at"] < 3600}
+        atomic_write_json(self.ids_path, self.quote_ids, indent=None)
 
     def close(self, basket_id: str, row: dict):
         """Move a fully settled basket to the settled history."""
