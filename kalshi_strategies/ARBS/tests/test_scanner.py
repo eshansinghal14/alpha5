@@ -23,10 +23,10 @@ def event(et, crt, markets, series=None, shard=0):
 def run(events, days=90, max_markets=1000, known_tickers=frozenset(), held=frozenset(), exclude=frozenset(),
         **kw):
     """scan then select, as the runner sees it."""
-    args = dict(now=NOW, mecnet_max_legs=6, ladder_span=3, complete_set_series=[], overrides={})
-    doc, review = scanner.scan(events, **{**args, **kw})
+    args = dict(now=NOW, mecnet_max_legs=6, ladder_span=3, complete_set_exclude=[], overrides={})
+    doc = scanner.scan(events, **{**args, **kw})
     return scanner.select(doc, now=NOW, days=days, max_markets=max_markets, known_tickers=known_tickers,
-                          held=held, exclude=exclude), review
+                          held=held, exclude=exclude)
 
 
 def baskets(doc):
@@ -41,7 +41,7 @@ def buckets(et):
 
 def test_mecnet_lists_no_on_the_likeliest_k():
     e = event("EV-1", "MECNET", [mkt("EV-1-A", 0.1), mkt("EV-1-B", 0.6), mkt("EV-1-C", 0.3)])
-    bs = baskets(run([e])[0])
+    bs = baskets(run([e]))
     assert set(bs) == {"mecnet:EV-1:no:B+C", "mecnet:EV-1:no:B+C+A"}
     b = bs["mecnet:EV-1:no:B+C+A"]
     assert b.payout == 2 and {l.side for l in b.legs} == {"no"}
@@ -50,7 +50,7 @@ def test_mecnet_lists_no_on_the_likeliest_k():
 def test_ladder_pairs_strikes_within_span():
     ms = [mkt(f"L-1-T{k}", strike_type="greater", floor_strike=k) for k in range(5)]
     ms.append(mkt("L-1-X", strike_type="greater_or_equal", floor_strike=2))
-    bs = baskets(run([event("L-1", "DIRECNET", ms)], ladder_span=2)[0])
+    bs = baskets(run([event("L-1", "DIRECNET", ms)], ladder_span=2))
     b = bs["ladder:L-1:T2=>T0"]
     assert b.payout == 1 and b.legs == (Leg("L-1-T0", "yes"), Leg("L-1-T2", "no"))
     assert "ladder:L-1:T3=>T0" not in bs              # 3 rungs up, past the span
@@ -59,20 +59,16 @@ def test_ladder_pairs_strikes_within_span():
 
 def test_less_ladder_runs_downward():
     ms = [mkt(f"D-1-T{k}", strike_type="less", cap_strike=k) for k in (1, 2)]
-    b = baskets(run([event("D-1", "DIRECNET", ms)])[0])["ladder:D-1:T1=>T2"]
+    b = baskets(run([event("D-1", "DIRECNET", ms)]))["ladder:D-1:T1=>T2"]
     # below 1 implies below 2: YES <2 + NO <1 pays at least 1.
     assert b.legs == (Leg("D-1-T2", "yes"), Leg("D-1-T1", "no"))
 
 
-def test_complete_set_only_once_series_approved():
+def test_covering_buckets_trade_as_complete_set_unless_excluded():
     e = event("BK-1", "MECNET", buckets("BK-1"))
-    doc, review = run([e])
-    assert "BK" in review["series"] and review["series"]["BK"]["max_gap"] == 0
-    assert not any(b.type == "complete_set" for b in parse_spec(doc))
-    doc, review = run([e], complete_set_series=["BK"])
-    bs = baskets(doc)
+    bs = baskets(run([e]))
     assert bs["complete_set:BK-1:buy_all_yes"].payout == 1 and bs["complete_set:BK-1:buy_all_no"].payout == 2
-    assert not review["series"]
+    assert not any(b.type == "complete_set" for b in parse_spec(run([e], complete_set_exclude=["BK"])))
 
 
 def test_coverage_rejects_overlap_and_missing_tail():
@@ -92,21 +88,21 @@ def test_filters_and_market_budget():
     big = event("BIG-1", "MECNET", [mkt("BIG-1-A", vol=500), mkt("BIG-1-B", vol=500)])
     other = event("OS-1", "MECNET", [mkt("OS-1-A", vol=900), mkt("OS-1-B", vol=900)], shard=3)
     small = event("SM-1", "MECNET", [mkt("SM-1-A", vol=1), mkt("SM-1-B", vol=1), mkt("SM-1-C", vol=1)])
-    doc, _ = run([far, mine, other, small, big], max_markets=4, skip_series={"KXINXU"})
+    doc = run([far, mine, other, small, big], max_markets=4, skip_series={"KXINXU"})
     # FAR settles past 90 days, KXINXU belongs to another strategy, OS is on an
     # unfunded shard, and SM's 3 markets don't fit beside BIG's 2.
     assert {b.relationship_id for b in parse_spec(doc)} == {"mecnet:BIG-1"}
-    doc, _ = run([far, small, big], max_markets=4, known_tickers={"SM-1-A", "SM-1-B"})
+    doc = run([far, small, big], max_markets=4, known_tickers={"SM-1-A", "SM-1-B"})
     assert {b.relationship_id for b in parse_spec(doc)} == {"mecnet:BIG-1", "mecnet:SM-1"}
-    doc, _ = run([far, small, big], max_markets=4, exclude={"BIG"})
+    doc = run([far, small, big], max_markets=4, exclude={"BIG"})
     assert {b.relationship_id for b in parse_spec(doc)} == {"mecnet:SM-1"}
 
 
 def test_scan_lists_everything_and_select_keeps_held():
     far = event("FAR-1", "MECNET", [mkt("FAR-1-A"), mkt("FAR-1-B", expected_expiration_time="2027-06-01T00:00:00Z")])
     big = event("BIG-1", "MECNET", [mkt("BIG-1-A", vol=500), mkt("BIG-1-B", vol=500)])
-    doc, _ = scanner.scan([far, big], now=NOW, mecnet_max_legs=6, ladder_span=3, complete_set_series=[],
-                          overrides={})
+    doc = scanner.scan([far, big], now=NOW, mecnet_max_legs=6, ladder_span=3, complete_set_exclude=[],
+                       overrides={})
     assert doc["n_markets"] == 4 and [r["volume_24h"] for r in doc["relationships"]] == [20.0, 1000.0]
     got = scanner.select(doc, now=NOW, days=90, max_markets=0, held={"mecnet:FAR-1:no:A+B"})
     assert [r["relationship_id"] for r in got["relationships"]] == ["mecnet:FAR-1"]
@@ -116,8 +112,8 @@ def test_series_override_sets_settlement():
     e = event("KXMIDTERMMOV-X", "DIRECNET", [mkt("KXMIDTERMMOV-X-P1", strike_type="greater", floor_strike=1,
                                                  expected_expiration_time="2027-11-03T15:00:00Z"),
                                              mkt("KXMIDTERMMOV-X-P2", strike_type="greater", floor_strike=2)])
-    assert not run([e])[0]["relationships"]
-    b = next(iter(baskets(run([e], overrides={"KXMIDTERMMOV": "2026-12"})[0]).values()))
+    assert not run([e])["relationships"]
+    b = next(iter(baskets(run([e], overrides={"KXMIDTERMMOV": "2026-12"})).values()))
     assert b.settles == pd.Timestamp("2026-12-31 23:59:59.999999999", tz="UTC")
 
 
@@ -135,15 +131,15 @@ def test_run_carries_over_held_relationships(tmp_path, monkeypatch):
     from kalshi_infra.config import ConfigStore
     from kalshi_strategies.ARBS.config import CONFIG_PATH
     cfg = ConfigStore(ArbsConfig, CONFIG_PATH, None).config
-    spec, review = str(tmp_path / "s.json"), str(tmp_path / "r.json")
+    spec = str(tmp_path / "s.json")
     monkeypatch.setattr(scanner, "other_series", lambda: set())
     monkeypatch.setattr(scanner, "fetch_events",
                         lambda: [event("EV-1", "MECNET", [mkt("EV-1-A"), mkt("EV-1-B")])])
-    scanner.run(cfg, {}, spec, review)
+    scanner.run(cfg, {}, spec)
     monkeypatch.setattr(scanner, "fetch_events", lambda: [])
-    scanner.run(cfg, {}, spec, review, held={"mecnet:EV-1:no:A+B"})
+    scanner.run(cfg, {}, spec, held={"mecnet:EV-1:no:A+B"})
     with open(spec) as fh:
         assert [r["relationship_id"] for r in json.load(fh)["relationships"]] == ["mecnet:EV-1"]
-    scanner.run(cfg, {}, spec, review)
+    scanner.run(cfg, {}, spec)
     with open(spec) as fh:
         assert json.load(fh)["relationships"] == []

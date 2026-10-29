@@ -38,6 +38,7 @@ from kalshi_strategies.ARBS.config import SPEC_PATH
 from kalshi_strategies.ARBS.execution import Gateway
 from kalshi_strategies.ARBS.feed import MultiFeed
 from kalshi_strategies.ARBS.ledger import Ledger
+from kalshi_strategies.ARBS.liquidity import Liquidity
 from kalshi_strategies.ARBS.spec import Basket, load_spec, merge, parse_spec
 
 _EPS = 1e-9
@@ -122,9 +123,7 @@ class ArbsRunner:
             self.hand_doc = json.load(fh)
         self.hand = load_spec(SPEC_PATH)
         self.scan_path = os.path.join(self.root, "scanned_spec.json")
-        self.review_path = os.path.join(self.root, "scan_review.json")
         self.scan_status: dict = {}
-        self.review_seen: set[str] = set()
         self.set_baskets(merge(self.hand, self.scanned()))
         self.arm_want = live_trading
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=16, thread_name_prefix="arbs")
@@ -148,6 +147,7 @@ class ArbsRunner:
         self.n = {"takes": 0, "take_bundles": 0.0, "quotes_placed": 0, "quote_moves": 0, "quote_cancels": 0,
                   "quote_fills": 0, "completions": 0, "completion_short": 0, "post_only_rejects": 0}
         self.started = _utc()
+        self.liq = Liquidity(self.root)
 
     # ------------------------------------------------------------------ util
 
@@ -272,6 +272,16 @@ class ArbsRunner:
         self.feed.add(new)
         _log(f"spec reloaded: {len(self.all_baskets)} baskets over {len(self.tickers)} markets (+{len(new)})")
 
+    async def liquidity_loop(self):
+        loop = asyncio.get_running_loop()
+        while True:
+            await asyncio.sleep(self.cfg.runtime.liquidity_log_s)
+            try:
+                rows = self.liq.flush(time.monotonic(), time.time())
+                await loop.run_in_executor(self.pool, self.liq.write, rows, f"{_utc():%Y-%m-%d}")
+            except Exception as e:
+                _log(f"WARN: liquidity log failed ({e!r})")
+
     async def scan_loop(self):
         loop = asyncio.get_running_loop()
         while True:
@@ -280,17 +290,12 @@ class ArbsRunner:
                 if sc.enable:
                     t0 = time.monotonic()
                     held = set(self.real_ledger.baskets) | set(self.shadow_ledger.baskets)
-                    review = await loop.run_in_executor(self.pool, scanner.run, self.cfg, self.hand_doc,
-                                                        self.scan_path, self.review_path, held)
+                    doc = await loop.run_in_executor(self.pool, scanner.run, self.cfg, self.hand_doc,
+                                                     self.scan_path, held)
                     await self.reload_spec()
-                    fresh = set(review["series"]) - self.review_seen
-                    if fresh:
-                        self.alert("warn", None, f"scan: {len(fresh)} series may be complete sets, e.g. "
-                                                 f"{', '.join(sorted(fresh)[:5])}; see scan_review.json")
-                        self.review_seen |= fresh
                     self.scan_status = {"at": _utc().isoformat(), "secs": round(time.monotonic() - t0, 1),
-                                        "baskets": len(self.all_baskets) - len(self.hand),
-                                        "review": len(review["series"]), "error": None}
+                                        "listed_markets": doc["n_markets"],
+                                        "baskets": len(self.all_baskets) - len(self.hand), "error": None}
                 elif len(self.all_baskets) > len(self.hand):
                     await self.reload_spec()
             except Exception as e:
@@ -417,10 +422,12 @@ class ArbsRunner:
         return None if any(v is None for v in vs) else vs
 
     def _on_quote(self, book):
+        self.liq.on_book(book.ticker, time.monotonic(), book.ask, book.ask_depth, book.bid, book.bid_depth)
         for bid in self.by_ticker.get(book.ticker, ()):
             self.dirty.add(bid)
 
     def _on_trade(self, ticker, trade):
+        self.liq.on_trade(ticker, trade.size)
         if self.live:
             return
         maker = {"yes": "no", "no": "yes"}.get(trade.taker_side)
@@ -1187,6 +1194,7 @@ class ArbsRunner:
         trading, stopper, stop = TradingModeWatcher(self.S), StopWatcher(), asyncio.Event()
         coros = [self.feed.run(), self.eval_loop(), self.rank_loop(), self.meta_loop(), self.fill_poll_loop(),
                  self.audit_loop(), self.guard_loop(), self.summary_loop(), self.scan_loop(),
+                 self.liquidity_loop(),
                  self.control_loop(trading, stopper, stop)]
         tasks = [asyncio.create_task(c) for c in coros]
         try:

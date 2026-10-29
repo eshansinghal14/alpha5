@@ -7,9 +7,11 @@ relationships in the hand spec's format, written to scanned_spec.json.
              scan time so the subsets that can clear are the ones listed.
   coverage   MECNET buckets running from a "below" tail through between ranges
              to an "above" tail are exhaustive as well: a complete set (both
-             directions). Only for series in scan.complete_set_series, since a
-             gap at a bucket edge pays zero; others are listed in
-             scan_review.json.
+             directions), unless the series is in scan.complete_set_exclude.
+             Of the 3,600 such events the API still returns as settled
+             (10-29 check, ~68 days, 59 series), 3,598 paid exactly one YES;
+             INX-24OCT25 and NASDAQ100-24OCT25 settled every bucket NO with
+             no value (voided), which no rule here can see coming.
   DIRECNET   for strikes a < b, YES >=a and NO >=b pays at least 1; each
              strike is paired with the next scan.ladder_span above it (a
              200-strike KXBTCD ladder is 20k pairs otherwise).
@@ -88,7 +90,7 @@ def coverage_step(markets: list[dict]) -> float | None:
     """The widest gap between neighbouring bucket edges if the markets run
     below-tail, contiguous betweens, above-tail with no overlap; else None.
     0 is exact coverage; a gap of 1 or 0.1 is fine when the value is reported
-    at that resolution, which is what the review is for."""
+    at that resolution."""
     lo = [m for m in markets if m.get("strike_type") in DOWN]
     hi = [m for m in markets if m.get("strike_type") in UP]
     mid = [m for m in markets if m.get("strike_type") == "between"]
@@ -157,12 +159,11 @@ def ladder(event: dict, markets: list[dict], span: int) -> list[dict]:
 
 
 def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_span: int,
-         complete_set_series: list[str], overrides: dict[str, str], shards=(0,),
-         skip_series: set[str] = frozenset()) -> tuple[dict, dict]:
-    """(spec doc, review doc). Every relationship found, each with its
-    event's expected settlement and 24h volume for `select`."""
-    approved = set(complete_set_series)
-    rels, review, tickers = [], {}, set()
+         complete_set_exclude: list[str], overrides: dict[str, str], shards=(0,),
+         skip_series: set[str] = frozenset()) -> dict:
+    """Every relationship found, each with its event's expected settlement
+    and 24h volume for `select`."""
+    rels, tickers = [], set()
     for e in events:
         if e.get("collateral_return_type") not in ("MECNET", "DIRECNET") or e.get("series_ticker") in skip_series \
                 or e.get("exchange_index") not in shards:
@@ -173,15 +174,9 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
         if len(ms) < 2 or s is None:
             continue
         if e["collateral_return_type"] == "MECNET":
-            step = coverage_step(ms) if len(ms) == len(e["markets"]) else None
-            ok = step is not None and e["series_ticker"] in approved
-            if step is not None and not ok:
-                r = review.setdefault(e["series_ticker"], {"events": 0, "max_gap": 0.0, "example": e["event_ticker"],
-                                                           "buckets": [m.get("yes_sub_title") for m in
-                                                                       sorted(ms, key=_bucket_key)]})
-                r["events"] += 1
-                r["max_gap"] = max(r["max_gap"], step)
-            got = mecnet(e, ms, mecnet_max_legs, ok)
+            complete = len(ms) == len(e["markets"]) and coverage_step(ms) is not None \
+                and e["series_ticker"] not in complete_set_exclude
+            got = mecnet(e, ms, mecnet_max_legs, complete)
         else:
             got = ladder(e, ms, ladder_span)
         vol = round(sum(_f(m.get("volume_24h_fp")) for m in ms), 2)
@@ -190,13 +185,9 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
                      volume_24h=vol)
             tickers |= {l["ticker"] for b in r["baskets"] for l in b["legs"]}
         rels += got
-    doc = {"generated_at_utc": now.isoformat(), "source": "kalshi_strategies.ARBS.scanner",
-           "n_events": len({r["relationship_id"].split(":", 1)[1] for r in rels}), "n_markets": len(tickers),
-           "relationships": rels}
-    return doc, {"generated_at_utc": now.isoformat(),
-                 "note": "MECNET bucket series that look exhaustive. Add a series to scan.complete_set_series once "
-                         "its rules confirm a gap of max_gap between buckets can't happen.",
-                 "series": review}
+    return {"generated_at_utc": now.isoformat(), "source": "kalshi_strategies.ARBS.scanner",
+            "n_events": len({r["relationship_id"].split(":", 1)[1] for r in rels}), "n_markets": len(tickers),
+            "relationships": rels}
 
 
 def select(doc: dict, *, now: pd.Timestamp, days: float, max_markets: int, known_tickers: set[str] = frozenset(),
@@ -226,22 +217,15 @@ def other_series() -> set[str]:
     return {t for t, s in registry().items() if t != "ARBS"}
 
 
-def _bucket_key(m: dict) -> float:
-    for f in ("floor_strike", "cap_strike"):
-        if m.get(f) is not None:
-            return float(m[f]) + (0.5 if m.get("strike_type") in UP else 0.0)
-    return float("-inf")
-
-
-def run(cfg, hand_doc: dict, spec_path: str, review_path: str, held: set[str] = frozenset()) -> dict:
-    """Blocking: fetch, scan, write both files. Returns the review doc.
-    Relationships of the previous file holding a basket in `held` are carried
-    over, so a position the scan no longer lists survives a restart."""
-    doc, review = scan(fetch_events(), now=pd.Timestamp.now(tz="UTC"), mecnet_max_legs=cfg.scan.mecnet_max_legs,
-                       ladder_span=cfg.scan.ladder_span, complete_set_series=cfg.scan.complete_set_series,
-                       shards=set(cfg.scan.shards), skip_series=other_series(),
-                       overrides={s: v["expected_settlement_month"]
-                                  for s, v in (hand_doc.get("settlement_basis_by_series") or {}).items()})
+def run(cfg, hand_doc: dict, spec_path: str, held: set[str] = frozenset()) -> dict:
+    """Blocking: fetch, scan, write the file; returns the doc. Relationships
+    of the previous file holding a basket in `held` are carried over, so a
+    position the scan no longer lists survives a restart."""
+    doc = scan(fetch_events(), now=pd.Timestamp.now(tz="UTC"), mecnet_max_legs=cfg.scan.mecnet_max_legs,
+               ladder_span=cfg.scan.ladder_span, complete_set_exclude=cfg.scan.complete_set_exclude,
+               shards=set(cfg.scan.shards), skip_series=other_series(),
+               overrides={s: v["expected_settlement_month"]
+                          for s, v in (hand_doc.get("settlement_basis_by_series") or {}).items()})
     have = {r["relationship_id"] for r in doc["relationships"]}
     try:
         with open(spec_path, encoding="utf-8") as fh:
@@ -252,8 +236,7 @@ def run(cfg, hand_doc: dict, spec_path: str, review_path: str, held: set[str] = 
         if r["relationship_id"] not in have and any(b["basket_id"] in held for b in r["baskets"]):
             doc["relationships"].append(r)
     atomic_write_json(spec_path, doc, indent=None)
-    atomic_write_json(review_path, review, indent=1)
-    return review
+    return doc
 
 
 if __name__ == "__main__":
@@ -267,12 +250,8 @@ if __name__ == "__main__":
         hand = json.load(fh)
     led = os.path.join(root, "ledger.json")
     held = set(json.load(open(led, encoding="utf-8")).get("baskets") or {}) if os.path.exists(led) else set()
-    rv = run(ConfigStore(ArbsConfig, CONFIG_PATH, None).config, hand,
-             os.path.join(root, "scanned_spec.json"), os.path.join(root, "scan_review.json"), held)
-    with open(os.path.join(root, "scanned_spec.json"), encoding="utf-8") as fh:
-        d = json.load(fh)
+    d = run(ConfigStore(ArbsConfig, CONFIG_PATH, None).config, hand, os.path.join(root, "scanned_spec.json"), held)
     n = {}
     for r in d["relationships"]:
         n[r["type"]] = n.get(r["type"], 0) + len(r["baskets"])
-    print(f"{d['n_events']} events, {d['n_markets']} markets, baskets {n}; "
-          f"{len(rv['series'])} series await complete-set review")
+    print(f"{d['n_events']} events, {d['n_markets']} markets, baskets {n}")

@@ -31,7 +31,7 @@
     "interval_s": 900.0,
     "mecnet_max_legs": 6,
     "ladder_span": 3,
-    "complete_set_series": []
+    "complete_set_exclude": []
   },
   "runtime": {
     "control_poll_s": 1.0,
@@ -41,6 +41,7 @@
     "fill_poll_s": 5.0,
     "meta_refresh_s": 300.0,
     "max_order_errors": 5,
+    "liquidity_log_s": 300.0,
     "feed_down_pull_s": 5.0
   }
 }

@@ -90,9 +90,9 @@ class ScanParams:
                                  min=2, max=50, step=1, editable=False)
     ladder_span: int = param("DIRECNET strikes each strike is paired with, going up the ladder.", min=1, max=100,
                              step=1, editable=False)
-    complete_set_series: list[str] = param("Series whose MECNET buckets were checked to cover every outcome "
-                                           "(candidates in data/live/ARBS/scan_review.json); they also trade "
-                                           "as complete sets.", editable=False)
+    complete_set_exclude: list[str] = param("Series whose MECNET buckets are not traded as complete sets "
+                                            "(buy every YES / every NO), though they look like they cover "
+                                            "every outcome.", editable=False)
 
 
 @section
@@ -114,6 +114,8 @@ class RuntimeParams:
                                   editable=False)
     max_order_errors: int = param("Consecutive order errors that stop new takes and quotes until a clean "
                                   "response.", min=1, max=100, step=1, editable=False)
+    liquidity_log_s: float = param("Seconds per row of the per-market liquidity log "
+                                   "(data/live/ARBS/liquidity/).", min=30.0, step=30.0, editable=False)
     feed_down_pull_s: float = param("Pull every quote once the Kalshi websocket has been down this long.",
                                     min=0.0, step=1.0, editable=False)
 
