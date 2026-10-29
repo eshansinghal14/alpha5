@@ -121,8 +121,13 @@ def _tables(series: str, s: dict):
     st.markdown("##### Bundles bought (newest first)")
     log = _bundle_log(series)
     if len(log):
+        small = st.column_config.Column(width="small")
         st.dataframe(_local(log.head(200).copy(), "time"), use_container_width=True, hide_index=True,
-                     column_config={"time": TIME_COL})
+                     column_order=["time", "series", "basket_id", "how", "bundles", "cost", "pnl", "return", "fills"],
+                     column_config={"time": st.column_config.DatetimeColumn(format="MM-DD HH:mm:ss", width="small"),
+                                    "series": small, "basket_id": st.column_config.Column(width="medium"),
+                                    "how": small, "bundles": small, "cost": small, "pnl": small, "return": small,
+                                    "fills": st.column_config.Column(width="medium")})
     else:
         st.caption("None.")
     st.markdown("##### Resting quotes")
