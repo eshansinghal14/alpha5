@@ -78,11 +78,13 @@ def _tables(s: dict):
     h = s.get("holdings") or []
     if h:
         df = pd.DataFrame(h)
+        # Series tickers, the part of a market ticker Kalshi's search finds.
+        df["series"] = df["held"].map(lambda d: " ".join(dict.fromkeys(t.split("-", 1)[0] for t in d)))
         df["held"] = df["held"].map(lambda d: ", ".join(f"{t.split('-', 1)[-1]} {q:g}" for t, q in d.items()))
         df["status"] = df["unhedged"].map(lambda u: "INCOMPLETE" if u else "complete")
         df["return"] = (df["locked_pnl"].fillna(0) / df["cost"].where(df["cost"] > 0)).map(
             lambda v: "" if pd.isna(v) else f"{v:.2%}")
-        st.dataframe(df[["basket_id", "type", "status", "bundles", "payout", "cost", "locked_pnl", "return", "held"]]
+        st.dataframe(df[["series", "basket_id", "type", "status", "bundles", "payout", "cost", "locked_pnl", "return", "held"]]
                      .sort_values("status", ascending=False), use_container_width=True, hide_index=True)
     else:
         st.caption("None.")
