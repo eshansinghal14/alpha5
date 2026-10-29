@@ -131,9 +131,16 @@ def _pnl_frame(series: str) -> pd.DataFrame:
 
 PNL_WINDOWS = {"6h": pd.Timedelta(hours=6), "24h": pd.Timedelta(hours=24), "7d": pd.Timedelta(days=7), "All": None}
 def _pnl_chart(series: str):
-    """Guaranteed PnL, real money only, from the journal: settled plus what
-    complete bundles held lock in. Starts at 0 at the window's start."""
+    """Settled + open PnL, real money only. History is replayed from the
+    journal (settled plus what complete bundles lock in); the last point adds
+    unfinished baskets at what their extra legs would sell for now, so it
+    matches the header. Starts at 0 at the window's start."""
     df = _pnl_frame(series)
+    s = read_summary(series)
+    if len(df) and s and s.get("ledger") == "real":
+        df = pd.concat([df, pd.DataFrame({"time": [pd.Timestamp.now(tz="UTC")], "settled": [df.settled.iloc[-1]],
+                                          "total": [df.total.iloc[-1] + ((s.get("pnl") or {}).get("broken") or 0.0)]})],
+                       ignore_index=True)
     if df.empty:
         st.caption("No live fills yet.")
         return
@@ -147,7 +154,7 @@ def _pnl_chart(series: str):
                       "usd": [0.0] + [float(v) - b0 for v in d.total]})
     chart = alt.Chart(c).mark_line(interpolate="step-after", strokeWidth=2, color="#1e88e5").encode(
         x=alt.X("time:T", title=None, axis=alt.Axis(format="%m-%d %H:%M")),
-        y=alt.Y("usd:Q", title="Guaranteed PnL $ (cumulative)"),
+        y=alt.Y("usd:Q", title="Settled + open PnL $"),
         tooltip=[alt.Tooltip("time:T", format="%m-%d %H:%M:%S"), alt.Tooltip("usd:Q", format="+.2f")])
     zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#888", strokeWidth=0.7).encode(y="y:Q")
     st.altair_chart((chart + zero).properties(height=260), use_container_width=True)
