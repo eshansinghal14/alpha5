@@ -619,7 +619,7 @@ class ArbsRunner:
         score, fastest = 0.0, float("inf")
         px = []
         for j, leg in enumerate(b.legs):
-            size = float(max(1, min(t.quote_size, int(pricing.touch_size(vs, j) + _EPS))))
+            size = max(1.0, pricing.depth_size(vs, j, b.payout, need, float(t.quote_size)))
             plan = pricing.quote_leg(vs, j, b.payout, need, size)
             px.append(None if plan is None else (plan.price, plan.edge, size))
             if plan is None:
@@ -1066,15 +1066,18 @@ class ArbsRunner:
             if q is not None and q.pending:
                 continue
             plan, size = None, 0.0
-            # No bigger than the other legs' touch: a fill then completes at
-            # the prices it was quoted against, not a level further in.
-            touch = float(int(pricing.touch_size(vs, j) + _EPS))
+            # As big as the other legs' books can complete at the edge needed,
+            # at the price the smallest quote would rest at: sized to their
+            # touch only, quotes after a full fill left ~1,870 more bundles
+            # that traded through our price unfilled (10-28/29, non-live).
             if want and ex >= 1:
-                size = min(cap, float(ex), touch)
+                need = self.exit_need(b, quote_need, now_ts)
+                size = pricing.depth_size(vs, j, b.payout, need, min(cap, float(ex)))
                 if size >= 1 and (q is None or q.remaining <= size + _EPS):
-                    plan = pricing.quote_leg(vs, j, b.payout, self.exit_need(b, quote_need, now_ts), size)
+                    plan = pricing.quote_leg(vs, j, b.payout, need, size)
             elif want:
-                size = min(cap, self.room_bundles(b, j), float(self.quote_size_by_dollars(b)), touch)
+                room = min(cap, self.room_bundles(b, j), float(self.quote_size_by_dollars(b)))
+                size = pricing.depth_size(vs, j, b.payout, quote_need, float(int(room + _EPS)))
                 if size >= 1 and (q is None or q.remaining <= size + _EPS):
                     plan = pricing.quote_leg(vs, j, b.payout, quote_need, size)
             if plan is None:

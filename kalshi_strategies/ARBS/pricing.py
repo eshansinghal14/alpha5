@@ -203,6 +203,34 @@ def quote_leg(legs: list[LegView], j: int, payout: float, required_edge: float, 
                      edge=payout - others - maker_cost(price, lv.maker_rate), others_cost=others)
 
 
+def depth_size(legs: list[LegView], j: int, payout: float, required_edge: float, cap: float) -> float:
+    """Largest whole size, up to `cap`, that leg j can rest at its smallest
+    quote's price and still have a fill completed through the other legs'
+    books (each taken at the worst level that size reaches) for
+    `required_edge`. 0 if not even 1 works."""
+    first = quote_leg(legs, j, payout, required_edge, 1.0)
+    if first is None or cap < 1:
+        return 0.0
+    # Sizes where some other leg's worst level changes, then the cap.
+    marks = {float(cap)}
+    for i, lv in enumerate(legs):
+        if i == j:
+            continue
+        got = 0.0
+        for _, q in lv.asks:
+            got += q
+            if got >= cap:
+                break
+            marks.add(float(int(got + _EPS)))
+    best = 1.0
+    for n in sorted(m for m in marks if m >= 1):
+        plan = quote_leg(legs, j, payout, required_edge, n)
+        if plan is None or plan.max_price < first.price - _EPS:
+            break
+        best = n
+    return best
+
+
 def touch_size(legs: list[LegView], j: int) -> float:
     """Contracts every leg but j offers at its best ask: what a fill on leg j
     can be completed with without walking past the touch."""

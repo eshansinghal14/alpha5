@@ -109,3 +109,17 @@ def test_tapered_grid():
     b = LegView(asks=[(0.50, 5)], bid=0.40, taker_rate=T, maker_rate=0.0)
     q = quote_leg([a, b], 0, 1.0, 0.01, 1)
     assert q.price == 0.081 and q.max_price == 0.094
+
+
+def test_depth_size_grows_while_completion_through_the_book_meets_the_edge():
+    # Quote A (rests at 0.43, a tick over its 0.42 bid); B offers 10 at 0.50,
+    # 20 at 0.52, 50 at 0.60.
+    b = lv([(0.50, 10), (0.52, 20), (0.60, 50)])
+    a = pricing.LegView(asks=[(0.47, 100)], bid=0.42, taker_rate=0.07, maker_rate=0.0)
+    first = pricing.quote_leg([a, b], 0, 1.0, 0.03, 1.0)
+    assert first.price == pytest.approx(0.43)
+    # 30 completes through 0.52 within the edge at 0.43; 31+ reaches 0.60.
+    assert pricing.depth_size([a, b], 0, 1.0, 0.03, 50.0) == 30.0
+    assert pricing.depth_size([a, b], 0, 1.0, 0.03, 5.0) == 5.0
+    a_low = pricing.LegView(asks=[(0.47, 100)], bid=0.30, taker_rate=0.07, maker_rate=0.0)
+    assert pricing.depth_size([a_low, b], 0, 1.0, 0.03, 50.0) == 50.0    # 0.31 leaves room even at 0.60
