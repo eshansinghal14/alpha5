@@ -269,6 +269,11 @@ class ArbsRunner:
         # Misses count only once the hot list has filled after a start: until
         # then every print looks like one (10-29 restarts, 9-92 s in).
         self.hot_ready = False
+        # New quote ids are saved by ledger_flush_loop, not per placement: a
+        # synchronous ledger write per quote held the loop ~200 ms each and
+        # queued a live exit 7 s behind a burst of placements (FURIABB-2 10-29).
+        self.ledger_dirty = False
+        self._horizon: tuple[float, pd.Timestamp] | None = None
         # Live order round trips, flushed with the liquidity log (orders_*.jsonl.gz).
         self.order_times: list[dict] = []
 
@@ -533,9 +538,18 @@ class ArbsRunner:
         return True
 
     def excluded(self, b: Basket) -> bool:
-        if {b.basket_id, b.relationship_id, b.cluster} & set(self.cfg.watch.exclude):
+        ex = self.cfg.watch.exclude
+        if ex and (b.basket_id in ex or b.relationship_id in ex or b.cluster in ex):
             return True
-        return b.settles is not None and b.settles > _utc() + pd.Timedelta(days=self.cfg.trading.days_till_expiry)
+        return b.settles is not None and b.settles > self.horizon()
+
+    def horizon(self) -> pd.Timestamp:
+        """Latest settlement traded, refreshed once a second: evaluate asks
+        for every basket and pd.Timestamp.now() was a tenth of the loop."""
+        now = time.monotonic()
+        if self._horizon is None or now - self._horizon[0] > 1.0:
+            self._horizon = (now, _utc() + pd.Timedelta(days=self.cfg.trading.days_till_expiry))
+        return self._horizon[1]
 
     # ------------------------------------------------------------------ books
 
@@ -1336,7 +1350,7 @@ class ArbsRunner:
         if oid:
             self.real_ledger.quote_ids[oid] = {"basket_id": q.basket_id, "ticker": q.ticker, "side": q.side,
                                                "retired_at": None}
-            self.real_ledger.save()
+            self.ledger_dirty = True
         self._replay_orphans()
 
     async def _find_lost(self, q: Quote):
@@ -1719,6 +1733,16 @@ class ArbsRunner:
             "config_status": self.store.status(), "scan": self.scan_status,
         }
 
+    async def ledger_flush_loop(self):
+        while True:
+            await asyncio.sleep(1.0)
+            if self.ledger_dirty:
+                self.ledger_dirty = False
+                try:
+                    self.real_ledger.save(time.time())
+                except Exception as e:
+                    _log(f"WARN: ledger save failed ({e!r})")
+
     async def summary_loop(self):
         while True:
             await asyncio.sleep(SUMMARY_S)
@@ -1750,7 +1774,7 @@ class ArbsRunner:
         trading, stopper, stop = TradingModeWatcher(self.S), StopWatcher(), asyncio.Event()
         coros = [self.feed.run(), self.eval_loop(), self.rank_loop(), self.meta_loop(), self.fill_poll_loop(),
                  self.audit_loop(), self.guard_loop(), self.summary_loop(), self.scan_loop(),
-                 self.liquidity_loop(), self.exchange_loop(), self.write_share_loop(),
+                 self.liquidity_loop(), self.exchange_loop(), self.write_share_loop(), self.ledger_flush_loop(),
                  self.control_loop(trading, stopper, stop)]
         tasks = [asyncio.create_task(c) for c in coros]
         try:
@@ -1764,6 +1788,7 @@ class ArbsRunner:
                 _log("WARN: shutdown cleanup failed -- CHECK KALSHI BY HAND for resting orders:")
                 traceback.print_exc()
             await asyncio.gather(*tasks, return_exceptions=True)
+            self.real_ledger.save(time.time())
             atomic_write_json(os.path.join(day_dir(self.S, f"{_utc():%Y-%m-%d}"), "summary.json"), self.summary(),
                               indent=None)
             self.pool.shutdown(wait=False)

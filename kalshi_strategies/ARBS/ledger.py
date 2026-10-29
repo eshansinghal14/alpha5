@@ -88,9 +88,10 @@ class Ledger:
         if not self.path:
             return
         if now is not None:
-            # A retired quote's late fills arrive within seconds; a day is ample.
+            # A retired quote's late fills arrive within seconds. A day of ids
+            # made the file 7 MB (36k ids, 10-29), rewritten on every save.
             self.quote_ids = {k: v for k, v in self.quote_ids.items()
-                              if v.get("retired_at") is None or now - v["retired_at"] < 86400}
+                              if v.get("retired_at") is None or now - v["retired_at"] < 3600}
         atomic_write_json(self.path, {
             "baskets": {bid: {"legs": {t: dataclasses.asdict(l) for t, l in b.legs.items()},
                               "broken_since": b.broken_since, "spec": b.spec}
