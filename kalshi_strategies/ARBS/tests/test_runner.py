@@ -474,3 +474,14 @@ def test_held_basket_survives_dropping_out_of_the_spec(arbs, tmp_path):
     r.set_baskets([])
     assert r.baskets[b.basket_id] == dataclasses.replace(b, cluster=b.cluster)
     assert r.summary()["holdings"][0]["locked_pnl"] == pytest.approx(5 * 1.0 - 4.5)
+
+
+def test_held_basket_wins_over_a_renamed_duplicate(arbs):
+    r, b = arbs
+    r.shadow_ledger.record(b.basket_id, b.tickers, "X-A", "yes", 1, 0.4, time.time())
+    renamed = dataclasses.replace(b, basket_id="t:renamed", legs=tuple(reversed(b.legs)))
+    r.set_baskets([renamed])
+    assert set(r.baskets) == {b.basket_id}
+    r.shadow_ledger.baskets.clear()
+    r.set_baskets([renamed])
+    assert set(r.baskets) == {"t:renamed"}

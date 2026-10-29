@@ -337,6 +337,12 @@ class ArbsRunner:
             pos = self.real_ledger.baskets.get(bid) or self.shadow_ledger.baskets.get(bid)
             if pos is not None and pos.spec:
                 new[bid] = basket_from_dict(pos.spec)
+        # A held basket kept under an old id (MECNET ids were renamed) wins
+        # over a listed basket with the same legs: both trading one set of
+        # legs took and exited against each other (MIACIN 10-29 01:33).
+        held_legs = {frozenset(new[bid].legs): bid for bid in keep if bid in new}
+        for bid in [k for k, v in new.items() if held_legs.get(frozenset(v.legs), k) != k]:
+            del new[bid]
         old = set(self.tickers)
         # Changed ones too: a new quote window has to pull a resting quote.
         changed = {k for k, v in new.items() if self.baskets.get(k) != v}
