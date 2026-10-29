@@ -153,5 +153,6 @@ def bundle_log(series: str, days: int = 2, gap_s: float = 30.0) -> pd.DataFrame:
                     "basket_id": c["basket_id"], "how": "+".join(sorted(h for h in c["how"] if h)),
                     "bundles": qty[0] if whole else None, "cost": round(c["cost"], 2),
                     "pnl": None if pnl is None else round(pnl, 2),
+                    "return": None if pnl is None or c["cost"] <= 0 else f"{pnl / c['cost']:.2%}",
                     "fills": ", ".join(f"{t.split('-', 1)[-1]} {s} {q:g}" for (t, s), q in c["legs"].items())})
     return pd.DataFrame(out)

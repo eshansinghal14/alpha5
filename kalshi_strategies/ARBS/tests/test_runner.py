@@ -261,14 +261,14 @@ def _with_flip(r, b):
     return f
 
 
-def test_flip_exits_held_bundles_at_exit_edge(arbs):
+def test_flip_exits_held_bundles_at_min_exit_edge(arbs):
     r, b = arbs
     f = _with_flip(r, b)
-    r.cfg.trading = dataclasses.replace(r.cfg.trading, exit_edge=0.01, min_edge=0.05, max_dollars=0.0,
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, min_exit_edge=0.01, min_edge=0.05, max_dollars=0.0,
                                         enable_quoting=False)
     for t in b.tickers:
         r.shadow_ledger.record(b.basket_id, b.tickers, t, "yes", 3, 1.35, time.time())
-    # NO asks 0.47 + 0.47 + fees 0.035: a 2.5c edge, above exit_edge, below min_edge.
+    # NO asks 0.47 + 0.47 + fees 0.035: a 2.5c edge, above min_exit_edge, below min_edge.
     book(r, "X-A", [(0.53, 10)], [(0.40, 10)])
     book(r, "X-B", [(0.53, 10)], [(0.40, 10)])
 
@@ -287,7 +287,7 @@ def test_flip_exits_held_bundles_at_exit_edge(arbs):
 def test_flip_without_held_bundles_needs_min_edge(arbs):
     r, b = arbs
     f = _with_flip(r, b)
-    r.cfg.trading = dataclasses.replace(r.cfg.trading, exit_edge=0.01, min_edge=0.05, enable_quoting=False)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, min_exit_edge=0.01, min_edge=0.05, enable_quoting=False)
     book(r, "X-A", [(0.53, 10)], [(0.40, 10)])
     book(r, "X-B", [(0.53, 10)], [(0.40, 10)])
 
@@ -301,7 +301,7 @@ def test_flip_without_held_bundles_needs_min_edge(arbs):
 def test_flip_quoted_for_exit_when_not_hot(arbs):
     r, b = arbs
     f = _with_flip(r, b)
-    r.cfg.trading = dataclasses.replace(r.cfg.trading, exit_edge=0.01, min_edge=0.05, max_dollars=0.0)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, min_exit_edge=0.01, min_edge=0.05, max_dollars=0.0)
     for t in b.tickers:
         r.shadow_ledger.record(b.basket_id, b.tickers, t, "yes", 3, 1.35, time.time())
     book(r, "X-A", [(0.50, 10)], [(0.30, 10)])     # NO asks 0.50 + 0.52: no take
@@ -666,10 +666,10 @@ def test_flip_on_a_live_event_needs_min_edge(arbs):
     f = _with_flip(r, b)
     f = dataclasses.replace(f, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
     r.baskets[f.basket_id] = f
-    r.cfg.trading = dataclasses.replace(r.cfg.trading, exit_edge=0.01, min_edge=0.05, enable_quoting=False)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, min_exit_edge=0.01, min_edge=0.05, enable_quoting=False)
     for t in b.tickers:
         r.shadow_ledger.record(b.basket_id, b.tickers, t, "yes", 3, 1.35, time.time())
-    book(r, "X-A", [(0.53, 10)], [(0.40, 10)])     # a 2.5c edge: exit_edge clears, min_edge doesn't
+    book(r, "X-A", [(0.53, 10)], [(0.40, 10)])     # a 2.5c edge: min_exit_edge clears, min_edge doesn't
     book(r, "X-B", [(0.53, 10)], [(0.40, 10)])
     _eval(r, f)
     assert f.basket_id not in r.shadow_ledger.baskets
@@ -730,3 +730,17 @@ def test_print_through_an_unquoted_basket_is_logged_as_missed(arbs):
     r._on_trade("X-A", Trade(ticker="X-A", time=pd.Timestamp.now(tz="UTC"), price=px, size=3.0, taker_side="no"))
     m = r.summary()["missed"]
     assert m and m[0]["basket_id"] == b.basket_id and m[0]["contracts"] == 3.0
+
+
+def test_exit_edge_scales_with_days_to_settlement(arbs):
+    r, b = arbs
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, min_exit_edge=0.01, exit_ref_days=30.0)
+    now = pd.Timestamp("2026-10-29", tz="UTC")
+    at = lambda days: dataclasses.replace(b, settles=now + pd.Timedelta(days=days))
+    assert r.exit_need(at(10), 0.03, now) == pytest.approx(0.03)        # within ref_days: the full edge
+    assert r.exit_need(at(90), 0.03, now) == pytest.approx(0.01)        # a third of it
+    assert r.exit_need(at(60), 0.03, now) == pytest.approx(0.015)
+    assert r.exit_need(at(900), 0.03, now) == pytest.approx(0.01)       # floored
+    assert r.exit_need(at(90), 0.005, now) == pytest.approx(0.005)      # never above the arb edge
+    live = dataclasses.replace(at(900), live_from=now - pd.Timedelta(hours=1))
+    assert r.exit_need(live, 0.03, now) == pytest.approx(0.03)

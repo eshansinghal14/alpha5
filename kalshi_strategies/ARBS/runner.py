@@ -872,6 +872,20 @@ class ArbsRunner:
         mine = max(pos.held(b.tickers)) if pos else 0.0
         return int(max(0.0, held.bundles(self.baskets[fid].tickers) - mine) + _EPS)
 
+    def exit_need(self, b: Basket, need: float, now: pd.Timestamp) -> float:
+        """Edge ($/bundle) to close held bundles through flip basket `b`:
+        `need` (the arb edge) within trading.exit_ref_days of settlement,
+        need x ref_days / days left beyond, never under min_exit_edge or over
+        need. No settlement date counts as far out."""
+        t = self.cfg.trading
+        if b.is_live(now):
+            # The same stale-leg risk as a new arb, whichever way the bundle points.
+            return need
+        days = None if b.settles is None else (b.settles - now).total_seconds() / 86400.0
+        scaled = need if days is not None and days <= t.exit_ref_days else \
+            (need * t.exit_ref_days / days if days is not None else 0.0)
+        return min(need, max(t.min_exit_edge, scaled))
+
     def room_dollars(self) -> float:
         return self.cfg.trading.max_dollars - self.committed()
 
@@ -936,11 +950,8 @@ class ArbsRunner:
             ex = self.exit_room(b)
             # An apparent arb on a live game is usually one leg not yet
             # repriced after a score, already being taken by faster traders.
-            live = b.is_live(_utc())
-            live_cap = t.live_quote_size if live else 10 ** 9
-            # On a live game closing a position needs the full edge too: the
-            # same stale-leg risk applies whichever way the bundle points.
-            exit_need = need if live else t.exit_edge
+            live_cap = t.live_quote_size if b.is_live(_utc()) else 10 ** 9
+            exit_need = self.exit_need(b, need, _utc())
             plan = None
             if ex >= 1 and g is not None and g >= exit_need - _EPS:
                 plan = pricing.take_plan(vs, b.payout, exit_need, min(ex, live_cap))
@@ -983,7 +994,7 @@ class ArbsRunner:
             if want and ex >= 1:
                 size = min(cap, float(ex), touch)
                 if size >= 1 and (q is None or q.remaining <= size + _EPS):
-                    plan = pricing.quote_leg(vs, j, b.payout, quote_need if live else t.exit_edge, size)
+                    plan = pricing.quote_leg(vs, j, b.payout, self.exit_need(b, quote_need, now_ts), size)
             elif want:
                 size = min(cap, self.room_bundles(b, j), float(self.quote_size_by_dollars(b)), touch)
                 if size >= 1 and (q is None or q.remaining <= size + _EPS):

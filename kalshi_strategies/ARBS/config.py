@@ -26,11 +26,15 @@ class TradingParams:
     quote_edge_add: float = param("Extra return (fraction of bundle cost) a quote must clear on top of min_edge: "
                                   "pays for being filled just as the other legs move away.", min=0.0, max=0.5,
                                   step=0.0025)
-    exit_edge: float = param("Required profit ($ per bundle, after fees) to take or quote a basket's flip "
-                             "(every leg's other side) up to the bundles held in it. Kalshi nets the pair to $1 "
-                             "a leg at once, so this closes a position early and frees its capital; no "
-                             "min_edge, max_dollars or max_bundles_per_basket check.", min=0.0, max=0.5,
-                             step=0.0025)
+    min_exit_edge: float = param("Least profit ($ per bundle, after fees) to take or quote a basket's flip "
+                                 "(every leg's other side) up to the bundles held in it. Kalshi nets the pair to "
+                                 "$1 a leg at once, so this closes a position early and frees its capital; no "
+                                 "max_dollars or max_bundles_per_basket check.", min=0.0, max=0.5, step=0.0025)
+    exit_ref_days: float = param("A flip settling within this many days needs the full min_edge (quotes: plus "
+                                 "quote_edge_add) to close held bundles; further out the requirement falls as "
+                                 "exit_ref_days / days to settlement, the capital freed for longer, down to "
+                                 "min_exit_edge. Live events always need the full edge.", min=1.0, max=2000.0,
+                                 step=1.0)
     days_till_expiry: float = param("Trade only baskets whose markets are all expected to settle within this "
                                     "many days (the hand spec's settlement month, else Kalshi's expected "
                                     "expiration). The scan skips events past it. Open positions past it are still "
