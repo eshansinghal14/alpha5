@@ -712,7 +712,7 @@ def test_quote_score_counts_only_legs_that_trade(arbs):
     book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
     book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
     _eval(r, b)
-    assert r.rank_rows[b.basket_id]["quote_usd_h"] == 0         # nothing sold into either side: not hot
+    assert r.rank_rows[b.basket_id]["quote_usd_h"] == 0         # nothing sold into either side lately
     r.flow.add("X-A", "yes", 3600.0, time.time())
     _eval(r, b)
     row = r.rank_rows[b.basket_id]

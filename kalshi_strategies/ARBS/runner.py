@@ -1395,8 +1395,7 @@ class ArbsRunner:
                 self.dirty |= {q.basket_id for q in self.quotes.values()
                                if q.basket_id in self.baskets and not self.may_quote(self.baskets[q.basket_id], now_ts)}
                 self.ranking = rows
-                quotable = [r["basket_id"] for r in rows
-                            if r["quote_usd_h"] > 0 and self.may_quote(self.baskets[r["basket_id"]], now_ts)]
+                quotable = [r["basket_id"] for r in rows if self.may_quote(self.baskets[r["basket_id"]], now_ts)]
                 hot = quotable[:self.cfg.watch.max_quoted_baskets]
                 if hot != self.hot:
                     self.dirty |= set(hot) ^ set(self.hot)
