@@ -76,8 +76,6 @@ class WatchParams:
                                     "the cost of taking every leg). Bounds write-token spend.", min=0, max=1000,
                                     step=1)
     rank_interval_s: float = param("Seconds between re-rankings.", min=0.5, step=0.5, editable=False)
-    eval_interval_s: float = param("Seconds between passes over baskets whose books changed.", min=0.01,
-                                   max=5.0, step=0.01, editable=False)
     exclude: list[str] = param("basket_id, relationship_id or cluster names never traded. Open positions "
                                "in them are still completed and settled.", editable=False)
 

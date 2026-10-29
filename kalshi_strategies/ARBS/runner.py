@@ -91,6 +91,61 @@ class Quote:
         return self.basket_id, self.leg
 
 
+class _Dirty(set):
+    """Basket ids to evaluate. Adding one wakes the eval loop."""
+
+    def __init__(self, items=(), wake: asyncio.Event | None = None):
+        super().__init__(items)
+        self.wake = wake
+
+    def add(self, x):
+        super().add(x)
+        self.wake.set()
+
+    def __ior__(self, other):
+        super().__ior__(other)
+        if other:
+            self.wake.set()
+        return self
+
+
+class _Quotes(dict):
+    """(basket_id, leg) -> Quote, indexed by (ticker, side): leg views and the
+    one-quote-per-side check look a market side up on every evaluation."""
+
+    def __init__(self):
+        super().__init__()
+        self.side: dict[tuple[str, str], dict] = collections.defaultdict(dict)
+
+    def __setitem__(self, k, q):
+        old = self.get(k)
+        if old is not None:
+            self.side[(old.ticker, old.side)].pop(k, None)
+        super().__setitem__(k, q)
+        self.side[(q.ticker, q.side)][k] = q
+
+    def __delitem__(self, k):
+        q = self[k]
+        super().__delitem__(k)
+        self.side[(q.ticker, q.side)].pop(k, None)
+
+    def pop(self, k, *default):
+        if k in self:
+            q = self[k]
+            del self[k]
+            return q
+        if default:
+            return default[0]
+        raise KeyError(k)
+
+    def clear(self):
+        super().clear()
+        self.side.clear()
+
+    def on(self, ticker: str, side: str):
+        return list(self.side.get((ticker, side), {}).values())
+
+
 @dataclasses.dataclass
 class Meta:
     ticker: str
@@ -117,11 +172,17 @@ class ArbsRunner:
         self.alerts: list[dict] = []
         self.live = False
         self.journal_dir = os.path.join(self.root, "journal")
-        self.quotes: dict[tuple[str, int], Quote] = {}   # (basket_id, leg index) -> its quote
+        self.quotes = _Quotes()                           # (basket_id, leg index) -> its quote
         self.busy: set[str] = set()
         self.baskets: dict[str, Basket] = {}
         self.tickers: list[str] = []
-        self.dirty: set[str] = set()
+        self.wake = asyncio.Event()
+        self._dirty = _Dirty((), self.wake)
+        # basket_id -> its ranking row, refreshed whenever the basket is
+        # evaluated (its books changed), so the rank pass only sorts.
+        self.rank_rows: dict[str, dict] = {}
+        self._in_pass = False
+        self._commit_cache: float | None = None
         self.hot: list[str] = []
         self.ranking: list[dict] = []
         with open(SPEC_PATH, encoding="utf-8") as fh:
@@ -160,8 +221,24 @@ class ArbsRunner:
                   "quote_fills": 0, "completions": 0, "unwinds": 0, "exit_unpriced": 0, "post_only_rejects": 0}
         self.started = _utc()
         self.liq = Liquidity(self.root)
+        # Live order round trips, flushed with the liquidity log (orders_*.jsonl.gz).
+        self.order_times: list[dict] = []
 
     # ------------------------------------------------------------------ util
+
+    @property
+    def dirty(self) -> _Dirty:
+        return self._dirty
+
+    @dirty.setter
+    def dirty(self, items):
+        self._dirty = _Dirty(items, self.wake)
+        if items:
+            self.wake.set()
+
+    def later(self, basket_id: str, delay: float):
+        """Re-evaluate a basket after `delay` without spinning the eval loop."""
+        asyncio.get_running_loop().call_later(delay, self.dirty.add, basket_id)
 
     @property
     def ledger(self) -> Ledger:
@@ -272,6 +349,7 @@ class ArbsRunner:
             for t in b.tickers:
                 self.by_ticker.setdefault(t, []).append(b.basket_id)
         self.dirty = {d for d in self.dirty if d in new} | changed
+        self.rank_rows = {k: v for k, v in self.rank_rows.items() if k in new}
         self.hot = [h for h in self.hot if h in new]
         self.ranking = [r for r in self.ranking if r["basket_id"] in new]
         return [t for t in self.tickers if t not in old]
@@ -297,7 +375,10 @@ class ArbsRunner:
             await asyncio.sleep(self.cfg.runtime.liquidity_log_s)
             try:
                 rows = self.liq.flush(time.monotonic(), time.time())
-                await loop.run_in_executor(self.pool, self.liq.write, rows, f"{_utc():%Y-%m-%d}")
+                orders, self.order_times = self.order_times, []
+                day = f"{_utc():%Y-%m-%d}"
+                await loop.run_in_executor(self.pool, self.liq.write, rows, day)
+                await loop.run_in_executor(self.pool, self.liq.write, orders, f"orders_{day}")
             except Exception as e:
                 _log(f"WARN: liquidity log failed ({e!r})")
 
@@ -386,8 +467,8 @@ class ArbsRunner:
 
     def _own(self, ticker: str, side: str) -> dict[float, float]:
         out: dict[float, float] = {}
-        for q in self.quotes.values():
-            if q.ticker == ticker and q.side == side and q.remaining > 0:
+        for q in self.quotes.on(ticker, side):
+            if q.remaining > 0:
                 out[round(q.price, 4)] = out.get(round(q.price, 4), 0.0) + q.remaining
         return out
 
@@ -597,6 +678,17 @@ class ArbsRunner:
         return max(q.remaining for q in qs) * self.worst_bundle_cost(self.baskets[basket_id])
 
     def committed(self) -> float:
+        """Inside an eval pass the value is cached (a pass runs without
+        yielding, and new_quote clears it): summing every basket's quotes per
+        leg checked cost ~1 ms each at 200 quotes."""
+        if self._commit_cache is not None:
+            return self._commit_cache
+        v = self._committed()
+        if self._in_pass:
+            self._commit_cache = v
+        return v
+
+    def _committed(self) -> float:
         held = sum(b.cost() for b in self.ledger.baskets.values())
         # Kalshi credits $1 per YES/NO pair at once, so bundles held in both a
         # basket and its flip are cash already back, not capital tied up.
@@ -642,13 +734,16 @@ class ArbsRunner:
     # ------------------------------------------------------------------ eval
 
     async def eval_loop(self):
+        """Runs as soon as a basket is marked: a book change, a fill, a task
+        ending. A busy basket is skipped; its task re-marks it when done."""
         while True:
-            await asyncio.sleep(self.cfg.watch.eval_interval_s)
+            await self.wake.wait()
+            self.wake.clear()
             self._replay_orphans()
             todo, self.dirty = self.dirty, set()
+            self._in_pass, self._commit_cache = True, None
             for bid in todo:
                 if bid in self.busy:
-                    self.dirty.add(bid)
                     continue
                 b = self.baskets.get(bid)
                 if b is None:
@@ -658,6 +753,9 @@ class ArbsRunner:
                 except Exception:
                     _log(f"eval error {bid}:")
                     traceback.print_exc()
+            self._in_pass, self._commit_cache = False, None
+            # Let the websocket reader run before the next pass.
+            await asyncio.sleep(0)
 
     def evaluate(self, b: Basket):
         now = time.time()
@@ -672,6 +770,7 @@ class ArbsRunner:
             self.spawn(self.cancel_quotes([q for q in live_qs if q.kind != "arb"], "whole"), b.basket_id)
             return
         vs = self.views(b) if self.tradeable(b) else None
+        self.rank_row(b, vs)
         blocked = self.blocked()
         if vs is None or blocked or self.excluded(b):
             if live_qs:
@@ -766,8 +865,8 @@ class ArbsRunner:
 
     def quoted_elsewhere(self, basket_id: str, ticker: str, side: str) -> Quote | None:
         """Another basket's arb quote resting on this market side, if any."""
-        for q in self.quotes.values():
-            if q.ticker == ticker and q.side == side and q.basket_id != basket_id and q.kind == "arb":
+        for q in self.quotes.on(ticker, side):
+            if q.basket_id != basket_id and q.kind == "arb":
                 return q
         return None
 
@@ -790,7 +889,10 @@ class ArbsRunner:
                 return None, None
             fee = kfees.fee(cost / got, got, view.taker_rate)
             return RealFill(price=cost / got, size=got, fee=fee, exchange_order_id=None), None
+        t0 = time.time()
         fill, exc, sent = await self.gw.ioc(ticker, side, limit, size, force=True, reason=reason)
+        self.order_times.append({"kind": "ioc", "reason": reason, "ticker": ticker, "sent": t0,
+                                 "answered": time.time(), "order_id": None if fill is None else fill.exchange_order_id})
         if not sent:
             return None, RuntimeError("no order client")
         if exc is None:
@@ -859,7 +961,7 @@ class ArbsRunner:
         today's asks."""
         c, bid = self.cfg.completion, b.basket_id
         if any(q.pending for q in qs):
-            self.dirty.add(bid)
+            self.later(bid, 0.05)
             return
         legs = [self.leg_view(l.ticker, l.side) if self.is_open(l.ticker) else None for l in b.legs]
         others = [self.leg_view(l.ticker, OTHER[l.side]) if self.is_open(l.ticker) else None for l in b.legs]
@@ -893,7 +995,7 @@ class ArbsRunner:
         elif now - self.last_completion.get(bid, 0.0) >= c.retry_s:
             self.spawn(self.exit_now(b, path, ex, legs, others, qs, loss, why), bid)
         else:
-            self.dirty.add(bid)
+            self.later(bid, c.retry_s - (now - self.last_completion[bid]))
 
     def exit_tick(self, b: Basket, path: str, ex: pricing.Exits, legs, others) -> float:
         """The coarsest tick among the exit's orders at their prices: a cent,
@@ -964,6 +1066,7 @@ class ArbsRunner:
                 q = Quote(basket_id=b.basket_id, leg=j, ticker=t, side=sd, price=price, size=n,
                           cid=str(uuid.uuid4()), edge=0.0, max_price=price, placed_at=now, kind=path)
                 self.quotes[q.key] = q
+                self._commit_cache = None
                 acts.append(self.place_quote(q))
             elif abs(q.price - price) > _EPS:
                 acts.append(self.move_quote(q, pricing.QuotePlan(leg=j, price=price, max_price=price, edge=0.0,
@@ -979,6 +1082,7 @@ class ArbsRunner:
                   size=size, cid=str(uuid.uuid4()), edge=plan.edge, max_price=plan.max_price,
                   placed_at=time.time())
         self.quotes[q.key] = q
+        self._commit_cache = None
         return q
 
     async def place_quote(self, q: Quote):
@@ -990,7 +1094,10 @@ class ArbsRunner:
             self.journal({"kind": "quote", "basket_id": b.basket_id, "ticker": q.ticker, "side": q.side,
                           "price": q.price, "size": size, "edge": round(q.edge, 4)})
             return
+        t0 = time.time()
         ack, exc, sent = await self.gw.rest(q.ticker, q.side, q.price, size, q.cid)
+        self.order_times.append({"kind": "rest", "reason": q.kind, "ticker": q.ticker, "sent": t0,
+                                 "answered": time.time(), "order_id": None if ack is None else ack.exchange_order_id})
         if not sent:
             self.quotes.pop(q.key, None)
             return
@@ -1064,6 +1171,7 @@ class ArbsRunner:
             if new_id and new_id != q.exchange_id:
                 self._retire(q)
                 self.quotes[q.key] = q
+                self._commit_cache = None
                 self._register(q, new_id)
         q.price, q.edge, q.max_price = plan.price, plan.edge, plan.max_price
         self.journal({"kind": "move", "basket_id": q.basket_id, "ticker": q.ticker, "from": old, "to": plan.price})
@@ -1101,21 +1209,22 @@ class ArbsRunner:
 
     # ------------------------------------------------------------------ ranking
 
+    def rank_row(self, b: Basket, vs):
+        g = None if vs is None or self.excluded(b) else pricing.gap(vs, b.payout)
+        if g is None:
+            self.rank_rows.pop(b.basket_id, None)
+            return
+        self.rank_rows[b.basket_id] = {
+            "basket_id": b.basket_id, "type": b.type, "ret": round(edge_return(b.payout, g), 4), "gap": round(g, 4),
+            "payout": b.payout, "asks": [v.best_ask for v in vs], "legs": len(b.legs),
+            "depth": round(min(v.depth() for v in vs), 1)}
+
     async def rank_loop(self):
+        """Sorts the rows evaluate() keeps fresh: re-pricing every basket here
+        blocked the event loop ~200 ms per pass at 2,500 baskets."""
         while True:
             try:
-                rows = []
-                for b in self.all_baskets:
-                    if not self.tradeable(b) or self.excluded(b):
-                        continue
-                    vs = self.views(b)
-                    g = None if vs is None else pricing.gap(vs, b.payout)
-                    if g is None:
-                        continue
-                    rows.append({"basket_id": b.basket_id, "type": b.type, "ret": round(edge_return(b.payout, g), 4),
-                                 "gap": round(g, 4), "payout": b.payout, "asks": [v.best_ask for v in vs],
-                                 "legs": len(b.legs), "depth": round(min(v.depth() for v in vs), 1)})
-                rows.sort(key=lambda r: -r["ret"])
+                rows = sorted(self.rank_rows.values(), key=lambda r: -r["ret"])
                 # A quote whose event just went live is pulled on its basket's next pass.
                 now_ts = _utc()
                 self.dirty |= {q.basket_id for q in self.quotes.values()
