@@ -119,6 +119,9 @@ class _Dirty(set):
 WRITE_COST_TAU_S = 300.0
 # Write tokens per order or move, per cancel (Kalshi's write budget).
 ORDER_TOKENS, CANCEL_TOKENS = 10.0, 2.0
+# Startup sweep: retries per cancel on a 429, and the gap between cancels
+# (~100/s, under the 150/s our cancel tokens allow at the 300/s shard bucket).
+SWEEP_RETRIES, SWEEP_PACING_S = 5, 0.01
 
 
 class _Rate:
@@ -306,7 +309,7 @@ class ArbsRunner:
         # move means the market reprices like a live game (weather readings,
         # news). Cleared by a clean completion or an even take on it.
         self.flagged: dict[str, float] = {}
-        self.unpriced_alert_at: dict[str, float] = {}
+        self.unpriced_alert_at: dict[str, float | None] = {}   # basket_id -> broken_since alerted for
         self._horizon: tuple[float, pd.Timestamp] | None = None
         # Live order round trips, flushed with the liquidity log (orders_*.jsonl.gz).
         self.order_times: list[dict] = []
@@ -1240,10 +1243,10 @@ class ArbsRunner:
             "path": pick and pick[0]}
         if pick is None:
             self.n["exit_unpriced"] += 1
-            # Once a minute per basket: every book update re-evaluates, and the
-            # first second alone sent 25 (NUMOVI 10-29 15:46 ET, market closing).
-            if now - self.unpriced_alert_at.get(bid, 0.0) >= 60.0:
-                self.unpriced_alert_at[bid] = now
+            # Once per break: every book update re-evaluates, and a decided
+            # game sits unpriced until it settles (PROGLS 10-29 alerted each minute).
+            if self.unpriced_alert_at.get(bid) != pos.broken_since:
+                self.unpriced_alert_at[bid] = pos.broken_since
                 self.alert("error", bid, f"no exit priced (a leg closed or too thin): excess "
                                          f"{self.completion_note[bid]['excess']} (broken {age:.0f}s)")
             return
@@ -1487,20 +1490,30 @@ class ArbsRunner:
             await self.sweep(reason)
 
     async def sweep(self, reason: str):
-        """Cancel anything resting on our tickers: the ground truth after a restart."""
+        """Cancel anything of ours resting: on our tickers, or placed by us on a
+        market since dropped from the scan (KXYTVIEWSW quotes sat 19 h, 10-29).
+        The ground truth after a restart."""
         c = self.gw.any_client()
         if c is None:
             return
         ours = set(self.tickers)
         resting = await self.gw.call(c._resting, "")
         for oid, ticker, _ in resting:
-            if ticker in ours:
+            if ticker not in ours and oid not in self.real_ledger.quote_ids:
+                continue
+            # Paced, with retries: ~700 cancels at once drew 429s on 180 of
+            # them at a restart (10-29 19:23 ET), leaving orders untracked.
+            for attempt in range(SWEEP_RETRIES):
                 _, exc, _ = await self.gw.cancel(ticker, oid, f"sweep/{reason}")
-                if exc is not None:
-                    self.alert("error", None, f"sweep cancel {oid} on {ticker} failed ({exc!r})")
-                elif oid in self.real_ledger.quote_ids:
-                    self.real_ledger.quote_ids[oid]["retired_at"] = time.time()
-                    self.ids_dirty = True
+                if exc is None or http_status(exc) != 429:
+                    break
+                await asyncio.sleep(0.5 * (attempt + 1))
+            if exc is not None:
+                self.alert("error", None, f"sweep cancel {oid} on {ticker} failed ({exc!r})")
+            elif oid in self.real_ledger.quote_ids:
+                self.real_ledger.quote_ids[oid]["retired_at"] = time.time()
+                self.ids_dirty = True
+            await asyncio.sleep(SWEEP_PACING_S)
 
     # ------------------------------------------------------------------ ranking
 
