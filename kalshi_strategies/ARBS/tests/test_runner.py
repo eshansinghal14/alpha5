@@ -748,6 +748,9 @@ def test_quote_score_counts_only_legs_that_trade(arbs):
     assert r.rank_rows[b.basket_id]["quote_usd_h"] == 0         # nothing sold into either side lately
     r.flow.add("X-A", "yes", 3600.0, time.time())
     _eval(r, b)
+    assert r.rank_rows[b.basket_id]["quote_usd_h"] == 0         # priced once per rank interval
+    r.rank_at.clear()
+    _eval(r, b)
     row = r.rank_rows[b.basket_id]
     assert row["quote_usd_h"] > 0 and row["wait_s"] is not None
 

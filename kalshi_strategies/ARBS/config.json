@@ -25,7 +25,7 @@
   "watch": {
     "max_quoted_baskets": 20,
     "queue_window_s": 10800.0,
-    "rank_interval_s": 5.0,
+    "rank_interval_s": 10.0,
     "exclude": []
   },
   "scan": {

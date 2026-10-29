@@ -269,6 +269,8 @@ class ArbsRunner:
         # Misses count only once the hot list has filled after a start: until
         # then every print looks like one (10-29 restarts, 9-92 s in).
         self.hot_ready = False
+        self.rank_at: dict[str, float] = {}       # basket_id -> monotonic time its rank row was last priced
+        self.hot_churn: collections.deque = collections.deque()   # (time, entered, left) per hot-list change
         # New quote ids are saved by ledger_flush_loop, not per placement: a
         # synchronous ledger write per quote held the loop ~200 ms each and
         # queued a live exit 7 s behind a burst of placements (FURIABB-2 10-29).
@@ -955,7 +957,11 @@ class ArbsRunner:
             self.spawn(self.cancel_quotes([q for q in live_qs if q.kind != "arb"], "whole"), b.basket_id)
             return
         vs = self.views(b) if self.tradeable(b) else None
-        self.rank_row(b, vs)
+        # Priced for the ranking once per rank interval, not on every book
+        # update: it was a fifth of the loop (py-spy 10-29).
+        if vs is None or now - self.rank_at.get(b.basket_id, 0.0) >= self.cfg.watch.rank_interval_s:
+            self.rank_at[b.basket_id] = now
+            self.rank_row(b, vs)
         blocked = self.blocked()
         if vs is None or blocked or self.excluded(b):
             if live_qs:
@@ -1465,8 +1471,13 @@ class ArbsRunner:
                 if len(hot) >= self.cfg.watch.max_quoted_baskets or _utc() - self.started > pd.Timedelta(minutes=2):
                     self.hot_ready = True
                 if hot != self.hot:
-                    self.dirty |= set(hot) ^ set(self.hot)
+                    entered, left = set(hot) - set(self.hot), set(self.hot) - set(hot)
+                    if self.hot_ready and (entered or left):
+                        self.hot_churn.append((time.time(), len(entered), len(left)))
+                    self.dirty |= entered | left
                     self.hot = hot
+                while self.hot_churn and self.hot_churn[0][0] < time.time() - 3600:
+                    self.hot_churn.popleft()
             except Exception:
                 traceback.print_exc()
             await asyncio.sleep(self.cfg.watch.rank_interval_s)
@@ -1726,6 +1737,8 @@ class ArbsRunner:
                     "held_cost": round(sum(h["cost"] for h in holdings), 4),
                     "committed": round(self.committed(), 4), "max_dollars": self.cfg.trading.max_dollars},
             "holdings": holdings, "quotes": quotes, "hot": self.hot, "ranking": self.ranking[:60],
+            "hot_churn": {f"{m}m": sum(e for t, e, _ in self.hot_churn if t >= time.time() - 60 * m)
+                          for m in (1, 10, 60)},
             "missed": sorted(({**m, "usd": round(m["usd"], 2)} for m in self.missed.values()),
                              key=lambda m: -m["usd"])[:50],
             "settled": settled[-200:], "alerts": self.alerts[-100:], "audit_diff": self.audit_diff,
