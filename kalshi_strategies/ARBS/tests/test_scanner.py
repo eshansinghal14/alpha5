@@ -143,3 +143,11 @@ def test_run_carries_over_held_relationships(tmp_path, monkeypatch):
     scanner.run(cfg, {}, spec)
     with open(spec) as fh:
         assert json.load(fh)["relationships"] == []
+
+
+def test_quoting_stops_at_kickoff():
+    e = event("GM-1", "MECNET", [mkt("GM-1-A", occurrence_datetime="2026-10-28T20:00:00Z"),
+                                 mkt("GM-1-B", occurrence_datetime="2026-10-28T20:00:00Z")])
+    b = next(iter(baskets(run([e])).values()))
+    assert b.quoting_allowed(pd.Timestamp("2026-10-28T19:59:00Z"))
+    assert not b.quoting_allowed(pd.Timestamp("2026-10-28T20:00:00Z"))

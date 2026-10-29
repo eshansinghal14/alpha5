@@ -12,6 +12,8 @@ relationships in the hand spec's format, written to scanned_spec.json.
              (10-29 check, ~68 days, 59 series), 3,598 paid exactly one YES;
              INX-24OCT25 and NASDAQ100-24OCT25 settled every bucket NO with
              no value (voided), which no rule here can see coming.
+  live       quoting stops at the event's earliest occurrence_datetime (a
+             game's kickoff); takes go on.
   DIRECNET   for strikes a < b, YES >=a and NO >=b pays at least 1; each
              strike is paired with the next scan.ladder_span above it (a
              200-strike KXBTCD ladder is 20k pairs otherwise).
@@ -180,9 +182,13 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
         else:
             got = ladder(e, ms, ladder_span)
         vol = round(sum(_f(m.get("volume_24h_fp")) for m in ms), 2)
+        # occurrence_datetime is kickoff for a game (a resting quote there is
+        # picked off the moment the score changes: CFCDLG 10-29 00:42) and at
+        # or after close for everything else, so quoting stops once it passes.
+        occ = [m["occurrence_datetime"] for m in ms if m.get("occurrence_datetime")]
         for r in got:
-            r.update(expected_settlement_utc=s.isoformat(), quote_until_utc=None, resume_quoting_utc=None,
-                     volume_24h=vol)
+            r.update(expected_settlement_utc=s.isoformat(), quote_until_utc=min(occ) if occ else None,
+                     resume_quoting_utc=None, volume_24h=vol)
             tickers |= {l["ticker"] for b in r["baskets"] for l in b["legs"]}
         rels += got
     return {"generated_at_utc": now.isoformat(), "source": "kalshi_strategies.ARBS.scanner",

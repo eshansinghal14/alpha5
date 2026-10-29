@@ -336,3 +336,15 @@ def test_audit_books_settlement_before_striking(arbs):
     r.gw.any_client, r.gw.call, r.load_meta = Client, call, load_meta
     assert asyncio.run(r.audit()) and r.audit_strikes == 0 and b.basket_id not in r.real_ledger.baskets
     assert r.real_ledger.settled[-1]["pnl"] == 0.0
+
+
+def test_unfinished_basket_marked_at_sale_value(arbs):
+    r, b = arbs
+    r.real_ledger.record(b.basket_id, b.tickers, "X-A", "yes", 10.0, 4.0, time.time())
+    book(r, "X-A", [(0.25, 50)], [(0.70, 50)])       # YES A sells at 0.25
+    book(r, "X-B", [(0.45, 10)], [(0.50, 10)])
+    s = r.summary()
+    h = s["holdings"][0]
+    fee = R.kfees.fee(0.25, 10.0, 0.07)
+    assert s["ledger"] == "real" and abs(h["broken_pnl"] - (2.5 - fee - 4.0)) < 1e-4
+    assert s["pnl"]["broken"] == h["broken_pnl"] and h["locked_pnl"] == 0.0

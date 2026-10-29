@@ -1135,17 +1135,35 @@ class ArbsRunner:
 
     # ------------------------------------------------------------------ summary
 
+    def sale_value(self, pos, unhedged: dict[str, float]) -> float:
+        """What the contracts beyond complete bundles would sell for now: each
+        at its side's best bid, less the taker fee; nothing without a bid."""
+        out = 0.0
+        for t, q in unhedged.items():
+            v, m = self.feed.book(t), self.meta.get(t)
+            if v is None:
+                continue
+            bid = v.bid if pos.legs[t].side == "yes" else (None if v.ask is None else 1.0 - v.ask)
+            if bid is not None and bid > 0:
+                out += q * bid - kfees.fee(bid, q, (m.taker_rate if m else None) or 0.0)
+        return out
+
     def summary(self) -> dict:
-        led = self.ledger
+        # Real positions stay on screen after a disarm; shadow ones only show
+        # when there is no real money held.
+        led = self.real_ledger if self.live or self.real_ledger.baskets else self.shadow_ledger
         holdings = []
         for bid, pos in led.baskets.items():
             b = self.baskets.get(bid)
             tickers = b.tickers if b else list(pos.legs)
             n = pos.bundles(tickers)
             locked = (n * b.payout - (pos.cost() - pos.broken_spent(tickers))) if b else None
+            un = pos.unhedged(tickers)
+            broken = self.sale_value(pos, un) - pos.broken_spent(tickers) if un else 0.0
             holdings.append({"basket_id": bid, "type": b.type if b else "", "payout": b.payout if b else None,
                              "bundles": n, "held": dict(zip(tickers, pos.held(tickers))),
                              "cost": round(pos.cost(), 4), "locked_pnl": None if locked is None else round(locked, 4),
+                             "broken_pnl": round(broken, 4),
                              "unhedged": pos.unhedged(tickers),
                              "broken_s": None if pos.broken_since is None else round(time.time() - pos.broken_since),
                              "completion": self.completion_note.get(bid)})
@@ -1158,6 +1176,7 @@ class ArbsRunner:
         return {
             "series": self.S, "event_ticker": "ARBS", "last_update": _utc().isoformat(),
             "session_started": self.started.isoformat(), "live_trading": self.live, "arm_requested": self.arm_want,
+            "ledger": "real" if led is self.real_ledger else "shadow",
             "halted": self.halt is not None, "halt_reason": self.halt, "blocked_reason": self.blocked(),
             "feed": {"up": self.feed.up, "reconnects": self.feed.n_reconnects, "seq_gaps": self.feed.n_seq_gaps,
                      "ws_errors": self.feed.n_errors, "last_msg_s": self.feed.seconds_since_message()},
@@ -1166,6 +1185,7 @@ class ArbsRunner:
             "market_status": _count(m.status for m in self.meta.values()),
             "pnl": {"settled": round(sum(r["pnl"] for r in settled), 4),
                     "locked": round(sum(h["locked_pnl"] or 0.0 for h in holdings), 4),
+                    "broken": round(sum(h["broken_pnl"] for h in holdings), 4),
                     "held_cost": round(sum(h["cost"] for h in holdings), 4),
                     "committed": round(self.committed(), 4), "max_dollars": self.cfg.trading.max_dollars},
             "holdings": holdings, "quotes": quotes, "hot": self.hot, "ranking": self.ranking[:60],

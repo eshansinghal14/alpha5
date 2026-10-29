@@ -62,8 +62,12 @@ def _metrics(s: dict):
     c = st.columns(5)
     c[0].metric("Settled PnL", _usd(p.get("settled")), f"{len(s.get('settled') or [])} baskets", delta_color="off",
                 help="Settled baskets: payout received minus everything paid incl. fees.")
-    c[1].metric("Locked-in PnL", _usd(p.get("locked")), delta_color="off",
-                help="Complete bundles held: guaranteed payout minus their cost. Paid at settlement.")
+    broken = p.get("broken") or 0.0
+    n_broken = sum(1 for h in s.get("holdings") or [] if h.get("unhedged"))
+    c[1].metric("Open PnL", _usd((p.get("locked") or 0.0) + broken),
+                f"{_usd(broken)} on {n_broken} unfinished" if n_broken else None,
+                help="Complete bundles held: guaranteed payout minus their cost, paid at settlement. Plus "
+                     "unfinished baskets' extra legs marked at what they'd sell for now, minus what they cost.")
     c[2].metric("Capital used", f"${p.get('committed', 0):,.2f}", f"of ${p.get('max_dollars', 0):,.0f}",
                 delta_color="off", help="Cost of held baskets plus what resting quotes commit if filled.")
     c[3].metric("Baskets tradeable", f"{s.get('n_tradeable')}/{s.get('n_baskets')}",
@@ -74,7 +78,7 @@ def _metrics(s: dict):
 
 
 def _tables(s: dict):
-    st.markdown("##### Bundles held")
+    st.markdown(f"##### Bundles held ({s.get('ledger', 'real')} money)")
     h = s.get("holdings") or []
     if h:
         df = pd.DataFrame(h)
@@ -82,9 +86,10 @@ def _tables(s: dict):
         df["series"] = df["held"].map(lambda d: " ".join(dict.fromkeys(t.split("-", 1)[0] for t in d)))
         df["held"] = df["held"].map(lambda d: ", ".join(f"{t.split('-', 1)[-1]} {q:g}" for t, q in d.items()))
         df["status"] = df["unhedged"].map(lambda u: "INCOMPLETE" if u else "complete")
-        df["return"] = (df["locked_pnl"].fillna(0) / df["cost"].where(df["cost"] > 0)).map(
+        df["pnl"] = df["locked_pnl"].fillna(0) + df.get("broken_pnl", 0.0)
+        df["return"] = (df["pnl"] / df["cost"].where(df["cost"] > 0)).map(
             lambda v: "" if pd.isna(v) else f"{v:.2%}")
-        st.dataframe(df[["series", "basket_id", "type", "status", "bundles", "payout", "cost", "locked_pnl", "return", "held"]]
+        st.dataframe(df[["series", "basket_id", "type", "status", "bundles", "payout", "cost", "pnl", "return", "held"]]
                      .sort_values("status", ascending=False), use_container_width=True, hide_index=True)
     else:
         st.caption("None.")
