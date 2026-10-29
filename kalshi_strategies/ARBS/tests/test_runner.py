@@ -433,3 +433,16 @@ def test_slow_drift_keeps_resting(arbs):
     _eval(r, b)
     assert r.shadow_ledger.baskets[b.basket_id].unhedged(b.tickers) == {"X-A": 5}
     assert r.quotes[(b.basket_id, 0)].kind == "unwind"
+
+
+def test_one_quote_per_market_side(arbs):
+    r, b = arbs
+    b2 = Basket(basket_id="t:b2", relationship_id="t", type="mutually_exclusive_no", cluster="t",
+                legs=(Leg("X-A", "yes"), Leg("X-B", "yes")), payout=1.0, quote_until=None, resume_quoting=None)
+    r.set_baskets([b, b2])
+    r.hot = [b.basket_id, b2.basket_id]
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    _eval(r, b)
+    _eval(r, b2)
+    assert {q.basket_id for q in r.quotes.values()} == {b.basket_id}

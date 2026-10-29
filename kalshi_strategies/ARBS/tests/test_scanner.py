@@ -133,6 +133,7 @@ def test_run_carries_over_held_relationships(tmp_path, monkeypatch):
     cfg = ConfigStore(ArbsConfig, CONFIG_PATH, None).config
     spec = str(tmp_path / "s.json")
     monkeypatch.setattr(scanner, "other_series", lambda: set())
+    monkeypatch.setattr(scanner, "fetch_starts", lambda now: {})
     monkeypatch.setattr(scanner, "fetch_events",
                         lambda: [event("EV-1", "MECNET", [mkt("EV-1-A"), mkt("EV-1-B")])])
     scanner.run(cfg, {}, spec)
@@ -146,8 +147,11 @@ def test_run_carries_over_held_relationships(tmp_path, monkeypatch):
 
 
 def test_quoting_stops_at_kickoff():
-    e = event("GM-1", "MECNET", [mkt("GM-1-A", occurrence_datetime="2026-10-28T20:00:00Z"),
-                                 mkt("GM-1-B", occurrence_datetime="2026-10-28T20:00:00Z")])
-    b = next(iter(baskets(run([e])).values()))
+    # occurrence_datetime is the game's expected end; the milestone start is kickoff.
+    e = event("GM-1", "MECNET", [mkt("GM-1-A", occurrence_datetime="2026-10-28T22:00:00Z"),
+                                 mkt("GM-1-B", occurrence_datetime="2026-10-28T22:00:00Z")])
+    b = next(iter(baskets(run([e], starts={"GM-1": "2026-10-28T20:00:00Z"})).values()))
     assert b.quoting_allowed(pd.Timestamp("2026-10-28T19:59:00Z"))
     assert not b.quoting_allowed(pd.Timestamp("2026-10-28T20:00:00Z"))
+    b = next(iter(baskets(run([e])).values()))
+    assert not b.quoting_allowed(pd.Timestamp("2026-10-28T22:00:00Z"))

@@ -249,8 +249,9 @@ class ArbsRunner:
         for bid in keep:
             if bid not in new and bid in self.baskets:
                 new[bid] = self.baskets[bid]
-        added = new.keys() - self.baskets.keys()
         old = set(self.tickers)
+        # Changed ones too: a new quote_until has to pull a resting quote.
+        changed = {k for k, v in new.items() if self.baskets.get(k) != v}
         self.all_baskets = list(new.values())
         self.baskets = new
         self.tickers = sorted({t for b in self.all_baskets for t in b.tickers})
@@ -259,7 +260,7 @@ class ArbsRunner:
         for b in self.all_baskets:
             for t in b.tickers:
                 self.by_ticker.setdefault(t, []).append(b.basket_id)
-        self.dirty = {d for d in self.dirty if d in new} | added
+        self.dirty = {d for d in self.dirty if d in new} | changed
         self.hot = [h for h in self.hot if h in new]
         self.ranking = [r for r in self.ranking if r["basket_id"] in new]
         return [t for t in self.tickers if t not in old]
@@ -718,6 +719,13 @@ class ArbsRunner:
                 if q is not None:
                     acts.append(self.cancel_quote(q, "no_edge" if want else "not_hot"))
                 continue
+            other = self.quoted_elsewhere(b.basket_id, leg.ticker, leg.side)
+            if other is not None and (q is None or other.placed_at < q.placed_at):
+                # One quote per market side: baskets sharing a leg would rest
+                # one bid each and fill (and complete) twice on one print.
+                if q is not None:
+                    acts.append(self.cancel_quote(q, "duplicate"))
+                continue
             if q is None:
                 if self.live and not self.gw.can_afford(leg.ticker, "order", reserve):
                     continue
@@ -738,6 +746,13 @@ class ArbsRunner:
             async def run(acts=acts):
                 await asyncio.gather(*acts)
             self.spawn(run(), b.basket_id)
+
+    def quoted_elsewhere(self, basket_id: str, ticker: str, side: str) -> Quote | None:
+        """Another basket's arb quote resting on this market side, if any."""
+        for q in self.quotes.values():
+            if q.ticker == ticker and q.side == side and q.basket_id != basket_id and q.kind == "arb":
+                return q
+        return None
 
     async def cancel_quotes(self, qs: list[Quote], reason: str):
         await asyncio.gather(*(self.cancel_quote(q, reason) for q in qs))
@@ -1084,6 +1099,9 @@ class ArbsRunner:
                                  "gap": round(g, 4), "payout": b.payout, "asks": [v.best_ask for v in vs],
                                  "legs": len(b.legs), "depth": round(min(v.depth() for v in vs), 1)})
                 rows.sort(key=lambda r: -r["ret"])
+                # A quote whose event just went live is pulled on its basket's next pass.
+                self.dirty |= {q.basket_id for q in self.quotes.values()
+                               if q.basket_id in self.baskets and not self.baskets[q.basket_id].quoting_allowed(_utc())}
                 self.ranking = rows
                 quotable = [r["basket_id"] for r in rows if self.baskets[r["basket_id"]].quoting_allowed(_utc())]
                 hot = quotable[:self.cfg.watch.max_quoted_baskets]

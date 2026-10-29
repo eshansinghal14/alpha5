@@ -12,8 +12,9 @@ relationships in the hand spec's format, written to scanned_spec.json.
              (10-29 check, ~68 days, 59 series), 3,598 paid exactly one YES;
              INX-24OCT25 and NASDAQ100-24OCT25 settled every bucket NO with
              no value (voided), which no rule here can see coming.
-  live       quoting stops at the event's earliest occurrence_datetime (a
-             game's kickoff); takes go on.
+  live       quoting stops when a sports event starts (Kalshi's milestones:
+             kickoff, first serve), or at its earliest occurrence_datetime if
+             sooner; takes go on.
   DIRECNET   for strikes a < b, YES >=a and NO >=b pays at least 1; each
              strike is paired with the next scan.ladder_span above it (a
              200-strike KXBTCD ladder is 20k pairs otherwise).
@@ -50,6 +51,29 @@ def fetch_events() -> list[dict]:
         out += d.get("events") or []
         cursor = d.get("cursor")
         if not cursor or not d.get("events"):
+            return out
+
+
+def fetch_starts(now: pd.Timestamp) -> dict[str, str]:
+    """Blocking (~10 pages). event_ticker -> earliest start_date of a sports
+    milestone it belongs to, for milestones started in the last week or not
+    yet (a Test match runs five days). Other categories carry placeholder
+    starts (elections: 2020-01-01) and are left out."""
+    out, cursor = {}, None
+    since = (now - pd.Timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    while True:
+        params = {"minimum_start_date": since, "limit": 500}
+        if cursor:
+            params["cursor"] = cursor
+        d = kalshi_get("/trade-api/v2/milestones", params=params)
+        for m in d.get("milestones") or []:
+            if m.get("category") != "Sports" or not m.get("start_date"):
+                continue
+            for et in m.get("related_event_tickers") or []:
+                if et not in out or m["start_date"] < out[et]:
+                    out[et] = m["start_date"]
+        cursor = d.get("cursor")
+        if not cursor or not d.get("milestones"):
             return out
 
 
@@ -162,9 +186,10 @@ def ladder(event: dict, markets: list[dict], span: int) -> list[dict]:
 
 def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_span: int,
          complete_set_exclude: list[str], overrides: dict[str, str], shards=(0,),
-         skip_series: set[str] = frozenset()) -> dict:
+         skip_series: set[str] = frozenset(), starts: dict[str, str] | None = None) -> dict:
     """Every relationship found, each with its event's expected settlement
-    and 24h volume for `select`."""
+    and 24h volume for `select`. `starts`: event -> when it goes live
+    (fetch_starts)."""
     rels, tickers = [], set()
     for e in events:
         if e.get("collateral_return_type") not in ("MECNET", "DIRECNET") or e.get("series_ticker") in skip_series \
@@ -182,12 +207,14 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
         else:
             got = ladder(e, ms, ladder_span)
         vol = round(sum(_f(m.get("volume_24h_fp")) for m in ms), 2)
-        # occurrence_datetime is kickoff for a game (a resting quote there is
-        # picked off the moment the score changes: CFCDLG 10-29 00:42) and at
-        # or after close for everything else, so quoting stops once it passes.
-        occ = [m["occurrence_datetime"] for m in ms if m.get("occurrence_datetime")]
+        # A resting quote on a live game is picked off the moment the score
+        # changes (CFCDLG 10-29 00:42). occurrence_datetime is a game's
+        # expected END, not its kickoff, hence the milestone start.
+        live = [pd.Timestamp(t) for t in [m.get("occurrence_datetime") for m in ms]
+                + [(starts or {}).get(e["event_ticker"])] if t]
         for r in got:
-            r.update(expected_settlement_utc=s.isoformat(), quote_until_utc=min(occ) if occ else None,
+            r.update(expected_settlement_utc=s.isoformat(),
+                     quote_until_utc=min(live).isoformat() if live else None,
                      resume_quoting_utc=None, volume_24h=vol)
             tickers |= {l["ticker"] for b in r["baskets"] for l in b["legs"]}
         rels += got
@@ -227,9 +254,10 @@ def run(cfg, hand_doc: dict, spec_path: str, held: set[str] = frozenset()) -> di
     """Blocking: fetch, scan, write the file; returns the doc. Relationships
     of the previous file holding a basket in `held` are carried over, so a
     position the scan no longer lists survives a restart."""
-    doc = scan(fetch_events(), now=pd.Timestamp.now(tz="UTC"), mecnet_max_legs=cfg.scan.mecnet_max_legs,
+    now = pd.Timestamp.now(tz="UTC")
+    doc = scan(fetch_events(), now=now, mecnet_max_legs=cfg.scan.mecnet_max_legs,
                ladder_span=cfg.scan.ladder_span, complete_set_exclude=cfg.scan.complete_set_exclude,
-               shards=set(cfg.scan.shards), skip_series=other_series(),
+               shards=set(cfg.scan.shards), skip_series=other_series(), starts=fetch_starts(now),
                overrides={s: v["expected_settlement_month"]
                           for s, v in (hand_doc.get("settlement_basis_by_series") or {}).items()})
     have = {r["relationship_id"] for r in doc["relationships"]}
