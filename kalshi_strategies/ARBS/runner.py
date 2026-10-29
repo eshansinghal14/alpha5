@@ -8,9 +8,9 @@ Per pass over baskets whose books changed:
      otherwise it rests post-only bids on that exit, re-pegged every pass;
   2. a whole-basket take if (payout - sum(ask + fee)) / sum(ask + fee) >= min_edge
      (a return on the bundle's cost, see edge_dollars);
-  3. one resting quote per hot basket (top watch.max_quoted_baskets by that
-     return), priced so a fill completed at today's asks still returns
-     min_edge + quote_edge_add.
+  3. one resting quote per leg of each hot basket (the best by expected
+     quote profit per hour, as many as the write budget covers), priced so a
+     fill completed at today's asks still returns min_edge + quote_edge_add.
 
 Shadow (default) runs the same decisions against the live book: takes fill
 at the levels they would cross, quotes fill on a print at or through their
@@ -24,6 +24,7 @@ import concurrent.futures
 import dataclasses
 import gzip
 import json
+import math
 import os
 import sys
 import time
@@ -36,6 +37,7 @@ from kalshi_infra.api_functions import kalshi_get
 from kalshi_infra.config import ConfigStore, atomic_write_json
 from kalshi_infra.kalshi import fees as kfees
 from kalshi_infra.kalshi.orders import RealFill, error_code, http_status, is_market_paused, is_post_only_reject
+from kalshi_infra.kalshi.orders import write_budget_tokens_per_s
 from kalshi_infra.trading.engine import MARKET_PAUSE_RETRY_S
 from kalshi_infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
 from kalshi_infra.runtime.persist import LIVE_ROOT, day_dir
@@ -110,6 +112,26 @@ class _Dirty(set):
         if other:
             self.wake.set()
         return self
+
+
+# Time constant of the per-basket write spend and per-market top-of-book
+# change rates the hot list is budgeted on.
+WRITE_COST_TAU_S = 300.0
+# Write tokens per order or move, per cancel (Kalshi's write budget).
+ORDER_TOKENS, CANCEL_TOKENS = 10.0, 2.0
+
+
+class _Rate:
+    """Events per second, exponentially weighted over WRITE_COST_TAU_S."""
+
+    def __init__(self):
+        self.v, self.t = 0.0, None
+
+    def at(self, now: float) -> float:
+        return 0.0 if self.t is None else self.v * math.exp(-(now - self.t) / WRITE_COST_TAU_S)
+
+    def add(self, x: float, now: float):
+        self.v, self.t = self.at(now) + x / WRITE_COST_TAU_S, now
 
 
 class _Flow:
@@ -266,11 +288,15 @@ class ArbsRunner:
         self.quote_px: dict[str, list] = {}
         # basket_id -> prints that would have filled a quote on a basket we didn't quote.
         self.missed: dict[str, dict] = {}
-        # Misses count only once the hot list has filled after a start: until
-        # then every print looks like one (10-29 restarts, 9-92 s in).
+        # Misses count only from 2 min after a start, once the hot list has
+        # filled: until then every print looks like one (10-29 restarts, 9-92 s in).
         self.hot_ready = False
         self.rank_at: dict[str, float] = {}       # basket_id -> monotonic time its rank row was last priced
+        self.spend: dict[str, _Rate] = {}         # basket_id -> write tokens/s its quotes spent
+        self.top_moves: dict[str, _Rate] = {}     # ticker -> best bid/ask changes per second
+        self.last_top: dict[str, tuple] = {}
         self.hot_churn: collections.deque = collections.deque()   # (time, entered, left) per hot-list change
+        self.hot_cost = 0.0                       # estimated write tokens/s of quoting the hot list
         # New quote ids are saved by ledger_flush_loop, not per placement: a
         # synchronous ledger write per quote held the loop ~200 ms each and
         # queued a live exit 7 s behind a burst of placements (FURIABB-2 10-29).
@@ -685,6 +711,10 @@ class ArbsRunner:
         return None if any(v is None for v in vs) else vs
 
     def _on_quote(self, book):
+        top = (book.bid, book.ask)
+        if self.last_top.get(book.ticker) != top:
+            self.last_top[book.ticker] = top
+            self.top_moves.setdefault(book.ticker, _Rate()).add(1.0, time.time())
         self.book_seq[book.ticker] = self.book_seq.get(book.ticker, 0) + 1
         self.book_time[book.ticker] = time.monotonic()
         self.liq.on_book(book.ticker, time.monotonic(), book.ask, book.ask_depth, book.bid, book.bid_depth)
@@ -1316,6 +1346,7 @@ class ArbsRunner:
     async def place_quote(self, q: Quote):
         b = self.baskets[q.basket_id]
         size = q.size
+        self.charge(q.basket_id, ORDER_TOKENS)
         if not self.live:
             q.pending = False
             self.n["quotes_placed"] += 1
@@ -1407,10 +1438,12 @@ class ArbsRunner:
                 self._register(q, new_id)
         q.price, q.edge, q.max_price = plan.price, plan.edge, plan.max_price
         self.n["quote_moves"] += 1
+        self.charge(q.basket_id, ORDER_TOKENS)
         self.journal({"kind": "move", "basket_id": q.basket_id, "ticker": q.ticker, "from": old, "to": plan.price})
 
     async def cancel_quote(self, q: Quote, reason: str):
         self.n["quote_cancels"] += 1
+        self.charge(q.basket_id, CANCEL_TOKENS)
         if self.live and q.exchange_id:
             _, exc, _ = await self.gw.cancel(q.ticker, q.exchange_id, reason)
             if exc is not None:
@@ -1455,16 +1488,39 @@ class ArbsRunner:
             "payout": b.payout, "asks": [v.best_ask for v in vs], "legs": len(b.legs),
             "depth": round(min(v.depth() for v in vs), 1)}
 
-    def pick_hot(self, quotable: list[str], cap: int) -> list[str]:
-        """The top `cap` by rank, except a basket already quoted keeps its
-        slot while it ranks within 1.5x the cap. Near the cut scores sit close
-        and reorder on small book changes: 339 entries in 10 min for 125
-        slots (10-29), each a cancel, a new order and a lost queue place."""
-        keep = set(self.hot) & set(quotable[:int(cap * 1.5)])
-        out = [b for b in quotable if b in keep]
-        out += [b for b in quotable if b not in keep][:max(0, cap - len(out))]
-        rank = {b: i for i, b in enumerate(quotable)}
-        return sorted(out[:cap], key=rank.get)
+    def charge(self, basket_id: str, tokens: float):
+        self.spend.setdefault(basket_id, _Rate()).add(tokens, time.time())
+
+    def write_cost(self, b: Basket, now: float) -> float:
+        """Write tokens/s quoting `b` takes: what its quotes spent lately, or
+        if more, a move per leg each time its best bid/ask changes (at most
+        one per requote_cooldown_s), plus placing every leg once per tau."""
+        gap = max(self.cfg.trading.requote_cooldown_s, 0.1)
+        est = sum(ORDER_TOKENS * (min(self.top_moves[l.ticker].at(now) if l.ticker in self.top_moves else 0.0,
+                                      1.0 / gap) + 1.0 / WRITE_COST_TAU_S) for l in b.legs)
+        spent = self.spend.get(b.basket_id)
+        return max(est, spent.at(now) if spent else 0.0)
+
+    def write_budget(self) -> float:
+        cap = self.write_cap()
+        return cap if cap is not None else write_budget_tokens_per_s()
+
+    def pick_hot(self, quotable: list[str], budget: float, cost: dict[str, float]) -> list[str]:
+        """The best-ranked baskets whose write cost fits `budget` (tokens/s).
+        A basket already quoted keeps its place while the quoted ones ranked
+        above it fit 1.5x the budget: near the cut scores sit close and
+        reorder on small book changes (339 entries in 10 min for 125 slots,
+        10-29), each a cancel, a new order and a lost queue place."""
+        out, used = set(), 0.0
+        for bid in quotable:
+            if bid in self.hot and used + cost[bid] <= 1.5 * budget:
+                out.add(bid)
+                used += cost[bid]
+        for bid in quotable:
+            if bid not in out and used + cost[bid] <= budget:
+                out.add(bid)
+                used += cost[bid]
+        return [bid for bid in quotable if bid in out]
 
     async def rank_loop(self):
         """Sorts the rows evaluate() keeps fresh: re-pricing every basket here
@@ -1478,8 +1534,13 @@ class ArbsRunner:
                                if q.basket_id in self.baskets and not self.may_quote(self.baskets[q.basket_id], now_ts)}
                 self.ranking = rows
                 quotable = [r["basket_id"] for r in rows if self.may_quote(self.baskets[r["basket_id"]], now_ts)]
-                hot = self.pick_hot(quotable, self.cfg.watch.max_quoted_baskets)
-                if len(hot) >= self.cfg.watch.max_quoted_baskets or _utc() - self.started > pd.Timedelta(minutes=2):
+                now = time.time()
+                cost = {bid: self.write_cost(self.baskets[bid], now) for bid in quotable}
+                for r in rows:
+                    r["write_tps"] = round(cost.get(r["basket_id"], 0.0), 2)
+                hot = self.pick_hot(quotable, self.write_budget(), cost)
+                self.hot_cost = round(sum(cost[bid] for bid in hot), 1)
+                if _utc() - self.started > pd.Timedelta(minutes=2):
                     self.hot_ready = True
                 if hot != self.hot:
                     entered, left = set(hot) - set(self.hot), set(self.hot) - set(hot)
@@ -1750,6 +1811,7 @@ class ArbsRunner:
             "holdings": holdings, "quotes": quotes, "hot": self.hot, "ranking": self.ranking[:60],
             "hot_churn": {f"{m}m": sum(e for t, e, _ in self.hot_churn if t >= time.time() - 60 * m)
                           for m in (1, 10, 60)},
+            "hot_cost_tps": self.hot_cost, "write_budget_tps": self.write_budget(),
             "missed": sorted(({**m, "usd": round(m["usd"], 2)} for m in self.missed.values()),
                              key=lambda m: -m["usd"])[:50],
             "settled": settled[-200:], "alerts": self.alerts[-100:], "audit_diff": self.audit_diff,

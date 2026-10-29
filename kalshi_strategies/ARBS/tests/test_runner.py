@@ -782,10 +782,21 @@ def test_exit_edge_scales_with_days_to_settlement(arbs):
     assert r.exit_need(live, 0.03, now) == pytest.approx(0.03)
 
 
-def test_hot_list_keeps_incumbents_near_the_cut(arbs):
+def test_hot_list_fills_the_write_budget_keeping_incumbents(arbs):
     r, b = arbs
-    r.hot = ["a", "b", "c", "d"]
-    ranked = ["a", "x", "y", "b", "c", "d", "z"]             # cap 4: d ranks 6th, within 1.5x (6)
-    assert r.pick_hot(ranked, 4) == ["a", "b", "c", "d"]
-    ranked = ["x", "y", "a", "b", "c", "z", "w", "d"]        # d falls to 8th: past 6, replaced by x
-    assert r.pick_hot(ranked, 4) == ["x", "a", "b", "c"]
+    cost = {"a": 40.0, "x": 40.0, "y": 40.0, "b": 40.0, "q": 0.0}
+    r.hot = []
+    assert r.pick_hot(["a", "x", "y", "b", "q"], 100.0, cost) == ["a", "x", "q"]     # q is free
+    r.hot = ["a", "b"]                   # incumbents keep their places; x and y no longer fit
+    assert r.pick_hot(["a", "x", "y", "b", "q"], 100.0, cost) == ["a", "b", "q"]
+
+
+def test_write_cost_counts_top_of_book_changes(arbs):
+    r, b = arbs
+    now = time.time()
+    quiet = r.write_cost(b, now)
+    for i in range(60):
+        r.top_moves.setdefault("X-A", R._Rate()).add(1.0, now)
+    assert r.write_cost(b, now) > quiet
+    r.charge(b.basket_id, 10_000.0)
+    assert r.write_cost(b, now) == pytest.approx(10_000.0 / R.WRITE_COST_TAU_S, rel=0.01)

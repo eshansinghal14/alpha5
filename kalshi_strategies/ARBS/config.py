@@ -79,9 +79,6 @@ class CompletionParams:
 
 @section
 class WatchParams:
-    max_quoted_baskets: int = param("Quote only this many baskets: the top by expected quote profit per hour "
-                                    "(each leg's edge x size / the time trading takes to reach it). Bounds "
-                                    "write-token spend.", min=0, max=1000, step=1)
     queue_window_s: float = param("Seconds of trades a market side's fill rate is measured over: contracts "
                                   "sold into its bids.", min=300.0, step=300.0, editable=False)
     rank_interval_s: float = param("Seconds between re-rankings, and least time between pricing one basket "
