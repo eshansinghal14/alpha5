@@ -831,10 +831,14 @@ class ArbsRunner:
             ex = self.exit_room(b)
             # An apparent arb on a live game is usually one leg not yet
             # repriced after a score, already being taken by faster traders.
-            live_cap = t.live_quote_size if b.is_live(_utc()) else 10 ** 9
+            live = b.is_live(_utc())
+            live_cap = t.live_quote_size if live else 10 ** 9
+            # On a live game closing a position needs the full edge too: the
+            # same stale-leg risk applies whichever way the bundle points.
+            exit_need = need if live else t.exit_edge
             plan = None
-            if ex >= 1 and g is not None and g >= t.exit_edge - _EPS:
-                plan = pricing.take_plan(vs, b.payout, t.exit_edge, min(ex, live_cap))
+            if ex >= 1 and g is not None and g >= exit_need - _EPS:
+                plan = pricing.take_plan(vs, b.payout, exit_need, min(ex, live_cap))
             if plan is None and g is not None and g >= need - _EPS:
                 per = b.payout - g
                 n = int(min(self.room_bundles(b), max(0.0, self.room_dollars()) // max(per, 0.01), live_cap))
@@ -858,7 +862,9 @@ class ArbsRunner:
         ex = self.exit_room(b)
         now_ts = _utc()
         want = t.enable_quoting and (b.basket_id in self.hot or ex >= 1) and self.may_quote(b, now_ts)
-        cap = float(t.live_quote_size if b.is_live(now_ts) else t.quote_size)
+        live = b.is_live(now_ts)
+        cap = float(t.live_quote_size if live else t.quote_size)
+        quote_need = edge_dollars(b.payout, t.min_edge + t.quote_edge_add)
         reserve = self.cfg.runtime.write_reserve_tokens
         acts = []
         for j, leg in enumerate(b.legs):
@@ -872,12 +878,11 @@ class ArbsRunner:
             if want and ex >= 1:
                 size = min(cap, float(ex), touch)
                 if size >= 1 and (q is None or q.remaining <= size + _EPS):
-                    plan = pricing.quote_leg(vs, j, b.payout, t.exit_edge, size)
+                    plan = pricing.quote_leg(vs, j, b.payout, quote_need if live else t.exit_edge, size)
             elif want:
                 size = min(cap, self.room_bundles(b, j), float(self.quote_size_by_dollars(b)), touch)
                 if size >= 1 and (q is None or q.remaining <= size + _EPS):
-                    plan = pricing.quote_leg(vs, j, b.payout, edge_dollars(b.payout, t.min_edge + t.quote_edge_add),
-                                             size)
+                    plan = pricing.quote_leg(vs, j, b.payout, quote_need, size)
             if plan is None:
                 if q is not None:
                     acts.append(self.cancel_quote(q, "no_edge" if want else "not_hot"))

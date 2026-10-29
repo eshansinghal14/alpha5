@@ -658,3 +658,17 @@ def test_exchange_pause_blocks_and_silences_market_pauses(arbs):
     r._order_err(b.basket_id, "cancel X-A", requests.HTTPError('409 for x: {"error":{"code":"trading_is_paused"}}'),
                  "X-A")
     assert not r.alerts and r.order_errors == 0
+
+
+def test_flip_on_a_live_event_needs_min_edge(arbs):
+    r, b = arbs
+    f = _with_flip(r, b)
+    f = dataclasses.replace(f, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
+    r.baskets[f.basket_id] = f
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, exit_edge=0.01, min_edge=0.05, enable_quoting=False)
+    for t in b.tickers:
+        r.shadow_ledger.record(b.basket_id, b.tickers, t, "yes", 3, 1.35, time.time())
+    book(r, "X-A", [(0.53, 10)], [(0.40, 10)])     # a 2.5c edge: exit_edge clears, min_edge doesn't
+    book(r, "X-B", [(0.53, 10)], [(0.40, 10)])
+    _eval(r, f)
+    assert f.basket_id not in r.shadow_ledger.baskets
