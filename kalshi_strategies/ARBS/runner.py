@@ -306,6 +306,7 @@ class ArbsRunner:
         # move means the market reprices like a live game (weather readings,
         # news). Cleared by a clean completion or an even take on it.
         self.flagged: dict[str, float] = {}
+        self.unpriced_alert_at: dict[str, float] = {}
         self._horizon: tuple[float, pd.Timestamp] | None = None
         # Live order round trips, flushed with the liquidity log (orders_*.jsonl.gz).
         self.order_times: list[dict] = []
@@ -1243,7 +1244,10 @@ class ArbsRunner:
             "path": pick and pick[0]}
         if pick is None:
             self.n["exit_unpriced"] += 1
-            if int(age) // 60 != int(age - 1) // 60 or age < 1:
+            # Once a minute per basket: every book update re-evaluates, and the
+            # first second alone sent 25 (NUMOVI 10-29 15:46 ET, market closing).
+            if now - self.unpriced_alert_at.get(bid, 0.0) >= 60.0:
+                self.unpriced_alert_at[bid] = now
                 self.alert("error", bid, f"no exit priced (a leg closed or too thin): excess "
                                          f"{self.completion_note[bid]['excess']} (broken {age:.0f}s)")
             return
