@@ -1341,7 +1341,12 @@ class ArbsRunner:
             await asyncio.get_running_loop().run_in_executor(self.pool, self.load_meta)
             self.settle()
             mine = self.real_ledger.net_by_ticker()
-            diff = {t: d for t, d in diff.items() if abs(real.get(t, 0.0) - mine.get(t, 0.0)) > 1e-6}
+            # On a determined or settled market we book the payout when the
+            # result is known, Kalshi when it pays out, in either order
+            # (KENNMTU 10-29 02:52: ours at determined, Kalshi's a minute
+            # later). Nothing can be traded there, so it isn't a strike.
+            diff = {t: d for t, d in diff.items() if abs(real.get(t, 0.0) - mine.get(t, 0.0)) > 1e-6
+                    and not (self.meta.get(t) and self.meta[t].status in SETTLED)}
         self.audit_diff = diff or None
         if not diff:
             self.audit_strikes = 0

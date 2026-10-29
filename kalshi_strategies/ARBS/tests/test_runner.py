@@ -605,3 +605,18 @@ def test_chase_ignores_what_older_bundles_cost(arbs):
     r._quote_fill(q, 1, 0.40, None, "shadow")
     _eval(r, b)
     assert r.summary()["holdings"][0]["completion"]["action"] == "rest"
+
+
+def test_audit_ignores_a_determined_market_kalshi_hasnt_paid_out(arbs):
+    r, b = arbs
+    for t in b.tickers:
+        r.meta[t].status = "determined"             # we booked the payout; Kalshi still shows the contracts
+
+    class Client:
+        def positions_all(self):
+            return {"X-A": 1.0, "X-B": 1.0}
+
+    async def call(fn, *a):
+        return fn(*a)
+    r.gw.any_client, r.gw.call, r.load_meta = Client, call, lambda: None
+    assert asyncio.run(r.audit()) and r.audit_strikes == 0
