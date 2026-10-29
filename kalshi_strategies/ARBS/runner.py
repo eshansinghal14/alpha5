@@ -262,6 +262,10 @@ class ArbsRunner:
         self.started = _utc()
         self.liq = Liquidity(self.root)
         self.flow = _Flow()
+        # basket_id -> per leg (price, edge per bundle, size) we'd quote, or None.
+        self.quote_px: dict[str, list] = {}
+        # basket_id -> prints that would have filled a quote on a basket we didn't quote.
+        self.missed: dict[str, dict] = {}
         # Live order round trips, flushed with the liquidity log (orders_*.jsonl.gz).
         self.order_times: list[dict] = []
 
@@ -558,16 +562,40 @@ class ArbsRunner:
         t = self.cfg.trading
         need = edge_dollars(b.payout, t.min_edge + t.quote_edge_add)
         score, fastest = 0.0, float("inf")
+        px = []
         for j, leg in enumerate(b.legs):
             size = float(max(1, min(t.quote_size, int(pricing.touch_size(vs, j) + _EPS))))
             plan = pricing.quote_leg(vs, j, b.payout, need, size)
+            px.append(None if plan is None else (plan.price, plan.edge, size))
             if plan is None:
                 continue
             wait = self.queue_wait(leg.ticker, leg.side, plan.price, size)
             fastest = min(fastest, wait)
             if wait < float("inf"):
                 score += plan.edge * size * 3600.0 / max(wait, 1.0)
+        self.quote_px[b.basket_id] = px
         return score, fastest
+
+    def note_missed(self, ticker: str, side: str, trade):
+        """A print through the price we'd have quoted on a basket outside the
+        hot list: what the basket cap left on the table."""
+        hot = set(self.hot)
+        for bid in self.by_ticker.get(ticker, ()):
+            px = self.quote_px.get(bid)
+            b = self.baskets.get(bid)
+            if bid in hot or px is None or b is None or not self.may_quote(b, _utc()):
+                continue
+            for leg, p in zip(b.legs, px):
+                if p is None or leg.ticker != ticker or leg.side != side or trade.price > p[0] + _EPS:
+                    continue
+                n = min(trade.size, p[2])
+                m = self.missed.setdefault(bid, {"basket_id": bid, "prints": 0, "contracts": 0.0, "usd": 0.0})
+                m["prints"] += 1
+                m["contracts"] += n
+                m["usd"] += n * p[1]
+                m["last"] = _utc().isoformat()
+                self.journal({"kind": "missed", "basket_id": bid, "ticker": ticker, "side": side,
+                              "price": trade.price, "size": n, "quote_price": p[0], "edge": round(p[1], 4)})
 
     def seed_flow(self):
         """Blocking. Recent fill rates from the liquidity log, so a restart
@@ -647,6 +675,7 @@ class ArbsRunner:
         maker = {"yes": "no", "no": "yes"}.get(trade.taker_side)
         if maker:
             self.flow.add(ticker, maker, trade.size, time.time())
+            self.note_missed(ticker, maker, trade)
         if self.live:
             return
         for q in list(self.quotes.values()):
@@ -1659,6 +1688,8 @@ class ArbsRunner:
                     "held_cost": round(sum(h["cost"] for h in holdings), 4),
                     "committed": round(self.committed(), 4), "max_dollars": self.cfg.trading.max_dollars},
             "holdings": holdings, "quotes": quotes, "hot": self.hot, "ranking": self.ranking[:60],
+            "missed": sorted(({**m, "usd": round(m["usd"], 2)} for m in self.missed.values()),
+                             key=lambda m: -m["usd"])[:50],
             "settled": settled[-200:], "alerts": self.alerts[-100:], "audit_diff": self.audit_diff,
             "order_errors": self.order_errors, "counts": self.n, "write_usage": self.gw.usage(), "write_cap": self.write_cap(),
             "config_status": self.store.status(), "scan": self.scan_status,

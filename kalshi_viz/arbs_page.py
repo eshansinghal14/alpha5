@@ -102,22 +102,17 @@ def _metrics(s: dict):
                 f"{n.get('completions', 0)} completions", delta_color="off")
 
 
-def _tables(s: dict):
-    st.markdown(f"##### Bundles held ({s.get('ledger', 'real')} money)")
-    h = s.get("holdings") or []
-    if h:
-        df = pd.DataFrame(h)
-        # Series tickers, the part of a market ticker Kalshi's search finds.
-        df["series"] = df["held"].map(lambda d: " ".join(dict.fromkeys(t.split("-", 1)[0] for t in d)))
-        df["held"] = df["held"].map(lambda d: ", ".join(f"{t.split('-', 1)[-1]} {q:g}" for t, q in d.items()))
-        df["status"] = df["unhedged"].map(lambda u: "INCOMPLETE" if u else "complete")
-        df["pnl"] = df["locked_pnl"].fillna(0) + df.get("broken_pnl", 0.0)
-        df["curr pnl"] = df["curr_pnl"] if "curr_pnl" in df else None
-        df["return"] = (df["pnl"] / df["cost"].where(df["cost"] > 0)).map(
-            lambda v: "" if pd.isna(v) else f"{v:.2%}")
-        st.dataframe(df[["series", "basket_id", "type", "status", "bundles", "payout", "cost", "pnl", "curr pnl",
-                         "return", "held"]]
-                     .sort_values("status", ascending=False), use_container_width=True, hide_index=True)
+@st.cache_data(ttl=5, show_spinner=False)
+def _bundle_log(series: str) -> pd.DataFrame:
+    return arbs_pnl.bundle_log(series)
+
+
+def _tables(series: str, s: dict):
+    st.markdown("##### Bundles bought (newest first)")
+    log = _bundle_log(series)
+    if len(log):
+        st.dataframe(log.head(200), use_container_width=True, hide_index=True,
+                     column_config={"time": st.column_config.DatetimeColumn(format="MM-DD HH:mm:ss")})
     else:
         st.caption("None.")
     st.markdown("##### Resting quotes")
@@ -139,6 +134,12 @@ def _tables(s: dict):
             if "ret" in df:
                 df["ret"] = df["ret"].map(lambda v: f"{v:.2%}")
             st.dataframe(df, use_container_width=True, hide_index=True)
+    with st.expander("Missed fills (prints through our quote price on baskets outside the quoted cap)"):
+        m = s.get("missed") or []
+        if m:
+            st.dataframe(pd.DataFrame(m), use_container_width=True, hide_index=True)
+        else:
+            st.caption("None since the last restart.")
     with st.expander("Settled baskets"):
         st_ = s.get("settled") or []
         if st_:
@@ -216,6 +217,6 @@ def render(series: str, stale_fn):
         _toggle(series, s, idle)
         _alerts(series, s)
         _metrics(s)
-        _tables(s)
+        _tables(series, s)
 
     body()

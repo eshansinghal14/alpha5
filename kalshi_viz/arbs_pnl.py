@@ -105,3 +105,47 @@ def load(series: str) -> pd.DataFrame:
                     except ValueError:
                         continue
     return replay(rows, basket_info(root))
+
+
+def bundle_log(series: str, days: int = 2, gap_s: float = 30.0) -> pd.DataFrame:
+    """Live fills, one row per burst on a basket (fills within gap_s of the
+    last), newest first: what we bought, how, and what it locked in."""
+    root = os.path.join(LIVE_ROOT, series)
+    rows = []
+    for f in sorted(glob.glob(os.path.join(root, "journal", "*.jsonl")))[-days:]:
+        with open(f, encoding="utf-8") as fh:
+            for line in fh:
+                if '"fill"' in line:
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        continue
+                    if r.get("kind") == "fill" and r.get("live"):
+                        rows.append(r)
+    info = basket_info(root)
+    bursts: list[dict] = []
+    last: dict[str, dict] = {}
+    for r in sorted(rows, key=lambda r: r["t"]):
+        bid = r["basket_id"]
+        cur = last.get(bid)
+        if cur is None or r["t"] - cur["t_last"] > gap_s:
+            cur = last[bid] = {"t": r["t"], "t_last": r["t"], "basket_id": bid, "how": set(), "legs": {}, "cost": 0.0}
+            bursts.append(cur)
+        cur["t_last"] = r["t"]
+        cur["how"].add(r.get("fill_kind") or "")
+        key = (r["ticker"], r["side"])
+        cur["legs"][key] = cur["legs"].get(key, 0.0) + float(r["size"])
+        cur["cost"] += float(r["cost"])
+    out = []
+    for c in reversed(bursts):
+        meta = info.get(c["basket_id"]) or guess_info(c["basket_id"])
+        qty = list(c["legs"].values())
+        whole = meta is not None and len(qty) >= meta[1] and len({round(q, 6) for q in qty}) == 1
+        out.append({"time": pd.Timestamp(c["t"], unit="s", tz="UTC"),
+                    # Series tickers, the part of a market ticker Kalshi's search finds.
+                    "series": " ".join(dict.fromkeys(t.split("-", 1)[0] for t, _ in c["legs"])),
+                    "basket_id": c["basket_id"], "how": "+".join(sorted(h for h in c["how"] if h)),
+                    "bundles": qty[0] if whole else None, "cost": round(c["cost"], 2),
+                    "locked": round(qty[0] * meta[0] - c["cost"], 2) if whole else None,
+                    "fills": ", ".join(f"{t.split('-', 1)[-1]} {s} {q:g}" for (t, s), q in c["legs"].items())})
+    return pd.DataFrame(out)
