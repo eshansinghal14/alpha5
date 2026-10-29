@@ -949,7 +949,8 @@ class ArbsRunner:
                            b.basket_id)
             return
         t = self.cfg.trading
-        if t.enable_takes and now - self.last_take.get(b.basket_id, 0.0) >= t.take_cooldown_s:
+        if (t.enable_takes and (t.take_live_events or not b.is_live(_utc()))
+                and now - self.last_take.get(b.basket_id, 0.0) >= t.take_cooldown_s):
             g = pricing.gap(vs, b.payout)
             need = edge_dollars(b.payout, t.min_edge)
             ex = self.exit_room(b)
@@ -1097,14 +1098,16 @@ class ArbsRunner:
                 c = self.gw.client(l.ticker)
                 if c is None or not c.can_afford("order", reserve=10 * (len(b.legs) - 1)):
                     return
-        # Stalest book first, the rest only for what it filled. In a burst the
-        # leg that hasn't repriced is the one others are taking: sent together,
-        # MSTOR's NO MS filled 310 while NO TOR's stale 0.64 was gone (10-29
-        # 02:06, -$27.71).
-        first = min(range(len(b.legs)), key=lambda j: self.book_time.get(b.legs[j].ticker, 0.0))
+        # On a live event: stalest book first, the rest only for what it
+        # filled. In a burst the leg that hasn't repriced is the one others are
+        # taking: sent together, MSTOR's NO MS filled 310 while NO TOR's stale
+        # 0.64 was gone (10-29 02:06, -$27.71). Elsewhere nothing moves in a
+        # round trip, so every leg goes at once.
+        live = b.is_live(_utc())
+        first = min(range(len(b.legs)), key=lambda j: self.book_time.get(b.legs[j].ticker, 0.0)) if live else None
         self.n["takes"] += 1
         self.journal({"kind": "take", "basket_id": b.basket_id, "size": plan.size, "limits": plan.limits,
-                      "edge": round(plan.edge, 4), "first": b.legs[first].ticker})
+                      "edge": round(plan.edge, 4), "first": None if first is None else b.legs[first].ticker})
         got = [0.0] * len(b.legs)
 
         async def leg(j: int, size: float):
@@ -1117,9 +1120,12 @@ class ArbsRunner:
                            order_id=fill.exchange_order_id)
                 got[j] = fill.size
 
-        await leg(first, plan.size)
-        if got[first] > _EPS:
-            await asyncio.gather(*(leg(j, got[first]) for j in range(len(b.legs)) if j != first))
+        if first is None:
+            await asyncio.gather(*(leg(j, plan.size) for j in range(len(b.legs))))
+        else:
+            await leg(first, plan.size)
+            if got[first] > _EPS:
+                await asyncio.gather(*(leg(j, got[first]) for j in range(len(b.legs)) if j != first))
         self.n["take_bundles"] += min(got)
         if max(got) - min(got) > _EPS:
             hi = max(got)

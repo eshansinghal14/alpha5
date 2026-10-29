@@ -16,6 +16,16 @@ from kalshi_viz.arm import arm_control
 from kalshi_viz.data import latest_summary, read_summary, summary_age_s
 
 STALE_S = 15.0
+LOCAL_TZ = "America/New_York"
+TIME_COL = st.column_config.DatetimeColumn(format="MM-DD HH:mm:ss")
+
+
+def _local(df: pd.DataFrame, *cols: str) -> pd.DataFrame:
+    """UTC times (ISO strings or timestamps) shown in local time."""
+    for c in cols:
+        if c in df:
+            df[c] = pd.to_datetime(df[c], utc=True, errors="coerce").dt.tz_convert(LOCAL_TZ)
+    return df
 
 
 def _usd(v) -> str:
@@ -75,8 +85,8 @@ def _alerts(series: str, s: dict):
     al = [a for a in (s.get("alerts") or []) if a["level"] in ("error", "warn") and a["time"] > cut]
     if al:
         with st.expander(f"Alerts ({len(al)} new)", expanded=any(a["level"] == "error" for a in al[-10:])):
-            st.dataframe(pd.DataFrame(al[::-1])[["time", "level", "basket_id", "msg", "live"]],
-                         use_container_width=True, hide_index=True)
+            st.dataframe(_local(pd.DataFrame(al[::-1]), "time")[["time", "level", "basket_id", "msg", "live"]],
+                         use_container_width=True, hide_index=True, column_config={"time": TIME_COL})
             if st.button("Clear (handled)", key="arbs_clear_alerts"):
                 with open(_cleared_path(series), "w", encoding="utf-8") as fh:
                     json.dump({"before": al[-1]["time"]}, fh)
@@ -111,8 +121,8 @@ def _tables(series: str, s: dict):
     st.markdown("##### Bundles bought (newest first)")
     log = _bundle_log(series)
     if len(log):
-        st.dataframe(log.head(200), use_container_width=True, hide_index=True,
-                     column_config={"time": st.column_config.DatetimeColumn(format="MM-DD HH:mm:ss")})
+        st.dataframe(_local(log.head(200).copy(), "time"), use_container_width=True, hide_index=True,
+                     column_config={"time": TIME_COL})
     else:
         st.caption("None.")
     st.markdown("##### Resting quotes")
@@ -137,13 +147,15 @@ def _tables(series: str, s: dict):
     with st.expander("Missed fills (prints through our quote price on baskets outside the quoted cap)"):
         m = s.get("missed") or []
         if m:
-            st.dataframe(pd.DataFrame(m), use_container_width=True, hide_index=True)
+            st.dataframe(_local(pd.DataFrame(m), "last"), use_container_width=True, hide_index=True,
+                         column_config={"last": TIME_COL})
         else:
             st.caption("None since the last restart.")
     with st.expander("Settled baskets"):
         st_ = s.get("settled") or []
         if st_:
-            st.dataframe(pd.DataFrame(st_[::-1]), use_container_width=True, hide_index=True)
+            st.dataframe(_local(pd.DataFrame(st_[::-1]), "settled_at"), use_container_width=True, hide_index=True,
+                         column_config={"settled_at": TIME_COL})
     with st.expander("Feed / write budget / market status"):
         st.json({"feed": s.get("feed"), "write_usage": s.get("write_usage"), "market_status": s.get("market_status"),
                  "counts": s.get("counts"), "order_errors": s.get("order_errors")})

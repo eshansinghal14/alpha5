@@ -531,8 +531,17 @@ def _cheap_book(r):
     book(r, "X-B", [(0.45, 10)], [(0.50, 10)])      # YES B ask 0.50
 
 
-def test_take_sends_the_stalest_leg_first_and_stops_if_it_misses(arbs):
+def _live_takes(r, b):
+    live = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
+    r.set_baskets([live])
+    r.hot = [live.basket_id]
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, take_live_events=True, live_quote_size=100)
+    return live
+
+
+def test_live_take_sends_the_stalest_leg_first_and_stops_if_it_misses(arbs):
     r, b = arbs
+    b = _live_takes(r, b)
     _cheap_book(r)
     r.book_time = {"X-A": 2.0, "X-B": 1.0}          # B hasn't updated for longer
     sent = []
@@ -545,8 +554,9 @@ def test_take_sends_the_stalest_leg_first_and_stops_if_it_misses(arbs):
     assert sent == [("X-B", 10.0)] and b.basket_id not in r.shadow_ledger.baskets
 
 
-def test_take_rest_of_the_legs_sized_to_the_first_fill(arbs):
+def test_live_take_rest_of_the_legs_sized_to_the_first_fill(arbs):
     r, b = arbs
+    b = _live_takes(r, b)
     _cheap_book(r)
     r.book_time = {"X-A": 2.0, "X-B": 1.0}
     sent = []
@@ -563,11 +573,34 @@ def test_take_rest_of_the_legs_sized_to_the_first_fill(arbs):
     assert r.shadow_ledger.baskets[b.basket_id].bundles(b.tickers) == 2
 
 
+def test_take_off_live_sends_every_leg_at_once(arbs):
+    r, b = arbs
+    _cheap_book(r)
+    r.book_time = {"X-A": 2.0, "X-B": 1.0}
+    sent = []
+
+    async def ioc(ticker, side, limit, size, reason, view):
+        sent.append((ticker, size))
+        return None, None
+    r._ioc = ioc
+    _eval(r, b)
+    assert sorted(sent) == [("X-A", 10.0), ("X-B", 10.0)]
+
+
+def test_no_takes_on_live_events_unless_enabled(arbs):
+    r, b = arbs
+    b = _live_takes(r, b)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, take_live_events=False)
+    _cheap_book(r)
+    _eval(r, b)
+    assert b.basket_id not in r.shadow_ledger.baskets
+
+
 def test_take_capped_on_live_events(arbs):
     r, b = arbs
     live = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
     r.set_baskets([live])
-    r.cfg.trading = dataclasses.replace(r.cfg.trading, live_quote_size=1)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, live_quote_size=1, take_live_events=True)
     _cheap_book(r)
     _eval(r, live)
     assert r.shadow_ledger.baskets[live.basket_id].bundles(live.tickers) == 1

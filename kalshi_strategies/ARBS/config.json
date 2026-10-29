@@ -9,6 +9,7 @@
     "days_till_expiry": 90.0,
     "quote_size": 5,
     "quote_live_events": false,
+    "take_live_events": false,
     "live_quote_size": 5,
     "max_bundles_per_basket": 50,
     "max_dollars": 500.0,

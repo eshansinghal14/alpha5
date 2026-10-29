@@ -43,6 +43,10 @@ class TradingParams:
     quote_live_events: bool = param("Quote events that have started (a game after kickoff). A live score change "
                                     "sweeps every leg at once, so a fill there is usually already a loss; "
                                     "exits on live events are taken at once.")
+    take_live_events: bool = param("Take arbs (and flips) on events that have started. A visible arb on a live "
+                                   "game is mostly one leg not yet repriced after a score, which faster traders "
+                                   "take first: 6 of 7 live takes filled unevenly (10-29). Exits of broken "
+                                   "baskets are taken regardless.")
     live_quote_size: int = param("Bundles per resting quote, and most bundles per take, on a live event.",
                                  min=1, max=10000, step=1)
     max_bundles_per_basket: int = param("Most bundles held in one basket (complete or not).", min=0, max=100000,
