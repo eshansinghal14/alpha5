@@ -780,3 +780,12 @@ def test_exit_edge_scales_with_days_to_settlement(arbs):
     assert r.exit_need(at(90), 0.005, now) == pytest.approx(0.005)      # never above the arb edge
     live = dataclasses.replace(at(900), live_from=now - pd.Timedelta(hours=1))
     assert r.exit_need(live, 0.03, now) == pytest.approx(0.03)
+
+
+def test_hot_list_keeps_incumbents_near_the_cut(arbs):
+    r, b = arbs
+    r.hot = ["a", "b", "c", "d"]
+    ranked = ["a", "x", "y", "b", "c", "d", "z"]             # cap 4: d ranks 6th, within 1.5x (6)
+    assert r.pick_hot(ranked, 4) == ["a", "b", "c", "d"]
+    ranked = ["x", "y", "a", "b", "c", "z", "w", "d"]        # d falls to 8th: past 6, replaced by x
+    assert r.pick_hot(ranked, 4) == ["x", "a", "b", "c"]

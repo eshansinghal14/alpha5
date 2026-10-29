@@ -1455,6 +1455,17 @@ class ArbsRunner:
             "payout": b.payout, "asks": [v.best_ask for v in vs], "legs": len(b.legs),
             "depth": round(min(v.depth() for v in vs), 1)}
 
+    def pick_hot(self, quotable: list[str], cap: int) -> list[str]:
+        """The top `cap` by rank, except a basket already quoted keeps its
+        slot while it ranks within 1.5x the cap. Near the cut scores sit close
+        and reorder on small book changes: 339 entries in 10 min for 125
+        slots (10-29), each a cancel, a new order and a lost queue place."""
+        keep = set(self.hot) & set(quotable[:int(cap * 1.5)])
+        out = [b for b in quotable if b in keep]
+        out += [b for b in quotable if b not in keep][:max(0, cap - len(out))]
+        rank = {b: i for i, b in enumerate(quotable)}
+        return sorted(out[:cap], key=rank.get)
+
     async def rank_loop(self):
         """Sorts the rows evaluate() keeps fresh: re-pricing every basket here
         blocked the event loop ~200 ms per pass at 2,500 baskets."""
@@ -1467,7 +1478,7 @@ class ArbsRunner:
                                if q.basket_id in self.baskets and not self.may_quote(self.baskets[q.basket_id], now_ts)}
                 self.ranking = rows
                 quotable = [r["basket_id"] for r in rows if self.may_quote(self.baskets[r["basket_id"]], now_ts)]
-                hot = quotable[:self.cfg.watch.max_quoted_baskets]
+                hot = self.pick_hot(quotable, self.cfg.watch.max_quoted_baskets)
                 if len(hot) >= self.cfg.watch.max_quoted_baskets or _utc() - self.started > pd.Timedelta(minutes=2):
                     self.hot_ready = True
                 if hot != self.hot:
