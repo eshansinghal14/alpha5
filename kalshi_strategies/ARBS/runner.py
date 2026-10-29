@@ -1002,10 +1002,10 @@ class ArbsRunner:
     def resolve(self, b: Basket, pos, qs: list[Quote], now: float):
         """A broken basket, on every change to its legs' books. Its cheaper exit
         is taken once it is chase_ticks per bundle worse than its best within
-        chase_window_s (the book running away), or at once on a live event
-        (prices jump, they don't drift). Otherwise post-only bids rest on that
-        exit's legs, re-pegged each pass: a fill completes or nets out below
-        today's asks."""
+        chase_window_s (the book running away), once it is at least as good as
+        planned, or at once on a live event (prices jump, they don't drift).
+        Otherwise post-only bids rest on that exit's legs, re-pegged each pass:
+        a fill completes or nets out below today's asks."""
         c, bid = self.cfg.completion, b.basket_id
         if any(q.pending for q in qs):
             self.later(bid, 0.05)
@@ -1034,7 +1034,14 @@ class ArbsRunner:
             hist.popleft()
         best = min(v for _, v in hist)
         moved = c.chase_ticks * self.exit_tick(b, path, ex, legs, others) * ex.target
+        # Resting only gambles for better than planned: once the exit is at
+        # least as good as the fill or take was priced at, take it (TXSEND-P4
+        # rested 48 min on thin legs 10-29 with completing worth +$0.54). With
+        # no plan (broken before a restart), "doesn't lose" stands in.
+        planned = self.exit_planned.get(bid)
+        at_plan = cost <= planned + _EPS if planned is not None else loss <= _EPS
         why = ("fast move" if cost - best >= moved - _EPS else
+               "at plan" if at_plan else
                "live event" if b.is_live(_utc()) or not b.quoting_allowed(_utc()) else None)
         self.completion_note[bid]["window_best"] = round(best, 4)
         self.completion_note[bid].update(action="take" if why else "rest", why=why)

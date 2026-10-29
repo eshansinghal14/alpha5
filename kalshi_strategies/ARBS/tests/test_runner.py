@@ -78,13 +78,12 @@ def _fill_quote_on_a(r, b, move_b_to=None):
     asyncio.run(go())
 
 
-def test_quote_fill_rests_a_completion_bid_when_the_book_held(arbs):
+def test_quote_fill_completes_at_plan_when_the_book_held(arbs):
     r, b = arbs
     _fill_quote_on_a(r, b)
-    _eval(r, b)                                      # first pass pulled B's arb quote; this one rests
-    assert r.shadow_ledger.baskets[b.basket_id].unhedged(b.tickers) == {"X-A": 5}
-    q = r.quotes[(b.basket_id, 1)]
-    assert (q.kind, q.side, q.size) == ("complete", "yes", 5)    # B's arb quote replaced by a completion bid
+    _eval(r, b)
+    pos = r.shadow_ledger.baskets[b.basket_id]
+    assert pos.bundles(b.tickers) == 5 and not pos.unhedged(b.tickers)
 
 
 def test_quote_fill_completes_at_once_when_the_other_leg_ran(arbs):
@@ -603,8 +602,11 @@ def test_chase_ignores_what_older_bundles_cost(arbs):
                 edge=1 - 0.40 - R.pricing.taker_cost(0.50, 0.07), max_price=0.40, pending=False)
     r.quotes[q.key] = q
     r._quote_fill(q, 1, 0.40, None, "shadow")
+    r.cfg.completion = dataclasses.replace(r.cfg.completion, chase_ticks=50)
+    r.exit_planned[b.basket_id] -= 0.01             # planned a cent better than today's book
     _eval(r, b)
-    assert r.summary()["holdings"][0]["completion"]["action"] == "rest"
+    note = r.summary()["holdings"][0]["completion"]
+    assert note["action"] == "rest" and note["why"] is None
 
 
 def test_audit_ignores_a_determined_market_kalshi_hasnt_paid_out(arbs):
@@ -620,3 +622,14 @@ def test_audit_ignores_a_determined_market_kalshi_hasnt_paid_out(arbs):
         return fn(*a)
     r.gw.any_client, r.gw.call, r.load_meta = Client, call, lambda: None
     assert asyncio.run(r.audit()) and r.audit_strikes == 0
+
+
+def test_broken_basket_with_no_plan_completes_once_finishing_doesnt_lose(arbs):
+    r, b = arbs
+    r.cfg.completion = dataclasses.replace(r.cfg.completion, chase_ticks=50)
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.45, 10)], [(0.50, 10)])       # B's YES ask 0.50: 0.40 + 0.50 + fees < 1
+    r.shadow_ledger.record(b.basket_id, b.tickers, "X-A", "yes", 5, 5 * 0.40, time.time())   # broke before a restart
+    _eval(r, b)
+    pos = r.shadow_ledger.baskets[b.basket_id]
+    assert pos.bundles(b.tickers) == 5 and not pos.unhedged(b.tickers)
