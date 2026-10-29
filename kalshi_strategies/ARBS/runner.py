@@ -222,7 +222,8 @@ class ArbsRunner:
         self.orphans: list[tuple[float, dict]] = []
         self.tasks: set[asyncio.Task] = set()
         self.n = {"takes": 0, "take_bundles": 0.0, "quotes_placed": 0, "quote_moves": 0, "quote_cancels": 0,
-                  "quote_fills": 0, "completions": 0, "unwinds": 0, "exit_unpriced": 0, "post_only_rejects": 0}
+                  "quote_fills": 0, "completions": 0, "unwinds": 0, "exit_unpriced": 0, "post_only_rejects": 0,
+                  "moves_refused": 0}
         self.started = _utc()
         self.liq = Liquidity(self.root)
         # Live order round trips, flushed with the liquidity log (orders_*.jsonl.gz).
@@ -1190,11 +1191,15 @@ class ArbsRunner:
     async def move_quote(self, q: Quote, plan: pricing.QuotePlan):
         b = self.baskets[q.basket_id]
         q.moved_at = time.time()
-        self.n["quote_moves"] += 1
         old = q.price
         if self.live:
             resp, exc, sent = await self.gw.amend(q.ticker, q.side, q.exchange_id, plan.price, q.remaining, q.filled)
             if not sent:
+                self.n["moves_refused"] += 1
+                if q.price > plan.max_price + _EPS:
+                    # Past its edge limit it would fill at a loss; a cancel
+                    # costs 2 write tokens to an amend's 10 and always goes out.
+                    await self.cancel_quote(q, "move_refused")
                 return
             if exc is not None:
                 if http_status(exc) == 404:
@@ -1213,6 +1218,7 @@ class ArbsRunner:
                 self._commit_cache = None
                 self._register(q, new_id)
         q.price, q.edge, q.max_price = plan.price, plan.edge, plan.max_price
+        self.n["quote_moves"] += 1
         self.journal({"kind": "move", "basket_id": q.basket_id, "ticker": q.ticker, "from": old, "to": plan.price})
 
     async def cancel_quote(self, q: Quote, reason: str):

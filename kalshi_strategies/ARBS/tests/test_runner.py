@@ -571,3 +571,21 @@ def test_take_capped_on_live_events(arbs):
     _cheap_book(r)
     _eval(r, live)
     assert r.shadow_ledger.baskets[live.basket_id].bundles(live.tickers) == 1
+
+
+def test_quote_past_its_limit_is_cancelled_when_the_move_is_refused(arbs):
+    r, b = arbs
+    q = R.Quote(basket_id=b.basket_id, leg=0, ticker="X-A", side="yes", price=0.40, size=5, cid="c", edge=0.0,
+                max_price=0.40, pending=False, exchange_id="oid")
+    r.quotes[q.key] = q
+    r.live = True
+
+    async def amend(*a, **k):
+        return None, None, False                   # write budget refused it
+
+    async def cancel(ticker, oid, reason):
+        return None, None, True
+    r.gw.amend, r.gw.cancel = amend, cancel
+    asyncio.run(r.move_quote(q, R.pricing.QuotePlan(leg=0, price=0.35, max_price=0.36, edge=0.0, others_cost=0.0)))
+    assert q.key not in r.quotes and r.n["moves_refused"] == 1
+    r.live = False

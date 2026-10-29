@@ -122,5 +122,5 @@ class Gateway:
 
     def usage(self) -> dict:
         return {str(s): {"tokens_now": round(c.tokens_now(), 1), "tokens_per_s": c.tokens_per_s,
-                         "http_429": c.usage().get("http_429")}
+                         "http_429": (u := c.usage()).get("http_429"), "refused": u.get("refused")}
                 for s, c in self.clients.items()}
