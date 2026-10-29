@@ -503,3 +503,24 @@ def test_missed_exit_retries_only_after_the_book_changes(arbs):
     r._on_quote(type("V", (), {"ticker": "X-A", "ask": 0.7, "ask_depth": 1, "bid": 0.3, "bid_depth": 1})())
     _eval(r, b)
     assert len(sent) == 2
+
+
+def test_market_missing_at_first_read_is_picked_up_later(arbs, monkeypatch):
+    r, b = arbs
+    del r.meta["X-B"]
+    listed = {"markets": [{"ticker": "X-A", "event_ticker": "X", "status": "active"}]}
+    calls = []
+
+    def get(path, params=None, auth=False):
+        calls.append(path)
+        if path.endswith("/markets"):
+            return listed
+        return {"event": {"series_ticker": "XS", "exchange_index": 0}}
+    monkeypatch.setattr(R, "kalshi_get", get)
+    monkeypatch.setattr(R.kfees, "for_event", lambda s, e: type("F", (), {"taker_rate": 0.07, "maker_rate": 0.0})())
+    r.load_meta()
+    assert r.meta["X-B"].status == "missing"
+    listed["markets"].append({"ticker": "X-B", "event_ticker": "X", "status": "active"})
+    r.load_meta()
+    assert (r.meta["X-B"].event, r.meta["X-B"].status, r.meta["X-B"].shard) == ("X", "active", 0)
+    assert "/trade-api/v2/events/" not in calls

@@ -430,7 +430,11 @@ class ArbsRunner:
                     self.meta[t] = Meta(ticker=t, event="", status="missing")
                     self.alert("warn", None, f"{t}: not listed by Kalshi; its baskets are not traded")
                 continue
-            mt = self.meta.get(t) or Meta(ticker=t, event=m["event_ticker"])
+            mt = self.meta.get(t)
+            if mt is None or mt.event != m["event_ticker"]:
+                # A market missing from an earlier read was stubbed with no
+                # event; keeping that stub looked fees up for event "" forever.
+                mt = Meta(ticker=t, event=m["event_ticker"], status=mt.status if mt else "unknown")
             if mt.status != m.get("status") and mt.status != "unknown":
                 self.journal({"kind": "status", "ticker": t, "from": mt.status, "to": m.get("status")})
             mt.status, mt.result = m.get("status") or "", m.get("result") or ""
@@ -438,7 +442,14 @@ class ArbsRunner:
             self.meta[t] = mt
             events.setdefault(mt.event, []).append(mt)
         for et, ms in events.items():
-            if ms[0].shard is not None:
+            known = next((mt for mt in ms if mt.shard is not None), None)
+            if known is not None:
+                # A market added to a known event (a new strike or candidate)
+                # shares its series, shard and fees.
+                for mt in ms:
+                    if mt.shard is None:
+                        mt.series, mt.shard = known.series, known.shard
+                        mt.taker_rate, mt.maker_rate = known.taker_rate, known.maker_rate
                 continue
             try:
                 ev = kalshi_get(f"/trade-api/v2/events/{et}", auth=True)["event"]
