@@ -109,7 +109,8 @@ def load(series: str) -> pd.DataFrame:
 
 def bundle_log(series: str, days: int = 2, gap_s: float = 30.0) -> pd.DataFrame:
     """Live fills, one row per burst on a basket (fills within gap_s of the
-    last), newest first: what we bought, how, and what it locked in."""
+    last), newest first. pnl: locked in for whole bundles, realized for an
+    unwind, None for a burst that left the basket incomplete."""
     root = os.path.join(LIVE_ROOT, series)
     rows = []
     for f in sorted(glob.glob(os.path.join(root, "journal", "*.jsonl")))[-days:]:
@@ -140,12 +141,17 @@ def bundle_log(series: str, days: int = 2, gap_s: float = 30.0) -> pd.DataFrame:
     for c in reversed(bursts):
         meta = info.get(c["basket_id"]) or guess_info(c["basket_id"])
         qty = list(c["legs"].values())
-        whole = meta is not None and len(qty) >= meta[1] and len({round(q, 6) for q in qty}) == 1
+        tickers = [t for t, _ in c["legs"]]
+        # Both sides of a market: an unwind, the pair paid out $1 each at once.
+        pairs = sum(min(c["legs"].get((t, "yes"), 0.0), c["legs"].get((t, "no"), 0.0)) for t in set(tickers))
+        whole = (not pairs and meta is not None and len(set(tickers)) >= meta[1]
+                 and len({round(q, 6) for q in qty}) == 1)
+        pnl = qty[0] * meta[0] - c["cost"] if whole else pairs - c["cost"] if pairs else None
         out.append({"time": pd.Timestamp(c["t"], unit="s", tz="UTC"),
                     # Series tickers, the part of a market ticker Kalshi's search finds.
                     "series": " ".join(dict.fromkeys(t.split("-", 1)[0] for t, _ in c["legs"])),
                     "basket_id": c["basket_id"], "how": "+".join(sorted(h for h in c["how"] if h)),
                     "bundles": qty[0] if whole else None, "cost": round(c["cost"], 2),
-                    "locked": round(qty[0] * meta[0] - c["cost"], 2) if whole else None,
+                    "pnl": None if pnl is None else round(pnl, 2),
                     "fills": ", ".join(f"{t.split('-', 1)[-1]} {s} {q:g}" for (t, s), q in c["legs"].items())})
     return pd.DataFrame(out)
