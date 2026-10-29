@@ -28,7 +28,7 @@
     "enable": true,
     "max_markets": 1000,
     "shards": [0],
-    "interval_s": 900.0,
+    "interval_s": 120.0,
     "mecnet_max_legs": 6,
     "ladder_span": 3,
     "complete_set_exclude": []
