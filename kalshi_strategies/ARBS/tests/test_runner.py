@@ -826,3 +826,16 @@ def test_live_edge_add_raises_the_quote_edge(arbs):
     r.flag_live(b, "test")
     _eval(r, b)
     assert r.quotes[(b.basket_id, 0)].max_price <= calm - 0.05 + 1e-9     # the limit drops by the add
+
+
+def test_no_missed_fills_counted_on_live_baskets(arbs):
+    r, b = arbs
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    _eval(r, b)
+    r.hot, r.hot_ready = [], True
+    r.flag_live(b, "test")
+    px = r.quote_px[b.basket_id][0][0]
+    from kalshi_backtest.core import Trade
+    r._on_trade("X-A", Trade(ticker="X-A", time=pd.Timestamp.now(tz="UTC"), price=px, size=3.0, taker_side="no"))
+    assert not r.summary()["missed"]

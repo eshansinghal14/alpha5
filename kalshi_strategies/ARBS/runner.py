@@ -637,7 +637,11 @@ class ArbsRunner:
         for bid in self.by_ticker.get(ticker, ()):
             px = self.quote_px.get(bid)
             b = self.baskets.get(bid)
-            if bid in hot or px is None or b is None or not self.may_quote(b, _utc()):
+            # Not on live or flagged baskets: a print through our price there is
+            # mostly the sweep that would have picked us off, not edge missed
+            # (CHACUS showed $410 of "edge" in one live game, 10-29).
+            if (bid in hot or px is None or b is None or not self.may_quote(b, _utc())
+                    or self.live_now(b, _utc())):
                 continue
             for leg, p in zip(b.legs, px):
                 if p is None or leg.ticker != ticker or leg.side != side or trade.price > p[0] + _EPS:
