@@ -14,7 +14,8 @@
     "take_cooldown_s": 1.0
   },
   "completion": {
-    "chase_per_bundle": 0.01,
+    "chase_ticks": 2,
+    "chase_window_s": 1.0,
     "retry_s": 0.25,
     "max_broken_baskets": 3
   },

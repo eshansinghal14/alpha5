@@ -59,26 +59,40 @@ def test_take_when_basket_cheap(arbs):
     assert pos.bundles(b.tickers) == 3 and not pos.unhedged(b.tickers)
 
 
-def test_quote_fill_completes_the_other_leg(arbs):
-    r, b = arbs
+def _fill_quote_on_a(r, b, move_b_to=None):
     book(r, "X-A", [(0.30, 10)], [(0.35, 10)])     # A ask 0.65
     book(r, "X-B", [(0.40, 10)], [(0.45, 10)])     # B ask 0.55 -> gap < 0, no take
 
     async def go():
         r.evaluate(b)
         await drain(r)
-        qs = r.basket_quotes(b.basket_id)
-        assert {q.leg for q in qs} == {0, 1}          # every leg quoted at once
+        assert {q.leg for q in r.basket_quotes(b.basket_id)} == {0, 1}   # every leg quoted at once
         q = r.quotes[(b.basket_id, 0)]
+        if move_b_to is not None:
+            book(r, "X-B", [(0.40, 10)], [(move_b_to, 10)])
         # A print through our quote fills it in shadow.
         r._on_trade(q.ticker, Trade(ticker=q.ticker, time=pd.Timestamp.now(tz="UTC"), price=q.price, size=5,
                                     taker_side="no" if q.side == "yes" else "yes"))
         r.evaluate(b)
         await drain(r)
     asyncio.run(go())
+
+
+def test_quote_fill_rests_a_completion_bid_when_the_book_held(arbs):
+    r, b = arbs
+    _fill_quote_on_a(r, b)
+    _eval(r, b)                                      # first pass pulled B's arb quote; this one rests
+    assert r.shadow_ledger.baskets[b.basket_id].unhedged(b.tickers) == {"X-A": 5}
+    q = r.quotes[(b.basket_id, 1)]
+    assert (q.kind, q.side, q.size) == ("complete", "yes", 5)    # B's arb quote replaced by a completion bid
+
+
+def test_quote_fill_completes_at_once_when_the_other_leg_ran(arbs):
+    r, b = arbs
+    _fill_quote_on_a(r, b, move_b_to=0.42)          # B's ask 0.55 -> 0.58 as A fills
     pos = r.shadow_ledger.baskets[b.basket_id]
     assert pos.bundles(b.tickers) == 5 and not pos.unhedged(b.tickers)
-    assert not r.basket_quotes(b.basket_id)          # the other leg's quote is pulled while completing
+    assert not r.basket_quotes(b.basket_id)
 
 
 def test_each_leg_priced_against_the_others_asks(arbs):
@@ -137,7 +151,7 @@ def test_broken_basket_takes_when_the_exit_moves_away(arbs):
 
 def test_broken_basket_takes_at_once_when_chase_is_zero_or_live(arbs):
     r, b = arbs
-    r.cfg.completion = dataclasses.replace(r.cfg.completion, chase_per_bundle=0.0)
+    r.cfg.completion = dataclasses.replace(r.cfg.completion, chase_ticks=0)
     _broken(r, b)
     _eval(r, b)
     assert b.basket_id not in r.shadow_ledger.baskets
@@ -186,7 +200,7 @@ def test_quotes_on_every_leg_count_once_per_basket(arbs):
     r, b = arbs
     book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
     book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
-    worst = b.payout + r.cfg.completion.chase_per_bundle
+    worst = b.payout + 0.01 * r.cfg.completion.chase_ticks
     # Room for exactly one basket's quotes at quote_size 5, not two.
     r.cfg.trading = dataclasses.replace(r.cfg.trading, max_dollars=5 * worst + 0.01)
 
@@ -410,11 +424,12 @@ def test_unfinished_basket_marked_at_sale_value(arbs):
     assert s["pnl"]["broken"] == h["broken_pnl"] and h["locked_pnl"] == 0.0
 
 
-def test_broken_basket_completes_at_once_when_it_still_profits(arbs):
+def test_slow_drift_keeps_resting(arbs):
     r, b = arbs
-    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
-    book(r, "X-B", [(0.40, 10)], [(0.50, 10)])       # B's YES ask 0.50: 0.40 + 0.50 + fees < 1
-    r.shadow_ledger.record(b.basket_id, b.tickers, "X-A", "yes", 5, 5 * 0.40, time.time())
+    r.cfg.completion = dataclasses.replace(r.cfg.completion, chase_window_s=0.0)
+    _broken(r, b)
     _eval(r, b)
-    pos = r.shadow_ledger.baskets[b.basket_id]
-    assert pos.bundles(b.tickers) == 5 and not pos.unhedged(b.tickers) and not r.quotes
+    book(r, "X-A", [(0.25, 10)], [(0.35, 10)])       # same 5-tick move, but nothing recent to measure from
+    _eval(r, b)
+    assert r.shadow_ledger.baskets[b.basket_id].unhedged(b.tickers) == {"X-A": 5}
+    assert r.quotes[(b.basket_id, 0)].kind == "unwind"

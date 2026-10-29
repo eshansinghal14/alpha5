@@ -39,7 +39,7 @@ class TradingParams:
     max_bundles_per_basket: int = param("Most bundles held in one basket (complete or not).", min=0, max=100000,
                                         step=1)
     max_dollars: float = param("Most dollars in the strategy: cost paid on held baskets, plus per quoted "
-                               "basket its largest resting quote x (payout + chase_per_bundle), the most it "
+                               "basket its largest resting quote x (payout + 1c per chase tick), the most it "
                                "can cost filled and completed however many legs fill.", min=0.0, step=50.0)
     take_cooldown_s: float = param("Least time between takes on one basket. A take buys only the touch of "
                                    "every leg; this is how long to wait for a thin touch to refill at the same "
@@ -53,11 +53,13 @@ class TradingParams:
 
 @section
 class CompletionParams:
-    chase_per_bundle: float = param("A broken basket rests post-only bids on its cheaper exit (buy the missing "
-                                    "legs, or net the extra ones out by buying their other side) and takes it "
-                                    "the moment it costs this much more per bundle ($) than the best seen since "
-                                    "the break. An exit that loses nothing, and any exit on a live event, is "
-                                    "taken at once; 0 = always take at once.", min=0.0, max=0.5, step=0.005)
+    chase_ticks: int = param("A broken basket rests post-only bids on its cheaper exit (buy the missing legs, "
+                             "or net the extra ones out by buying their other side) and takes it once that exit "
+                             "gets this many ticks per bundle worse within chase_window_s: a fast move. A slow "
+                             "drift keeps resting. Live events always take at once; 0 = always take at once.",
+                             min=0, max=50, step=1)
+    chase_window_s: float = param("How recent the best exit price a fast move is measured from.", min=0.0,
+                                  max=60.0, step=0.1)
     retry_s: float = param("Least seconds between exit IOCs on one broken basket.", min=0.05, step=0.05,
                            editable=False)
     max_broken_baskets: int = param("No new takes or quotes while this many baskets are broken.", min=1,

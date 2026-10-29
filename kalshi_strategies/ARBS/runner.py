@@ -3,8 +3,8 @@
 Per pass over baskets whose books changed:
   1. a broken basket (legs uneven, after a quote fill or a partial take)
      takes its cheaper exit, completing the missing legs or netting the
-     extra ones out (pricing.exits), when that loses nothing, has worsened by
-     chase_per_bundle since the break, or the event is live;
+     extra ones out (pricing.exits), when it worsens by chase_ticks within
+     chase_window_s or the event is live;
      otherwise it rests post-only bids on that exit, re-pegged every pass;
   2. a whole-basket take if (payout - sum(ask + fee)) / sum(ask + fee) >= min_edge
      (a return on the bundle's cost, see edge_dollars);
@@ -19,6 +19,7 @@ price (no queue, so optimistic). It has its own ledger file.
 from __future__ import annotations
 
 import asyncio
+import collections
 import concurrent.futures
 import dataclasses
 import json
@@ -142,8 +143,8 @@ class ArbsRunner:
         self.last_take: dict[str, float] = {}
         self.last_completion: dict[str, float] = {}
         self.completion_note: dict[str, dict] = {}
-        # basket_id -> least exit loss seen since it broke: the chase reference.
-        self.break_best: dict[str, float] = {}
+        # basket_id -> recent (time, exit loss) of a broken basket: the chase reference.
+        self.exit_hist: dict[str, collections.deque] = {}
         self.order_errors = 0
         self.halt: str | None = None                     # until restart
         self.audit_strikes = 0
@@ -473,8 +474,17 @@ class ArbsRunner:
         self.journal({"kind": "settled", **row})
         self.dirty.add(b.basket_id)
 
+    def seed_exit(self, basket_id: str, planned_loss: float):
+        """Start a basket's chase history at the exit it was priced against: a
+        fill usually lands in the same burst that moves the other legs, so a
+        history begun at the fill would miss that move."""
+        if basket_id not in self.exit_hist:
+            self.exit_hist[basket_id] = collections.deque([(time.time(), planned_loss)])
+
     def _quote_fill(self, q: Quote, size: float, cost: float, trade_id, source: str):
         q.filled += size
+        if q.kind == "arb":
+            self.seed_exit(q.basket_id, -q.edge * q.filled)
         self.n["quote_fills"] += 1
         self._book(q.basket_id, q.ticker, q.side, size, cost, "quote", source=source, order_id=q.exchange_id,
                    trade_id=trade_id)
@@ -560,8 +570,8 @@ class ArbsRunner:
 
     def worst_bundle_cost(self, b: Basket) -> float:
         """Commitment per bundle of a resting quote: payout plus what a broken
-        basket's exit may drift before it is taken (chase_per_bundle)."""
-        return b.payout + self.cfg.completion.chase_per_bundle
+        basket's exit may move before it is taken (a cent per chase tick)."""
+        return b.payout + 0.01 * self.cfg.completion.chase_ticks
 
     def quote_commit(self, basket_id: str) -> float:
         """Dollars a basket's resting quotes can cost, counted ONCE per basket:
@@ -644,7 +654,7 @@ class ArbsRunner:
         if pos is not None and pos.unhedged(b.tickers):
             self.resolve(b, pos, qs, now)
             return
-        self.break_best.pop(b.basket_id, None)
+        self.exit_hist.pop(b.basket_id, None)
         if any(q.kind != "arb" for q in live_qs):
             self.spawn(self.cancel_quotes([q for q in live_qs if q.kind != "arb"], "whole"), b.basket_id)
             return
@@ -792,6 +802,7 @@ class ArbsRunner:
             got.append(0.0 if fill is None else fill.size)
         self.n["take_bundles"] += min(got)
         if max(got) - min(got) > _EPS:
+            self.seed_exit(b.basket_id, -plan.edge * (max(got) - min(got)))
             self.alert("warn", b.basket_id, f"take filled unevenly {dict(zip(b.tickers, got))}; completing")
 
     def _ioc_exc(self, b, ticker, exc, what):
@@ -809,11 +820,11 @@ class ArbsRunner:
 
     def resolve(self, b: Basket, pos, qs: list[Quote], now: float):
         """A broken basket, on every change to its legs' books. Its cheaper exit
-        is taken at once when it loses nothing (the quote's edge is still there), when it
-        costs chase_per_bundle more than the best seen since the break (the
-        book moving away), or when the event is live (prices jump, they don't
-        drift). Otherwise post-only bids rest on that exit's legs, re-pegged
-        each pass: a fill completes or nets out below today's asks."""
+        is taken once it is chase_ticks per bundle worse than its best within
+        chase_window_s (the book running away), or at once on a live event
+        (prices jump, they don't drift). Otherwise post-only bids rest on that
+        exit's legs, re-pegged each pass: a fill completes or nets out below
+        today's asks."""
         c, bid = self.cfg.completion, b.basket_id
         if any(q.pending for q in qs):
             self.dirty.add(bid)
@@ -827,7 +838,7 @@ class ArbsRunner:
             "time": _utc().isoformat(), "excess": {t: e for t, e in zip(b.tickers, ex.excess) if e > _EPS},
             "complete_loss": None if ex.complete is None else round(ex.complete, 4),
             "unwind_loss": None if ex.unwind is None else round(ex.unwind, 4),
-            "best_since_break": self.break_best.get(bid), "path": pick and pick[0]}
+            "path": pick and pick[0]}
         if pick is None:
             self.n["exit_unpriced"] += 1
             if int(age) // 60 != int(age - 1) // 60 or age < 1:
@@ -835,12 +846,15 @@ class ArbsRunner:
                                          f"{self.completion_note[bid]['excess']} (broken {age:.0f}s)")
             return
         path, loss = pick
-        best = min(self.break_best.get(bid, loss), loss)
-        self.break_best[bid] = best
-        target = ex.target
-        why = ("no loss" if loss <= _EPS else
-               "moved away" if loss >= best + c.chase_per_bundle * target - _EPS else
+        hist = self.exit_hist.setdefault(bid, collections.deque())
+        hist.append((now, loss))
+        while hist and hist[0][0] < now - c.chase_window_s:
+            hist.popleft()
+        best = min(v for _, v in hist)
+        moved = c.chase_ticks * self.exit_tick(b, path, ex, legs, others) * ex.target
+        why = ("fast move" if loss - best >= moved - _EPS else
                "live event" if not b.quoting_allowed(_utc()) else None)
+        self.completion_note[bid]["window_best"] = round(best, 4)
         self.completion_note[bid].update(action="take" if why else "rest", why=why)
         if why is None:
             self.rest_exit(b, path, ex, legs, others, qs, now)
@@ -848,6 +862,14 @@ class ArbsRunner:
             self.spawn(self.exit_now(b, path, ex, legs, others, qs, loss, why), bid)
         else:
             self.dirty.add(bid)
+
+    def exit_tick(self, b: Basket, path: str, ex: pricing.Exits, legs, others) -> float:
+        """The coarsest tick among the exit's orders at their prices: a cent,
+        or 0.1c on a tapered market's tails."""
+        lim = ex.complete_limits if path == "complete" else ex.unwind_limits
+        ticks = [v.ticks.up(lim[j]) - lim[j] for j, _, _, _, v in self._exit_orders(b, path, ex, legs, others)
+                 if v is not None and lim[j] is not None]
+        return max(ticks, default=0.01)
 
     def _exit_orders(self, b: Basket, path: str, ex: pricing.Exits, legs, others):
         """(leg, ticker, side, size, view) per order the exit needs."""
@@ -884,7 +906,7 @@ class ArbsRunner:
         pos = self.ledger.baskets.get(bid)
         if pos is None or not pos.unhedged(b.tickers):
             self.completion_note.pop(bid, None)
-            self.break_best.pop(bid, None)
+            self.exit_hist.pop(bid, None)
             self.journal({"kind": "completed", "basket_id": bid, "path": path})
 
     def rest_exit(self, b: Basket, path: str, ex: pricing.Exits, legs, others, qs, now: float):
