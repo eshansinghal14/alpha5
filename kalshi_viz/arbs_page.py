@@ -108,7 +108,7 @@ def _metrics(s: dict):
                 help="What complete bundles held lock in at settlement, plus unfinished baskets' extra legs at "
                      "what they'd sell for now.")
     c[2].metric("Capital used", f"${p.get('committed', 0):,.2f}", f"of ${p.get('max_dollars', 0):,.0f}",
-                delta_color="off", help="Cost of held baskets plus what resting quotes commit if filled.")
+                delta_color="off", help="Cost of held baskets (resting quotes aren't counted; each is sized to fit what's left).")
     c[3].metric("Baskets tradeable", f"{s.get('n_tradeable')}/{s.get('n_baskets')}",
                 f"{s.get('n_tickers')} markets", delta_color="off")
     n = s.get("counts") or {}

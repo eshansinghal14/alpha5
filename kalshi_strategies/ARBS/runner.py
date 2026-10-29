@@ -881,16 +881,6 @@ class ArbsRunner:
         basket's exit may move before it is taken (a cent per chase tick)."""
         return b.payout + 0.01 * self.cfg.completion.chase_ticks
 
-    def quote_commit(self, basket_id: str) -> float:
-        """Dollars a basket's resting quotes can cost, counted ONCE per basket:
-        a fill on one leg pulls the others and completes, several legs filling
-        leaves less to take, so the basket never needs more than its largest
-        quote's bundles."""
-        qs = self.basket_quotes(basket_id)
-        if not qs:
-            return 0.0
-        return max(q.remaining for q in qs) * self.worst_bundle_cost(self.baskets[basket_id])
-
     def committed(self) -> float:
         """Inside an eval pass the value is cached (a pass runs without
         yielding, and new_quote clears it): summing every basket's quotes per
@@ -911,7 +901,10 @@ class ArbsRunner:
             if bid < fid and pa and pb:
                 b, f = self.baskets[bid], self.baskets[fid]
                 held -= min(pa.bundles(b.tickers), pb.bundles(f.tickers)) * len(b.legs)
-        return held + sum(self.quote_commit(bid) for bid in {q.basket_id for q in self.quotes.values()})
+        # Resting quotes aren't counted: reserving each one's worst case left
+        # $5.9k of $9k committed to 701 quotes that rarely fill, and most were
+        # cut to 1-2 lots (10-29). Each quote alone still fits the room left.
+        return held
 
     def room_bundles(self, b: Basket, leg: int | None = None) -> float:
         """Bundles the basket may still add. For a quote on `leg`, net of what
@@ -968,10 +961,9 @@ class ArbsRunner:
         return self.cfg.trading.max_dollars - self.committed()
 
     def quote_size_by_dollars(self, b: Basket) -> int:
-        """Largest quote size any leg of `b` may have under max_dollars. The
-        basket's own quotes are added back, since a leg at or below the
-        basket's largest quote adds nothing to what it can cost."""
-        budget = self.room_dollars() + self.quote_commit(b.basket_id)
+        """Largest quote size any leg of `b` may have under max_dollars, if
+        it alone fills: other baskets' quotes aren't counted."""
+        budget = self.room_dollars()
         return int(max(0.0, budget) // max(self.worst_bundle_cost(b), 0.01))
 
     # ------------------------------------------------------------------ eval

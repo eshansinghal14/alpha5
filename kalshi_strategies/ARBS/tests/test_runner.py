@@ -196,21 +196,17 @@ def test_settlement_books_pnl(arbs):
     assert r.shadow_ledger.settled[-1]["pnl"] == pytest.approx(0.2)
 
 
-def test_quotes_on_every_leg_count_once_per_basket(arbs):
+def test_resting_quotes_are_not_capital_used(arbs):
     r, b = arbs
     book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
     book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
     worst = b.payout + 0.01 * r.cfg.completion.chase_ticks
-    # Room for exactly one basket's quotes at quote_size 5, not two.
+    # Room for one basket's 5 bundles: each quote is sized to fit it alone.
     r.cfg.trading = dataclasses.replace(r.cfg.trading, max_dollars=5 * worst + 0.01)
-
-    async def go():
-        r.evaluate(b)
-        await drain(r)
-    asyncio.run(go())
+    _eval(r, b)
     qs = r.basket_quotes(b.basket_id)
     assert {q.leg for q in qs} == {0, 1} and all(q.size == 5 for q in qs)
-    assert r.committed() == pytest.approx(5 * worst)
+    assert r.committed() == 0.0
 
 
 def test_edge_is_a_return_on_bundle_cost():
