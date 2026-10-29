@@ -50,6 +50,22 @@ def _ts(v) -> pd.Timestamp | None:
     return None if not v else pd.Timestamp(v)
 
 
+def basket_to_dict(b: Basket) -> dict:
+    return {"basket_id": b.basket_id, "relationship_id": b.relationship_id, "type": b.type, "cluster": b.cluster,
+            "legs": [[l.ticker, l.side] for l in b.legs], "payout": b.payout,
+            "settles": None if b.settles is None else b.settles.isoformat(),
+            "live_from": None if b.live_from is None else b.live_from.isoformat()}
+
+
+def basket_from_dict(d: dict) -> Basket:
+    """A held basket's saved definition. Its quote window isn't kept: it is
+    only completed and settled, never quoted, once the spec drops it."""
+    return Basket(basket_id=d["basket_id"], relationship_id=d["relationship_id"], type=d["type"],
+                  cluster=d["cluster"], legs=tuple(Leg(t, s) for t, s in d["legs"]), payout=float(d["payout"]),
+                  quote_until=None, resume_quoting=None, settles=_ts(d.get("settles")),
+                  live_from=_ts(d.get("live_from")))
+
+
 def _settles(rel: dict) -> pd.Timestamp | None:
     if rel.get("expected_settlement_utc"):
         return pd.Timestamp(rel["expected_settlement_utc"])

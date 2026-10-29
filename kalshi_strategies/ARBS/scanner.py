@@ -151,7 +151,8 @@ def mecnet(event: dict, markets: list[dict], max_legs: int, complete: bool) -> l
         if complete and k == len(ranked):
             break
         ts = [m["ticker"] for m in ranked[:k]]
-        baskets.append({"basket_id": f"mecnet:{et}:no:" + "+".join(_sfx(et, t) for t in ts), "payout": k - 1,
+        # Legs sorted in the id: the same set keeps its id when prices reorder.
+        baskets.append({"basket_id": f"mecnet:{et}:no:" + "+".join(sorted(_sfx(et, t) for t in ts)), "payout": k - 1,
                         "legs": _legs(*((t, "no") for t in ts))})
     if baskets:
         rels.append({"relationship_id": f"mecnet:{et}", "type": "mutually_exclusive_no", "cluster": series,

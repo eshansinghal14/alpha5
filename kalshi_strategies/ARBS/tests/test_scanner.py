@@ -42,8 +42,8 @@ def buckets(et):
 def test_mecnet_lists_no_on_the_likeliest_k():
     e = event("EV-1", "MECNET", [mkt("EV-1-A", 0.1), mkt("EV-1-B", 0.6), mkt("EV-1-C", 0.3)])
     bs = baskets(run([e]))
-    assert set(bs) == {"mecnet:EV-1:no:B+C", "mecnet:EV-1:no:B+C+A"}
-    b = bs["mecnet:EV-1:no:B+C+A"]
+    assert set(bs) == {"mecnet:EV-1:no:B+C", "mecnet:EV-1:no:A+B+C"}
+    b = bs["mecnet:EV-1:no:A+B+C"]
     assert b.payout == 2 and {l.side for l in b.legs} == {"no"}
 
 

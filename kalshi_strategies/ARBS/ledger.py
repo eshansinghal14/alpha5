@@ -35,6 +35,9 @@ class LegPos:
 class BasketPos:
     legs: dict[str, LegPos] = dataclasses.field(default_factory=dict)   # ticker -> pos
     broken_since: float | None = None       # unix time the basket first went uneven
+    # The basket's definition (spec.basket_to_dict), kept while it is held: a
+    # scanned basket can drop out of the scan before it settles.
+    spec: dict | None = None
 
     def held(self, tickers: list[str]) -> list[float]:
         return [self.legs.get(t, LegPos()).qty for t in tickers]
@@ -75,7 +78,7 @@ class Ledger:
             d = json.load(fh)
         for bid, b in d.get("baskets", {}).items():
             self.baskets[bid] = BasketPos(legs={t: LegPos(**l) for t, l in b["legs"].items()},
-                                          broken_since=b.get("broken_since"))
+                                          broken_since=b.get("broken_since"), spec=b.get("spec"))
         self.quote_ids = d.get("quote_ids", {})
         self.last_fill_ts = d.get("last_fill_ts")
         self.seen_trades = set(d.get("seen_trades", []))
@@ -90,7 +93,7 @@ class Ledger:
                               if v.get("retired_at") is None or now - v["retired_at"] < 86400}
         atomic_write_json(self.path, {
             "baskets": {bid: {"legs": {t: dataclasses.asdict(l) for t, l in b.legs.items()},
-                              "broken_since": b.broken_since}
+                              "broken_since": b.broken_since, "spec": b.spec}
                         for bid, b in self.baskets.items() if b.legs},
             "quote_ids": self.quote_ids,
             "last_fill_ts": self.last_fill_ts,

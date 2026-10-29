@@ -42,7 +42,7 @@ from kalshi_strategies.ARBS.execution import Gateway
 from kalshi_strategies.ARBS.feed import MultiFeed
 from kalshi_strategies.ARBS.ledger import Ledger
 from kalshi_strategies.ARBS.liquidity import Liquidity
-from kalshi_strategies.ARBS.spec import Basket, load_spec, merge, parse_spec
+from kalshi_strategies.ARBS.spec import Basket, basket_from_dict, basket_to_dict, load_spec, merge, parse_spec
 
 _EPS = 1e-9
 OTHER = {"yes": "no", "no": "yes"}
@@ -130,6 +130,11 @@ class ArbsRunner:
         self.scan_path = os.path.join(self.root, "scanned_spec.json")
         self.scan_status: dict = {}
         self.set_baskets(merge(self.hand, self.scanned()))
+        for led in (self.real_ledger, self.shadow_ledger):
+            for bid, pos in led.baskets.items():
+                if pos.spec is None and bid in self.baskets:
+                    pos.spec = basket_to_dict(self.baskets[bid])
+            led.save()
         self.arm_want = live_trading
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=16, thread_name_prefix="arbs")
         self.gw = Gateway(self.pool)
@@ -247,8 +252,14 @@ class ArbsRunner:
         keep = set(self.real_ledger.baskets) | set(self.shadow_ledger.baskets) | self.busy | \
             {q.basket_id for q in self.quotes.values()}
         for bid in keep:
-            if bid not in new and bid in self.baskets:
+            if bid in new:
+                continue
+            if bid in self.baskets:
                 new[bid] = self.baskets[bid]
+                continue
+            pos = self.real_ledger.baskets.get(bid) or self.shadow_ledger.baskets.get(bid)
+            if pos is not None and pos.spec:
+                new[bid] = basket_from_dict(pos.spec)
         old = set(self.tickers)
         # Changed ones too: a new quote window has to pull a resting quote.
         changed = {k for k, v in new.items() if self.baskets.get(k) != v}
@@ -453,6 +464,7 @@ class ArbsRunner:
         if any(l.ticker == ticker and l.side != side for l in b.legs):
             self._book_unwind(b, ticker, side, size, cost, kind, **kw)
             return
+        self.ledger.pos(basket_id).spec = basket_to_dict(b)
         self.ledger.record(basket_id, b.tickers, ticker, side, size, cost, time.time())
         self.journal({"kind": "fill", "fill_kind": kind, "basket_id": basket_id, "ticker": ticker, "side": side,
                       "size": size, "cost": round(cost, 4), "price": round((cost / size) if size else 0, 4), **kw})

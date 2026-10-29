@@ -460,3 +460,17 @@ def test_live_events_quoted_only_when_enabled_and_smaller(arbs):
     r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_live_events=True, live_quote_size=2)
     _eval(r, live)
     assert {q.size for q in r.quotes.values()} == {2}
+
+
+def test_held_basket_survives_dropping_out_of_the_spec(arbs, tmp_path):
+    r, b = arbs
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.50, 10)])
+    r._book(b.basket_id, "X-A", "yes", 5, 2.0, "take")
+    r._book(b.basket_id, "X-B", "yes", 5, 2.5, "take")
+    from kalshi_strategies.ARBS.ledger import Ledger
+    again = Ledger(r.shadow_ledger.path)                 # as after a restart
+    r.shadow_ledger, r.baskets, r.all_baskets = again, {}, []
+    r.set_baskets([])
+    assert r.baskets[b.basket_id] == dataclasses.replace(b, cluster=b.cluster)
+    assert r.summary()["holdings"][0]["locked_pnl"] == pytest.approx(5 * 1.0 - 4.5)
