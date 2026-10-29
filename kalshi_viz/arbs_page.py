@@ -3,9 +3,11 @@ in on held bundles), bundles held, resting quotes, the opportunity ranking
 and the settled history. Reads only data/live/ARBS/<date>/summary.json."""
 from __future__ import annotations
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
+from kalshi_viz import arbs_pnl
 from kalshi_viz.arm import arm_control
 from kalshi_viz.data import latest_summary, read_summary, summary_age_s
 
@@ -122,10 +124,59 @@ def _tables(s: dict):
                  "counts": s.get("counts"), "order_errors": s.get("order_errors")})
 
 
+@st.cache_data(ttl=15, show_spinner=False)
+def _pnl_frame(series: str) -> pd.DataFrame:
+    return arbs_pnl.load(series)
+
+
+PNL_WINDOWS = {"6h": pd.Timedelta(hours=6), "24h": pd.Timedelta(hours=24), "7d": pd.Timedelta(days=7), "All": None}
+PNL_LINES = {"PnL (settled + locked)": "#1e88e5", "Settled": "#6d4c41"}
+
+
+def _pnl_chart(series: str):
+    """Real money only, from the journal: settled plus what complete bundles
+    held lock in. Each line starts at 0 at the window's start."""
+    df = _pnl_frame(series)
+    if df.empty:
+        st.caption("No live fills yet.")
+        return
+    win = st.radio("Window", list(PNL_WINDOWS), index=1, horizontal=True, key=f"arbs_pnl_win_{series}",
+                   label_visibility="collapsed")
+    since = None if PNL_WINDOWS[win] is None else pd.Timestamp.now(tz="UTC") - PNL_WINDOWS[win]
+    before = df[df.time < since] if since is not None else df.iloc[:0]
+    d = df[df.time >= since] if since is not None else df
+    base = before.iloc[-1] if len(before) else None
+    start = since if since is not None else d.time.min()
+    rows = []
+    for name, col in (("PnL (settled + locked)", "total"), ("Settled", "settled")):
+        b0 = 0.0 if base is None else float(base[col])
+        rows.append(pd.DataFrame({"time": [start] + list(d.time), "line": name,
+                                  "usd": [0.0] + [float(v) - b0 for v in d[col]]}))
+    c = pd.concat(rows, ignore_index=True)
+    chart = alt.Chart(c).encode(
+        x=alt.X("time:T", title=None, axis=alt.Axis(format="%m-%d %H:%M")),
+        y=alt.Y("usd:Q", title="$ (cumulative)"),
+        color=alt.Color("line:N", title=None, legend=alt.Legend(orient="top-left"),
+                        scale=alt.Scale(domain=list(PNL_LINES), range=list(PNL_LINES.values()))),
+        strokeDash=alt.condition(alt.datum.line == "Settled", alt.value([5, 3]), alt.value([1, 0])),
+        tooltip=[alt.Tooltip("time:T", format="%m-%d %H:%M:%S"), "line:N", alt.Tooltip("usd:Q", format="+.2f")])
+    zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#888", strokeWidth=0.7).encode(y="y:Q")
+    st.altair_chart((chart.mark_line(interpolate="step-after", strokeWidth=2) + zero).properties(height=260),
+                    use_container_width=True)
+
+
 def render(series: str, stale_fn):
     st.title("Arbitrage · risk-free")
     st.caption("Whole baskets only: take every leg, or quote legs and complete the rest on a fill. "
                f"Series {series}.")
+
+    @st.fragment(run_every="15s")
+    def chart():
+        if stale_fn(series):
+            return
+        _pnl_chart(series)
+
+    chart()
 
     @st.fragment(run_every="2s")
     def body():
