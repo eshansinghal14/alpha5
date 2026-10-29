@@ -39,7 +39,8 @@ class TradingParams:
     quote_live_events: bool = param("Quote events that have started (a game after kickoff). A live score change "
                                     "sweeps every leg at once, so a fill there is usually already a loss; "
                                     "exits on live events are taken at once.")
-    live_quote_size: int = param("Bundles per resting quote on a live event.", min=1, max=10000, step=1)
+    live_quote_size: int = param("Bundles per resting quote, and most bundles per take, on a live event.",
+                                 min=1, max=10000, step=1)
     max_bundles_per_basket: int = param("Most bundles held in one basket (complete or not).", min=0, max=100000,
                                         step=1)
     max_dollars: float = param("Most dollars in the strategy: cost paid on held baskets, plus per quoted "

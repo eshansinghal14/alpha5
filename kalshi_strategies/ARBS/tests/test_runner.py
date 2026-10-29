@@ -524,3 +524,50 @@ def test_market_missing_at_first_read_is_picked_up_later(arbs, monkeypatch):
     r.load_meta()
     assert (r.meta["X-B"].event, r.meta["X-B"].status, r.meta["X-B"].shard) == ("X", "active", 0)
     assert "/trade-api/v2/events/" not in calls
+
+
+def _cheap_book(r):
+    book(r, "X-A", [(0.35, 10)], [(0.60, 10)])      # YES A ask 0.40
+    book(r, "X-B", [(0.45, 10)], [(0.50, 10)])      # YES B ask 0.50
+
+
+def test_take_sends_the_stalest_leg_first_and_stops_if_it_misses(arbs):
+    r, b = arbs
+    _cheap_book(r)
+    r.book_time = {"X-A": 2.0, "X-B": 1.0}          # B hasn't updated for longer
+    sent = []
+
+    async def ioc(ticker, side, limit, size, reason, view):
+        sent.append((ticker, size))
+        return None, None                             # B's level was already gone
+    r._ioc = ioc
+    _eval(r, b)
+    assert sent == [("X-B", 10.0)] and b.basket_id not in r.shadow_ledger.baskets
+
+
+def test_take_rest_of_the_legs_sized_to_the_first_fill(arbs):
+    r, b = arbs
+    _cheap_book(r)
+    r.book_time = {"X-A": 2.0, "X-B": 1.0}
+    sent = []
+    real = r._ioc
+
+    async def ioc(ticker, side, limit, size, reason, view):
+        sent.append((ticker, size))
+        if ticker == "X-B":
+            return R.RealFill(price=0.50, size=2.0, fee=0.0, exchange_order_id=None), None
+        return await real(ticker, side, limit, size, reason, view)
+    r._ioc = ioc
+    _eval(r, b)
+    assert sent == [("X-B", 10.0), ("X-A", 2.0)]
+    assert r.shadow_ledger.baskets[b.basket_id].bundles(b.tickers) == 2
+
+
+def test_take_capped_on_live_events(arbs):
+    r, b = arbs
+    live = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
+    r.set_baskets([live])
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, live_quote_size=1)
+    _cheap_book(r)
+    _eval(r, live)
+    assert r.shadow_ledger.baskets[live.basket_id].bundles(live.tickers) == 1

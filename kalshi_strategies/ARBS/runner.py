@@ -210,6 +210,7 @@ class ArbsRunner:
         # ticker -> book updates seen; basket_id -> (its legs' counts, held)
         # at its last exit attempt. An exit is retried only once one changed.
         self.book_seq: dict[str, int] = {}
+        self.book_time: dict[str, float] = {}     # ticker -> monotonic time of its last book update
         self.last_exit: dict[str, tuple] = {}
         self.completion_note: dict[str, dict] = {}
         # basket_id -> recent (time, exit loss) of a broken basket: the chase reference.
@@ -543,6 +544,7 @@ class ArbsRunner:
 
     def _on_quote(self, book):
         self.book_seq[book.ticker] = self.book_seq.get(book.ticker, 0) + 1
+        self.book_time[book.ticker] = time.monotonic()
         self.liq.on_book(book.ticker, time.monotonic(), book.ask, book.ask_depth, book.bid, book.bid_depth)
         for bid in self.by_ticker.get(book.ticker, ()):
             self.dirty.add(bid)
@@ -803,12 +805,15 @@ class ArbsRunner:
             g = pricing.gap(vs, b.payout)
             need = edge_dollars(b.payout, t.min_edge)
             ex = self.exit_room(b)
+            # An apparent arb on a live game is usually one leg not yet
+            # repriced after a score, already being taken by faster traders.
+            live_cap = t.live_quote_size if b.is_live(_utc()) else 10 ** 9
             plan = None
             if ex >= 1 and g is not None and g >= t.exit_edge - _EPS:
-                plan = pricing.take_plan(vs, b.payout, t.exit_edge, ex)
+                plan = pricing.take_plan(vs, b.payout, t.exit_edge, min(ex, live_cap))
             if plan is None and g is not None and g >= need - _EPS:
                 per = b.payout - g
-                n = int(min(self.room_bundles(b), max(0.0, self.room_dollars()) // max(per, 0.01)))
+                n = int(min(self.room_bundles(b), max(0.0, self.room_dollars()) // max(per, 0.01), live_cap))
                 plan = pricing.take_plan(vs, b.payout, need, n) if n >= 1 else None
             if plan is not None:
                 if live_qs:
@@ -942,19 +947,29 @@ class ArbsRunner:
                 c = self.gw.client(l.ticker)
                 if c is None or not c.can_afford("order", reserve=10 * (len(b.legs) - 1)):
                     return
+        # Stalest book first, the rest only for what it filled. In a burst the
+        # leg that hasn't repriced is the one others are taking: sent together,
+        # MSTOR's NO MS filled 310 while NO TOR's stale 0.64 was gone (10-29
+        # 02:06, -$27.71).
+        first = min(range(len(b.legs)), key=lambda j: self.book_time.get(b.legs[j].ticker, 0.0))
         self.n["takes"] += 1
         self.journal({"kind": "take", "basket_id": b.basket_id, "size": plan.size, "limits": plan.limits,
-                      "edge": round(plan.edge, 4)})
-        res = await asyncio.gather(*(self._ioc(l.ticker, l.side, lim, plan.size, "take", v)
-                                     for l, lim, v in zip(b.legs, plan.limits, vs)))
-        got = []
-        for l, (fill, exc) in zip(b.legs, res):
+                      "edge": round(plan.edge, 4), "first": b.legs[first].ticker})
+        got = [0.0] * len(b.legs)
+
+        async def leg(j: int, size: float):
+            l = b.legs[j]
+            fill, exc = await self._ioc(l.ticker, l.side, plan.limits[j], size, "take", vs[j])
             if exc is not None:
                 self._ioc_exc(b, l.ticker, exc, "take")
             if fill is not None and fill.size > 0:
                 self._book(b.basket_id, l.ticker, l.side, fill.size, fill.price * fill.size + fill.fee, "take",
                            order_id=fill.exchange_order_id)
-            got.append(0.0 if fill is None else fill.size)
+                got[j] = fill.size
+
+        await leg(first, plan.size)
+        if got[first] > _EPS:
+            await asyncio.gather(*(leg(j, got[first]) for j in range(len(b.legs)) if j != first))
         self.n["take_bundles"] += min(got)
         if max(got) - min(got) > _EPS:
             self.seed_exit(b.basket_id, -plan.edge * (max(got) - min(got)))
