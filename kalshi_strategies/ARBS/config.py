@@ -76,9 +76,6 @@ class WatchParams:
                                     "write-token spend.", min=0, max=1000, step=1)
     queue_window_s: float = param("Seconds of trades a market side's fill rate is measured over: contracts "
                                   "sold into its bids.", min=300.0, step=300.0, editable=False)
-    max_queue_wait_s: float | None = param("A leg isn't quoted when the contracts ahead of its price would take "
-                                           "longer than this to trade at the recent fill rate. Exits are "
-                                           "quoted regardless. Empty = no limit.", min=1.0, step=60.0)
     rank_interval_s: float = param("Seconds between re-rankings.", min=0.5, step=0.5, editable=False)
     exclude: list[str] = param("basket_id, relationship_id or cluster names never traded. Open positions "
                                "in them are still completed and settled.", editable=False)

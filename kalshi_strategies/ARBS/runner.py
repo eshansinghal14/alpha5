@@ -554,9 +554,8 @@ class ArbsRunner:
 
     def quote_score(self, b: Basket, vs) -> tuple[float, float]:
         """(expected $/h of quoting every leg, shortest leg wait in s): each
-        leg's edge x size over the time trading takes to reach it, for legs
-        within watch.max_queue_wait_s."""
-        t, cap = self.cfg.trading, self.cfg.watch.max_queue_wait_s
+        leg's edge x size over the time trading takes to reach it."""
+        t = self.cfg.trading
         need = edge_dollars(b.payout, t.min_edge + t.quote_edge_add)
         score, fastest = 0.0, float("inf")
         for j, leg in enumerate(b.legs):
@@ -566,7 +565,7 @@ class ArbsRunner:
                 continue
             wait = self.queue_wait(leg.ticker, leg.side, plan.price, size)
             fastest = min(fastest, wait)
-            if wait < float("inf") and (cap is None or wait <= cap):
+            if wait < float("inf"):
                 score += plan.edge * size * 3600.0 / max(wait, 1.0)
         return score, fastest
 
@@ -960,12 +959,6 @@ class ArbsRunner:
                 size = min(cap, self.room_bundles(b, j), float(self.quote_size_by_dollars(b)), touch)
                 if size >= 1 and (q is None or q.remaining <= size + _EPS):
                     plan = pricing.quote_leg(vs, j, b.payout, quote_need, size)
-                wait_cap = self.cfg.watch.max_queue_wait_s
-                if (plan is not None and wait_cap is not None
-                        and self.queue_wait(leg.ticker, leg.side, plan.price, size) > wait_cap):
-                    if q is not None:
-                        acts.append(self.cancel_quote(q, "queue"))
-                    continue
             if plan is None:
                 if q is not None:
                     acts.append(self.cancel_quote(q, "no_edge" if want else "not_hot"))
