@@ -633,3 +633,18 @@ def test_broken_basket_with_no_plan_completes_once_finishing_doesnt_lose(arbs):
     _eval(r, b)
     pos = r.shadow_ledger.baskets[b.basket_id]
     assert pos.bundles(b.tickers) == 5 and not pos.unhedged(b.tickers)
+
+
+def test_paused_market_is_held_with_one_alert(arbs):
+    r, b = arbs
+    _cheap_book(r)
+    import requests
+    exc = requests.HTTPError('409 for x: {"error":{"code":"trading_is_paused"}}')
+    for _ in range(3):
+        r._order_err(b.basket_id, "quote X-A", exc, "X-A")
+    assert r.order_errors == 0 and sum("paused" in a["msg"] for a in r.alerts) == 1
+    _eval(r, b)                                    # would take, but X-A is held
+    assert b.basket_id not in r.shadow_ledger.baskets and not r.quotes
+    r.paused_until["X-A"] = 0.0
+    _eval(r, b)
+    assert b.basket_id in r.shadow_ledger.baskets

@@ -35,6 +35,7 @@ from kalshi_infra.api_functions import kalshi_get
 from kalshi_infra.config import ConfigStore, atomic_write_json
 from kalshi_infra.kalshi import fees as kfees
 from kalshi_infra.kalshi.orders import RealFill, error_code, http_status, is_market_paused, is_post_only_reject
+from kalshi_infra.trading.engine import MARKET_PAUSE_RETRY_S
 from kalshi_infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
 from kalshi_infra.runtime.persist import LIVE_ROOT, day_dir
 from kalshi_strategies.ARBS import pricing, scanner
@@ -212,6 +213,7 @@ class ArbsRunner:
         # at its last exit attempt. An exit is retried only once one changed.
         self.book_seq: dict[str, int] = {}
         self.book_time: dict[str, float] = {}     # ticker -> monotonic time of its last book update
+        self.paused_until: dict[str, float] = {}  # ticker -> monotonic time Kalshi's pause is next retried
         self.last_exit: dict[str, tuple] = {}
         self.completion_note: dict[str, dict] = {}
         # basket_id -> recent (time, exit cost) of a broken basket: the chase
@@ -304,12 +306,18 @@ class ArbsRunner:
     def _order_ok(self):
         self.order_errors = 0
 
-    def _order_err(self, basket_id, what, exc):
+    def _order_err(self, basket_id, what, exc, ticker: str):
         st, code = http_status(exc), error_code(exc)
         if st == 429:
             return
         if is_market_paused(exc):
-            self.alert("warn", basket_id, f"{what}: market paused/closed ({code})")
+            # Held like the engine does: Kalshi's Thursday maintenance pauses
+            # every market, and retrying each pass sent 1563 rejected orders
+            # in 8 min (10-29 07:00).
+            if not self.market_paused(ticker):
+                self.alert("warn", basket_id, f"{what}: market paused/closed ({code}); "
+                                              f"no new orders on it for {MARKET_PAUSE_RETRY_S:.0f}s")
+            self.paused_until[ticker] = time.monotonic() + MARKET_PAUSE_RETRY_S
             return
         self.order_errors += 1
         self.alert("error", basket_id, f"{what} failed: {st} {code} {str(exc)[:200]}")
@@ -476,10 +484,14 @@ class ArbsRunner:
             except Exception as e:
                 _log(f"WARN: meta refresh failed ({e!r})")
 
+    def market_paused(self, ticker: str) -> bool:
+        return time.monotonic() < self.paused_until.get(ticker, 0.0)
+
     def tradeable(self, b: Basket) -> bool:
         for t in b.tickers:
             m = self.meta.get(t)
-            if m is None or m.status not in TRADEABLE or m.shard is None or m.taker_rate is None:
+            if (m is None or m.status not in TRADEABLE or m.shard is None or m.taker_rate is None
+                    or self.market_paused(t)):
                 return False
         return True
 
@@ -993,7 +1005,7 @@ class ArbsRunner:
             self.halt = f"unreadable {what} fill on {ticker}: {exc}"
             self.alert("error", b.basket_id, self.halt)
         else:
-            self._order_err(b.basket_id, f"{what} IOC {ticker}", exc)
+            self._order_err(b.basket_id, f"{what} IOC {ticker}", exc, ticker)
 
     def is_open(self, ticker: str) -> bool:
         m = self.meta.get(ticker)
@@ -1172,7 +1184,7 @@ class ArbsRunner:
                 await self._find_lost(q)
                 return
             self.quotes.pop(q.key, None)
-            self._order_err(b.basket_id, f"quote {q.ticker}", exc)
+            self._order_err(b.basket_id, f"quote {q.ticker}", exc, q.ticker)
             return
         self._order_ok()
         self._register(q, ack.exchange_order_id)
@@ -1226,7 +1238,7 @@ class ArbsRunner:
                 if http_status(exc) == 404:
                     self._retire(q)           # filled or gone; fills arrive on their own
                     return
-                self._order_err(q.basket_id, f"move {q.ticker}", exc)
+                self._order_err(q.basket_id, f"move {q.ticker}", exc, q.ticker)
                 if q.price > plan.max_price + _EPS:
                     await self.cancel_quote(q, "move_failed")
                 return
@@ -1247,7 +1259,7 @@ class ArbsRunner:
         if self.live and q.exchange_id:
             _, exc, _ = await self.gw.cancel(q.ticker, q.exchange_id, reason)
             if exc is not None:
-                self._order_err(q.basket_id, f"cancel {q.ticker}", exc)
+                self._order_err(q.basket_id, f"cancel {q.ticker}", exc, q.ticker)
                 return            # stays tracked; the next pass retries
         self._retire(q)
         self.journal({"kind": "cancel", "basket_id": q.basket_id, "ticker": q.ticker, "reason": reason})
