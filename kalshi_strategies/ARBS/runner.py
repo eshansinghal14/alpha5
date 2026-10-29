@@ -214,6 +214,7 @@ class ArbsRunner:
         self.book_seq: dict[str, int] = {}
         self.book_time: dict[str, float] = {}     # ticker -> monotonic time of its last book update
         self.paused_until: dict[str, float] = {}  # ticker -> monotonic time Kalshi's pause is next retried
+        self.exchange_paused = False              # Kalshi's exchange-wide trading_active is off
         self.last_exit: dict[str, tuple] = {}
         self.completion_note: dict[str, dict] = {}
         # basket_id -> recent (time, exit cost) of a broken basket: the chase
@@ -298,6 +299,8 @@ class ArbsRunner:
             return "order_error_breaker"
         if not self.feed.up:
             return "feed_down"
+        if self.exchange_paused:
+            return "Kalshi trading paused"
         broken = sum(1 for b in self.ledger.baskets.values() if b.broken_since is not None)
         if broken >= self.cfg.completion.max_broken_baskets:
             return f"{broken} broken baskets"
@@ -314,7 +317,7 @@ class ArbsRunner:
             # Held like the engine does: Kalshi's Thursday maintenance pauses
             # every market, and retrying each pass sent 1563 rejected orders
             # in 8 min (10-29 07:00).
-            if not self.market_paused(ticker):
+            if not self.market_paused(ticker) and not self.exchange_paused:
                 self.alert("warn", basket_id, f"{what}: market paused/closed ({code}); "
                                               f"no new orders on it for {MARKET_PAUSE_RETRY_S:.0f}s")
             self.paused_until[ticker] = time.monotonic() + MARKET_PAUSE_RETRY_S
@@ -1319,6 +1322,25 @@ class ArbsRunner:
 
     # ------------------------------------------------------------------ guards
 
+    async def exchange_loop(self):
+        """Tracks Kalshi's exchange-wide trading switch (off in the Thursday
+        maintenance window), so a pause is one alert, not one per market."""
+        while True:
+            try:
+                st = await asyncio.get_running_loop().run_in_executor(
+                    self.pool, kalshi_get, "/trade-api/v2/exchange/status")
+                paused = not st.get("trading_active", True)
+                if paused != self.exchange_paused:
+                    self.exchange_paused = paused
+                    self.alert("warn" if paused else "info", None,
+                               "Kalshi trading paused exchange-wide" if paused else "Kalshi trading resumed")
+                    if not paused:
+                        self.paused_until.clear()
+                        self.dirty |= set(self.baskets)
+            except Exception as e:
+                _log(f"WARN: exchange status failed ({e!r})")
+            await asyncio.sleep(10.0)
+
     async def guard_loop(self):
         while True:
             await asyncio.sleep(1.0)
@@ -1557,7 +1579,7 @@ class ArbsRunner:
         trading, stopper, stop = TradingModeWatcher(self.S), StopWatcher(), asyncio.Event()
         coros = [self.feed.run(), self.eval_loop(), self.rank_loop(), self.meta_loop(), self.fill_poll_loop(),
                  self.audit_loop(), self.guard_loop(), self.summary_loop(), self.scan_loop(),
-                 self.liquidity_loop(),
+                 self.liquidity_loop(), self.exchange_loop(),
                  self.control_loop(trading, stopper, stop)]
         tasks = [asyncio.create_task(c) for c in coros]
         try:

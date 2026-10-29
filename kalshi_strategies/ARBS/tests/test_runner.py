@@ -648,3 +648,13 @@ def test_paused_market_is_held_with_one_alert(arbs):
     r.paused_until["X-A"] = 0.0
     _eval(r, b)
     assert b.basket_id in r.shadow_ledger.baskets
+
+
+def test_exchange_pause_blocks_and_silences_market_pauses(arbs):
+    r, b = arbs
+    import requests
+    r.exchange_paused = True
+    assert r.blocked() == "Kalshi trading paused"
+    r._order_err(b.basket_id, "cancel X-A", requests.HTTPError('409 for x: {"error":{"code":"trading_is_paused"}}'),
+                 "X-A")
+    assert not r.alerts and r.order_errors == 0
