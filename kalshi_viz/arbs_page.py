@@ -134,7 +134,7 @@ def _pnl_chart(series: str):
     """Settled + open PnL, real money only. History is replayed from the
     journal (settled plus what complete bundles lock in); the last point adds
     unfinished baskets at what their extra legs would sell for now, so it
-    matches the header. Starts at 0 at the window's start."""
+    matches the header."""
     df = _pnl_frame(series)
     s = read_summary(series)
     if len(df) and s and s.get("ledger") == "real":
@@ -147,11 +147,11 @@ def _pnl_chart(series: str):
     win = st.radio("Window", list(PNL_WINDOWS), index=1, horizontal=True, key=f"arbs_pnl_win_{series}",
                    label_visibility="collapsed")
     since = None if PNL_WINDOWS[win] is None else pd.Timestamp.now(tz="UTC") - PNL_WINDOWS[win]
+    # The level, not the change: the window only sets how much of it shows.
     before = df[df.time < since] if since is not None else df.iloc[:0]
     d = df[df.time >= since] if since is not None else df
-    b0 = float(before.total.iloc[-1]) if len(before) else 0.0
-    c = pd.DataFrame({"time": [since if since is not None else d.time.min()] + list(d.time),
-                      "usd": [0.0] + [float(v) - b0 for v in d.total]})
+    start = [] if since is None else [(since, float(before.total.iloc[-1]) if len(before) else 0.0)]
+    c = pd.DataFrame(start + [(t, float(v)) for t, v in zip(d.time, d.total)], columns=["time", "usd"])
     chart = alt.Chart(c).mark_line(interpolate="step-after", strokeWidth=2, color="#1e88e5").encode(
         x=alt.X("time:T", title=None, axis=alt.Axis(format="%m-%d %H:%M")),
         y=alt.Y("usd:Q", title="Settled + open PnL $"),
