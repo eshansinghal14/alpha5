@@ -485,3 +485,21 @@ def test_held_basket_wins_over_a_renamed_duplicate(arbs):
     r.shadow_ledger.baskets.clear()
     r.set_baskets([renamed])
     assert set(r.baskets) == {"t:renamed"}
+
+
+def test_missed_exit_retries_only_after_the_book_changes(arbs):
+    r, b = arbs
+    r.cfg.completion = dataclasses.replace(r.cfg.completion, chase_ticks=0)
+    _broken(r, b)
+    sent = []
+
+    async def miss(ticker, side, limit, size, reason, view):
+        sent.append(ticker)
+        return None, None
+    r._ioc = miss
+    _eval(r, b)
+    _eval(r, b)                                      # same book: no second IOC at the level that missed
+    assert len(sent) == 1
+    r._on_quote(type("V", (), {"ticker": "X-A", "ask": 0.7, "ask_depth": 1, "bid": 0.3, "bid_depth": 1})())
+    _eval(r, b)
+    assert len(sent) == 2

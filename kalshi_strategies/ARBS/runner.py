@@ -207,7 +207,10 @@ class ArbsRunner:
         # TXSENR P2 and P4 ladders each came up one leg short).
         self.inflight: dict[tuple[str, str], float] = {}
         self.last_take: dict[str, float] = {}
-        self.last_completion: dict[str, float] = {}
+        # ticker -> book updates seen; basket_id -> (its legs' counts, held)
+        # at its last exit attempt. An exit is retried only once one changed.
+        self.book_seq: dict[str, int] = {}
+        self.last_exit: dict[str, tuple] = {}
         self.completion_note: dict[str, dict] = {}
         # basket_id -> recent (time, exit loss) of a broken basket: the chase reference.
         self.exit_hist: dict[str, collections.deque] = {}
@@ -528,6 +531,7 @@ class ArbsRunner:
         return None if any(v is None for v in vs) else vs
 
     def _on_quote(self, book):
+        self.book_seq[book.ticker] = self.book_seq.get(book.ticker, 0) + 1
         self.liq.on_book(book.ticker, time.monotonic(), book.ask, book.ask_depth, book.bid, book.bid_depth)
         for bid in self.by_ticker.get(book.ticker, ()):
             self.dirty.add(bid)
@@ -998,10 +1002,13 @@ class ArbsRunner:
         self.completion_note[bid].update(action="take" if why else "rest", why=why)
         if why is None:
             self.rest_exit(b, path, ex, legs, others, qs, now)
-        elif now - self.last_completion.get(bid, 0.0) >= c.retry_s:
-            self.spawn(self.exit_now(b, path, ex, legs, others, qs, loss, why), bid)
         else:
-            self.later(bid, c.retry_s - (now - self.last_completion[bid]))
+            # A missed IOC leaves our book showing the level it missed until
+            # Kalshi's update lands; retrying before that fires at it again.
+            sig = (tuple(self.book_seq.get(t, 0) for t in b.tickers), tuple(pos.held(b.tickers)))
+            if self.last_exit.get(bid) != sig:
+                self.last_exit[bid] = sig
+                self.spawn(self.exit_now(b, path, ex, legs, others, qs, loss, why), bid)
 
     def exit_tick(self, b: Basket, path: str, ex: pricing.Exits, legs, others) -> float:
         """The coarsest tick among the exit's orders at their prices: a cent,
@@ -1020,7 +1027,6 @@ class ArbsRunner:
 
     async def exit_now(self, b: Basket, path: str, ex: pricing.Exits, legs, others, qs, loss: float, why: str):
         bid = b.basket_id
-        self.last_completion[bid] = time.time()
         live_qs = [q for q in qs if not q.pending]
         if live_qs:
             # A resting exit bid filling alongside these IOCs would overshoot.
@@ -1047,6 +1053,7 @@ class ArbsRunner:
         if pos is None or not pos.unhedged(b.tickers):
             self.completion_note.pop(bid, None)
             self.exit_hist.pop(bid, None)
+            self.last_exit.pop(bid, None)
             self.journal({"kind": "completed", "basket_id": bid, "path": path})
 
     def rest_exit(self, b: Basket, path: str, ex: pricing.Exits, legs, others, qs, now: float):

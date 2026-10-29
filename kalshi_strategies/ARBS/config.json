@@ -18,7 +18,6 @@
   "completion": {
     "chase_ticks": 2,
     "chase_window_s": 1.0,
-    "retry_s": 0.05,
     "max_broken_baskets": 3
   },
   "watch": {

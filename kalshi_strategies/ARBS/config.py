@@ -64,8 +64,6 @@ class CompletionParams:
                              min=0, max=50, step=1)
     chase_window_s: float = param("How recent the best exit price a fast move is measured from.", min=0.0,
                                   max=60.0, step=0.1)
-    retry_s: float = param("Least seconds between exit IOCs on one broken basket.", min=0.05, step=0.05,
-                           editable=False)
     max_broken_baskets: int = param("No new takes or quotes while this many baskets are broken.", min=1,
                                     max=1000, step=1, editable=False)
 
