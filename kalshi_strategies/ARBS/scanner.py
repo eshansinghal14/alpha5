@@ -24,7 +24,7 @@ strategy trades (the position audit would read its contracts as ours).
 `select` picks what the runner trades: within trading.days_till_expiry, the
 most traded events until scan.max_markets markets.
 
-    python -m kalshi_strategies.ARBS.scanner      # one scan, prints a summary
+    python -m kalshi_strategies.ARBS.scanner [root]   # one scan + selection, as the runner runs it
 """
 from __future__ import annotations
 
@@ -273,19 +273,43 @@ def run(cfg, hand_doc: dict, spec_path: str, held: set[str] = frozenset()) -> di
     return doc
 
 
-if __name__ == "__main__":
-    from kalshi_infra.config import ConfigStore
-    from kalshi_infra.runtime.persist import LIVE_ROOT
-    from kalshi_strategies.ARBS.config import CONFIG_PATH, SPEC_PATH, ArbsConfig
+SELECTED = "scanned_selected.json"
 
-    root = os.path.join(LIVE_ROOT, "ARBS")
-    os.makedirs(root, exist_ok=True)
+
+def scan_and_select(root: str) -> dict:
+    """Blocking, and meant for a child process: a scan holds ~1 GB of
+    temporary objects that Python keeps after freeing them, so scanning in
+    the trading process grew it ~430 MB a scan until the OOM killer took it
+    (10-29 03:45 and 04:12). Writes the full scan and the part to trade
+    (`select` under today's config, held baskets kept) to SELECTED, which is
+    all the runner reads. Returns counts."""
+    from kalshi_infra.config import ConfigStore
+    from kalshi_strategies.ARBS.config import CONFIG_PATH, SPEC_PATH, ArbsConfig
+    from kalshi_strategies.ARBS.spec import load_spec
+
+    cfg = ConfigStore(ArbsConfig, CONFIG_PATH, None).config
     with open(SPEC_PATH, encoding="utf-8") as fh:
         hand = json.load(fh)
-    led = os.path.join(root, "ledger.json")
-    held = set(json.load(open(led, encoding="utf-8")).get("baskets") or {}) if os.path.exists(led) else set()
-    d = run(ConfigStore(ArbsConfig, CONFIG_PATH, None).config, hand, os.path.join(root, "scanned_spec.json"), held)
-    n = {}
-    for r in d["relationships"]:
-        n[r["type"]] = n.get(r["type"], 0) + len(r["baskets"])
-    print(f"{d['n_events']} events, {d['n_markets']} markets, baskets {n}")
+    held = set()
+    for name in ("ledger.json", "ledger_shadow.json"):
+        try:
+            with open(os.path.join(root, name), encoding="utf-8") as fh:
+                held |= set(json.load(fh).get("baskets") or {})
+        except (OSError, ValueError):
+            pass
+    doc = run(cfg, hand, os.path.join(root, "scanned_spec.json"), held)
+    sel = select(doc, now=pd.Timestamp.now(tz="UTC"), days=cfg.trading.days_till_expiry,
+                 max_markets=cfg.scan.max_markets, known_tickers={t for b in load_spec(SPEC_PATH) for t in b.tickers},
+                 held=held, exclude=set(cfg.watch.exclude))
+    atomic_write_json(os.path.join(root, SELECTED), sel, indent=None)
+    return {"listed_markets": doc["n_markets"], "selected_relationships": len(sel["relationships"])}
+
+
+if __name__ == "__main__":
+    import sys
+
+    from kalshi_infra.runtime.persist import LIVE_ROOT
+
+    root = sys.argv[1] if len(sys.argv) > 1 else os.path.join(LIVE_ROOT, "ARBS")
+    os.makedirs(root, exist_ok=True)
+    print(json.dumps(scan_and_select(root)))

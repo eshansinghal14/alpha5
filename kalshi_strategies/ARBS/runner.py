@@ -24,6 +24,7 @@ import concurrent.futures
 import dataclasses
 import json
 import os
+import sys
 import time
 import traceback
 import uuid
@@ -188,7 +189,7 @@ class ArbsRunner:
         with open(SPEC_PATH, encoding="utf-8") as fh:
             self.hand_doc = json.load(fh)
         self.hand = load_spec(SPEC_PATH)
-        self.scan_path = os.path.join(self.root, "scanned_spec.json")
+        self.scan_path = os.path.join(self.root, scanner.SELECTED)
         self.scan_status: dict = {}
         self.set_baskets(merge(self.hand, self.scanned()))
         for led in (self.real_ledger, self.shadow_ledger):
@@ -316,17 +317,11 @@ class ArbsRunner:
     # ------------------------------------------------------------------ spec
 
     def scanned(self) -> list[Basket]:
-        """Blocking (a full scan is ~25 MB). The part of the last scan to trade."""
+        """The part of the last scan to trade, as the scan process selected it."""
         if not self.cfg.scan.enable or not os.path.exists(self.scan_path):
             return []
         try:
-            with open(self.scan_path, encoding="utf-8") as fh:
-                doc = json.load(fh)
-            return parse_spec(scanner.select(
-                doc, now=_utc(), days=self.cfg.trading.days_till_expiry, max_markets=self.cfg.scan.max_markets,
-                known_tickers={t for b in self.hand for t in b.tickers},
-                held=set(self.real_ledger.baskets) | set(self.shadow_ledger.baskets),
-                exclude=set(self.cfg.watch.exclude)))
+            return load_spec(self.scan_path)
         except Exception as e:
             self.alert("warn", None, f"scanned spec unreadable ({e!r}); hand spec only")
             return []
@@ -399,19 +394,22 @@ class ArbsRunner:
                 _log(f"WARN: liquidity log failed ({e!r})")
 
     async def scan_loop(self):
-        loop = asyncio.get_running_loop()
         while True:
             sc = self.cfg.scan
             try:
                 if sc.enable:
                     t0 = time.monotonic()
-                    held = set(self.real_ledger.baskets) | set(self.shadow_ledger.baskets)
-                    doc = await loop.run_in_executor(self.pool, scanner.run, self.cfg, self.hand_doc,
-                                                     self.scan_path, held)
+                    # A child process: the scan's memory goes back when it exits.
+                    proc = await asyncio.create_subprocess_exec(
+                        sys.executable, "-m", "kalshi_strategies.ARBS.scanner", self.root,
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                    out, err = await asyncio.wait_for(proc.communicate(), timeout=600)
+                    if proc.returncode != 0:
+                        raise RuntimeError(f"scan exited {proc.returncode}: {err.decode()[-300:]}")
+                    counts = json.loads(out.decode().strip().splitlines()[-1])
                     await self.reload_spec()
                     self.scan_status = {"at": _utc().isoformat(), "secs": round(time.monotonic() - t0, 1),
-                                        "listed_markets": doc["n_markets"],
-                                        "baskets": len(self.all_baskets) - len(self.hand), "error": None}
+                                        **counts, "baskets": len(self.all_baskets) - len(self.hand), "error": None}
                 elif len(self.all_baskets) > len(self.hand):
                     await self.reload_spec()
             except Exception as e:
