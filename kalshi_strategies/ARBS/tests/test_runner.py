@@ -315,3 +315,24 @@ def test_days_till_expiry_gates_new_trades(arbs):
     soon = dataclasses.replace(b, settles=pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=20))
     late = dataclasses.replace(b, settles=pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=40))
     assert not r.excluded(soon) and r.excluded(late) and not r.excluded(b)
+
+
+def test_audit_books_settlement_before_striking(arbs):
+    r, b = arbs
+    for t in b.tickers:
+        r.real_ledger.record(b.basket_id, b.tickers, t, "yes", 5.0, 2.5, time.time())
+        r.meta[t].status = "closed"
+
+    class Client:
+        def positions_all(self):
+            return {}                       # Kalshi already dropped the settled position
+
+    async def call(fn, *a):
+        return fn(*a)
+
+    def load_meta():
+        for t, res in zip(b.tickers, ("yes", "no")):
+            r.meta[t].status, r.meta[t].result = "finalized", res
+    r.gw.any_client, r.gw.call, r.load_meta = Client, call, load_meta
+    assert asyncio.run(r.audit()) and r.audit_strikes == 0 and b.basket_id not in r.real_ledger.baskets
+    assert r.real_ledger.settled[-1]["pnl"] == 0.0

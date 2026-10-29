@@ -1021,6 +1021,13 @@ class ArbsRunner:
             await self.poll_fills()
             mine = self.real_ledger.net_by_ticker()
             diff = {t: d for t, d in diff.items() if abs(real.get(t, 0.0) - mine.get(t, 0.0)) > 1e-6}
+        if any(self.meta.get(t) is None or self.meta[t].status not in TRADEABLE for t in diff):
+            # Kalshi drops a position the moment it settles; we book settlement
+            # only on the next meta refresh (FLUINT 10-29 00:36 halted us for it).
+            await asyncio.get_running_loop().run_in_executor(self.pool, self.load_meta)
+            self.settle()
+            mine = self.real_ledger.net_by_ticker()
+            diff = {t: d for t, d in diff.items() if abs(real.get(t, 0.0) - mine.get(t, 0.0)) > 1e-6}
         self.audit_diff = diff or None
         if not diff:
             self.audit_strikes = 0
