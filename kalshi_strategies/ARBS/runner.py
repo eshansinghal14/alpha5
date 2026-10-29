@@ -1101,10 +1101,14 @@ class ArbsRunner:
             past_limit = q.price > plan.max_price + _EPS
             ticks = vs[j].ticks.steps(plan.price, q.price)
             cooled = now - max(q.moved_at, q.placed_at) >= t.requote_cooldown_s
-            if past_limit or (ticks >= t.requote_min_ticks and cooled):
+            # Grown in place when the room is much bigger than what rests: a
+            # quote placed small kept its size through every later move
+            # (KXRT-MON-30 stayed 1 lot with 629 behind the other leg, 10-29).
+            grow = size >= 2.0 * q.remaining and cooled
+            if past_limit or grow or (ticks >= t.requote_min_ticks and cooled):
                 if self.live and not past_limit and not self.gw.can_afford(leg.ticker, "amend", reserve):
                     continue
-                acts.append(self.move_quote(q, plan))
+                acts.append(self.move_quote(q, plan, size if grow else None))
             else:
                 q.edge, q.max_price = plan.edge, plan.max_price
         if acts:
@@ -1441,12 +1445,14 @@ class ArbsRunner:
         self._register(q, hit[0])
         await self.cancel_quote(q, "lost_create")
 
-    async def move_quote(self, q: Quote, plan: pricing.QuotePlan):
+    async def move_quote(self, q: Quote, plan: pricing.QuotePlan, size: float | None = None):
+        """Reprice, and resize to `size` contracts left if given."""
         b = self.baskets[q.basket_id]
         q.moved_at = time.time()
         old = q.price
+        left = q.remaining if size is None else size
         if self.live:
-            resp, exc, sent = await self.gw.amend(q.ticker, q.side, q.exchange_id, plan.price, q.remaining, q.filled)
+            resp, exc, sent = await self.gw.amend(q.ticker, q.side, q.exchange_id, plan.price, left, q.filled)
             if not sent:
                 self.n["moves_refused"] += 1
                 if q.price > plan.max_price + _EPS:
@@ -1471,9 +1477,11 @@ class ArbsRunner:
                 self._commit_cache = None
                 self._register(q, new_id)
         q.price, q.edge, q.max_price = plan.price, plan.edge, plan.max_price
+        q.size = q.filled + left
         self.n["quote_moves"] += 1
         self.charge(q.basket_id, ORDER_TOKENS)
-        self.journal({"kind": "move", "basket_id": q.basket_id, "ticker": q.ticker, "from": old, "to": plan.price})
+        self.journal({"kind": "move", "basket_id": q.basket_id, "ticker": q.ticker, "from": old, "to": plan.price,
+                      "size": q.size})
 
     async def cancel_quote(self, q: Quote, reason: str):
         self.n["quote_cancels"] += 1

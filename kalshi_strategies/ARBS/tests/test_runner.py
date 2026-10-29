@@ -835,3 +835,15 @@ def test_no_missed_fills_counted_on_live_baskets(arbs):
     from kalshi_backtest.core import Trade
     r._on_trade("X-A", Trade(ticker="X-A", time=pd.Timestamp.now(tz="UTC"), price=px, size=3.0, taker_side="no"))
     assert not r.summary()["missed"]
+
+
+def test_resting_quote_grows_when_the_room_does(arbs):
+    r, b = arbs
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, requote_cooldown_s=0.0)
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 1)])       # B's YES ask 0.55: 1 offered
+    _eval(r, b)
+    assert r.quotes[(b.basket_id, 0)].size == 1
+    book(r, "X-B", [(0.40, 10)], [(0.45, 1), (0.44, 40)])     # 40 more behind it at 0.56
+    _eval(r, b)
+    assert r.quotes[(b.basket_id, 0)].size == 5     # quote_size in the fixture
