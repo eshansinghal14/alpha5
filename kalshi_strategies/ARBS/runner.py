@@ -1511,12 +1511,14 @@ class ArbsRunner:
     def pick_hot(self, quotable: list[str], budget: float, cost: dict[str, float]) -> list[str]:
         """The best-ranked baskets whose write cost fits `budget` (tokens/s).
         A basket already quoted keeps its place while the quoted ones ranked
-        above it fit 1.5x the budget: near the cut scores sit close and
+        above it fit 1.1x the budget: near the cut scores sit close and
         reorder on small book changes (339 entries in 10 min for 125 slots,
-        10-29), each a cancel, a new order and a lost queue place."""
+        10-29), each a cancel, a new order and a lost queue place. At 1.5x the
+        list planned 186 tokens/s on a 150 budget and 568 placements were
+        refused in 4 min (10-29)."""
         out, used = set(), 0.0
         for bid in quotable:
-            if bid in self.hot and used + cost[bid] <= 1.5 * budget:
+            if bid in self.hot and used + cost[bid] <= 1.1 * budget:
                 out.add(bid)
                 used += cost[bid]
         for bid in quotable:
