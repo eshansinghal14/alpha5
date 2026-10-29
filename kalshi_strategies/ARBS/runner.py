@@ -1034,12 +1034,11 @@ class ArbsRunner:
             hist.popleft()
         best = min(v for _, v in hist)
         moved = c.chase_ticks * self.exit_tick(b, path, ex, legs, others) * ex.target
-        # Resting only gambles for better than planned: once the exit is at
-        # least as good as the fill or take was priced at, take it (TXSEND-P4
-        # rested 48 min on thin legs 10-29 with completing worth +$0.54). With
-        # no plan (broken before a restart), "doesn't lose" stands in.
+        # Resting only gambles for more: once the exit is at least as good as
+        # the fill or take was priced at, or finishing doesn't lose, take it
+        # (TXSEND-P4 rested 48 min on thin legs 10-29 with completing worth +$0.54).
         planned = self.exit_planned.get(bid)
-        at_plan = cost <= planned + _EPS if planned is not None else loss <= _EPS
+        at_plan = loss <= _EPS or (planned is not None and cost <= planned + _EPS)
         why = ("fast move" if cost - best >= moved - _EPS else
                "at plan" if at_plan else
                "live event" if b.is_live(_utc()) or not b.quoting_allowed(_utc()) else None)
