@@ -3,10 +3,14 @@ in on held bundles), bundles held, resting quotes, the opportunity ranking
 and the settled history. Reads only data/live/ARBS/<date>/summary.json."""
 from __future__ import annotations
 
+import json
+import os
+
 import altair as alt
 import pandas as pd
 import streamlit as st
 
+from kalshi_infra.runtime.persist import LIVE_ROOT
 from kalshi_viz import arbs_pnl
 from kalshi_viz.arm import arm_control
 from kalshi_viz.data import latest_summary, read_summary, summary_age_s
@@ -31,7 +35,20 @@ def _toggle(series: str, s: dict, idle: bool):
         st.warning("Armed, not live yet: arming, halted, or the arm was refused (see alerts).")
 
 
-def _alerts(s: dict):
+def _cleared_path(series: str) -> str:
+    return os.path.join(LIVE_ROOT, series, "alerts_cleared.json")
+
+
+def _cleared(series: str) -> str:
+    """ISO time up to which alerts were cleared as handled ("" if never)."""
+    try:
+        with open(_cleared_path(series), encoding="utf-8") as fh:
+            return json.load(fh).get("before") or ""
+    except (OSError, ValueError):
+        return ""
+
+
+def _alerts(series: str, s: dict):
     if s.get("halt_reason"):
         st.error(f"⛔ **Halted until restart -- {s['halt_reason']}.** Completions of broken baskets still run.")
     elif s.get("blocked_reason"):
@@ -53,11 +70,17 @@ def _alerts(s: dict):
     f = s.get("feed") or {}
     if not f.get("up"):
         st.error("📡 Kalshi websocket down (quotes are pulled after runtime.feed_down_pull_s).")
-    al = [a for a in (s.get("alerts") or []) if a["level"] in ("error", "warn")]
+    # Times are all UTC isoformat from the runner, so they compare as strings.
+    cut = _cleared(series)
+    al = [a for a in (s.get("alerts") or []) if a["level"] in ("error", "warn") and a["time"] > cut]
     if al:
-        with st.expander(f"Alerts ({len(al)} recent)", expanded=any(a["level"] == "error" for a in al[-10:])):
+        with st.expander(f"Alerts ({len(al)} new)", expanded=any(a["level"] == "error" for a in al[-10:])):
             st.dataframe(pd.DataFrame(al[::-1])[["time", "level", "basket_id", "msg", "live"]],
                          use_container_width=True, hide_index=True)
+            if st.button("Clear (handled)", key="arbs_clear_alerts"):
+                with open(_cleared_path(series), "w", encoding="utf-8") as fh:
+                    json.dump({"before": al[-1]["time"]}, fh)
+                st.rerun(scope="fragment")
 
 
 def _metrics(s: dict):
@@ -189,7 +212,7 @@ def render(series: str, stale_fn):
         if idle:
             st.warning(f"Process not running (last summary {age or 0:.0f}s ago). Figures are as of then.")
         _toggle(series, s, idle)
-        _alerts(s)
+        _alerts(series, s)
         _metrics(s)
         _tables(s)
 
