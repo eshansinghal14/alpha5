@@ -3,8 +3,8 @@
 Per pass over baskets whose books changed:
   1. a broken basket (legs uneven, after a quote fill or a partial take)
      takes its cheaper exit, completing the missing legs or netting the
-     extra ones out (pricing.exits), when that is within max_loss_per_bundle,
-     has worsened by chase_per_bundle since the break, or the event is live;
+     extra ones out (pricing.exits), when that loses nothing, has worsened by
+     chase_per_bundle since the break, or the event is live;
      otherwise it rests post-only bids on that exit, re-pegged every pass;
   2. a whole-basket take if (payout - sum(ask + fee)) / sum(ask + fee) >= min_edge
      (a return on the bundle's cost, see edge_dollars);
@@ -559,9 +559,9 @@ class ArbsRunner:
     # ------------------------------------------------------------------ limits
 
     def worst_bundle_cost(self, b: Basket) -> float:
-        """Commitment per bundle of a resting quote: payout plus the loss a
-        broken basket's exit is let off at once (max_loss_per_bundle)."""
-        return b.payout + self.cfg.completion.max_loss_per_bundle
+        """Commitment per bundle of a resting quote: payout plus what a broken
+        basket's exit may drift before it is taken (chase_per_bundle)."""
+        return b.payout + self.cfg.completion.chase_per_bundle
 
     def quote_commit(self, basket_id: str) -> float:
         """Dollars a basket's resting quotes can cost, counted ONCE per basket:
@@ -809,7 +809,7 @@ class ArbsRunner:
 
     def resolve(self, b: Basket, pos, qs: list[Quote], now: float):
         """A broken basket, on every change to its legs' books. Its cheaper exit
-        is taken at once when that loses at most max_loss_per_bundle, when it
+        is taken at once when it loses nothing (the quote's edge is still there), when it
         costs chase_per_bundle more than the best seen since the break (the
         book moving away), or when the event is live (prices jump, they don't
         drift). Otherwise post-only bids rest on that exit's legs, re-pegged
@@ -838,7 +838,7 @@ class ArbsRunner:
         best = min(self.break_best.get(bid, loss), loss)
         self.break_best[bid] = best
         target = ex.target
-        why = ("within max_loss" if loss <= c.max_loss_per_bundle * target + _EPS else
+        why = ("no loss" if loss <= _EPS else
                "moved away" if loss >= best + c.chase_per_bundle * target - _EPS else
                "live event" if not b.quoting_allowed(_utc()) else None)
         self.completion_note[bid].update(action="take" if why else "rest", why=why)
@@ -868,7 +868,7 @@ class ArbsRunner:
         self.n["completions" if path == "complete" else "unwinds"] += 1
         self.journal({"kind": path, "basket_id": bid, "why": why, "loss": round(loss, 4),
                       "orders": {t: [sd, n, p] for _, t, sd, n, _, p in orders}})
-        if loss > self.cfg.completion.max_loss_per_bundle * ex.target + _EPS:
+        if loss > _EPS:
             self.alert("warn", bid, f"{path} at a ${loss:.2f} loss ({why})")
         held = self.hold([(t, sd, n) for _, t, sd, n, _, _ in orders])
         try:

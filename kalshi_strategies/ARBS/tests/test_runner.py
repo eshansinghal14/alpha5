@@ -186,7 +186,7 @@ def test_quotes_on_every_leg_count_once_per_basket(arbs):
     r, b = arbs
     book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
     book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
-    worst = b.payout + r.cfg.completion.max_loss_per_bundle
+    worst = b.payout + r.cfg.completion.chase_per_bundle
     # Room for exactly one basket's quotes at quote_size 5, not two.
     r.cfg.trading = dataclasses.replace(r.cfg.trading, max_dollars=5 * worst + 0.01)
 
@@ -408,3 +408,13 @@ def test_unfinished_basket_marked_at_sale_value(arbs):
     fee = R.kfees.fee(0.25, 10.0, 0.07)
     assert s["ledger"] == "real" and abs(h["broken_pnl"] - (2.5 - fee - 4.0)) < 1e-4
     assert s["pnl"]["broken"] == h["broken_pnl"] and h["locked_pnl"] == 0.0
+
+
+def test_broken_basket_completes_at_once_when_it_still_profits(arbs):
+    r, b = arbs
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.50, 10)])       # B's YES ask 0.50: 0.40 + 0.50 + fees < 1
+    r.shadow_ledger.record(b.basket_id, b.tickers, "X-A", "yes", 5, 5 * 0.40, time.time())
+    _eval(r, b)
+    pos = r.shadow_ledger.baskets[b.basket_id]
+    assert pos.bundles(b.tickers) == 5 and not pos.unhedged(b.tickers) and not r.quotes

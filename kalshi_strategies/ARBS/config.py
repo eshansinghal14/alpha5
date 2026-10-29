@@ -39,7 +39,7 @@ class TradingParams:
     max_bundles_per_basket: int = param("Most bundles held in one basket (complete or not).", min=0, max=100000,
                                         step=1)
     max_dollars: float = param("Most dollars in the strategy: cost paid on held baskets, plus per quoted "
-                               "basket its largest resting quote x (payout + max_loss_per_bundle), the most it "
+                               "basket its largest resting quote x (payout + chase_per_bundle), the most it "
                                "can cost filled and completed however many legs fill.", min=0.0, step=50.0)
     take_cooldown_s: float = param("Least time between takes on one basket. A take buys only the touch of "
                                    "every leg; this is how long to wait for a thin touch to refill at the same "
@@ -53,13 +53,11 @@ class TradingParams:
 
 @section
 class CompletionParams:
-    max_loss_per_bundle: float = param("A broken basket takes its cheaper exit at once (buy the missing legs, "
-                                       "or net the extra ones out by buying their other side) when that loses "
-                                       "at most this much per bundle ($).", min=0.0, max=1.0, step=0.01)
-    chase_per_bundle: float = param("Otherwise it rests post-only bids on that exit and takes it the moment it "
-                                    "costs this much more per bundle ($) than the best seen since the break. "
-                                    "0 = always take at once. Live events always take at once.",
-                                    min=0.0, max=0.5, step=0.005)
+    chase_per_bundle: float = param("A broken basket rests post-only bids on its cheaper exit (buy the missing "
+                                    "legs, or net the extra ones out by buying their other side) and takes it "
+                                    "the moment it costs this much more per bundle ($) than the best seen since "
+                                    "the break. An exit that loses nothing, and any exit on a live event, is "
+                                    "taken at once; 0 = always take at once.", min=0.0, max=0.5, step=0.005)
     retry_s: float = param("Least seconds between exit IOCs on one broken basket.", min=0.05, step=0.05,
                            editable=False)
     max_broken_baskets: int = param("No new takes or quotes while this many baskets are broken.", min=1,
