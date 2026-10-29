@@ -106,6 +106,12 @@ class RuntimeParams:
     max_write_tokens_per_s: float | None = param("Cap on this strategy's write spend per shard, on top of the "
                                                  "shard's shared bucket. Empty = none.", min=1.0, step=10.0,
                                                  editable=False)
+    max_write_tokens_per_s_solo: float | None = param("The cap instead while none of write_priority_series is "
+                                                      "trading (live, inside its session). Empty = "
+                                                      "max_write_tokens_per_s always.", min=1.0, step=10.0,
+                                                      editable=False)
+    write_priority_series: list[str] = param("Series whose trading session holds this strategy to "
+                                             "max_write_tokens_per_s.", editable=False)
     # Must stay below max_write_tokens_per_s - 10: the capped bucket holds one
     # second of its rate, so a larger reserve blocks every quote (60 vs a cap of
     # 50 placed no live quote 10-24 21:30 UTC).

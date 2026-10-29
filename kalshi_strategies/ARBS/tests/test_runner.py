@@ -1,4 +1,5 @@
 """Runner decisions in shadow mode on hand-built books (no network)."""
+import json
 import asyncio
 import dataclasses
 import time
@@ -672,3 +673,24 @@ def test_flip_on_a_live_event_needs_min_edge(arbs):
     book(r, "X-B", [(0.53, 10)], [(0.40, 10)])
     _eval(r, f)
     assert f.basket_id not in r.shadow_ledger.baskets
+
+
+def test_write_cap_rises_while_priority_series_is_out_of_session(arbs, tmp_path):
+    r, b = arbs
+    r.cfg.runtime = dataclasses.replace(r.cfg.runtime, max_write_tokens_per_s=150.0,
+                                        max_write_tokens_per_s_solo=250.0, write_priority_series=["KXINXU"])
+    now = pd.Timestamp.now(tz="UTC")
+    d = tmp_path / "KXINXU" / now.strftime("%Y-%m-%d")
+    d.mkdir(parents=True)
+
+    def summary(start, close):
+        (d / "summary.json").write_text(json.dumps({
+            "live_trading": True, "last_update": now.isoformat(),
+            "session_started": (now + start).isoformat(), "close_time": (now + close).isoformat()}))
+    summary(pd.Timedelta(hours=-1), pd.Timedelta(hours=1))
+    assert r.series_trading("KXINXU")
+    summary(pd.Timedelta(hours=-8), pd.Timedelta(hours=-1))     # session over
+    assert not r.series_trading("KXINXU") and not r.series_trading("KXINXDUD")
+    assert r.write_cap() == 250.0
+    r.priority_trading = ["KXINXU"]
+    assert r.write_cap() == 150.0

@@ -215,6 +215,7 @@ class ArbsRunner:
         self.book_time: dict[str, float] = {}     # ticker -> monotonic time of its last book update
         self.paused_until: dict[str, float] = {}  # ticker -> monotonic time Kalshi's pause is next retried
         self.exchange_paused = False              # Kalshi's exchange-wide trading_active is off
+        self.priority_trading: list[str] = []     # write_priority_series in session now
         self.last_exit: dict[str, tuple] = {}
         self.completion_note: dict[str, dict] = {}
         # basket_id -> recent (time, exit cost) of a broken basket: the chase
@@ -385,7 +386,7 @@ class ArbsRunner:
         shards = {t: m.shard for t, m in self.meta.items() if m.shard is not None}
         try:
             await loop.run_in_executor(self.pool, self.gw.setup, shards,
-                                       lambda: self.cfg.runtime.max_write_tokens_per_s)
+                                       self.write_cap)
         except Exception as e:
             self.alert("error", None, f"order client setup failed ({e!r})")
         self.feed.add(new)
@@ -1346,6 +1347,32 @@ class ArbsRunner:
                 _log(f"WARN: exchange status failed ({e!r})")
             await asyncio.sleep(10.0)
 
+    def write_cap(self) -> float | None:
+        rt = self.cfg.runtime
+        if rt.max_write_tokens_per_s_solo is None or self.priority_trading:
+            return rt.max_write_tokens_per_s
+        return rt.max_write_tokens_per_s_solo
+
+    def series_trading(self, series: str) -> bool:
+        """Live and inside its session, by its summary.json (written ~1/s)."""
+        try:
+            with open(os.path.join(LIVE_ROOT, series, _utc().strftime("%Y-%m-%d"), "summary.json"),
+                      encoding="utf-8") as fh:
+                s = json.load(fh)
+            now = _utc()
+            return (bool(s.get("live_trading")) and now - pd.Timestamp(s["last_update"]) < pd.Timedelta(seconds=30)
+                    and pd.Timestamp(s["session_started"]) <= now < pd.Timestamp(s["close_time"]))
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+
+    async def write_share_loop(self):
+        while True:
+            busy = [s for s in self.cfg.runtime.write_priority_series if self.series_trading(s)]
+            if busy != self.priority_trading:
+                self.priority_trading = busy
+                _log(f"write cap {self.write_cap()} tokens/s ({', '.join(busy) or 'no priority series'} trading)")
+            await asyncio.sleep(5.0)
+
     async def guard_loop(self):
         while True:
             await asyncio.sleep(1.0)
@@ -1555,7 +1582,7 @@ class ArbsRunner:
                     "committed": round(self.committed(), 4), "max_dollars": self.cfg.trading.max_dollars},
             "holdings": holdings, "quotes": quotes, "hot": self.hot, "ranking": self.ranking[:60],
             "settled": settled[-200:], "alerts": self.alerts[-100:], "audit_diff": self.audit_diff,
-            "order_errors": self.order_errors, "counts": self.n, "write_usage": self.gw.usage(),
+            "order_errors": self.order_errors, "counts": self.n, "write_usage": self.gw.usage(), "write_cap": self.write_cap(),
             "config_status": self.store.status(), "scan": self.scan_status,
         }
 
@@ -1579,14 +1606,14 @@ class ArbsRunner:
         _log(f"markets by status {_count(m.status for m in self.meta.values())}; shards {sorted(set(shards.values()))}")
         try:
             await loop.run_in_executor(self.pool, self.gw.setup, shards,
-                                       lambda: self.cfg.runtime.max_write_tokens_per_s)
+                                       self.write_cap)
         except Exception as e:
             self.alert("error", None, f"no order clients ({e!r}); shadow only")
         self.settle()
         trading, stopper, stop = TradingModeWatcher(self.S), StopWatcher(), asyncio.Event()
         coros = [self.feed.run(), self.eval_loop(), self.rank_loop(), self.meta_loop(), self.fill_poll_loop(),
                  self.audit_loop(), self.guard_loop(), self.summary_loop(), self.scan_loop(),
-                 self.liquidity_loop(), self.exchange_loop(),
+                 self.liquidity_loop(), self.exchange_loop(), self.write_share_loop(),
                  self.control_loop(trading, stopper, stop)]
         tasks = [asyncio.create_task(c) for c in coros]
         try:

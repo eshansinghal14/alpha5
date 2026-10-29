@@ -37,6 +37,8 @@
   "runtime": {
     "control_poll_s": 1.0,
     "max_write_tokens_per_s": 50.0,
+    "max_write_tokens_per_s_solo": null,
+    "write_priority_series": ["KXINXU"],
     "write_reserve_tokens": 20.0,
     "audit_s": 30.0,
     "fill_poll_s": 5.0,
