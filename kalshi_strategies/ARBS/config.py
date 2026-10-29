@@ -43,6 +43,8 @@ class TradingParams:
     quote_live_events: bool = param("Quote events that have started (a game after kickoff). A live score change "
                                     "sweeps every leg at once, so a fill there is usually already a loss; "
                                     "exits on live events are taken at once.")
+    live_edge_add: float = param("Extra edge ($ per bundle) quotes and takes need on a live event, or on a market "
+                                 "flagged live by a bad exit.", min=0.0, max=0.5, step=0.005)
     take_live_events: bool = param("Take arbs (and flips) on events that have started. A visible arb on a live "
                                    "game is mostly one leg not yet repriced after a score, which faster traders "
                                    "take first: 6 of 7 live takes filled unevenly (10-29). Exits of broken "

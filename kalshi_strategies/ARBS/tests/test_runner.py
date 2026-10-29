@@ -800,3 +800,29 @@ def test_write_cost_counts_top_of_book_changes(arbs):
     assert r.write_cost(b, now) > quiet
     r.charge(b.basket_id, 10_000.0)
     assert r.write_cost(b, now) == pytest.approx(10_000.0 / R.WRITE_COST_TAU_S, rel=0.01)
+
+
+def test_bad_exit_flags_markets_live_until_a_clean_fill(arbs):
+    r, b = arbs
+    now = pd.Timestamp.now(tz="UTC")
+    assert not r.live_now(b, now)
+    r.flag_live(b, "a fast move unwind")
+    assert r.live_now(b, now) and set(r.flagged) == {"X-A", "X-B"}
+    other = Basket(basket_id="t:o", relationship_id="t", type="complete_set", cluster="t",
+                   legs=(Leg("X-A", "no"), Leg("X-C", "no")), payout=1.0, quote_until=None, resume_quoting=None)
+    assert r.live_now(other, now)                       # shares X-A
+    r.unflag_live(b)
+    assert not r.live_now(b, now) and not r.flagged
+
+
+def test_live_edge_add_raises_the_quote_edge(arbs):
+    r, b = arbs
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    _eval(r, b)
+    calm = r.quotes[(b.basket_id, 0)].max_price
+    r.quotes.clear()
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, live_edge_add=0.05, quote_live_events=True)
+    r.flag_live(b, "test")
+    _eval(r, b)
+    assert r.quotes[(b.basket_id, 0)].max_price <= calm - 0.05 + 1e-9     # the limit drops by the add

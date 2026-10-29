@@ -302,6 +302,10 @@ class ArbsRunner:
         # live exit 7 s behind a burst of placements (FURIABB-2 10-29). Dirty
         # at start so ids read from a pre-split ledger reach their own file.
         self.ids_dirty = True
+        # ticker -> unix time a bad exit flagged it live: an unwind or a fast
+        # move means the market reprices like a live game (weather readings,
+        # news). Cleared by a clean completion or an even take on it.
+        self.flagged: dict[str, float] = {}
         self._horizon: tuple[float, pd.Timestamp] | None = None
         # Live order round trips, flushed with the liquidity log (orders_*.jsonl.gz).
         self.order_times: list[dict] = []
@@ -606,7 +610,8 @@ class ArbsRunner:
         """(expected $/h of quoting every leg, shortest leg wait in s): each
         leg's edge x size over the time trading takes to reach it."""
         t = self.cfg.trading
-        need = edge_dollars(b.payout, t.min_edge + t.quote_edge_add)
+        need = edge_dollars(b.payout, t.min_edge + t.quote_edge_add) + \
+            (t.live_edge_add if self.live_now(b, _utc()) else 0.0)
         score, fastest = 0.0, float("inf")
         px = []
         for j, leg in enumerate(b.legs):
@@ -925,13 +930,28 @@ class ArbsRunner:
         mine = max(pos.held(b.tickers)) if pos else 0.0
         return int(max(0.0, held.bundles(self.baskets[fid].tickers) - mine) + _EPS)
 
+    def live_now(self, b: Basket, now: pd.Timestamp) -> bool:
+        return b.is_live(now) or any(t in self.flagged for t in b.tickers)
+
+    def flag_live(self, b: Basket, why: str):
+        new = [t for t in b.tickers if t not in self.flagged]
+        for t in new:
+            self.flagged[t] = time.time()
+        if new:
+            self.alert("info", b.basket_id, f"treated as live after {why}: {', '.join(new)}")
+
+    def unflag_live(self, b: Basket):
+        gone = [t for t in b.tickers if self.flagged.pop(t, None) is not None]
+        if gone:
+            self.alert("info", b.basket_id, f"no longer treated as live after a clean fill: {', '.join(gone)}")
+
     def exit_need(self, b: Basket, need: float, now: pd.Timestamp) -> float:
         """Edge ($/bundle) to close held bundles through flip basket `b`:
         `need` (the arb edge) within trading.exit_ref_days of settlement,
         need x ref_days / days left beyond, never under min_exit_edge or over
         need. No settlement date counts as far out."""
         t = self.cfg.trading
-        if b.is_live(now):
+        if self.live_now(b, now):
             # The same stale-leg risk as a new arb, whichever way the bundle points.
             return need
         days = None if b.settles is None else (b.settles - now).total_seconds() / 86400.0
@@ -1001,14 +1021,14 @@ class ArbsRunner:
                            b.basket_id)
             return
         t = self.cfg.trading
-        if (t.enable_takes and (t.take_live_events or not b.is_live(_utc()))
+        if (t.enable_takes and (t.take_live_events or not self.live_now(b, _utc()))
                 and now - self.last_take.get(b.basket_id, 0.0) >= t.take_cooldown_s):
             g = pricing.gap(vs, b.payout)
-            need = edge_dollars(b.payout, t.min_edge)
+            need = edge_dollars(b.payout, t.min_edge) + (t.live_edge_add if self.live_now(b, _utc()) else 0.0)
             ex = self.exit_room(b)
             # An apparent arb on a live game is usually one leg not yet
             # repriced after a score, already being taken by faster traders.
-            live_cap = t.live_quote_size if b.is_live(_utc()) else 10 ** 9
+            live_cap = t.live_quote_size if self.live_now(b, _utc()) else 10 ** 9
             exit_need = self.exit_need(b, need, _utc())
             plan = None
             if ex >= 1 and g is not None and g >= exit_need - _EPS:
@@ -1036,9 +1056,9 @@ class ArbsRunner:
         ex = self.exit_room(b)
         now_ts = _utc()
         want = t.enable_quoting and (b.basket_id in self.hot or ex >= 1) and self.may_quote(b, now_ts)
-        live = b.is_live(now_ts)
+        live = self.live_now(b, now_ts)
         cap = float(t.live_quote_size if live else t.quote_size)
-        quote_need = edge_dollars(b.payout, t.min_edge + t.quote_edge_add)
+        quote_need = edge_dollars(b.payout, t.min_edge + t.quote_edge_add) + (t.live_edge_add if live else 0.0)
         reserve = self.cfg.runtime.write_reserve_tokens
         acts = []
         for j, leg in enumerate(b.legs):
@@ -1090,7 +1110,7 @@ class ArbsRunner:
             self.spawn(run(), b.basket_id)
 
     def may_quote(self, b: Basket, now: pd.Timestamp) -> bool:
-        return b.quoting_allowed(now) and (self.cfg.trading.quote_live_events or not b.is_live(now))
+        return b.quoting_allowed(now) and (self.cfg.trading.quote_live_events or not self.live_now(b, now))
 
     def quoted_elsewhere(self, basket_id: str, ticker: str, side: str) -> Quote | None:
         """Another basket's arb quote resting on this market side, if any."""
@@ -1155,7 +1175,7 @@ class ArbsRunner:
         # taking: sent together, MSTOR's NO MS filled 310 while NO TOR's stale
         # 0.64 was gone (10-29 02:06, -$27.71). Elsewhere nothing moves in a
         # round trip, so every leg goes at once.
-        live = b.is_live(_utc())
+        live = self.live_now(b, _utc())
         first = min(range(len(b.legs)), key=lambda j: self.book_time.get(b.legs[j].ticker, 0.0)) if live else None
         self.n["takes"] += 1
         self.journal({"kind": "take", "basket_id": b.basket_id, "size": plan.size, "limits": plan.limits,
@@ -1179,6 +1199,8 @@ class ArbsRunner:
             if got[first] > _EPS:
                 await asyncio.gather(*(leg(j, got[first]) for j in range(len(b.legs)) if j != first))
         self.n["take_bundles"] += min(got)
+        if min(got) > _EPS and max(got) - min(got) <= _EPS:
+            self.unflag_live(b)
         if max(got) - min(got) > _EPS:
             hi = max(got)
             self.seed_exit(b.basket_id, sum((hi - g) * pricing.taker_cost(p, v.taker_rate)
@@ -1240,7 +1262,7 @@ class ArbsRunner:
         at_plan = loss <= _EPS or (planned is not None and cost <= planned + _EPS)
         why = ("fast move" if cost - best >= moved - _EPS else
                "at plan" if at_plan else
-               "live event" if b.is_live(_utc()) or not b.quoting_allowed(_utc()) else None)
+               "live event" if self.live_now(b, _utc()) or not b.quoting_allowed(_utc()) else None)
         self.completion_note[bid]["window_best"] = round(best, 4)
         self.completion_note[bid].update(action="take" if why else "rest", why=why)
         if why is None:
@@ -1284,6 +1306,10 @@ class ArbsRunner:
                       "orders": {t: [sd, n, p] for _, t, sd, n, _, p in orders}})
         if worse is not None and worse > _EPS:
             self.alert("warn", bid, f"{path} ${worse:.2f} worse than planned ({why})")
+        if path == "unwind" or why == "fast move":
+            self.flag_live(b, f"a {why} {path}")
+        elif why == "at plan":
+            self.unflag_live(b)
         held = self.hold([(t, sd, n) for _, t, sd, n, _, _ in orders])
         try:
             res = await asyncio.gather(*(self._ioc(t, sd, p, n, path, v) for _, t, sd, n, v, p in orders))
@@ -1817,6 +1843,7 @@ class ArbsRunner:
             "hot_churn": {f"{m}m": sum(e for t, e, _ in self.hot_churn if t >= time.time() - 60 * m)
                           for m in (1, 10, 60)},
             "hot_cost_tps": self.hot_cost, "write_budget_tps": self.write_budget(),
+            "flagged_live": {t: datetime_iso(ts) for t, ts in self.flagged.items()},
             "missed": sorted(({**m, "usd": round(m["usd"], 2)} for m in self.missed.values()),
                              key=lambda m: -m["usd"])[:50],
             "settled": settled[-200:], "alerts": self.alerts[-100:], "audit_diff": self.audit_diff,
@@ -1896,6 +1923,10 @@ def flips(baskets: list[Basket]) -> dict[str, str]:
         if f is not None and abs(b.payout + f.payout - len(b.legs)) < _EPS:
             out[b.basket_id] = f.basket_id
     return out
+
+
+def datetime_iso(ts: float) -> str:
+    return pd.Timestamp(ts, unit="s", tz="UTC").isoformat()
 
 
 def edge_dollars(payout: float, rate: float) -> float:
