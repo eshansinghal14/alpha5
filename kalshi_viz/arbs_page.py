@@ -95,20 +95,24 @@ def _alerts(series: str, s: dict):
 
 def _metrics(s: dict):
     p = s.get("pnl") or {}
-    c = st.columns(4)
+    c = st.columns(6)
     broken = p.get("broken") or 0.0
     n_broken = sum(1 for h in s.get("holdings") or [] if h.get("unhedged"))
-    total = (p.get("settled") or 0.0) + (p.get("locked") or 0.0) + broken
-    c[0].metric("Total PnL", _usd(total), f"{_usd(broken)} on {n_broken} unfinished" if n_broken else None,
-                help="Settled (payouts and unwound contracts, minus everything paid incl. fees) plus what complete "
-                     "bundles held lock in at settlement, plus unfinished baskets' extra legs at what they'd sell "
-                     "for now.")
-    c[1].metric("Capital used", f"${p.get('committed', 0):,.2f}", f"of ${p.get('max_dollars', 0):,.0f}",
+    settled = p.get("settled") or 0.0
+    unrealized = (p.get("locked") or 0.0) + broken
+    c[0].metric("Total PnL", _usd(settled + unrealized), help="Settled plus expected unrealized.")
+    c[1].metric("Settled PnL", _usd(settled),
+                help="Payouts and unwound contracts, minus everything paid incl. fees.")
+    c[2].metric("Expected unrealized", _usd(unrealized),
+                f"{_usd(broken)} on {n_broken} unfinished" if n_broken else None,
+                help="What complete bundles held lock in at settlement, plus unfinished baskets' extra legs at "
+                     "what they'd sell for now.")
+    c[3].metric("Capital used", f"${p.get('committed', 0):,.2f}", f"of ${p.get('max_dollars', 0):,.0f}",
                 delta_color="off", help="Cost of held baskets plus what resting quotes commit if filled.")
-    c[2].metric("Baskets tradeable", f"{s.get('n_tradeable')}/{s.get('n_baskets')}",
+    c[4].metric("Baskets tradeable", f"{s.get('n_tradeable')}/{s.get('n_baskets')}",
                 f"{s.get('n_tickers')} markets", delta_color="off")
     n = s.get("counts") or {}
-    c[3].metric("Quote fills / takes", f"{n.get('quote_fills', 0)} / {n.get('takes', 0)}",
+    c[5].metric("Quote fills / takes", f"{n.get('quote_fills', 0)} / {n.get('takes', 0)}",
                 f"{n.get('completions', 0)} completions", delta_color="off")
 
 
