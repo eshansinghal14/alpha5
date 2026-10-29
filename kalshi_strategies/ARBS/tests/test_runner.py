@@ -395,7 +395,7 @@ def test_audit_books_settlement_before_striking(arbs):
     r, b = arbs
     for t in b.tickers:
         r.real_ledger.record(b.basket_id, b.tickers, t, "yes", 5.0, 2.5, time.time())
-        r.meta[t].status = "closed"
+        r.meta[t].status = "active"                 # our cache hasn't seen the settlement yet
 
     class Client:
         def positions_all(self):
