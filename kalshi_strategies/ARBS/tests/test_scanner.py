@@ -155,3 +155,11 @@ def test_quoting_stops_at_kickoff():
     assert b.is_live(pd.Timestamp("2026-10-28T20:00:00Z"))
     b = next(iter(baskets(run([e])).values()))
     assert b.is_live(pd.Timestamp("2026-10-28T22:00:00Z"))
+
+
+def test_starts_include_esports(monkeypatch):
+    page = {"milestones": [
+        {"category": "Esports", "start_date": "2026-10-29T10:20:00Z", "related_event_tickers": ["KXCS2MAP-X-1"]},
+        {"category": "Elections", "start_date": "2020-01-01T00:00:00Z", "related_event_tickers": ["KXHOUSE-X"]}]}
+    monkeypatch.setattr(scanner, "kalshi_get", lambda path, params: page)
+    assert scanner.fetch_starts(pd.Timestamp("2026-10-29", tz="UTC")) == {"KXCS2MAP-X-1": "2026-10-29T10:20:00Z"}

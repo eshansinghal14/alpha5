@@ -12,7 +12,7 @@ relationships in the hand spec's format, written to scanned_spec.json.
              (10-29 check, ~68 days, 59 series), 3,598 paid exactly one YES;
              INX-24OCT25 and NASDAQ100-24OCT25 settled every bucket NO with
              no value (voided), which no rule here can see coming.
-  live       live_from: when a sports event starts (Kalshi's milestones:
+  live       live_from: when a sports or esports event starts (Kalshi's milestones:
              kickoff, first serve), or its earliest occurrence_datetime if
              sooner. Quoting past it is trading.quote_live_events.
   DIRECNET   for strikes a < b, YES >=a and NO >=b pays at least 1; each
@@ -56,9 +56,9 @@ def fetch_events() -> list[dict]:
 
 def fetch_starts(now: pd.Timestamp) -> dict[str, str]:
     """Blocking (~10 pages). event_ticker -> earliest start_date of a sports
-    milestone it belongs to, for milestones started in the last week or not
-    yet (a Test match runs five days). Other categories carry placeholder
-    starts (elections: 2020-01-01) and are left out."""
+    or esports milestone it belongs to, for milestones started in the last
+    week or not yet (a Test match runs five days). Other categories carry
+    placeholder starts (elections: 2020-01-01) and are left out."""
     out, cursor = {}, None
     since = (now - pd.Timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
     while True:
@@ -67,7 +67,7 @@ def fetch_starts(now: pd.Timestamp) -> dict[str, str]:
             params["cursor"] = cursor
         d = kalshi_get("/trade-api/v2/milestones", params=params)
         for m in d.get("milestones") or []:
-            if m.get("category") != "Sports" or not m.get("start_date"):
+            if m.get("category") not in ("Sports", "Esports") or not m.get("start_date"):
                 continue
             for et in m.get("related_event_tickers") or []:
                 if et not in out or m["start_date"] < out[et]:
