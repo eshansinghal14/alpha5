@@ -250,7 +250,7 @@ class ArbsRunner:
             if bid not in new and bid in self.baskets:
                 new[bid] = self.baskets[bid]
         old = set(self.tickers)
-        # Changed ones too: a new quote_until has to pull a resting quote.
+        # Changed ones too: a new quote window has to pull a resting quote.
         changed = {k for k, v in new.items() if self.baskets.get(k) != v}
         self.all_baskets = list(new.values())
         self.baskets = new
@@ -695,7 +695,9 @@ class ArbsRunner:
         other legs' asks. Several legs filling together just leaves less to take."""
         t = self.cfg.trading
         ex = self.exit_room(b)
-        want = t.enable_quoting and (b.basket_id in self.hot or ex >= 1) and b.quoting_allowed(_utc())
+        now_ts = _utc()
+        want = t.enable_quoting and (b.basket_id in self.hot or ex >= 1) and self.may_quote(b, now_ts)
+        cap = float(t.live_quote_size if b.is_live(now_ts) else t.quote_size)
         reserve = self.cfg.runtime.write_reserve_tokens
         acts = []
         for j, leg in enumerate(b.legs):
@@ -707,11 +709,11 @@ class ArbsRunner:
             # the prices it was quoted against, not a level further in.
             touch = float(int(pricing.touch_size(vs, j) + _EPS))
             if want and ex >= 1:
-                size = min(float(t.quote_size), float(ex), touch)
+                size = min(cap, float(ex), touch)
                 if size >= 1 and (q is None or q.remaining <= size + _EPS):
                     plan = pricing.quote_leg(vs, j, b.payout, t.exit_edge, size)
             elif want:
-                size = min(float(t.quote_size), self.room_bundles(b, j), float(self.quote_size_by_dollars(b)), touch)
+                size = min(cap, self.room_bundles(b, j), float(self.quote_size_by_dollars(b)), touch)
                 if size >= 1 and (q is None or q.remaining <= size + _EPS):
                     plan = pricing.quote_leg(vs, j, b.payout, edge_dollars(b.payout, t.min_edge + t.quote_edge_add),
                                              size)
@@ -746,6 +748,9 @@ class ArbsRunner:
             async def run(acts=acts):
                 await asyncio.gather(*acts)
             self.spawn(run(), b.basket_id)
+
+    def may_quote(self, b: Basket, now: pd.Timestamp) -> bool:
+        return b.quoting_allowed(now) and (self.cfg.trading.quote_live_events or not b.is_live(now))
 
     def quoted_elsewhere(self, basket_id: str, ticker: str, side: str) -> Quote | None:
         """Another basket's arb quote resting on this market side, if any."""
@@ -868,7 +873,7 @@ class ArbsRunner:
         best = min(v for _, v in hist)
         moved = c.chase_ticks * self.exit_tick(b, path, ex, legs, others) * ex.target
         why = ("fast move" if loss - best >= moved - _EPS else
-               "live event" if not b.quoting_allowed(_utc()) else None)
+               "live event" if b.is_live(_utc()) or not b.quoting_allowed(_utc()) else None)
         self.completion_note[bid]["window_best"] = round(best, 4)
         self.completion_note[bid].update(action="take" if why else "rest", why=why)
         if why is None:
@@ -1100,10 +1105,11 @@ class ArbsRunner:
                                  "legs": len(b.legs), "depth": round(min(v.depth() for v in vs), 1)})
                 rows.sort(key=lambda r: -r["ret"])
                 # A quote whose event just went live is pulled on its basket's next pass.
+                now_ts = _utc()
                 self.dirty |= {q.basket_id for q in self.quotes.values()
-                               if q.basket_id in self.baskets and not self.baskets[q.basket_id].quoting_allowed(_utc())}
+                               if q.basket_id in self.baskets and not self.may_quote(self.baskets[q.basket_id], now_ts)}
                 self.ranking = rows
-                quotable = [r["basket_id"] for r in rows if self.baskets[r["basket_id"]].quoting_allowed(_utc())]
+                quotable = [r["basket_id"] for r in rows if self.may_quote(self.baskets[r["basket_id"]], now_ts)]
                 hot = quotable[:self.cfg.watch.max_quoted_baskets]
                 if hot != self.hot:
                     self.dirty |= set(hot) ^ set(self.hot)

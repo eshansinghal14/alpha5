@@ -36,6 +36,10 @@ class TradingParams:
                                     "expiration). The scan skips events past it. Open positions past it are still "
                                     "completed and settled.", min=0.0, max=2000.0, step=1.0)
     quote_size: int = param("Bundles per resting quote.", min=1, max=10000, step=1)
+    quote_live_events: bool = param("Quote events that have started (a game after kickoff). A live score change "
+                                    "sweeps every leg at once, so a fill there is usually already a loss; "
+                                    "exits on live events are taken at once.")
+    live_quote_size: int = param("Bundles per resting quote on a live event.", min=1, max=10000, step=1)
     max_bundles_per_basket: int = param("Most bundles held in one basket (complete or not).", min=0, max=100000,
                                         step=1)
     max_dollars: float = param("Most dollars in the strategy: cost paid on held baskets, plus per quoted "

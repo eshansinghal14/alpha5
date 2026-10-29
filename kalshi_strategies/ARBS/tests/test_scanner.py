@@ -151,7 +151,7 @@ def test_quoting_stops_at_kickoff():
     e = event("GM-1", "MECNET", [mkt("GM-1-A", occurrence_datetime="2026-10-28T22:00:00Z"),
                                  mkt("GM-1-B", occurrence_datetime="2026-10-28T22:00:00Z")])
     b = next(iter(baskets(run([e], starts={"GM-1": "2026-10-28T20:00:00Z"})).values()))
-    assert b.quoting_allowed(pd.Timestamp("2026-10-28T19:59:00Z"))
-    assert not b.quoting_allowed(pd.Timestamp("2026-10-28T20:00:00Z"))
+    assert not b.is_live(pd.Timestamp("2026-10-28T19:59:00Z"))
+    assert b.is_live(pd.Timestamp("2026-10-28T20:00:00Z"))
     b = next(iter(baskets(run([e])).values()))
-    assert not b.quoting_allowed(pd.Timestamp("2026-10-28T22:00:00Z"))
+    assert b.is_live(pd.Timestamp("2026-10-28T22:00:00Z"))

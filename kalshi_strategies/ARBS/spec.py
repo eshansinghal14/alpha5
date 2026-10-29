@@ -28,6 +28,7 @@ class Basket:
     quote_until: pd.Timestamp | None
     resume_quoting: pd.Timestamp | None
     settles: pd.Timestamp | None = None
+    live_from: pd.Timestamp | None = None      # a game's start: its quotes are picked off on each score
 
     @property
     def tickers(self) -> list[str]:
@@ -40,6 +41,9 @@ class Basket:
         if self.quote_until is None or now < self.quote_until:
             return True
         return self.resume_quoting is not None and now >= self.resume_quoting
+
+    def is_live(self, now: pd.Timestamp) -> bool:
+        return self.live_from is not None and now >= self.live_from
 
 
 def _ts(v) -> pd.Timestamp | None:
@@ -82,7 +86,8 @@ def parse_spec(doc: dict, exclude: list[str] | None = None) -> list[Basket]:
             out.append(Basket(basket_id=b["basket_id"], relationship_id=rel["relationship_id"],
                               type=rel["type"], cluster=rel.get("cluster") or "", legs=legs, payout=payout,
                               quote_until=_ts(rel.get("quote_until_utc")),
-                              resume_quoting=_ts(rel.get("resume_quoting_utc")), settles=_settles(rel)))
+                              resume_quoting=_ts(rel.get("resume_quoting_utc")), settles=_settles(rel),
+                              live_from=_ts(rel.get("live_from_utc"))))
     return out
 
 

@@ -159,7 +159,7 @@ def test_broken_basket_takes_at_once_when_chase_is_zero_or_live(arbs):
 
 def test_live_event_exits_at_once(arbs):
     r, b = arbs
-    live = dataclasses.replace(b, quote_until=pd.Timestamp("2026-01-01", tz="UTC"))
+    live = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
     r.baskets[b.basket_id] = live
     _broken(r, live)
     _eval(r, live)
@@ -446,3 +446,17 @@ def test_one_quote_per_market_side(arbs):
     _eval(r, b)
     _eval(r, b2)
     assert {q.basket_id for q in r.quotes.values()} == {b.basket_id}
+
+
+def test_live_events_quoted_only_when_enabled_and_smaller(arbs):
+    r, b = arbs
+    live = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
+    r.set_baskets([live])
+    r.hot = [live.basket_id]
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    _eval(r, live)
+    assert not r.quotes
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_live_events=True, live_quote_size=2)
+    _eval(r, live)
+    assert {q.size for q in r.quotes.values()} == {2}
