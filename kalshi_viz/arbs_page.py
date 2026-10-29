@@ -45,8 +45,9 @@ def _alerts(s: dict):
         c = h.get("completion") or {}
         st.error(f"🧩 **Incomplete basket {h['basket_id']}** for {h.get('broken_s') or 0}s -- unhedged "
                  + ", ".join(f"{t.split('-', 1)[-1]} {q:g}" for t, q in h["unhedged"].items())
-                 + (f"; still needs {c.get('need')}, caps {c.get('caps')}, asks {c.get('asks')}"
-                    + (f", **short: {c.get('short')}**" if c.get("short") else "") if c else ""))
+                 + (f"; exits now: complete {_usd(c.get('complete_loss') and -c['complete_loss'])}, "
+                    f"unwind {_usd(c.get('unwind_loss') and -c['unwind_loss'])} -- {c.get('action')} "
+                    f"{c.get('path') or ''}" + (f" ({c['why']})" if c.get("why") else "") if c else ""))
     f = s.get("feed") or {}
     if not f.get("up"):
         st.error("📡 Kalshi websocket down (quotes are pulled after runtime.feed_down_pull_s).")

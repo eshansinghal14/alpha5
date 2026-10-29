@@ -203,56 +203,85 @@ def quote_leg(legs: list[LegView], j: int, payout: float, required_edge: float, 
                      edge=payout - others - maker_cost(price, lv.maker_rate), others_cost=others)
 
 
+def touch_size(legs: list[LegView], j: int) -> float:
+    """Contracts every leg but j offers at its best ask: what a fill on leg j
+    can be completed with without walking past the touch."""
+    return min((lv.asks[0][1] if lv.asks else 0.0 for i, lv in enumerate(legs) if i != j), default=0.0)
+
+
+def buy_cost(lv: LegView | None, n: float) -> tuple[float, float] | None:
+    """(dollars incl. the taker fee, worst price reached) to buy `n` now, or
+    None if the book holds less (or the leg is closed: lv None)."""
+    if lv is None:
+        return None
+    got, cost = 0.0, 0.0
+    for p, q in lv.asks:
+        k = min(q, n - got)
+        got += k
+        cost += k * p
+        if got >= n - _EPS:
+            return cost + fee(cost / n, n, lv.taker_rate), p
+    return None
+
+
+def rest_price(lv: LegView) -> float | None:
+    """A post-only bid one tick above the best bid, never at or through the ask."""
+    p = lv.ticks.lo if lv.bid is None else lv.ticks.up(lv.bid)
+    if lv.best_ask is not None:
+        p = min(p, lv.ticks.down(lv.best_ask))
+    return p if p >= lv.ticks.lo - _EPS else None
+
+
 @dataclasses.dataclass
-class Completion:
-    need: list[float]                 # contracts each leg still needs
-    caps: list[float | None]          # cap_j per contract incl. fee (None = leg done)
-    limits: list[float | None]        # IOC limit price to send (None = don't send)
-    short: list[int]                  # legs whose cap is below the price their need reaches
+class Exits:
+    need: list[float]                   # contracts each leg buys to complete
+    excess: list[float]                 # contracts each leg holds beyond complete bundles
+    complete: float | None              # $ lost completing at the asks now; None if a missing leg can't fill
+    unwind: float | None                # $ lost netting the excess out at the other sides' asks now
+    complete_limits: list[float | None]
+    unwind_limits: list[float | None]
+
+    @property
+    def target(self) -> float:
+        return max(self.excess)
+
+    def cheaper(self) -> tuple[str, float] | None:
+        got = [(k, v) for k, v in (("complete", self.complete), ("unwind", self.unwind)) if v is not None]
+        return min(got, key=lambda kv: kv[1]) if got else None
 
 
-def completion(payout: float, max_loss: float, target: float, filled: list[float], spent: float,
-               legs: list[LegView]) -> Completion:
-    """How to finish a broken basket. With `target` bundles wanted, `filled[i]`
-    held on leg i and `spent` dollars (fees included) paid toward them, leg j
-    may cost at most
+def exits(payout: float, held: list[float], spent: float, legs: list[LegView | None],
+          others: list[LegView | None]) -> Exits:
+    """The two ways out of a broken basket, as losses on `spent` (what the
+    contracts beyond complete bundles cost, fees included):
 
-        cap_j = (target * (payout + max_loss) - spent - sum_{i != j} r_i * (ask_i + fee_i)) / r_j
+      complete  buy each leg's `need` at its asks; the target bundles then
+                pay target * payout.
+      unwind    buy the other side of each leg's `excess`: Kalshi pays $1 a
+                YES/NO pair back at once.
 
-    per contract (fee included), r_i being what leg i still needs: the basket
-    then loses at most max_loss per bundle. ask_i is the level r_i reaches, or
-    the deepest level when the book is shorter (that IOC fills partially and
-    the next attempt recomputes from what was actually spent).
+    legs[j] / others[j]: leg j's own side and its other side, None when the
+    market is closed. A path any leg can't fill in full is None."""
+    done = min(held)
+    excess = [h - done for h in held]
+    target = max(excess)
+    need = [target - e for e in excess]
 
-    Every missing leg's IOC goes out at once, so each can't be sent at its own
-    cap_j: two legs both filling at their caps would overshoot. Each gets its
-    current price plus an equal share of the slack; with one missing leg (any
-    2-leg basket) that is exactly cap_j. When the slack is negative nothing is
-    sent and the short legs are reported."""
-    need = [max(0.0, target - f) for f in filled]
-    unit = []
-    for lv, r in zip(legs, need):
-        if r <= _EPS:
-            unit.append(0.0)
-            continue
-        p = lv.ladder_price(r)
-        if p is None:
-            p = lv.asks[-1][0] if lv.asks else lv.ticks.hi
-        unit.append(taker_cost(p, lv.taker_rate))
-    budget = target * (payout + max_loss) - spent
-    missing = [j for j, r in enumerate(need) if r > _EPS]
-    caps: list[float | None] = [None] * len(legs)
-    for j in missing:
-        rest = sum(need[i] * unit[i] for i in missing if i != j)
-        caps[j] = (budget - rest) / need[j]
-    slack = budget - sum(need[i] * unit[i] for i in missing)
-    limits: list[float | None] = [None] * len(legs)
-    short = [j for j in missing if caps[j] < unit[j] - _EPS]
-    if slack >= -_EPS and missing:
-        for j in missing:
-            lv = legs[j]
-            if not lv.asks:
+    def walk(views, sizes):
+        total, limits = 0.0, [None] * len(sizes)
+        for j, n in enumerate(sizes):
+            if n <= _EPS:
                 continue
-            limits[j] = max_price_within(unit[j] + max(0.0, slack) / (len(missing) * need[j]), lv.taker_rate,
-                                         lv.ticks)
-    return Completion(need=need, caps=caps, limits=limits, short=short)
+            got = buy_cost(views[j], n)
+            if got is None:
+                return None, limits
+            total += got[0]
+            limits[j] = got[1]
+        return total, limits
+
+    c_cost, c_lim = walk(legs, need)
+    u_cost, u_lim = walk(others, excess)
+    return Exits(need=need, excess=excess,
+                 complete=None if c_cost is None else spent + c_cost - target * payout,
+                 unwind=None if u_cost is None else spent - (sum(excess) - u_cost),
+                 complete_limits=c_lim, unwind_limits=u_lim)

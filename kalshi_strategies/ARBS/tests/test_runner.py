@@ -96,19 +96,79 @@ def test_each_leg_priced_against_the_others_asks(arbs):
     assert qb.max_price + 0.65 + 0.0160 <= 1 - req + 1e-9
 
 
-def test_broken_basket_alerts_when_cap_below_ask(arbs):
-    r, b = arbs
+def _broken(r, b):
+    # Hold 5 YES A at 0.40. B's YES ask is 0.80 (complete loses ~$1.0); A's NO
+    # ask is 0.70 (unwind loses ~$0.5 + fee), its NO bid 0.35.
     book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
-    book(r, "X-B", [(0.10, 10)], [(0.20, 10)])     # B ask 0.80
+    book(r, "X-B", [(0.10, 10)], [(0.20, 10)])
     r.shadow_ledger.record(b.basket_id, b.tickers, "X-A", "yes", 5, 5 * 0.40, time.time())
 
+
+def _eval(r, b):
     async def go():
         r.evaluate(b)
         await drain(r)
     asyncio.run(go())
-    assert r.shadow_ledger.baskets[b.basket_id].unhedged(b.tickers) == {"X-A": 5}
-    assert any("cannot complete" in a["msg"] for a in r.alerts)
-    assert r.summary()["holdings"][0]["completion"]["short"] == ["X-B"]
+
+
+def test_broken_basket_rests_on_the_cheaper_exit(arbs):
+    r, b = arbs
+    _broken(r, b)
+    _eval(r, b)
+    q = r.quotes[(b.basket_id, 0)]
+    assert (q.kind, q.side, q.size, q.price) == ("unwind", "no", 5, 0.36)
+    assert (b.basket_id, 1) not in r.quotes
+    note = r.summary()["holdings"][0]["completion"]
+    assert note["action"] == "rest" and note["path"] == "unwind"
+
+
+def test_broken_basket_takes_when_the_exit_moves_away(arbs):
+    r, b = arbs
+    _broken(r, b)
+    _eval(r, b)
+    book(r, "X-A", [(0.25, 10)], [(0.35, 10)])      # A's NO ask 0.75: unwind 0.25 worse
+    _eval(r, b)
+    assert b.basket_id not in r.shadow_ledger.baskets
+    row = r.shadow_ledger.settled[-1]
+    fee = R.kfees.fee(0.75, 5, 0.07)
+    assert row["pnl"] == pytest.approx(5 - 5 * 0.75 - fee - 2.0, abs=1e-4)
+    assert not r.quotes
+
+
+def test_broken_basket_takes_at_once_when_chase_is_zero_or_live(arbs):
+    r, b = arbs
+    r.cfg.completion = dataclasses.replace(r.cfg.completion, chase_per_bundle=0.0)
+    _broken(r, b)
+    _eval(r, b)
+    assert b.basket_id not in r.shadow_ledger.baskets
+
+
+def test_live_event_exits_at_once(arbs):
+    r, b = arbs
+    live = dataclasses.replace(b, quote_until=pd.Timestamp("2026-01-01", tz="UTC"))
+    r.baskets[b.basket_id] = live
+    _broken(r, live)
+    _eval(r, live)
+    assert live.basket_id not in r.shadow_ledger.baskets
+
+
+def test_exit_quote_fill_nets_the_leg_out(arbs):
+    r, b = arbs
+    _broken(r, b)
+    _eval(r, b)
+    q = r.quotes[(b.basket_id, 0)]
+    r._quote_fill(q, 5, 5 * 0.36, None, "shadow")
+    assert b.basket_id not in r.shadow_ledger.baskets
+    assert r.shadow_ledger.settled[-1]["pnl"] == pytest.approx(5 - 1.8 - 2.0)
+
+
+def test_quote_sized_to_the_other_legs_touch(arbs):
+    r, b = arbs
+    book(r, "X-A", [(0.30, 10)], [(0.35, 3)])        # A's YES ask 0.65, 3 deep
+    book(r, "X-B", [(0.20, 10)], [(0.45, 10)])
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, min_edge=0.0, quote_edge_add=0.0)
+    _eval(r, b)
+    assert r.quotes[(b.basket_id, 1)].size == 3
 
 
 def test_settlement_books_pnl(arbs):

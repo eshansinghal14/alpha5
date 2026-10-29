@@ -53,10 +53,14 @@ class TradingParams:
 
 @section
 class CompletionParams:
-    max_loss_per_bundle: float = param("A broken basket is finished at any price that loses at most this much "
-                                       "per bundle ($). Each missing leg's IOC limit is its cap_j.",
-                                       min=0.0, max=1.0, step=0.01)
-    retry_s: float = param("Seconds between completion attempts while a basket is broken.", min=0.1, step=0.5,
+    max_loss_per_bundle: float = param("A broken basket takes its cheaper exit at once (buy the missing legs, "
+                                       "or net the extra ones out by buying their other side) when that loses "
+                                       "at most this much per bundle ($).", min=0.0, max=1.0, step=0.01)
+    chase_per_bundle: float = param("Otherwise it rests post-only bids on that exit and takes it the moment it "
+                                    "costs this much more per bundle ($) than the best seen since the break. "
+                                    "0 = always take at once. Live events always take at once.",
+                                    min=0.0, max=0.5, step=0.005)
+    retry_s: float = param("Least seconds between exit IOCs on one broken basket.", min=0.05, step=0.05,
                            editable=False)
     max_broken_baskets: int = param("No new takes or quotes while this many baskets are broken.", min=1,
                                     max=1000, step=1, editable=False)

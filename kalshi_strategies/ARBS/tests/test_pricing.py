@@ -70,34 +70,29 @@ def test_quote_none_when_other_leg_lacks_depth():
     assert pricing.quote_leg(legs, 0, 1.0, 0.0, 5) is None
 
 
-def test_completion_two_legs_limit_is_cap_j():
-    # Bought 5 of leg 0 for $2.00 incl. fees; payout 1, max loss 0.05.
-    legs = [lv([(0.50, 9)]), lv([(0.55, 9)])]
-    c = pricing.completion(1.0, 0.05, 5, [5, 0], 2.00, legs)
-    cap = (5 * 1.05 - 2.00) / 5
-    assert c.need == [0, 5] and c.caps[1] == pytest.approx(cap)
-    assert tc(c.limits[1]) <= cap + 1e-9 and tc(round(c.limits[1] + 0.01, 2)) > cap
-    assert c.limits[0] is None and c.short == []
+def test_exits_price_completing_and_unwinding():
+    # Hold 5 YES of leg 0 bought for $2.00; leg 1's YES ask is 0.55, leg 0's NO ask 0.58.
+    legs, others = [lv([(0.45, 9)]), lv([(0.55, 9)])], [lv([(0.58, 9)]), lv([(0.40, 9)])]
+    e = pricing.exits(1.0, [5, 0], 2.00, legs, others)
+    assert e.need == [0, 5] and e.excess == [5, 0]
+    assert e.complete == pytest.approx(2.00 + 5 * 0.55 + fee(0.55, 5, T) - 5)
+    assert e.unwind == pytest.approx(2.00 - (5 - 5 * 0.58 - fee(0.58, 5, T)))
+    assert e.complete_limits == [None, 0.55] and e.unwind_limits == [0.58, None]
+    assert e.cheaper() == ("complete", e.complete)
 
 
-def test_completion_refuses_past_max_loss():
-    legs = [lv([(0.50, 9)]), lv([(0.80, 9)])]
-    c = pricing.completion(1.0, 0.05, 5, [5, 0], 2.00, legs)    # cap 0.65 < 0.80 ask
-    assert c.limits == [None, None] and c.short == [1]
+def test_exits_need_full_depth_and_open_markets():
+    legs, others = [lv([(0.45, 9)]), lv([(0.55, 2), (0.60, 2)])], [None, lv([(0.40, 9)])]
+    e = pricing.exits(1.0, [5, 0], 2.00, legs, others)
+    assert e.complete is None and e.unwind is None and e.cheaper() is None
+    e = pricing.exits(1.0, [5, 0], 2.00, [lv([]), lv([(0.55, 2), (0.60, 3)])], others)
+    assert e.complete_limits[1] == 0.60
 
 
-def test_completion_multi_leg_limits_sum_within_budget():
-    legs = [lv([(0.10, 9)]), lv([(0.20, 9)]), lv([(0.30, 9)])]
-    c = pricing.completion(1.0, 0.05, 2, [2, 0, 0], 0.22, legs)
-    worst = 0.22 + 2 * (tc(c.limits[1]) + tc(c.limits[2]))
-    assert worst <= 2 * 1.05 + 1e-9
-    assert c.limits[1] >= 0.20 and c.limits[2] >= 0.30
-
-
-def test_completion_shallow_book_prices_deepest_level():
-    legs = [lv([(0.50, 9)]), lv([(0.30, 2)])]
-    c = pricing.completion(1.0, 0.05, 5, [5, 0], 2.50, legs)
-    assert c.limits[1] is not None and c.limits[1] >= 0.30
+def test_rest_price_and_touch_size():
+    assert pricing.rest_price(lv([(0.40, 5)], bid=0.30)) == 0.31
+    assert pricing.rest_price(lv([(0.31, 5)], bid=0.30)) == 0.30
+    assert pricing.touch_size([lv([(0.4, 25)]), lv([(0.5, 23), (0.6, 50)]), lv([(0.1, 40)])], 0) == 23
 
 
 def test_tapered_grid():

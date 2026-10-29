@@ -1,9 +1,11 @@
 """ARBS live loop: baskets from the spec across ~70 events, one process.
 
 Per pass over baskets whose books changed:
-  1. a broken basket (legs uneven, after a quote fill or a partial take) is
-     completed: IOCs on the missing legs, each limited by its cap_j
-     (pricing.completion), retried every completion.retry_s;
+  1. a broken basket (legs uneven, after a quote fill or a partial take)
+     takes its cheaper exit, completing the missing legs or netting the
+     extra ones out (pricing.exits), when that is within max_loss_per_bundle,
+     has worsened by chase_per_bundle since the break, or the event is live;
+     otherwise it rests post-only bids on that exit, re-pegged every pass;
   2. a whole-basket take if (payout - sum(ask + fee)) / sum(ask + fee) >= min_edge
      (a return on the bundle's cost, see edge_dollars);
   3. one resting quote per hot basket (top watch.max_quoted_baskets by that
@@ -42,6 +44,7 @@ from kalshi_strategies.ARBS.liquidity import Liquidity
 from kalshi_strategies.ARBS.spec import Basket, load_spec, merge, parse_spec
 
 _EPS = 1e-9
+OTHER = {"yes": "no", "no": "yes"}
 TRADEABLE = ("active", "open")
 SETTLED = ("determined", "settled", "finalized")
 SUMMARY_S = 1.0
@@ -76,6 +79,7 @@ class Quote:
     placed_at: float = 0.0
     moved_at: float = 0.0
     pending: bool = True        # create in flight
+    kind: str = "arb"           # or "complete" / "unwind": resting on a broken basket's exit
 
     @property
     def remaining(self) -> float:
@@ -138,6 +142,8 @@ class ArbsRunner:
         self.last_take: dict[str, float] = {}
         self.last_completion: dict[str, float] = {}
         self.completion_note: dict[str, dict] = {}
+        # basket_id -> least exit loss seen since it broke: the chase reference.
+        self.break_best: dict[str, float] = {}
         self.order_errors = 0
         self.halt: str | None = None                     # until restart
         self.audit_strikes = 0
@@ -145,7 +151,7 @@ class ArbsRunner:
         self.orphans: list[tuple[float, dict]] = []
         self.tasks: set[asyncio.Task] = set()
         self.n = {"takes": 0, "take_bundles": 0.0, "quotes_placed": 0, "quote_moves": 0, "quote_cancels": 0,
-                  "quote_fills": 0, "completions": 0, "completion_short": 0, "post_only_rejects": 0}
+                  "quote_fills": 0, "completions": 0, "unwinds": 0, "exit_unpriced": 0, "post_only_rejects": 0}
         self.started = _utc()
         self.liq = Liquidity(self.root)
 
@@ -442,12 +448,30 @@ class ArbsRunner:
 
     def _book(self, basket_id: str, ticker: str, side: str, size: float, cost: float, kind: str, **kw):
         b = self.baskets[basket_id]
+        if any(l.ticker == ticker and l.side != side for l in b.legs):
+            self._book_unwind(b, ticker, side, size, cost, kind, **kw)
+            return
         self.ledger.record(basket_id, b.tickers, ticker, side, size, cost, time.time())
         self.journal({"kind": "fill", "fill_kind": kind, "basket_id": basket_id, "ticker": ticker, "side": side,
                       "size": size, "cost": round(cost, 4), "price": round((cost / size) if size else 0, 4), **kw})
         self.dirty.add(basket_id)
         if basket_id in self.flip:
             self.dirty.add(self.flip[basket_id])
+
+    def _book_unwind(self, b: Basket, ticker: str, side: str, size: float, cost: float, kind: str, **kw):
+        """Bought the other side of a leg we hold: Kalshi pays $1 a pair, so
+        the loss is realized now and goes to the settled history."""
+        now = time.time()
+        basis = self.ledger.unwind(b.basket_id, b.tickers, ticker, size, now)
+        row = {"basket_id": b.basket_id, "type": b.type, "settled_at": _utc().isoformat(), "bundles": 0.0,
+               "payout": round(size - cost, 4), "cost": round(basis, 4), "pnl": round(size - cost - basis, 4),
+               "results": {ticker: f"unwound {size:g} ({kind})"}, "live": self.live}
+        self.ledger.settled.append(row)
+        self.ledger.save(now)
+        self.journal({"kind": "fill", "fill_kind": kind, "basket_id": b.basket_id, "ticker": ticker, "side": side,
+                      "size": size, "cost": round(cost, 4), "price": round(cost / size if size else 0, 4), **kw})
+        self.journal({"kind": "settled", **row})
+        self.dirty.add(b.basket_id)
 
     def _quote_fill(self, q: Quote, size: float, cost: float, trade_id, source: str):
         q.filled += size
@@ -535,8 +559,8 @@ class ArbsRunner:
     # ------------------------------------------------------------------ limits
 
     def worst_bundle_cost(self, b: Basket) -> float:
-        """Most one bundle can cost once a quote fills and is completed: the
-        completion's cap_j allows up to payout + max_loss_per_bundle."""
+        """Commitment per bundle of a resting quote: payout plus the loss a
+        broken basket's exit is let off at once (max_loss_per_bundle)."""
         return b.payout + self.cfg.completion.max_loss_per_bundle
 
     def quote_commit(self, basket_id: str) -> float:
@@ -618,17 +642,11 @@ class ArbsRunner:
         qs = self.basket_quotes(b.basket_id)
         live_qs = [q for q in qs if not q.pending]
         if pos is not None and pos.unhedged(b.tickers):
-            if live_qs:
-                # Pull every leg's quote while completing: another leg filling
-                # now would buy what the completion IOCs are buying. Complete
-                # alongside, not after: the asks the fill was priced against
-                # only get worse.
-                async def both(qs=live_qs):
-                    await asyncio.gather(*(self.cancel_quote(q, "filled") for q in qs), self.complete(b))
-                self.spawn(both(), b.basket_id)
-                return
-            if now - self.last_completion.get(b.basket_id, 0.0) >= self.cfg.completion.retry_s:
-                self.spawn(self.complete(b), b.basket_id)
+            self.resolve(b, pos, qs, now)
+            return
+        self.break_best.pop(b.basket_id, None)
+        if any(q.kind != "arb" for q in live_qs):
+            self.spawn(self.cancel_quotes([q for q in live_qs if q.kind != "arb"], "whole"), b.basket_id)
             return
         vs = self.views(b) if self.tradeable(b) else None
         blocked = self.blocked()
@@ -674,13 +692,16 @@ class ArbsRunner:
             if q is not None and q.pending:
                 continue
             plan, size = None, 0.0
+            # No bigger than the other legs' touch: a fill then completes at
+            # the prices it was quoted against, not a level further in.
+            touch = float(int(pricing.touch_size(vs, j) + _EPS))
             if want and ex >= 1:
-                size = min(float(t.quote_size), float(ex))
-                if q is None or q.remaining <= size + _EPS:
+                size = min(float(t.quote_size), float(ex), touch)
+                if size >= 1 and (q is None or q.remaining <= size + _EPS):
                     plan = pricing.quote_leg(vs, j, b.payout, t.exit_edge, size)
             elif want:
-                size = min(float(t.quote_size), self.room_bundles(b, j), float(self.quote_size_by_dollars(b)))
-                if size >= 1:
+                size = min(float(t.quote_size), self.room_bundles(b, j), float(self.quote_size_by_dollars(b)), touch)
+                if size >= 1 and (q is None or q.remaining <= size + _EPS):
                     plan = pricing.quote_leg(vs, j, b.payout, edge_dollars(b.payout, t.min_edge + t.quote_edge_add),
                                              size)
             if plan is None:
@@ -782,58 +803,121 @@ class ArbsRunner:
         else:
             self._order_err(b.basket_id, f"{what} IOC {ticker}", exc)
 
-    async def complete(self, b: Basket):
-        self.last_completion[b.basket_id] = time.time()
-        pos = self.ledger.baskets[b.basket_id]
-        held = pos.held(b.tickers)
-        done = min(held)
-        target = max(held) - done
-        filled = [h - done for h in held]
-        spent = pos.broken_spent(b.tickers)
-        vs = [self.leg_view(l.ticker, l.side) or pricing.LegView([], None, self.meta[l.ticker].taker_rate or 0.07,
-                                                                 0.0) for l in b.legs]
-        plan = pricing.completion(b.payout, self.cfg.completion.max_loss_per_bundle, target, filled, spent, vs)
-        missing = {b.tickers[j]: plan.need[j] for j in range(len(b.legs)) if plan.need[j] > _EPS}
-        closed = [l.ticker for j, l in enumerate(b.legs) if plan.need[j] > _EPS
-                  and (self.meta.get(l.ticker) is None or self.meta[l.ticker].status not in TRADEABLE)]
-        if closed:
-            # Buying the open legs would only add exposure the closed one can't hedge.
-            plan.limits = [None] * len(b.legs)
-            plan.short = [b.tickers.index(t) for t in closed]
-        self.completion_note[b.basket_id] = {
-            "time": _utc().isoformat(), "need": missing,
-            "caps": {b.tickers[j]: round(c, 4) for j, c in enumerate(plan.caps) if c is not None},
-            "asks": {b.tickers[j]: vs[j].best_ask for j in range(len(b.legs)) if plan.need[j] > _EPS},
-            "short": [b.tickers[j] for j in plan.short]}
-        if not any(p is not None for p in plan.limits):
-            self.n["completion_short"] += 1
-            age = time.time() - (pos.broken_since or time.time())
-            # One alert per minute per basket: retries are every retry_s.
-            if int(age) // 60 != int(age - self.cfg.completion.retry_s) // 60 or age < self.cfg.completion.retry_s:
-                self.alert("error", b.basket_id,
-                           f"cannot complete within max_loss {self.cfg.completion.max_loss_per_bundle:g}/bundle: "
-                           f"need {missing}, caps {self.completion_note[b.basket_id]['caps']}, "
-                           f"asks {self.completion_note[b.basket_id]['asks']} (broken {age:.0f}s)")
+    def is_open(self, ticker: str) -> bool:
+        m = self.meta.get(ticker)
+        return m is not None and m.status in TRADEABLE
+
+    def resolve(self, b: Basket, pos, qs: list[Quote], now: float):
+        """A broken basket, on every change to its legs' books. Its cheaper exit
+        is taken at once when that loses at most max_loss_per_bundle, when it
+        costs chase_per_bundle more than the best seen since the break (the
+        book moving away), or when the event is live (prices jump, they don't
+        drift). Otherwise post-only bids rest on that exit's legs, re-pegged
+        each pass: a fill completes or nets out below today's asks."""
+        c, bid = self.cfg.completion, b.basket_id
+        if any(q.pending for q in qs):
+            self.dirty.add(bid)
             return
-        self.n["completions"] += 1
-        legs = [(j, b.legs[j]) for j in range(len(b.legs)) if plan.limits[j] is not None]
-        self.journal({"kind": "complete", "basket_id": b.basket_id, "need": missing,
-                      "limits": {l.ticker: plan.limits[j] for j, l in legs}})
-        held = self.hold([(l.ticker, l.side, plan.need[j]) for j, l in legs])
+        legs = [self.leg_view(l.ticker, l.side) if self.is_open(l.ticker) else None for l in b.legs]
+        others = [self.leg_view(l.ticker, OTHER[l.side]) if self.is_open(l.ticker) else None for l in b.legs]
+        ex = pricing.exits(b.payout, pos.held(b.tickers), pos.broken_spent(b.tickers), legs, others)
+        pick = ex.cheaper()
+        age = now - (pos.broken_since or now)
+        self.completion_note[bid] = {
+            "time": _utc().isoformat(), "excess": {t: e for t, e in zip(b.tickers, ex.excess) if e > _EPS},
+            "complete_loss": None if ex.complete is None else round(ex.complete, 4),
+            "unwind_loss": None if ex.unwind is None else round(ex.unwind, 4),
+            "best_since_break": self.break_best.get(bid), "path": pick and pick[0]}
+        if pick is None:
+            self.n["exit_unpriced"] += 1
+            if int(age) // 60 != int(age - 1) // 60 or age < 1:
+                self.alert("error", bid, f"no exit priced (a leg closed or too thin): excess "
+                                         f"{self.completion_note[bid]['excess']} (broken {age:.0f}s)")
+            return
+        path, loss = pick
+        best = min(self.break_best.get(bid, loss), loss)
+        self.break_best[bid] = best
+        target = ex.target
+        why = ("within max_loss" if loss <= c.max_loss_per_bundle * target + _EPS else
+               "moved away" if loss >= best + c.chase_per_bundle * target - _EPS else
+               "live event" if not b.quoting_allowed(_utc()) else None)
+        self.completion_note[bid].update(action="take" if why else "rest", why=why)
+        if why is None:
+            self.rest_exit(b, path, ex, legs, others, qs, now)
+        elif now - self.last_completion.get(bid, 0.0) >= c.retry_s:
+            self.spawn(self.exit_now(b, path, ex, legs, others, qs, loss, why), bid)
+        else:
+            self.dirty.add(bid)
+
+    def _exit_orders(self, b: Basket, path: str, ex: pricing.Exits, legs, others):
+        """(leg, ticker, side, size, view) per order the exit needs."""
+        if path == "complete":
+            return [(j, l.ticker, l.side, ex.need[j], legs[j]) for j, l in enumerate(b.legs) if ex.need[j] > _EPS]
+        return [(j, l.ticker, OTHER[l.side], ex.excess[j], others[j]) for j, l in enumerate(b.legs)
+                if ex.excess[j] > _EPS]
+
+    async def exit_now(self, b: Basket, path: str, ex: pricing.Exits, legs, others, qs, loss: float, why: str):
+        bid = b.basket_id
+        self.last_completion[bid] = time.time()
+        live_qs = [q for q in qs if not q.pending]
+        if live_qs:
+            # A resting exit bid filling alongside these IOCs would overshoot.
+            await self.cancel_quotes(live_qs, "exit")
+        lim = ex.complete_limits if path == "complete" else ex.unwind_limits
+        orders = [(j, t, sd, n, v, lim[j]) for j, t, sd, n, v in self._exit_orders(b, path, ex, legs, others)]
+        self.n["completions" if path == "complete" else "unwinds"] += 1
+        self.journal({"kind": path, "basket_id": bid, "why": why, "loss": round(loss, 4),
+                      "orders": {t: [sd, n, p] for _, t, sd, n, _, p in orders}})
+        if loss > self.cfg.completion.max_loss_per_bundle * ex.target + _EPS:
+            self.alert("warn", bid, f"{path} at a ${loss:.2f} loss ({why})")
+        held = self.hold([(t, sd, n) for _, t, sd, n, _, _ in orders])
         try:
-            res = await asyncio.gather(*(self._ioc(l.ticker, l.side, plan.limits[j], plan.need[j], "complete",
-                                                   vs[j]) for j, l in legs))
+            res = await asyncio.gather(*(self._ioc(t, sd, p, n, path, v) for _, t, sd, n, v, p in orders))
         finally:
             self.release(held)
-        for (j, l), (fill, exc) in zip(legs, res):
+        for (_, t, sd, _, _, _), (fill, exc) in zip(orders, res):
             if exc is not None:
-                self._ioc_exc(b, l.ticker, exc, "completion")
+                self._ioc_exc(b, t, exc, path)
             if fill is not None and fill.size > 0:
-                self._book(b.basket_id, l.ticker, l.side, fill.size, fill.price * fill.size + fill.fee,
-                           "complete", order_id=fill.exchange_order_id)
-        if not self.ledger.baskets[b.basket_id].unhedged(b.tickers):
-            self.completion_note.pop(b.basket_id, None)
-            self.journal({"kind": "completed", "basket_id": b.basket_id})
+                self._book(bid, t, sd, fill.size, fill.price * fill.size + fill.fee, path,
+                           order_id=fill.exchange_order_id)
+        pos = self.ledger.baskets.get(bid)
+        if pos is None or not pos.unhedged(b.tickers):
+            self.completion_note.pop(bid, None)
+            self.break_best.pop(bid, None)
+            self.journal({"kind": "completed", "basket_id": bid, "path": path})
+
+    def rest_exit(self, b: Basket, path: str, ex: pricing.Exits, legs, others, qs, now: float):
+        """Post-only bids on every order the exit needs, re-pegged one tick
+        over the best bid; quotes for the other path are pulled."""
+        want = {j: (t, sd, n, pricing.rest_price(v) if v is not None else None)
+                for j, t, sd, n, v in self._exit_orders(b, path, ex, legs, others)}
+        reserve = self.cfg.runtime.write_reserve_tokens
+        acts = []
+        for j, leg in enumerate(b.legs):
+            q = self.quotes.get((b.basket_id, j))
+            w = want.get(j)
+            if w is None or w[3] is None:
+                if q is not None:
+                    acts.append(self.cancel_quote(q, "exit_path"))
+                continue
+            t, sd, n, price = w
+            if q is not None and (q.kind != path or q.side != sd or abs(q.remaining - n) > _EPS):
+                acts.append(self.cancel_quote(q, "exit_resize"))
+            elif q is None:
+                if self.live and not self.gw.can_afford(t, "order", reserve):
+                    continue
+                q = Quote(basket_id=b.basket_id, leg=j, ticker=t, side=sd, price=price, size=n,
+                          cid=str(uuid.uuid4()), edge=0.0, max_price=price, placed_at=now, kind=path)
+                self.quotes[q.key] = q
+                acts.append(self.place_quote(q))
+            elif abs(q.price - price) > _EPS:
+                acts.append(self.move_quote(q, pricing.QuotePlan(leg=j, price=price, max_price=price, edge=0.0,
+                                                                 others_cost=0.0)))
+        if acts:
+            async def run(acts=acts):
+                await asyncio.gather(*acts)
+            self.spawn(run(), b.basket_id)
 
     def new_quote(self, b: Basket, plan: pricing.QuotePlan, size: float) -> Quote:
         leg = b.legs[plan.leg]
@@ -1171,7 +1255,8 @@ class ArbsRunner:
         quotes = [{"basket_id": q.basket_id, "ticker": q.ticker, "side": q.side, "price": q.price,
                    "size": q.size, "filled": q.filled, "edge": round(q.edge, 4),
                    "ret": round(edge_return(self.baskets[q.basket_id].payout, q.edge), 4), "max_price": q.max_price,
-                   "age_s": round(time.time() - q.placed_at), "pending": q.pending, "order_id": q.exchange_id}
+                   "age_s": round(time.time() - q.placed_at), "pending": q.pending, "order_id": q.exchange_id,
+                   "kind": q.kind}
                   for q in self.quotes.values()]
         return {
             "series": self.S, "event_ticker": "ARBS", "last_update": _utc().isoformat(),

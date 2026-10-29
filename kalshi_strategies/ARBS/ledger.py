@@ -120,6 +120,24 @@ class Ledger:
             b.broken_since = None
         self.save(now)
 
+    def unwind(self, basket_id: str, tickers: list[str], ticker: str, qty: float, now: float) -> float:
+        """Net `qty` contracts out of a leg (we bought the other side; Kalshi
+        pays $1 a pair). The leg shrinks at its average cost, which is returned."""
+        b = self.baskets[basket_id]
+        lp = b.legs[ticker]
+        qty = min(qty, lp.qty)
+        basis = lp.avg * qty
+        lp.qty -= qty
+        lp.cost -= basis
+        if lp.qty <= _EPS:
+            del b.legs[ticker]
+        if not b.legs:
+            del self.baskets[basket_id]
+        else:
+            b.broken_since = (b.broken_since or now) if b.unhedged(tickers) else None
+        self.save(now)
+        return basis
+
     def net_by_ticker(self) -> dict[str, float]:
         """Signed YES position per ticker summed over baskets (NO negative),
         the way Kalshi's positions endpoint reports it."""
