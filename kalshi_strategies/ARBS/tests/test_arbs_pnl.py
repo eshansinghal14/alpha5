@@ -41,3 +41,18 @@ def test_bundle_log_groups_bursts_newest_first(tmp_path, monkeypatch):
     assert pd.isna(log.bundles.iloc[0]) and log.pnl.iloc[0] == pytest.approx(2 - 2.1)
     assert pd.isna(log.bundles.iloc[1]) and pd.isna(log.pnl.iloc[1])
     assert log.bundles.iloc[2] == 5 and log.pnl.iloc[2] == pytest.approx(0.5)
+
+
+def test_bundle_log_counts_bundles_and_unwound_pairs_in_one_burst(tmp_path, monkeypatch):
+    import json
+    from kalshi_viz import arbs_pnl
+    monkeypatch.setattr(arbs_pnl, "LIVE_ROOT", str(tmp_path))
+    monkeypatch.setattr(arbs_pnl, "basket_info", lambda root: {"b": (1.0, 2)})
+    j = tmp_path / "ARBS" / "journal"
+    j.mkdir(parents=True)
+    rows = [fill(1, "b", "S-K", "no", 1, 0.70) | {"fill_kind": "quote"},       # a bundle: K no + C no
+            fill(2, "b", "S-C", "no", 2, 0.53) | {"fill_kind": "complete"},
+            fill(3, "b", "S-C", "yes", 1, 0.71) | {"fill_kind": "unwind"}]     # one C no netted out
+    (j / "2026-10-29.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    log = arbs_pnl.bundle_log("ARBS")
+    assert log.bundles.iloc[0] == 1 and log.pnl.iloc[0] == pytest.approx(2 - 1.94)

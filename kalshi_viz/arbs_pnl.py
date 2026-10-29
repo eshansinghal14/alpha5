@@ -109,8 +109,8 @@ def load(series: str) -> pd.DataFrame:
 
 def bundle_log(series: str, days: int = 2, gap_s: float = 30.0) -> pd.DataFrame:
     """Live fills, one row per burst on a basket (fills within gap_s of the
-    last), newest first. pnl: locked in for whole bundles, realized for an
-    unwind, None for a burst that left the basket incomplete."""
+    last), newest first. pnl: unwound pairs ($1 each) plus whole bundles at
+    their payout, less cost; None for a burst that left the basket incomplete."""
     root = os.path.join(LIVE_ROOT, series)
     rows = []
     for f in sorted(glob.glob(os.path.join(root, "journal", "*.jsonl")))[-days:]:
@@ -140,18 +140,24 @@ def bundle_log(series: str, days: int = 2, gap_s: float = 30.0) -> pd.DataFrame:
     out = []
     for c in reversed(bursts):
         meta = info.get(c["basket_id"]) or guess_info(c["basket_id"])
-        qty = list(c["legs"].values())
-        tickers = [t for t, _ in c["legs"]]
+        tickers = {t for t, _ in c["legs"]}
         # Both sides of a market: an unwind, the pair paid out $1 each at once.
-        pairs = sum(min(c["legs"].get((t, "yes"), 0.0), c["legs"].get((t, "no"), 0.0)) for t in set(tickers))
-        whole = (not pairs and meta is not None and len(set(tickers)) >= meta[1]
-                 and len({round(q, 6) for q in qty}) == 1)
-        pnl = qty[0] * meta[0] - c["cost"] if whole else pairs - c["cost"] if pairs else None
+        # What's left after netting pairs is whole bundles, or an unfinished basket.
+        pairs, left = 0.0, {}
+        for t in tickers:
+            y, n = c["legs"].get((t, "yes"), 0.0), c["legs"].get((t, "no"), 0.0)
+            pairs += min(y, n)
+            if abs(y - n) > _EPS:
+                left[t] = abs(y - n)
+        rest = {round(q, 6) for q in left.values()}
+        whole = (meta is not None and len(left) >= meta[1] and len(rest) == 1) or not left
+        bundles = next(iter(left.values())) if left and whole else 0.0
+        pnl = pairs + bundles * meta[0] - c["cost"] if whole and meta is not None else None
         out.append({"time": pd.Timestamp(c["t"], unit="s", tz="UTC"),
                     # Series tickers, the part of a market ticker Kalshi's search finds.
                     "series": " ".join(dict.fromkeys(t.split("-", 1)[0] for t, _ in c["legs"])),
                     "basket_id": c["basket_id"], "how": "+".join(sorted(h for h in c["how"] if h)),
-                    "bundles": qty[0] if whole else None, "cost": round(c["cost"], 2),
+                    "bundles": bundles if whole and bundles else None, "cost": round(c["cost"], 2),
                     "pnl": None if pnl is None else round(pnl, 2),
                     "return": None if pnl is None or c["cost"] <= 0 else f"{pnl / c['cost']:.2%}",
                     "fills": ", ".join(f"{t.split('-', 1)[-1]} {s} {q:g}" for (t, s), q in c["legs"].items())})
