@@ -1522,10 +1522,12 @@ class ArbsRunner:
             locked = (n * b.payout - (pos.cost() - pos.broken_spent(tickers))) if b else None
             un = pos.unhedged(tickers)
             broken = self.sale_value(pos, un) - pos.broken_spent(tickers) if un else 0.0
+            # Every contract held, sold at its bid now.
+            curr = self.sale_value(pos, {t: q for t, q in zip(tickers, pos.held(tickers)) if q > 0}) - pos.cost()
             holdings.append({"basket_id": bid, "type": b.type if b else "", "payout": b.payout if b else None,
                              "bundles": n, "held": dict(zip(tickers, pos.held(tickers))),
                              "cost": round(pos.cost(), 4), "locked_pnl": None if locked is None else round(locked, 4),
-                             "broken_pnl": round(broken, 4),
+                             "broken_pnl": round(broken, 4), "curr_pnl": round(curr, 4),
                              "unhedged": pos.unhedged(tickers),
                              "broken_s": None if pos.broken_since is None else round(time.time() - pos.broken_since),
                              "completion": self.completion_note.get(bid)})

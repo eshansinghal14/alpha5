@@ -112,9 +112,11 @@ def _tables(s: dict):
         df["held"] = df["held"].map(lambda d: ", ".join(f"{t.split('-', 1)[-1]} {q:g}" for t, q in d.items()))
         df["status"] = df["unhedged"].map(lambda u: "INCOMPLETE" if u else "complete")
         df["pnl"] = df["locked_pnl"].fillna(0) + df.get("broken_pnl", 0.0)
+        df["curr pnl"] = df["curr_pnl"] if "curr_pnl" in df else None
         df["return"] = (df["pnl"] / df["cost"].where(df["cost"] > 0)).map(
             lambda v: "" if pd.isna(v) else f"{v:.2%}")
-        st.dataframe(df[["series", "basket_id", "type", "status", "bundles", "payout", "cost", "pnl", "return", "held"]]
+        st.dataframe(df[["series", "basket_id", "type", "status", "bundles", "payout", "cost", "pnl", "curr pnl",
+                         "return", "held"]]
                      .sort_values("status", ascending=False), use_container_width=True, hide_index=True)
     else:
         st.caption("None.")
