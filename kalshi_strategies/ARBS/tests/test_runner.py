@@ -589,3 +589,19 @@ def test_quote_past_its_limit_is_cancelled_when_the_move_is_refused(arbs):
     asyncio.run(r.move_quote(q, R.pricing.QuotePlan(leg=0, price=0.35, max_price=0.36, edge=0.0, others_cost=0.0)))
     assert q.key not in r.quotes and r.n["moves_refused"] == 1
     r.live = False
+
+
+def test_chase_ignores_what_older_bundles_cost(arbs):
+    r, b = arbs
+    # 5 whole bundles bought dear, then a quote on A fills 1 more at 0.40,
+    # priced against B's 0.50 ask: the book hasn't moved, so it rests.
+    r.shadow_ledger.record(b.basket_id, b.tickers, "X-A", "yes", 5, 5 * 0.70, time.time())
+    r.shadow_ledger.record(b.basket_id, b.tickers, "X-B", "yes", 5, 5 * 0.29, time.time())
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.45, 10)], [(0.50, 10)])
+    q = R.Quote(basket_id=b.basket_id, leg=0, ticker="X-A", side="yes", price=0.40, size=1, cid="c",
+                edge=1 - 0.40 - R.pricing.taker_cost(0.50, 0.07), max_price=0.40, pending=False)
+    r.quotes[q.key] = q
+    r._quote_fill(q, 1, 0.40, None, "shadow")
+    _eval(r, b)
+    assert r.summary()["holdings"][0]["completion"]["action"] == "rest"

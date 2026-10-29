@@ -213,8 +213,13 @@ class ArbsRunner:
         self.book_time: dict[str, float] = {}     # ticker -> monotonic time of its last book update
         self.last_exit: dict[str, tuple] = {}
         self.completion_note: dict[str, dict] = {}
-        # basket_id -> recent (time, exit loss) of a broken basket: the chase reference.
+        # basket_id -> recent (time, exit cost) of a broken basket: the chase
+        # reference. Exit cost is what finishing costs from here, net of the
+        # payout, without what the extra contracts already cost: a leg's
+        # average cost mixes in older bundles, and it is the same for both
+        # paths and over time anyway.
         self.exit_hist: dict[str, collections.deque] = {}
+        self.exit_planned: dict[str, float] = {}  # exit cost the fill or take was priced at
         self.order_errors = 0
         self.halt: str | None = None                     # until restart
         self.audit_strikes = 0
@@ -592,17 +597,21 @@ class ArbsRunner:
         self.journal({"kind": "settled", **row})
         self.dirty.add(b.basket_id)
 
-    def seed_exit(self, basket_id: str, planned_loss: float):
-        """Start a basket's chase history at the exit it was priced against: a
-        fill usually lands in the same burst that moves the other legs, so a
-        history begun at the fill would miss that move."""
+    def seed_exit(self, basket_id: str, planned: float):
+        """Start a basket's chase history at the exit cost it was priced
+        against: a fill usually lands in the same burst that moves the other
+        legs, so a history begun at the fill would miss that move."""
         if basket_id not in self.exit_hist:
-            self.exit_hist[basket_id] = collections.deque([(time.time(), planned_loss)])
+            self.exit_hist[basket_id] = collections.deque([(time.time(), planned)])
+            self.exit_planned[basket_id] = planned
 
     def _quote_fill(self, q: Quote, size: float, cost: float, trade_id, source: str):
         q.filled += size
         if q.kind == "arb":
-            self.seed_exit(q.basket_id, -q.edge * q.filled)
+            # Priced so the other legs cost payout - edge - this leg's cost a bundle.
+            m = self.meta.get(q.ticker)
+            per = q.edge + pricing.maker_cost(q.price, (m.maker_rate if m else None) or 0.0)
+            self.seed_exit(q.basket_id, -per * q.filled)
         self.n["quote_fills"] += 1
         self._book(q.basket_id, q.ticker, q.side, size, cost, "quote", source=source, order_id=q.exchange_id,
                    trade_id=trade_id)
@@ -790,6 +799,7 @@ class ArbsRunner:
             self.resolve(b, pos, qs, now)
             return
         self.exit_hist.pop(b.basket_id, None)
+        self.exit_planned.pop(b.basket_id, None)
         if any(q.kind != "arb" for q in live_qs):
             self.spawn(self.cancel_quotes([q for q in live_qs if q.kind != "arb"], "whole"), b.basket_id)
             return
@@ -973,7 +983,9 @@ class ArbsRunner:
             await asyncio.gather(*(leg(j, got[first]) for j in range(len(b.legs)) if j != first))
         self.n["take_bundles"] += min(got)
         if max(got) - min(got) > _EPS:
-            self.seed_exit(b.basket_id, -plan.edge * (max(got) - min(got)))
+            hi = max(got)
+            self.seed_exit(b.basket_id, sum((hi - g) * pricing.taker_cost(p, v.taker_rate)
+                                            for g, p, v in zip(got, plan.limits, vs)) - (hi - min(got)) * b.payout)
             self.alert("warn", b.basket_id, f"take filled unevenly {dict(zip(b.tickers, got))}; completing")
 
     def _ioc_exc(self, b, ticker, exc, what):
@@ -1017,13 +1029,14 @@ class ArbsRunner:
                                          f"{self.completion_note[bid]['excess']} (broken {age:.0f}s)")
             return
         path, loss = pick
+        cost = loss - pos.broken_spent(b.tickers)
         hist = self.exit_hist.setdefault(bid, collections.deque())
-        hist.append((now, loss))
+        hist.append((now, cost))
         while hist and hist[0][0] < now - c.chase_window_s:
             hist.popleft()
         best = min(v for _, v in hist)
         moved = c.chase_ticks * self.exit_tick(b, path, ex, legs, others) * ex.target
-        why = ("fast move" if loss - best >= moved - _EPS else
+        why = ("fast move" if cost - best >= moved - _EPS else
                "live event" if b.is_live(_utc()) or not b.quoting_allowed(_utc()) else None)
         self.completion_note[bid]["window_best"] = round(best, 4)
         self.completion_note[bid].update(action="take" if why else "rest", why=why)
@@ -1035,7 +1048,7 @@ class ArbsRunner:
             sig = (tuple(self.book_seq.get(t, 0) for t in b.tickers), tuple(pos.held(b.tickers)))
             if self.last_exit.get(bid) != sig:
                 self.last_exit[bid] = sig
-                self.spawn(self.exit_now(b, path, ex, legs, others, qs, loss, why), bid)
+                self.spawn(self.exit_now(b, path, ex, legs, others, qs, cost, why), bid)
 
     def exit_tick(self, b: Basket, path: str, ex: pricing.Exits, legs, others) -> float:
         """The coarsest tick among the exit's orders at their prices: a cent,
@@ -1052,7 +1065,7 @@ class ArbsRunner:
         return [(j, l.ticker, OTHER[l.side], ex.excess[j], others[j]) for j, l in enumerate(b.legs)
                 if ex.excess[j] > _EPS]
 
-    async def exit_now(self, b: Basket, path: str, ex: pricing.Exits, legs, others, qs, loss: float, why: str):
+    async def exit_now(self, b: Basket, path: str, ex: pricing.Exits, legs, others, qs, cost: float, why: str):
         bid = b.basket_id
         live_qs = [q for q in qs if not q.pending]
         if live_qs:
@@ -1061,10 +1074,13 @@ class ArbsRunner:
         lim = ex.complete_limits if path == "complete" else ex.unwind_limits
         orders = [(j, t, sd, n, v, lim[j]) for j, t, sd, n, v in self._exit_orders(b, path, ex, legs, others)]
         self.n["completions" if path == "complete" else "unwinds"] += 1
-        self.journal({"kind": path, "basket_id": bid, "why": why, "loss": round(loss, 4),
+        planned = self.exit_planned.get(bid)
+        worse = None if planned is None else cost - planned
+        self.journal({"kind": path, "basket_id": bid, "why": why, "cost": round(cost, 4),
+                      "vs_plan": None if worse is None else round(worse, 4),
                       "orders": {t: [sd, n, p] for _, t, sd, n, _, p in orders}})
-        if loss > _EPS:
-            self.alert("warn", bid, f"{path} at a ${loss:.2f} loss ({why})")
+        if worse is not None and worse > _EPS:
+            self.alert("warn", bid, f"{path} ${worse:.2f} worse than planned ({why})")
         held = self.hold([(t, sd, n) for _, t, sd, n, _, _ in orders])
         try:
             res = await asyncio.gather(*(self._ioc(t, sd, p, n, path, v) for _, t, sd, n, v, p in orders))
@@ -1080,6 +1096,7 @@ class ArbsRunner:
         if pos is None or not pos.unhedged(b.tickers):
             self.completion_note.pop(bid, None)
             self.exit_hist.pop(bid, None)
+            self.exit_planned.pop(bid, None)
             self.last_exit.pop(bid, None)
             self.journal({"kind": "completed", "basket_id": bid, "path": path})
 
