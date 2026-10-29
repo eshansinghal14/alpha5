@@ -1,9 +1,10 @@
-"""Kalshi websocket for every basket leg (~400 markets) on one connection,
+"""Kalshi websocket for every basket leg (~1500 markets) on one connection,
 subscribed in batches. Seq is checked per sid."""
 from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 
 import websockets
@@ -17,6 +18,12 @@ from kalshi_infra.kalshi.ws_feed import (OPEN_TIMEOUT_S, RECONNECT_DELAY_S, RECV
 # command with ~1000 tickers was the suspect in a 12h silent gap (2026-08-26).
 SUBSCRIBE_BATCH = 50
 SUBSCRIBE_PACING_S = 0.2
+# Every market gets a fresh snapshot once per RESYNC_INTERVAL_S, a batch at a
+# time on the open connection: removing a market from the orderbook sid and
+# adding it back sends a new snapshot (probe 10-29; a repeat subscribe sends
+# none). A full reconnect instead took ~6 s to resubscribe 1450 markets, past
+# feed_down_pull_s, so every quote was pulled every 15 min.
+REFRESH_BATCH = 50
 
 
 class MultiFeed(LiveKalshiFeed):
@@ -29,6 +36,7 @@ class MultiFeed(LiveKalshiFeed):
         self.up = False
         self.down_since: float | None = time.monotonic()
         self._new: list[str] = []
+        self.n_refreshes = 0
 
     def add(self, tickers):
         """Subscribe to more markets: on the open connection, and on every
@@ -48,6 +56,9 @@ class MultiFeed(LiveKalshiFeed):
                 sub_id += 1
             await asyncio.sleep(SUBSCRIBE_PACING_S)
         return sub_id
+
+    def _refresh_gap(self) -> float:
+        return RESYNC_INTERVAL_S / max(1, math.ceil(len(self._tickers) / REFRESH_BATCH))
 
     def ladder(self, ticker: str):
         return self._books.get(ticker)
@@ -75,13 +86,25 @@ class MultiFeed(LiveKalshiFeed):
                         await ws.send(json.dumps({"id": sub_id, "cmd": "subscribe",
                                                   "params": {"channels": ["fill"]}}))
                         sub_id += 1
-                    resync_at = time.monotonic() + RESYNC_INTERVAL_S
                     last_seq: dict = {}
+                    ob_sid, refresh_i = None, 0
+                    refresh_at = time.monotonic() + self._refresh_gap()
                     self._set_up(True)
-                    while time.monotonic() <= resync_at:
+                    while True:
                         if self._new:
                             new, self._new = self._new, []
                             sub_id = await self._subscribe(ws, new, sub_id)
+                        if ob_sid is not None and time.monotonic() >= refresh_at:
+                            if refresh_i >= len(self._tickers):
+                                refresh_i = 0
+                            batch = self._tickers[refresh_i:refresh_i + REFRESH_BATCH]
+                            refresh_i += REFRESH_BATCH
+                            for action in ("delete_markets", "add_markets"):
+                                await ws.send(json.dumps({"id": sub_id, "cmd": "update_subscription", "params": {
+                                    "sids": [ob_sid], "market_tickers": batch, "action": action}}))
+                                sub_id += 1
+                            self.n_refreshes += 1
+                            refresh_at = time.monotonic() + self._refresh_gap()
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=RECV_TIMEOUT_S)
                         except asyncio.TimeoutError:
@@ -89,6 +112,8 @@ class MultiFeed(LiveKalshiFeed):
                         self.last_msg_mono = time.monotonic()
                         d = json.loads(raw)
                         mtype = d.get("type", "")
+                        if mtype == "subscribed" and (d.get("msg") or {}).get("channel") == "orderbook_delta":
+                            ob_sid = d["msg"].get("sid")
                         if mtype in ("error", "unsubscribed"):
                             # e.g. code 25 "Subscription buffer overflow" ends that
                             # subscription; a reconnect resubscribes everything.

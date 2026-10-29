@@ -1537,7 +1537,7 @@ class ArbsRunner:
             "ledger": "real" if led is self.real_ledger else "shadow",
             "halted": self.halt is not None, "halt_reason": self.halt, "blocked_reason": self.blocked(),
             "feed": {"up": self.feed.up, "reconnects": self.feed.n_reconnects, "seq_gaps": self.feed.n_seq_gaps,
-                     "ws_errors": self.feed.n_errors, "last_msg_s": self.feed.seconds_since_message()},
+                     "ws_errors": self.feed.n_errors, "refreshes": self.feed.n_refreshes, "last_msg_s": self.feed.seconds_since_message()},
             "n_baskets": len(self.all_baskets), "n_tickers": len(self.tickers),
             "n_tradeable": sum(1 for b in self.all_baskets if self.tradeable(b)),
             "market_status": _count(m.status for m in self.meta.values()),
