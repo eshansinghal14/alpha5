@@ -28,6 +28,7 @@ def arbs(tmp_path, monkeypatch):
         r.meta[t] = R.Meta(ticker=t, event="X", status="active", shard=0, taker_rate=0.07, maker_rate=0.0)
     r.cfg.trading = dataclasses.replace(r.cfg.trading, min_edge=0.01, quote_edge_add=0.02, quote_size=5,
                                         max_bundles_per_basket=50, max_dollars=1000.0, take_cooldown_s=0.0)
+    r.cfg.watch = dataclasses.replace(r.cfg.watch, max_queue_wait_s=None)
     r.hot = [b.basket_id]
     return r, b
 
@@ -694,3 +695,25 @@ def test_write_cap_rises_while_priority_series_is_out_of_session(arbs, tmp_path)
     assert r.write_cap() == 250.0
     r.priority_trading = ["KXINXU"]
     assert r.write_cap() == 150.0
+
+
+def test_queue_wait_is_depth_ahead_over_the_fill_rate(arbs):
+    r, b = arbs
+    r.cfg.watch = dataclasses.replace(r.cfg.watch, queue_window_s=3600.0)
+    book(r, "X-A", [(0.30, 100), (0.29, 50)], [(0.60, 10)])
+    r.flow.add("X-A", "yes", 360.0, time.time())          # 0.1 contracts/s sold into YES bids
+    assert r.queue_wait("X-A", "yes", 0.31, 5) == pytest.approx(50.0)      # alone above the best bid
+    assert r.queue_wait("X-A", "yes", 0.30, 5) == pytest.approx(1050.0)    # behind the 100 at 0.30
+    assert r.queue_wait("X-A", "no", 0.30, 5) == float("inf")              # nothing sold into NO bids
+
+
+def test_leg_with_a_long_queue_is_not_quoted(arbs):
+    r, b = arbs
+    r.cfg.watch = dataclasses.replace(r.cfg.watch, queue_window_s=3600.0, max_queue_wait_s=600.0)
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    r.flow.add("X-A", "yes", 3600.0, time.time())          # A's YES bids fill fast; nothing sells into B's
+    _eval(r, b)
+    assert (b.basket_id, 0) in r.quotes and (b.basket_id, 1) not in r.quotes
+    row = r.rank_rows[b.basket_id]
+    assert row["quote_usd_h"] > 0 and row["wait_s"] is not None

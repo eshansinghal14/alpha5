@@ -22,6 +22,8 @@
   },
   "watch": {
     "max_quoted_baskets": 20,
+    "queue_window_s": 10800.0,
+    "max_queue_wait_s": 3600.0,
     "rank_interval_s": 5.0,
     "exclude": []
   },

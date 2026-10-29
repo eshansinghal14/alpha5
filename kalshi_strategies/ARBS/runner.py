@@ -22,6 +22,7 @@ import asyncio
 import collections
 import concurrent.futures
 import dataclasses
+import gzip
 import json
 import os
 import sys
@@ -109,6 +110,30 @@ class _Dirty(set):
         if other:
             self.wake.set()
         return self
+
+
+class _Flow:
+    """Contracts sold into each market side's bids (a YES bid fills on a
+    taker selling YES, i.e. buying NO), by wall time."""
+
+    def __init__(self):
+        self.d: dict[tuple[str, str], collections.deque] = {}
+        self.total: dict[tuple[str, str], float] = {}
+
+    def add(self, ticker: str, side: str, size: float, t: float):
+        k = (ticker, side)
+        self.d.setdefault(k, collections.deque()).append((t, size))
+        self.total[k] = self.total.get(k, 0.0) + size
+
+    def rate(self, ticker: str, side: str, now: float, window: float) -> float:
+        """Contracts per second over the last `window` seconds."""
+        k = (ticker, side)
+        dq = self.d.get(k)
+        if not dq:
+            return 0.0
+        while dq and dq[0][0] < now - window:
+            self.total[k] -= dq.popleft()[1]
+        return max(0.0, self.total[k]) / window
 
 
 class _Quotes(dict):
@@ -236,6 +261,7 @@ class ArbsRunner:
                   "moves_refused": 0}
         self.started = _utc()
         self.liq = Liquidity(self.root)
+        self.flow = _Flow()
         # Live order round trips, flushed with the liquidity log (orders_*.jsonl.gz).
         self.order_times: list[dict] = []
 
@@ -513,6 +539,54 @@ class ArbsRunner:
                 out[round(q.price, 4)] = out.get(round(q.price, 4), 0.0) + q.remaining
         return out
 
+    def queue_wait(self, ticker: str, side: str, price: float, size: float) -> float:
+        """Seconds of recent trading to fill `size` bid at `price`: other
+        orders at or above it go first (joining a level puts us at its back).
+        inf on a side nothing has sold into lately."""
+        bk = self.feed.ladder(ticker)
+        if bk is None:
+            return float("inf")
+        own = self._own(ticker, side)
+        ahead = sum(max(0.0, q - own.get(round(p, 4), 0.0))
+                    for p, q in (bk.yes_bids if side == "yes" else bk.no_bids).items() if p >= price - _EPS)
+        rate = self.flow.rate(ticker, side, time.time(), self.cfg.watch.queue_window_s)
+        return (ahead + size) / rate if rate > 0 else float("inf")
+
+    def quote_score(self, b: Basket, vs) -> tuple[float, float]:
+        """(expected $/h of quoting every leg, shortest leg wait in s): each
+        leg's edge x size over the time trading takes to reach it, for legs
+        within watch.max_queue_wait_s."""
+        t, cap = self.cfg.trading, self.cfg.watch.max_queue_wait_s
+        need = edge_dollars(b.payout, t.min_edge + t.quote_edge_add)
+        score, fastest = 0.0, float("inf")
+        for j, leg in enumerate(b.legs):
+            size = float(max(1, min(t.quote_size, int(pricing.touch_size(vs, j) + _EPS))))
+            plan = pricing.quote_leg(vs, j, b.payout, need, size)
+            if plan is None:
+                continue
+            wait = self.queue_wait(leg.ticker, leg.side, plan.price, size)
+            fastest = min(fastest, wait)
+            if wait < float("inf") and (cap is None or wait <= cap):
+                score += plan.edge * size * 3600.0 / max(wait, 1.0)
+        return score, fastest
+
+    def seed_flow(self):
+        """Blocking. Recent fill rates from the liquidity log, so a restart
+        doesn't quote blind for a window: each window's contracts, half to
+        each side (the log doesn't split them)."""
+        since = time.time() - self.cfg.watch.queue_window_s
+        days = {f"{pd.Timestamp(since, unit='s', tz='UTC'):%Y-%m-%d}", f"{_utc():%Y-%m-%d}"}
+        for day in sorted(days):
+            path = os.path.join(self.liq.dir, f"{day}.jsonl.gz")
+            if not os.path.exists(path):
+                continue
+            with gzip.open(path, "rt", encoding="utf-8") as fh:
+                for line in fh:
+                    r = json.loads(line)
+                    if r["t"] >= since and r["contracts"] > 0 and r["ticker"] in self.by_ticker:
+                        for s in ("yes", "no"):
+                            self.flow.add(r["ticker"], s, r["contracts"] / 2, r["t"])
+
     def leg_view(self, ticker: str, side: str) -> pricing.LegView | None:
         """None if the book can't be trusted (no snapshot yet, or crossed: a
         reconstruction drift, see L2Book)."""
@@ -571,9 +645,11 @@ class ArbsRunner:
 
     def _on_trade(self, ticker, trade):
         self.liq.on_trade(ticker, trade.size)
+        maker = {"yes": "no", "no": "yes"}.get(trade.taker_side)
+        if maker:
+            self.flow.add(ticker, maker, trade.size, time.time())
         if self.live:
             return
-        maker = {"yes": "no", "no": "yes"}.get(trade.taker_side)
         for q in list(self.quotes.values()):
             if (q.ticker == ticker and q.side == maker and not q.pending and q.remaining > 0
                     and trade.price <= q.price + _EPS):
@@ -884,6 +960,12 @@ class ArbsRunner:
                 size = min(cap, self.room_bundles(b, j), float(self.quote_size_by_dollars(b)), touch)
                 if size >= 1 and (q is None or q.remaining <= size + _EPS):
                     plan = pricing.quote_leg(vs, j, b.payout, quote_need, size)
+                wait_cap = self.cfg.watch.max_queue_wait_s
+                if (plan is not None and wait_cap is not None
+                        and self.queue_wait(leg.ticker, leg.side, plan.price, size) > wait_cap):
+                    if q is not None:
+                        acts.append(self.cancel_quote(q, "queue"))
+                    continue
             if plan is None:
                 if q is not None:
                     acts.append(self.cancel_quote(q, "no_edge" if want else "not_hot"))
@@ -1301,8 +1383,11 @@ class ArbsRunner:
         if g is None:
             self.rank_rows.pop(b.basket_id, None)
             return
+        score, wait = self.quote_score(b, vs)
         self.rank_rows[b.basket_id] = {
-            "basket_id": b.basket_id, "type": b.type, "ret": round(edge_return(b.payout, g), 4), "gap": round(g, 4),
+            "basket_id": b.basket_id, "type": b.type, "quote_usd_h": round(score, 4),
+            "wait_s": None if wait == float("inf") else round(wait), "ret": round(edge_return(b.payout, g), 4),
+            "gap": round(g, 4),
             "payout": b.payout, "asks": [v.best_ask for v in vs], "legs": len(b.legs),
             "depth": round(min(v.depth() for v in vs), 1)}
 
@@ -1311,13 +1396,14 @@ class ArbsRunner:
         blocked the event loop ~200 ms per pass at 2,500 baskets."""
         while True:
             try:
-                rows = sorted(self.rank_rows.values(), key=lambda r: -r["ret"])
+                rows = sorted(self.rank_rows.values(), key=lambda r: (-r["quote_usd_h"], -r["ret"]))
                 # A quote whose event just went live is pulled on its basket's next pass.
                 now_ts = _utc()
                 self.dirty |= {q.basket_id for q in self.quotes.values()
                                if q.basket_id in self.baskets and not self.may_quote(self.baskets[q.basket_id], now_ts)}
                 self.ranking = rows
-                quotable = [r["basket_id"] for r in rows if self.may_quote(self.baskets[r["basket_id"]], now_ts)]
+                quotable = [r["basket_id"] for r in rows
+                            if r["quote_usd_h"] > 0 and self.may_quote(self.baskets[r["basket_id"]], now_ts)]
                 hot = quotable[:self.cfg.watch.max_quoted_baskets]
                 if hot != self.hot:
                     self.dirty |= set(hot) ^ set(self.hot)
@@ -1610,6 +1696,10 @@ class ArbsRunner:
         except Exception as e:
             self.alert("error", None, f"no order clients ({e!r}); shadow only")
         self.settle()
+        try:
+            await loop.run_in_executor(self.pool, self.seed_flow)
+        except Exception as e:
+            _log(f"WARN: fill-rate seed failed ({e!r})")
         trading, stopper, stop = TradingModeWatcher(self.S), StopWatcher(), asyncio.Event()
         coros = [self.feed.run(), self.eval_loop(), self.rank_loop(), self.meta_loop(), self.fill_poll_loop(),
                  self.audit_loop(), self.guard_loop(), self.summary_loop(), self.scan_loop(),
