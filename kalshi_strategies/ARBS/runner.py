@@ -1210,7 +1210,10 @@ class ArbsRunner:
                 # A resting deep quote stays while it clears the edge on its own:
                 # pulled every time the arb quote ahead of it blinked, half lived
                 # under 1.4 s and they took 13% of our writes (10-30 18:16-18:21).
+                # Not once our arb quote has come down to it: that is just more
+                # size at the arb price (KXHIGHMIA 10-30 filled both at 0.73).
                 keep = on and self.quoted_elsewhere(b.basket_id, leg.ticker, leg.side) is None and \
+                    (j not in mains or vs[j].ticks.steps(dq.price, mains[j].price) >= t.deep_min_gap_ticks) and \
                     (p := pricing.quote_leg(vs, j, b.payout, need, dq.remaining)) is not None and \
                     dq.price <= p.max_price + _EPS
                 if keep:

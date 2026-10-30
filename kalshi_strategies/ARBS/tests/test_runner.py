@@ -982,3 +982,15 @@ def test_deep_quote_reprices_at_most_every_deep_requote_s(arbs):
     r.quotes[(live.basket_id, 0, "deep")].placed_at -= R.DEEP_REQUOTE_S
     _eval(r, live)
     assert r.quotes[(live.basket_id, 0, "deep")].price == pytest.approx(0.31)
+
+
+def test_deep_quote_leaves_the_arb_price_when_the_arb_quote_comes_down(arbs):
+    r, b = arbs
+    live = _live_gap(r, b, [(0.45, 10), (0.20, 5)])
+    assert r.quotes[(live.basket_id, 0, "deep")].price == pytest.approx(0.21)
+    # B's ask rises to 0.72: A's arb limit drops to 0.23, two ticks over the deep
+    # quote at 0.21, which still clears its edge but is no longer behind a gap.
+    book(r, "X-B", [(0.40, 10)], [(0.28, 10)])
+    _eval(r, live)
+    assert r.quotes[(live.basket_id, 0)].price == pytest.approx(0.23)
+    assert (live.basket_id, 0, "deep") not in r.quotes
