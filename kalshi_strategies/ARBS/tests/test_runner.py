@@ -943,3 +943,11 @@ def test_main_and_deep_fill_together_exit_once(arbs, tmp_path):
     assert pos is None or not pos.unhedged(live.tickers)
     rows = [json.loads(l) for f in (tmp_path / "ARBS" / "journal").glob("*.jsonl") for l in open(f)]
     assert sum(x["kind"] in ("complete", "unwind") for x in rows) == 1
+
+
+def test_basket_of_a_retired_quote_id_is_kept_for_late_fills(arbs):
+    r, b = arbs
+    r.real_ledger.quote_ids["oid-1"] = {"basket_id": b.basket_id, "ticker": "X-A", "side": "yes",
+                                        "retired_at": time.time()}
+    r.set_baskets([])                                    # the scan dropped it
+    assert b.basket_id in r.baskets

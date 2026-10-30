@@ -432,8 +432,11 @@ class ArbsRunner:
         basket dropped from the list is kept while it has a position, quote
         or task: completion, settlement and cancels look it up by id."""
         new = {b.basket_id: b for b in baskets}
+        # Also every basket a tracked quote id belongs to, retired ones included:
+        # a fill racing a cancel books after the quote is gone (KeyError, ALGQSC 10-30).
         keep = set(self.real_ledger.baskets) | set(self.shadow_ledger.baskets) | self.busy | \
-            {q.basket_id for q in self.quotes.values()}
+            {q.basket_id for q in self.quotes.values()} | \
+            {v["basket_id"] for v in self.real_ledger.quote_ids.values()}
         for bid in keep:
             if bid in new:
                 continue
