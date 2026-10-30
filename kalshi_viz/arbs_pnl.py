@@ -165,7 +165,8 @@ def bundle_log(series: str, days: int = 2, gap_s: float = 30.0) -> pd.DataFrame:
         bid = r["basket_id"]
         cur = last.get(bid)
         if cur is None or r["t"] - cur["t_last"] > gap_s:
-            cur = last[bid] = {"t": r["t"], "t_last": r["t"], "basket_id": bid, "how": set(), "legs": {}, "cost": 0.0}
+            cur = last[bid] = {"t": r["t"], "t_last": r["t"], "basket_id": bid, "how": set(), "legs": {}, "cost": 0.0,
+                               "settles": r.get("settles")}
             bursts.append(cur)
         cur["t_last"] = r["t"]
         cur["how"].add(r.get("fill_kind") or "")
@@ -188,7 +189,7 @@ def bundle_log(series: str, days: int = 2, gap_s: float = 30.0) -> pd.DataFrame:
         whole = (meta is not None and len(left) >= meta[1] and len(rest) == 1) or not left
         bundles = next(iter(left.values())) if left and whole else 0.0
         pnl = pairs + bundles * meta[0] - c["cost"] if whole and meta is not None else None
-        st = settles.get(c["basket_id"])
+        st = pd.Timestamp(c["settles"]) if c.get("settles") else settles.get(c["basket_id"])
         out.append({"time": pd.Timestamp(c["t"], unit="s", tz="UTC"),
                     # Time to expected settlement when the burst began.
                     "tte": None if st is None else _tte((st - pd.Timestamp(c["t"], unit="s", tz="UTC")).total_seconds()),

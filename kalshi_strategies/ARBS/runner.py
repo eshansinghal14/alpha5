@@ -765,7 +765,8 @@ class ArbsRunner:
         self.ledger.pos(basket_id).spec = basket_to_dict(b)
         self.ledger.record(basket_id, b.tickers, ticker, side, size, cost, time.time())
         self.journal({"kind": "fill", "fill_kind": kind, "basket_id": basket_id, "ticker": ticker, "side": side,
-                      "size": size, "cost": round(cost, 4), "price": round((cost / size) if size else 0, 4), **kw})
+                      "size": size, "cost": round(cost, 4), "price": round((cost / size) if size else 0, 4),
+                      "settles": None if b.settles is None else b.settles.isoformat(), **kw})
         self.dirty.add(basket_id)
         if basket_id in self.flip:
             self.dirty.add(self.flip[basket_id])
@@ -781,7 +782,8 @@ class ArbsRunner:
         self.ledger.settled.append(row)
         self.ledger.save(now)
         self.journal({"kind": "fill", "fill_kind": kind, "basket_id": b.basket_id, "ticker": ticker, "side": side,
-                      "size": size, "cost": round(cost, 4), "price": round(cost / size if size else 0, 4), **kw})
+                      "size": size, "cost": round(cost, 4), "price": round(cost / size if size else 0, 4),
+                      "settles": None if b.settles is None else b.settles.isoformat(), **kw})
         self.journal({"kind": "settled", **row})
         self.dirty.add(b.basket_id)
 
