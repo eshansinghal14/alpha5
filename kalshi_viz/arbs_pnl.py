@@ -85,10 +85,23 @@ def guess_info(basket_id: str) -> tuple[float, int] | None:
 
 
 def replay(rows: list[dict], info: dict[str, tuple[float, int]]) -> pd.DataFrame:
-    """(time, settled, total) after every live fill or settlement."""
+    """(time, settled, total, capital) after every live fill or settlement.
+    capital: cost of the contracts held, less $1 per YES/NO pair of a market
+    held across baskets (Kalshi pays a pair out at once), as the runner's
+    max_dollars counts it; resting quotes aren't in it."""
     legs: dict[str, dict[str, list]] = {}       # basket -> ticker -> [side, qty, cost]
     locked: dict[str, float] = {}
     settled, out = 0.0, []
+    held: dict[tuple[str, str], float] = {}     # (ticker, side) -> contracts, all baskets
+    spent, paired = 0.0, 0.0
+
+    def move(ticker: str, side: str, dq: float, dc: float):
+        nonlocal spent, paired
+        other = held.get((ticker, "no" if side == "yes" else "yes"), 0.0)
+        before = min(held.get((ticker, side), 0.0), other)
+        held[(ticker, side)] = held.get((ticker, side), 0.0) + dq
+        paired += min(held[(ticker, side)], other) - before
+        spent += dc
 
     def lock(bid: str) -> float:
         meta = info.get(bid) or guess_info(bid)
@@ -107,24 +120,29 @@ def replay(rows: list[dict], info: dict[str, tuple[float, int]]) -> pd.DataFrame
                 # The other side of a held leg: nets out at the leg's average cost.
                 v = ls[t]
                 n = min(size, v[1])
-                v[2] -= v[2] / v[1] * n if v[1] > _EPS else 0.0
+                basis = v[2] / v[1] * n if v[1] > _EPS else 0.0
+                v[2] -= basis
                 v[1] -= n
+                move(t, v[0], -n, -basis)
                 if v[1] <= _EPS:
                     del ls[t]
             else:
                 v = ls.setdefault(t, [side, 0.0, 0.0])
                 v[1] += size
                 v[2] += cost
+                move(t, side, size, cost)
             locked[bid] = lock(bid)
         elif r.get("kind") == "settled":
             settled += float(r.get("pnl") or 0.0)
             if not any(str(v).startswith(("unwound", "sold by hand")) for v in (r.get("results") or {}).values()):
-                legs.pop(bid, None)
+                for t, (side, q, c) in legs.pop(bid, {}).items():
+                    move(t, side, -q, -c)
                 locked.pop(bid, None)
         else:
             continue
-        out.append((pd.Timestamp(r["t"], unit="s", tz="UTC"), settled, settled + sum(locked.values())))
-    return pd.DataFrame(out, columns=["time", "settled", "total"])
+        out.append((pd.Timestamp(r["t"], unit="s", tz="UTC"), settled, settled + sum(locked.values()),
+                    max(0.0, spent - paired)))
+    return pd.DataFrame(out, columns=["time", "settled", "total", "capital"])
 
 
 def load(series: str) -> pd.DataFrame:

@@ -21,6 +21,14 @@ def test_locked_then_settled_then_unwound():
     df = replay(rows, info)
     assert list(df.total.round(4)) == [0.0, 0.5, 0.5, 0.5, 0.5, 0.4]
     assert df.settled.iloc[-1] == pytest.approx(0.4)
+    assert list(df.capital.round(4)) == [2.0, 4.5, 0.0, 0.6, 0.0, 0.0]
+
+
+def test_capital_nets_a_markets_yes_and_no_held_in_different_baskets():
+    info = {"x": (1.0, 2), "y": (1.0, 2)}
+    rows = [fill(1, "x", "A", "yes", 3, 1.8), fill(2, "y", "A", "no", 2, 1.0)]
+    # Kalshi pays the 2 YES/NO pairs out at once: $2.80 spent, $2 back.
+    assert replay(rows, info).capital.iloc[-1] == pytest.approx(0.8)
 
 
 def test_bundle_log_groups_bursts_newest_first(tmp_path, monkeypatch):

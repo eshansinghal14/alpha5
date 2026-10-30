@@ -186,12 +186,14 @@ def _pnl_chart(series: str):
     """Settled + open PnL, real money only. History is replayed from the
     journal (settled plus what complete bundles lock in); the last point adds
     unfinished baskets at what their extra legs would sell for now, so it
-    matches the header. Starts at 0 at the window's start."""
+    matches the header. Starts at 0 at the window's start. Capital used
+    (right axis) is a level, not rebased to the window."""
     df = _pnl_frame(series)
     s = read_summary(series)
     if len(df) and s and s.get("ledger") == "real":
         df = pd.concat([df, pd.DataFrame({"time": [pd.Timestamp.now(tz="UTC")], "settled": [df.settled.iloc[-1]],
-                                          "total": [df.total.iloc[-1] + ((s.get("pnl") or {}).get("broken") or 0.0)]})],
+                                          "total": [df.total.iloc[-1] + ((s.get("pnl") or {}).get("broken") or 0.0)],
+                                          "capital": [df.capital.iloc[-1]]})],
                        ignore_index=True)
     if df.empty:
         st.caption("No live fills yet.")
@@ -202,14 +204,23 @@ def _pnl_chart(series: str):
     before = df[df.time < since] if since is not None else df.iloc[:0]
     d = df[df.time >= since] if since is not None else df
     b0 = float(before.total.iloc[-1]) if len(before) else 0.0
+    cap0 = float(before.capital.iloc[-1]) if len(before) else 0.0
     c = pd.DataFrame({"time": [since if since is not None else d.time.min()] + list(d.time),
-                      "usd": [0.0] + [float(v) - b0 for v in d.total]})
+                      "usd": [0.0] + [float(v) - b0 for v in d.total],
+                      "capital": [cap0] + list(d.capital.astype(float))})
+    x = alt.X("time:T", title=None, axis=time_axis(PNL_WINDOWS[win]))
     chart = alt.Chart(c).mark_line(interpolate="step-after", strokeWidth=2, color="#1e88e5").encode(
-        x=alt.X("time:T", title=None, axis=time_axis(PNL_WINDOWS[win])),
-        y=alt.Y("usd:Q", title="Settled + open PnL $"),
-        tooltip=[alt.Tooltip("time:T", format="%m-%d %H:%M:%S"), alt.Tooltip("usd:Q", format="+.2f")])
+        x=x, y=alt.Y("usd:Q", title="Settled + open PnL $", axis=alt.Axis(titleColor="#1e88e5")),
+        tooltip=[alt.Tooltip("time:T", format="%m-%d %H:%M:%S"), alt.Tooltip("usd:Q", format="+.2f"),
+                 alt.Tooltip("capital:Q", title="capital used", format=",.0f")])
     zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#888", strokeWidth=0.7).encode(y="y:Q")
-    st.altair_chart((chart + zero).properties(height=260), use_container_width=True)
+    capital = alt.Chart(c).mark_line(interpolate="step-after", strokeWidth=1.5, color="#fb8c00", opacity=0.8).encode(
+        x=x, y=alt.Y("capital:Q", title="Capital used $",
+                     axis=alt.Axis(orient="right", titleColor="#fb8c00", format=",.0f")),
+        tooltip=[alt.Tooltip("time:T", format="%m-%d %H:%M:%S"),
+                 alt.Tooltip("capital:Q", title="capital used", format=",.0f")])
+    layers = alt.layer(chart + zero, capital).resolve_scale(y="independent")
+    st.altair_chart(layers.properties(height=260), use_container_width=True)
 
 
 def render(series: str, stale_fn):
