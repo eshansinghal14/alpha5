@@ -18,6 +18,13 @@ COLORS = {"PnL (settled; open at mid)": "#1e88e5", "1s markout": "#fb8c00", "10s
 SOLID = ("PnL (settled; open at mid)", "PnL incl. LIP")
 
 
+def time_axis(window: pd.Timedelta | None) -> alt.Axis:
+    """Dates on multi-day windows (7d, All), clock times on shorter ones."""
+    if window is None or window >= pd.Timedelta(days=2):
+        return alt.Axis(format="%m-%d", title=None)
+    return alt.Axis(format="%H:%M", title=None)
+
+
 def _usd(v: float) -> str:
     return "n/a" if v is None or (isinstance(v, float) and math.isnan(v)) else f"${v:+.2f}"
 
@@ -26,14 +33,14 @@ def _c(v: float) -> str:
     return "n/a" if v is None or (isinstance(v, float) and math.isnan(v)) else f"{v:+.2f}c"
 
 
-def _chart(df: pd.DataFrame, since: pd.Timestamp | None, lip: pd.DataFrame | None = None):
+def _chart(df: pd.DataFrame, since: pd.Timestamp | None, window: pd.Timedelta | None, lip: pd.DataFrame | None = None):
     c = perf.curves(df, since, lip)
     if c.empty:
         st.caption("No real fills in this window.")
         return
     shown = [k for k in COLORS if k in set(c.line)]
     base = alt.Chart(c).encode(
-        x=alt.X("time:T", title=None, axis=alt.Axis(format="%H:%M")),
+        x=alt.X("time:T", title=None, axis=time_axis(window)),
         y=alt.Y("usd:Q", title="$ (cumulative)"),
         color=alt.Color("line:N", title=None, scale=alt.Scale(domain=shown, range=[COLORS[k] for k in shown]),
                         legend=alt.Legend(orient="top-left")),
@@ -170,7 +177,7 @@ def render(series: str, lip: bool = False):
         if lip:
             with cols[2]:
                 _lip(sp["lip"])
-        _chart(df, since, lf)
+        _chart(df, since, WINDOWS[win], lf)
         _edge_share(perf.summarize_edge(df, r.prints, since))
         if s.get("fills"):
             st.caption(f"Settled {_usd(s['settled_usd'])} · open {_usd(s['open_usd'])} on {s['unsettled']} fills · "

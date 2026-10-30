@@ -13,6 +13,7 @@ import streamlit as st
 from kalshi_infra.runtime.persist import LIVE_ROOT
 from kalshi_viz import arbs_pnl
 from kalshi_viz.arm import arm_control
+from kalshi_viz.perf_panel import time_axis
 from kalshi_viz.data import latest_summary, read_summary, summary_age_s
 
 STALE_S = 15.0
@@ -204,7 +205,7 @@ def _pnl_chart(series: str):
     c = pd.DataFrame({"time": [since if since is not None else d.time.min()] + list(d.time),
                       "usd": [0.0] + [float(v) - b0 for v in d.total]})
     chart = alt.Chart(c).mark_line(interpolate="step-after", strokeWidth=2, color="#1e88e5").encode(
-        x=alt.X("time:T", title=None, axis=alt.Axis(format="%m-%d %H:%M")),
+        x=alt.X("time:T", title=None, axis=time_axis(PNL_WINDOWS[win])),
         y=alt.Y("usd:Q", title="Settled + open PnL $"),
         tooltip=[alt.Tooltip("time:T", format="%m-%d %H:%M:%S"), alt.Tooltip("usd:Q", format="+.2f")])
     zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#888", strokeWidth=0.7).encode(y="y:Q")
