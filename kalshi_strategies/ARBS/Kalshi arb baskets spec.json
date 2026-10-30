@@ -754,8 +754,8 @@
    "relationship_id": "complete_set:KXMETXCOMBO",
    "type": "complete_set",
    "cluster": "me_tx_combo",
-   "description": "Maine x Texas Senate combos (Collins/Jackson x Talarico/Paxton); exactly one resolves YES.",
-   "constraint": "P(KXMETXCOMBO-26NOV-TAL-COL) + P(KXMETXCOMBO-26NOV-PAX-COL) + P(KXMETXCOMBO-26NOVB-TAL-JAC) + P(KXMETXCOMBO-26NOVB-PAX-JAC) = 1",
+   "description": "Maine x Texas Senate combos (Collins/Jackson/Platner x Talarico/Paxton); exactly one resolves YES.",
+   "constraint": "P(KXMETXCOMBO-26NOV-TAL-COL) + P(KXMETXCOMBO-26NOV-PAX-COL) + P(KXMETXCOMBO-26NOVB-TAL-JAC) + P(KXMETXCOMBO-26NOVB-PAX-JAC) + P(KXMETXCOMBO-26NOV-TAL-PLA) + P(KXMETXCOMBO-26NOV-PAX-PLA) = 1",
    "expected_settlement_month": "2026-11",
    "quote_until_utc": "2026-11-03T22:00:00Z",
    "take_only_from_utc": "2026-11-03T22:00:00Z",
@@ -778,6 +778,14 @@
       },
       {
        "ticker": "KXMETXCOMBO-26NOVB-PAX-JAC",
+       "side": "yes"
+      },
+      {
+       "ticker": "KXMETXCOMBO-26NOV-TAL-PLA",
+       "side": "yes"
+      },
+      {
+       "ticker": "KXMETXCOMBO-26NOV-PAX-PLA",
        "side": "yes"
       }
      ],
@@ -802,10 +810,18 @@
       {
        "ticker": "KXMETXCOMBO-26NOVB-PAX-JAC",
        "side": "no"
+      },
+      {
+       "ticker": "KXMETXCOMBO-26NOV-TAL-PLA",
+       "side": "no"
+      },
+      {
+       "ticker": "KXMETXCOMBO-26NOV-PAX-PLA",
+       "side": "no"
       }
      ],
-     "payout": 3,
-     "arb_if": "sum of leg prices < 3"
+     "payout": 5,
+     "arb_if": "sum of leg prices < 5"
     }
    ]
   },
@@ -3251,8 +3267,8 @@
    "relationship_id": "combo_vs_winner:metx:SENATETX-26-D:TAL",
    "type": "identity",
    "cluster": "me_tx_combo",
-   "description": "Talarico wins = Talarico&Collins + Talarico&Jackson",
-   "constraint": "P(SENATETX-26-D) = P(KXMETXCOMBO-26NOV-TAL-COL) + P(KXMETXCOMBO-26NOVB-TAL-JAC)",
+   "description": "Talarico wins = Talarico&Collins + Talarico&Jackson + Talarico&Platner",
+   "constraint": "P(SENATETX-26-D) = P(KXMETXCOMBO-26NOV-TAL-COL) + P(KXMETXCOMBO-26NOVB-TAL-JAC) + P(KXMETXCOMBO-26NOV-TAL-PLA)",
    "expected_settlement_month": "2026-11",
    "quote_until_utc": "2026-11-03T22:00:00Z",
    "take_only_from_utc": "2026-11-03T22:00:00Z",
@@ -3272,10 +3288,14 @@
       {
        "ticker": "KXMETXCOMBO-26NOVB-TAL-JAC",
        "side": "no"
+      },
+      {
+       "ticker": "KXMETXCOMBO-26NOV-TAL-PLA",
+       "side": "no"
       }
      ],
-     "payout": 2,
-     "arb_if": "sum of leg prices < 2"
+     "payout": 3,
+     "arb_if": "sum of leg prices < 3"
     },
     {
      "basket_id": "combo_vs_winner:metx:SENATETX-26-D:TAL:no_parent_yes_parts",
@@ -3291,6 +3311,10 @@
       {
        "ticker": "KXMETXCOMBO-26NOVB-TAL-JAC",
        "side": "yes"
+      },
+      {
+       "ticker": "KXMETXCOMBO-26NOV-TAL-PLA",
+       "side": "yes"
       }
      ],
      "payout": 1,
@@ -3302,8 +3326,8 @@
    "relationship_id": "combo_vs_winner:metx:SENATETX-26-R:PAX",
    "type": "identity",
    "cluster": "me_tx_combo",
-   "description": "Paxton wins = Paxton&Collins + Paxton&Jackson",
-   "constraint": "P(SENATETX-26-R) = P(KXMETXCOMBO-26NOV-PAX-COL) + P(KXMETXCOMBO-26NOVB-PAX-JAC)",
+   "description": "Paxton wins = Paxton&Collins + Paxton&Jackson + Paxton&Platner",
+   "constraint": "P(SENATETX-26-R) = P(KXMETXCOMBO-26NOV-PAX-COL) + P(KXMETXCOMBO-26NOVB-PAX-JAC) + P(KXMETXCOMBO-26NOV-PAX-PLA)",
    "expected_settlement_month": "2026-11",
    "quote_until_utc": "2026-11-03T22:00:00Z",
    "take_only_from_utc": "2026-11-03T22:00:00Z",
@@ -3323,10 +3347,14 @@
       {
        "ticker": "KXMETXCOMBO-26NOVB-PAX-JAC",
        "side": "no"
+      },
+      {
+       "ticker": "KXMETXCOMBO-26NOV-PAX-PLA",
+       "side": "no"
       }
      ],
-     "payout": 2,
-     "arb_if": "sum of leg prices < 2"
+     "payout": 3,
+     "arb_if": "sum of leg prices < 3"
     },
     {
      "basket_id": "combo_vs_winner:metx:SENATETX-26-R:PAX:no_parent_yes_parts",
@@ -3341,6 +3369,10 @@
       },
       {
        "ticker": "KXMETXCOMBO-26NOVB-PAX-JAC",
+       "side": "yes"
+      },
+      {
+       "ticker": "KXMETXCOMBO-26NOV-PAX-PLA",
        "side": "yes"
       }
      ],
