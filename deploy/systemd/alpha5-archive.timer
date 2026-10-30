@@ -1,0 +1,9 @@
+[Unit]
+Description=Move old recorded data to S3 daily
+
+[Timer]
+OnCalendar=*-*-* 07:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

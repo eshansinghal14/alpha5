@@ -56,7 +56,9 @@ _FILL_KEY = ["exchange_order_id", "trade_id", "time", "price", "size"]
 # safety bound, not a measurement.
 THEO_TOL = pd.Timedelta("5min")
 # Bump when Perf's accumulated state changes shape: a pickle from another
-# version is discarded and the journals are rescanned.
+# version is discarded and the journals are rescanned. Journals older than 5
+# days are on S3 (deploy/archive_s3.sh), so a bump drops their fills unless
+# they are restored first.
 STATE_VERSION = 2
 
 

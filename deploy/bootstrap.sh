@@ -12,8 +12,13 @@ sudo timedatectl set-timezone UTC
 # chrony keeps the clock to ~ms; this box's clock was 178 ms off NTP and every
 # exchange-timestamp lag we measured carried that error.
 sudo apt-get update -y
-sudo apt-get install -y python3.12 python3.12-venv git chrony
+sudo apt-get install -y python3.12 python3.12-venv git chrony unzip
 sudo systemctl enable --now chrony
+# AWS CLI for deploy/archive_s3.sh (needs the alpha5-live instance profile).
+if ! command -v aws >/dev/null; then
+  curl -sSo /tmp/awscliv2.zip "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip"
+  unzip -qo /tmp/awscliv2.zip -d /tmp && sudo /tmp/aws/install && rm -rf /tmp/aws /tmp/awscliv2.zip
+fi
 # Docker only runs IB Gateway (deploy/ibgateway) for the S&P strategy.
 if ! command -v docker >/dev/null; then
   sudo apt-get install -y docker.io docker-compose-v2
@@ -38,8 +43,9 @@ chmod 700 "$APP/secrets"
 # The gateway image runs as uid 1000 and saves its settings here.
 sudo chown 1000:1000 "$APP/deploy/ibgateway/tws_settings"
 
-sudo cp deploy/systemd/*.service /etc/systemd/system/
+sudo cp deploy/systemd/*.service deploy/systemd/*.timer /etc/systemd/system/
 sudo systemctl daemon-reload
+sudo systemctl enable --now alpha5-archive.timer
 echo "bootstrap done at $(git rev-parse --short HEAD). Copy secrets, then: sudo systemctl enable --now alpha5-crypto"
 echo "S&P (needs deploy/ibgateway/ib.env, see docs/ec2-spx.md):"
 echo "  sudo systemctl enable --now alpha5-ibgateway alpha5-spx"

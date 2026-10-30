@@ -1,0 +1,10 @@
+[Unit]
+Description=alpha5: move recorded data older than 5 days to S3 (deploy/archive_s3.sh)
+
+[Service]
+Type=oneshot
+User=ubuntu
+Nice=19
+IOSchedulingClass=idle
+MemoryMax=600M
+ExecStart=/bin/bash /opt/alpha5/deploy/archive_s3.sh
