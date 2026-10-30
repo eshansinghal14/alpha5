@@ -13,8 +13,10 @@ relationships in the hand spec's format, written to scanned_spec.json.
              INX-24OCT25 and NASDAQ100-24OCT25 settled every bucket NO with
              no value (voided), which no rule here can see coming.
   live       live_from: when a sports or esports event starts (Kalshi's milestones:
-             kickoff, first serve), or its earliest occurrence_datetime if
-             sooner. Quoting past it is trading.quote_live_events.
+             kickoff, first serve); for a daily or hourly series (temperature,
+             gas, index ladders) the start of the day or hour its strike_date
+             closes; or its earliest occurrence_datetime if sooner. Quoting
+             past it is trading.quote_live_events.
   DIRECNET   for strikes a < b, YES >=a and NO >=b pays at least 1; each
              strike is paired with the next scan.ladder_span above it (a
              200-strike KXBTCD ladder is 20k pairs otherwise).
@@ -74,6 +76,26 @@ def fetch_starts(now: pd.Timestamp) -> dict[str, str]:
                     out[et] = m["start_date"]
         cursor = d.get("cursor")
         if not cursor or not d.get("milestones"):
+            return out
+
+
+# A series' measurement period (Kalshi's series frequency): its events are
+# live from strike_date minus this. A day's temperature is known hours before
+# Kalshi settles it, and late traders know it (KXHIGHTSFO 10-29 22:02 PT took a
+# 50-lot NO for -$7.16 while quoted as not live).
+PERIODS = {"daily": pd.Timedelta(days=1), "hourly": pd.Timedelta(hours=1),
+           "fifteen_min": pd.Timedelta(minutes=15)}
+
+
+def fetch_frequencies() -> dict[str, str]:
+    """Blocking (one paged call, ~0.2 s). series_ticker -> frequency."""
+    out, cursor = {}, None
+    while True:
+        d = kalshi_get("/trade-api/v2/series", params={"limit": 1000, **({"cursor": cursor} if cursor else {})})
+        for s in d.get("series") or []:
+            out[s["ticker"]] = s.get("frequency")
+        cursor = d.get("cursor")
+        if not cursor or not d.get("series"):
             return out
 
 
@@ -187,10 +209,11 @@ def ladder(event: dict, markets: list[dict], span: int) -> list[dict]:
 
 def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_span: int,
          complete_set_exclude: list[str], overrides: dict[str, str], shards=(0,),
-         skip_series: set[str] = frozenset(), starts: dict[str, str] | None = None) -> dict:
+         skip_series: set[str] = frozenset(), starts: dict[str, str] | None = None,
+         freqs: dict[str, str] | None = None) -> dict:
     """Every relationship found, each with its event's expected settlement
     and 24h volume for `select`. `starts`: event -> when it goes live
-    (fetch_starts)."""
+    (fetch_starts); `freqs`: series -> frequency (fetch_frequencies)."""
     rels, tickers = [], set()
     for e in events:
         if e.get("collateral_return_type") not in ("MECNET", "DIRECNET") or e.get("series_ticker") in skip_series \
@@ -213,6 +236,9 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
         # expected END, not its kickoff, hence the milestone start.
         live = [pd.Timestamp(t) for t in [m.get("occurrence_datetime") for m in ms]
                 + [(starts or {}).get(e["event_ticker"])] if t]
+        period = PERIODS.get((freqs or {}).get(e.get("series_ticker")))
+        if period is not None and e.get("strike_date"):
+            live.append(pd.Timestamp(e["strike_date"]) - period)
         for r in got:
             r.update(expected_settlement_utc=s.isoformat(), quote_until_utc=None, resume_quoting_utc=None,
                      live_from_utc=min(live).isoformat() if live else None, volume_24h=vol)
@@ -258,6 +284,7 @@ def run(cfg, hand_doc: dict, spec_path: str, held: set[str] = frozenset()) -> di
     doc = scan(fetch_events(), now=now, mecnet_max_legs=cfg.scan.mecnet_max_legs,
                ladder_span=cfg.scan.ladder_span, complete_set_exclude=cfg.scan.complete_set_exclude,
                shards=set(cfg.scan.shards), skip_series=other_series(), starts=fetch_starts(now),
+               freqs=fetch_frequencies(),
                overrides={s: v["expected_settlement_month"]
                           for s, v in (hand_doc.get("settlement_basis_by_series") or {}).items()})
     have = {r["relationship_id"] for r in doc["relationships"]}

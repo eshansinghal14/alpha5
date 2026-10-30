@@ -134,6 +134,7 @@ def test_run_carries_over_held_relationships(tmp_path, monkeypatch):
     spec = str(tmp_path / "s.json")
     monkeypatch.setattr(scanner, "other_series", lambda: set())
     monkeypatch.setattr(scanner, "fetch_starts", lambda now: {})
+    monkeypatch.setattr(scanner, "fetch_frequencies", lambda: {})
     monkeypatch.setattr(scanner, "fetch_events",
                         lambda: [event("EV-1", "MECNET", [mkt("EV-1-A"), mkt("EV-1-B")])])
     scanner.run(cfg, {}, spec)
@@ -163,3 +164,14 @@ def test_starts_include_esports(monkeypatch):
         {"category": "Elections", "start_date": "2020-01-01T00:00:00Z", "related_event_tickers": ["KXHOUSE-X"]}]}
     monkeypatch.setattr(scanner, "kalshi_get", lambda path, params: page)
     assert scanner.fetch_starts(pd.Timestamp("2026-10-29", tz="UTC")) == {"KXCS2MAP-X-1": "2026-10-29T10:20:00Z"}
+
+
+def test_daily_series_live_from_the_start_of_its_day():
+    e = event("KXHIGHNY-26OCT30", "MECNET", [mkt("KXHIGHNY-26OCT30-A", occurrence_datetime="2026-10-31T14:00:00Z"),
+                                             mkt("KXHIGHNY-26OCT30-B", occurrence_datetime="2026-10-31T14:00:00Z")],
+              series="KXHIGHNY") | {"strike_date": "2026-10-31T05:00:00Z"}
+    b = next(iter(baskets(run([e], freqs={"KXHIGHNY": "daily"})).values()))
+    assert not b.is_live(pd.Timestamp("2026-10-30T04:59:00Z"))
+    assert b.is_live(pd.Timestamp("2026-10-30T05:00:00Z"))          # its measurement day began
+    b = next(iter(baskets(run([e], freqs={"KXHIGHNY": "one_off"})).values()))
+    assert not b.is_live(pd.Timestamp("2026-10-30T20:00:00Z"))      # not a daily series: occurrence only
