@@ -122,6 +122,7 @@ ORDER_TOKENS, CANCEL_TOKENS = 10.0, 2.0
 # Startup sweep: retries per cancel on a 429, and the gap between cancels
 # (~100/s, under the 150/s our cancel tokens allow at the 300/s shard bucket).
 SWEEP_RETRIES, SWEEP_PACING_S = 5, 0.01
+PULL_BATCH = 20
 
 
 class _Rate:
@@ -1488,7 +1489,7 @@ class ArbsRunner:
         self.charge(q.basket_id, CANCEL_TOKENS)
         if self.live and q.exchange_id:
             _, exc, _ = await self.gw.cancel(q.ticker, q.exchange_id, reason)
-            if exc is not None:
+            if exc is not None and http_status(exc) != 404:    # 404: already gone
                 self._order_err(q.basket_id, f"cancel {q.ticker}", exc, q.ticker)
                 return            # stays tracked; the next pass retries
         self._retire(q)
@@ -1496,7 +1497,11 @@ class ArbsRunner:
 
     async def pull_all(self, reason: str):
         qs = [q for q in self.quotes.values() if not q.pending]
-        await asyncio.gather(*(self.cancel_quote(q, reason) for q in qs), return_exceptions=True)
+        # In batches: ~1000 cancels at once drew 429s (feed drop 10-30 06:25 ET).
+        for i in range(0, len(qs), PULL_BATCH):
+            await asyncio.gather(*(self.cancel_quote(q, reason) for q in qs[i:i + PULL_BATCH]),
+                                 return_exceptions=True)
+            await asyncio.sleep(PULL_BATCH * SWEEP_PACING_S)
         if self.live:
             await self.sweep(reason)
 
@@ -1519,9 +1524,16 @@ class ArbsRunner:
                 if exc is None or http_status(exc) != 429:
                     break
                 await asyncio.sleep(0.5 * (attempt + 1))
-            if exc is not None:
+            if exc is not None and http_status(exc) != 404:
                 self.alert("error", None, f"sweep cancel {oid} on {ticker} failed ({exc!r})")
-            elif oid in self.real_ledger.quote_ids:
+                continue
+            # A quote whose own cancel was refused is still tracked: drop it, or
+            # it stays a ghost the basket never requotes (217 after the 10-30
+            # 06:25 ET feed drop).
+            for q in [q for q in self.quotes.values() if q.exchange_id == oid]:
+                self._retire(q)
+                self.dirty.add(q.basket_id)
+            if oid in self.real_ledger.quote_ids:
                 self.real_ledger.quote_ids[oid]["retired_at"] = time.time()
                 self.ids_dirty = True
             await asyncio.sleep(SWEEP_PACING_S)
