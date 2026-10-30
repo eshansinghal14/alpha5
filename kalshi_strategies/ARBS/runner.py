@@ -1221,7 +1221,12 @@ class ArbsRunner:
                 else:
                     acts.append(self.cancel_quote(dq, "deep_off"))
             elif dq is None:
-                if not self.live or self.gw.can_afford(leg.ticker, "order", reserve):
+                # Only behind an arb quote that has rested a while: golf's
+                # overlapping baskets hand one side's arb quote back and forth
+                # every few 100 ms, and a deep quote followed each hop (10-30).
+                main = self.quotes.get((b.basket_id, j))
+                settled = main is not None and not main.pending and now - main.placed_at >= DEEP_REQUOTE_S
+                if settled and (not self.live or self.gw.can_afford(leg.ticker, "order", reserve)):
                     acts.append(self.place_quote(self.new_quote(b, plan, size, deep=True)))
             elif dq.price > plan.max_price + _EPS:
                 acts.append(self.move_quote(dq, plan, size))

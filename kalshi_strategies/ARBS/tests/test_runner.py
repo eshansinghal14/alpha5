@@ -874,6 +874,9 @@ def _live_gap(r, b, a_yes_bids):
     book(r, "X-A", a_yes_bids, [(0.35, 10)])
     book(r, "X-B", [(0.40, 10)], [(0.45, 10)])      # B's YES ask 0.55
     _eval(r, live)
+    for q in list(r.quotes.values()):               # deep quotes wait for arb quotes that have rested
+        q.placed_at -= R.DEEP_REQUOTE_S
+    _eval(r, live)
     return live
 
 
@@ -994,3 +997,16 @@ def test_deep_quote_leaves_the_arb_price_when_the_arb_quote_comes_down(arbs):
     _eval(r, live)
     assert r.quotes[(live.basket_id, 0)].price == pytest.approx(0.23)
     assert (live.basket_id, 0, "deep") not in r.quotes
+
+
+def test_no_deep_quote_behind_a_fresh_arb_quote(arbs):
+    r, b = arbs
+    live = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
+    r.set_baskets([live])
+    r.hot = [live.basket_id]
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_live_events=True, live_quote_size=2, live_edge_add=0.0,
+                                        deep_quote_size=5, deep_min_gap_ticks=5)
+    book(r, "X-A", [(0.45, 10), (0.20, 5)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    _eval(r, live)
+    assert (live.basket_id, 0) in r.quotes and not any(q.deep for q in r.quotes.values())
