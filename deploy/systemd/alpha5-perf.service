@@ -9,6 +9,8 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/alpha5/.venv/bin/python -u -W ignore -m kalshi_viz.perf_worker
 # Lowest priority, like the dashboard: it only reads what the writers produce.
 Nice=19
+# Not trading: first for the OOM killer.
+OOMScoreAdjust=1000
 # So a runaway pass is killed here instead of taking memory from the trading
 # processes; the box has no swap.
 MemoryMax=1500M

@@ -8,6 +8,10 @@ WorkingDirectory=/opt/alpha5
 ExecStart=/opt/alpha5/.venv/bin/streamlit run kalshi_viz/app.py --server.port 8502 --server.address 127.0.0.1 --server.headless true
 # Lowest priority: it only reads files the writer produces.
 Nice=19
+# First for the OOM killer, and capped: its per-session caches reached 2.1 GB
+# and took the box to a global OOM (2026-10-30 09:47 UTC).
+OOMScoreAdjust=1000
+MemoryMax=1500M
 Restart=on-failure
 RestartSec=10
 

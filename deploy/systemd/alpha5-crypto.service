@@ -21,6 +21,9 @@ Nice=-5
 # Ctrl-C equivalent: the process pulls every quote on SIGINT before exiting.
 KillSignal=SIGINT
 TimeoutStopSec=90
+# Last for the OOM killer; non-trading units run at +1000 and go first. The
+# writer and feed children inherit it. No MemoryMax: a cap would kill trading.
+OOMScoreAdjust=-900
 Restart=on-failure
 RestartSec=10
 StandardOutput=append:/opt/alpha5/data/live/run.out.log

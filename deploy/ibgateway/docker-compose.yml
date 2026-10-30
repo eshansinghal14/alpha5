@@ -45,3 +45,6 @@ services:
       # Reach it with an SSH tunnel (see docs/ec2-spx.md).
       - "127.0.0.1:5900:5900"
     mem_limit: 1200m
+    # The S&P strategy's option feed: protected from the OOM killer like the
+    # trading units (deploy/systemd, OOMScoreAdjust=-900).
+    oom_score_adj: -900

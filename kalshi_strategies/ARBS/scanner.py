@@ -339,6 +339,13 @@ if __name__ == "__main__":
 
     from kalshi_infra.runtime.persist import LIVE_ROOT
 
+    # The scan peaks ~1 GB and isn't trading: it gives up the -900 inherited
+    # from alpha5-arbs so the OOM killer takes it before any trading process.
+    try:
+        with open("/proc/self/oom_score_adj", "w") as fh:
+            fh.write("1000")
+    except OSError:
+        pass
     root = sys.argv[1] if len(sys.argv) > 1 else os.path.join(LIVE_ROOT, "ARBS")
     os.makedirs(root, exist_ok=True)
     print(json.dumps(scan_and_select(root)))

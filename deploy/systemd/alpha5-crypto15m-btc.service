@@ -19,6 +19,9 @@ Environment=CRYPTO15M_PERSIST=0
 ExecStart=/opt/alpha5/.venv/bin/python -u -m kalshi_strategies.run --only KXBTC15M --resume-arm
 KillSignal=SIGINT
 TimeoutStopSec=90
+# Last for the OOM killer; non-trading units run at +1000 and go first. The
+# writer and feed children inherit it. No MemoryMax: a cap would kill trading.
+OOMScoreAdjust=-900
 Restart=on-failure
 RestartSec=10
 StandardOutput=append:/opt/alpha5/data/live/crypto15m-btc.out.log
