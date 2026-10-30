@@ -128,6 +128,15 @@ def _gc_timer(phase, info):
         GC_PAUSES.append(time.perf_counter() - _gc_t0[0])
 
 
+def _freeze_heap():
+    """Collect everything, then exempt the survivors from future collections.
+    Unfreezing first means last event's cyclic garbage is still reclaimed:
+    frozen objects are never collected."""
+    gc.unfreeze()
+    gc.collect()
+    gc.freeze()
+
+
 def _decision_key(row: dict) -> tuple:
     # The crypto perp nowcast (shadow) can move while nothing priced does;
     # at 0.1bp it adds a row only on a real lead, not on every tick's jitter.
@@ -700,6 +709,11 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
 
     _log(S, f"starting feeds for {ev.event_ticker} ({len(tickers)} markets, "
             f"{'REAL ORDERS' if engine.live_trading else 'shadow'})")
+    # A full collection walks every tracked object; with the imports, model
+    # and feeds frozen it walks only what this event allocates (crypto's gc
+    # pauses reached 41 ms, 2026-10-30). The one collection here runs before
+    # this event's feeds start.
+    _freeze_heap()
     coros = [kalshi.run(), *model.feed_tasks(), reprice_loop(), control_loop(), audit_loop(),
              quote_fill_loop(), pump_loop(), lip_queue_loop(), lag_probe(), flush_loop(), prefetch_next(), lip_lookup(),
              keepalive_loop()]
