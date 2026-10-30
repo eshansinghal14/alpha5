@@ -39,6 +39,40 @@ def basket_info(root: str) -> dict[str, tuple[float, int]]:
     return out
 
 
+def basket_settles(root: str) -> dict[str, pd.Timestamp]:
+    """basket_id -> expected settlement, from the same sources as basket_info."""
+    from kalshi_strategies.ARBS.config import SPEC_PATH
+    from kalshi_strategies.ARBS.spec import load_spec
+    out = {b.basket_id: b.settles for b in load_spec(SPEC_PATH) if b.settles is not None}
+    try:
+        with open(os.path.join(root, "scanned_spec.json"), encoding="utf-8") as fh:
+            for r in json.load(fh)["relationships"]:
+                if r.get("expected_settlement_utc"):
+                    ts = pd.Timestamp(r["expected_settlement_utc"])
+                    for b in r["baskets"]:
+                        out.setdefault(b["basket_id"], ts)
+    except (OSError, ValueError, KeyError):
+        pass
+    try:
+        with open(os.path.join(root, "ledger.json"), encoding="utf-8") as fh:
+            for bid, p in (json.load(fh).get("baskets") or {}).items():
+                if (p.get("spec") or {}).get("settles"):
+                    out.setdefault(bid, pd.Timestamp(p["spec"]["settles"]))
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+def _tte(seconds: float) -> str:
+    """Time left as '3d 4h', '5h 20m' or '12m'."""
+    m = max(0, int(seconds // 60))
+    if m >= 1440:
+        return f"{m // 1440}d {m % 1440 // 60}h"
+    if m >= 60:
+        return f"{m // 60}h {m % 60}m"
+    return f"{m}m"
+
+
 def guess_info(basket_id: str) -> tuple[float, int] | None:
     """A scanned basket no longer listed anywhere, from its id's shape."""
     kind = basket_id.split(":", 1)[0]
@@ -124,6 +158,7 @@ def bundle_log(series: str, days: int = 2, gap_s: float = 30.0) -> pd.DataFrame:
                     if r.get("kind") == "fill" and r.get("live"):
                         rows.append(r)
     info = basket_info(root)
+    settles = basket_settles(root)
     bursts: list[dict] = []
     last: dict[str, dict] = {}
     for r in sorted(rows, key=lambda r: r["t"]):
@@ -153,7 +188,10 @@ def bundle_log(series: str, days: int = 2, gap_s: float = 30.0) -> pd.DataFrame:
         whole = (meta is not None and len(left) >= meta[1] and len(rest) == 1) or not left
         bundles = next(iter(left.values())) if left and whole else 0.0
         pnl = pairs + bundles * meta[0] - c["cost"] if whole and meta is not None else None
+        st = settles.get(c["basket_id"])
         out.append({"time": pd.Timestamp(c["t"], unit="s", tz="UTC"),
+                    # Time to expected settlement when the burst began.
+                    "tte": None if st is None else _tte((st - pd.Timestamp(c["t"], unit="s", tz="UTC")).total_seconds()),
                     # Series tickers, the part of a market ticker Kalshi's search finds.
                     "series": " ".join(dict.fromkeys(t.split("-", 1)[0] for t, _ in c["legs"])),
                     "basket_id": c["basket_id"], "how": "+".join(sorted(h for h in c["how"] if h)),
