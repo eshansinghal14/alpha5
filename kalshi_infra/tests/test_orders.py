@@ -113,3 +113,29 @@ def test_queue_positions_parses_entries():
     body = {"queue_positions": [{"order_id": "a", "queue_position_fp": "120.00"},
                                 {"order_id": "b", "queue_position_fp": None}, {"order_id": None}]}
     assert _client(body).queue_positions("E") == {"a": 120.0, "b": 0.0}
+
+
+def test_pooled_counts_idle_connections_only():
+    import requests
+    import requests.adapters
+    from kalshi_infra.kalshi import orders
+    s = requests.Session()
+    s.mount("https://", requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=4))
+    assert orders._pooled(s) == 0
+    pool = s.get_adapter("https://h").poolmanager.connection_from_url("https://h")
+    taken = [pool.pool.get_nowait() for _ in range(2)]     # two slots checked out...
+    for _ in taken:                                        # ...and returned as connections
+        pool.pool.put(types.SimpleNamespace(close=lambda: None))
+    assert orders._pooled(s) == 2
+
+
+def test_keepalive_reuses_every_idle_connection_on_both_sessions(monkeypatch):
+    from kalshi_infra.kalshi import orders
+    c = KalshiOrderClient.__new__(KalshiOrderClient)
+    c._session, c._cancel_session, c.timeout_s = "orders", "cancels", 1.0
+    monkeypatch.setattr(orders, "_pooled", lambda s: {"orders": 3, "cancels": 0}[s])
+    pinged = []
+    c._ping = lambda s: pinged.append(s) or True
+    # An empty pool still gets one, which opens its first connection.
+    assert c.keepalive() == 4
+    assert sorted(pinged) == ["cancels", "orders", "orders", "orders"]

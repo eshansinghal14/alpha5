@@ -334,6 +334,11 @@ def main(argv=None):
         # ALPHA5_PRIORITY lets a second strategy on the same box sit below the
         # first (deploy/systemd/alpha5-spx.service runs S&P at "normal").
         set_priority(os.environ.get("ALPHA5_PRIORITY", "above_normal"))
+        # Order sends run on worker threads that need the GIL from a busy loop
+        # thread, which holds it up to the switch interval (default 5 ms). On
+        # the box a warm GET beside one busy thread took 15.9 ms p50 at 5 ms
+        # and 7.0 ms at 0.5 ms, vs 4.3 ms alone (2026-10-30).
+        sys.setswitchinterval(0.0005)
         try:
             asyncio.run(_run_unit([reg[s] for s in units[0]], args))
         except KeyboardInterrupt:

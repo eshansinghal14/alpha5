@@ -397,6 +397,33 @@ def shard_budget(shard: int) -> WriteBudget:
         return b
 
 
+KEEPALIVE_S = 30.0
+_KEEPALIVE_POOL = None
+
+
+def _keepalive_pool():
+    global _KEEPALIVE_POOL
+    if _KEEPALIVE_POOL is None:
+        import concurrent.futures
+        _KEEPALIVE_POOL = concurrent.futures.ThreadPoolExecutor(16, thread_name_prefix="keepalive")
+    return _KEEPALIVE_POOL
+
+
+def _pooled(session) -> int:
+    """Connections idle in the session's pools. Reads urllib3's pool queue,
+    which holds a connection or a None placeholder per slot."""
+    n = 0
+    for adapter in session.adapters.values():
+        pools = getattr(getattr(adapter, "poolmanager", None), "pools", None)
+        if pools is None:
+            continue
+        for key in pools.keys():
+            q = getattr(pools.get(key), "pool", None)
+            if q is not None:
+                n += sum(c is not None for c in list(q.queue))
+    return n
+
+
 class KalshiOrderClient:
     """Places real IOC orders and reads real positions. Every method here
     does blocking network I/O and MUST be called off the asyncio event loop
@@ -420,6 +447,8 @@ class KalshiOrderClient:
         # the default 10, urllib3 opens and discards a fresh TLS connection
         # (~105ms vs ~34ms warm, see execution.MEASURED_SEND_S).
         self._cancel_session.mount("https://", requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=16))
+        # Same for creates, amends and takes (engine.ORDER_WORKERS, ARBS's write pool).
+        self._session.mount("https://", requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=16))
         # No proxy/netrc/CA env lookups per request (a netrc stat on every
         # write: 2% of the race process's samples, py-spy 10-21 21:45 UTC).
         # Nothing in the environment sets them.
@@ -460,6 +489,24 @@ class KalshiOrderClient:
             self._cancel_session.get(BASE_URL + "/trade-api/v2/exchange/status", timeout=self.timeout_s)
         except Exception:
             pass
+
+    def keepalive(self) -> int:
+        """Re-use every idle pooled connection once (a public GET, no write
+        tokens), all at once so each request checks out its own. Kalshi's load
+        balancer closes a connection idle ~60 s, and the write that next used
+        it paid a new TCP+TLS: a GET re-using one after 55 s took 3.0 ms, after
+        65-245 s 10-13 ms (2026-10-30). Blocking; run every KEEPALIVE_S off the
+        loop. Returns how many were sent."""
+        futs = [_keepalive_pool().submit(self._ping, s)
+                for s in (self._session, self._cancel_session) for _ in range(max(_pooled(s), 1))]
+        return sum(f.result() for f in futs)
+
+    def _ping(self, session) -> bool:
+        try:
+            session.get(BASE_URL + "/trade-api/v2/exchange/status", timeout=self.timeout_s)
+            return True
+        except Exception:
+            return False
 
     # Kalshi order group every create joins (create_order_group), or None.
     order_group_id: str | None = None

@@ -37,7 +37,7 @@ from kalshi_infra.api_functions import kalshi_get
 from kalshi_infra.config import ConfigStore, atomic_write_json
 from kalshi_infra.kalshi import fees as kfees
 from kalshi_infra.kalshi.orders import RealFill, error_code, http_status, is_market_paused, is_post_only_reject
-from kalshi_infra.kalshi.orders import write_budget_tokens_per_s
+from kalshi_infra.kalshi.orders import KEEPALIVE_S, write_budget_tokens_per_s
 from kalshi_infra.trading.engine import MARKET_PAUSE_RETRY_S
 from kalshi_infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
 from kalshi_infra.runtime.persist import LIVE_ROOT, day_dir
@@ -253,7 +253,10 @@ class ArbsRunner:
             led.save()
         self.arm_want = live_trading
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=16, thread_name_prefix="arbs")
-        self.gw = Gateway(self.pool)
+        # Order writes off the pool that loads meta and writes the liquidity
+        # log: sharing it, a quote's send -> answer was p99 105 ms (2026-10-30).
+        self.write_pool = concurrent.futures.ThreadPoolExecutor(max_workers=16, thread_name_prefix="arbs-write")
+        self.gw = Gateway(self.pool, self.write_pool)
         self.feed = MultiFeed(self.tickers, self._on_quote, self._on_trade, label=self.S,
                               on_fill=self._on_fill, on_error=lambda m: self.alert("warn", None, m))
         # (ticker, side) -> contracts our IOCs in flight are buying. Held from
@@ -1724,6 +1727,16 @@ class ArbsRunner:
 
     # ------------------------------------------------------------------ guards
 
+    async def keepalive_loop(self):
+        """Every shard client's pooled connections, see KalshiOrderClient.keepalive."""
+        while True:
+            await asyncio.sleep(KEEPALIVE_S)
+            for c in list(self.gw.clients.values()):
+                try:
+                    await asyncio.get_running_loop().run_in_executor(self.pool, c.keepalive)
+                except Exception as e:
+                    _log(f"WARN: connection keepalive failed ({e!r})")
+
     async def exchange_loop(self):
         """Tracks Kalshi's exchange-wide trading switch (off in the Thursday
         maintenance window), so a pause is one alert, not one per market."""
@@ -2031,7 +2044,7 @@ class ArbsRunner:
         coros = [self.feed.run(), self.eval_loop(), self.rank_loop(), self.meta_loop(), self.fill_poll_loop(),
                  self.audit_loop(), self.guard_loop(), self.summary_loop(), self.scan_loop(),
                  self.liquidity_loop(), self.exchange_loop(), self.write_share_loop(), self.ledger_flush_loop(),
-                 self.control_loop(trading, stopper, stop)]
+                 self.keepalive_loop(), self.control_loop(trading, stopper, stop)]
         tasks = [asyncio.create_task(c) for c in coros]
         try:
             await stop.wait()
@@ -2048,6 +2061,7 @@ class ArbsRunner:
             atomic_write_json(os.path.join(day_dir(self.S, f"{_utc():%Y-%m-%d}"), "summary.json"), self.summary(),
                               indent=None)
             self.pool.shutdown(wait=False)
+            self.write_pool.shutdown(wait=False)
 
 
 def flips(baskets: list[Basket]) -> dict[str, str]:

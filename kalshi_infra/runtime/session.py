@@ -29,7 +29,7 @@ import pandas as pd
 from kalshi_infra.config import ConfigStore
 from kalshi_infra.kalshi import fees as kfees
 from kalshi_infra.kalshi import markets as km
-from kalshi_infra.kalshi.orders import KalshiOrderClient
+from kalshi_infra.kalshi.orders import KEEPALIVE_S, KalshiOrderClient
 from kalshi_infra.kalshi.ws_feed import LiveKalshiFeed
 from kalshi_infra.runtime import persist, write_groups
 from kalshi_infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
@@ -585,6 +585,15 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
                 _log(S, "WARN: quote pump failed:")
                 traceback.print_exc()
 
+    async def keepalive_loop():
+        while engine.order_client is not None:
+            await asyncio.sleep(KEEPALIVE_S)
+            try:
+                await asyncio.get_running_loop().run_in_executor(None, engine.order_client.keepalive)
+            except Exception:
+                _log(S, "WARN: connection keepalive failed:")
+                traceback.print_exc()
+
     async def lag_probe():
         probe = 0.02
         while True:
@@ -675,7 +684,8 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
     _log(S, f"starting feeds for {ev.event_ticker} ({len(tickers)} markets, "
             f"{'REAL ORDERS' if engine.live_trading else 'shadow'})")
     coros = [kalshi.run(), *model.feed_tasks(), reprice_loop(), control_loop(), audit_loop(),
-             quote_fill_loop(), pump_loop(), lip_queue_loop(), lag_probe(), flush_loop(), prefetch_next(), lip_lookup()]
+             quote_fill_loop(), pump_loop(), lip_queue_loop(), lag_probe(), flush_loop(), prefetch_next(), lip_lookup(),
+             keepalive_loop()]
     tasks = [asyncio.create_task(c) for c in coros]
     try:
         closer, stopped = asyncio.create_task(until_close()), asyncio.create_task(stop_evt.wait())

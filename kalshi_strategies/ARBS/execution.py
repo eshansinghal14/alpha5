@@ -19,8 +19,11 @@ from kalshi_infra.kalshi.orders import KalshiOrderClient, http_status
 
 
 class Gateway:
-    def __init__(self, pool):
+    def __init__(self, pool, write_pool=None):
+        """`pool` runs reads (fills, positions, balance); `write_pool` the
+        order writes, so a write never queues behind them."""
         self.pool = pool
+        self.write_pool = write_pool or pool
         self.clients: dict[int, KalshiOrderClient] = {}
         self.shard_of: dict[str, int] = {}
         self._ids = itertools.count(1)
@@ -60,6 +63,9 @@ class Gateway:
     async def call(self, fn, *a, **kw):
         return await asyncio.get_running_loop().run_in_executor(self.pool, functools.partial(fn, *a, **kw))
 
+    async def write(self, fn, *a, **kw):
+        return await asyncio.get_running_loop().run_in_executor(self.write_pool, functools.partial(fn, *a, **kw))
+
     def _note_ioc(self, oid: str | None):
         if not oid:
             return
@@ -74,7 +80,7 @@ class Gateway:
             return None, None, False
         o = self._order(ticker, side, price, size, "take")
         try:
-            fill = await self.call(c.place_ioc, o)
+            fill = await self.write(c.place_ioc, o)
         except Exception as e:
             if http_status(e) == 429:
                 c.note_rate_limited(reason)
@@ -89,7 +95,7 @@ class Gateway:
             return None, None, False
         o = self._order(ticker, side, price, size, "quote", cid=cid)
         try:
-            return await self.call(c.place_resting, o), None, True
+            return await self.write(c.place_resting, o), None, True
         except Exception as e:
             if http_status(e) == 429:
                 c.note_rate_limited("quote")
@@ -101,7 +107,7 @@ class Gateway:
             return None, None, False
         o = self._order(ticker, side, price, filled + remaining, "quote")
         try:
-            return await self.call(c.amend, exchange_id, o, remaining, filled, price=round(price, 4)), None, True
+            return await self.write(c.amend, exchange_id, o, remaining, filled, price=round(price, 4)), None, True
         except Exception as e:
             if http_status(e) == 429:
                 c.note_rate_limited("move")
@@ -114,7 +120,7 @@ class Gateway:
             return None, RuntimeError(f"no order client for {ticker}"), False
         c.allow_now("cancel", force=True, reason=reason)
         try:
-            return await self.call(c.cancel, exchange_id, ticker), None, True
+            return await self.write(c.cancel, exchange_id, ticker), None, True
         except Exception as e:
             if http_status(e) == 429:
                 c.note_rate_limited("cancel")

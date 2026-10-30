@@ -98,6 +98,11 @@ PRICE_SANITY_TOL = 0.01
 # cancels one pull sends at once (a full race pull is 10 quotes).
 CANCEL_WORKERS = 16
 _CANCEL_POOL = None
+# Creates, amends and takes likewise get their own threads, off the default
+# executor's REST polls and file work: their loop -> worker pickup was p90
+# 8 ms there (crypto, 2026-10-30).
+ORDER_WORKERS = 16
+_ORDER_POOL = None
 
 
 def _cancel_pool():
@@ -106,6 +111,14 @@ def _cancel_pool():
         import concurrent.futures
         _CANCEL_POOL = concurrent.futures.ThreadPoolExecutor(CANCEL_WORKERS, thread_name_prefix="cancel")
     return _CANCEL_POOL
+
+
+def _order_pool():
+    global _ORDER_POOL
+    if _ORDER_POOL is None:
+        import concurrent.futures
+        _ORDER_POOL = concurrent.futures.ThreadPoolExecutor(ORDER_WORKERS, thread_name_prefix="order")
+    return _ORDER_POOL
 
 
 # cancel_resting: pause between list-and-cancel passes, and the overall cap.
@@ -295,6 +308,7 @@ class LiveEngine:
         self.balance_at_arm: float | None = None
         self._sweep = None          # disarm_nowait's exchange sweep, while it runs
         self._og = None             # this session's Kalshi order group (see _og_open_blocking)
+        self._pump_queued = False   # see _pump_soon
         self.reconcile_mismatches: list[str] = []
 
         # --- quotes: owned by the OrderManager (see order_manager.py) ---
@@ -1202,7 +1216,7 @@ class LiveEngine:
         if loop is None:
             self._on_real_result(order, self._place_blocking(order))
             return
-        fut = loop.run_in_executor(None, self._place_blocking, order)
+        fut = loop.run_in_executor(_order_pool(), self._place_blocking, order)
         fut.add_done_callback(lambda f: self._on_real_result(order, f.result()))
 
     def _place_blocking(self, order: Order) -> tuple:
@@ -1309,7 +1323,7 @@ class LiveEngine:
             self.n_real_in_flight += 1
             self._oev("create_sent", q, size=q.size)
             self._run_blocking(self._timed(lambda: self._rest_blocking(order)),
-                               lambda res: self._on_real_quote_timed(order, res))
+                               lambda res: self._on_real_quote_timed(order, res), executor=_order_pool())
             return True
         # Shadow: lands after the modelled send latency, against the book then.
         self._schedule_shadow(order)
@@ -1395,6 +1409,7 @@ class LiveEngine:
 
         def done(res):
             resp, exc, rtt = res
+            self._pump_soon()
             self._oev("amend_ack", q, new_price=price, rtt_s=rtt,
                       status="ok" if exc is None else f"err:{http_status(exc)}",
                       error_code=None if exc is None else error_code(exc))
@@ -1414,7 +1429,7 @@ class LiveEngine:
                 print(f"[live] WARN: move of quote {q.order_id} to {price} failed ({exc!r}); left at old price")
             self.om.on_amended(q.order_id, ok=False)
 
-        self._run_blocking(work, done)
+        self._run_blocking(work, done, executor=_order_pool())
         return True
 
     @staticmethod
@@ -1460,6 +1475,7 @@ class LiveEngine:
         """Shadow analog of a create ack: cross what's marketable at arrival
         (a quote priced into a book that moved), rest the remainder behind
         the displayed queue."""
+        self._pump_soon()
         if order.order_id < self._min_valid_order_id or self.om.quotes.get(order.order_id) is None:
             return
         q = self.om.quotes[order.order_id]
@@ -1490,6 +1506,7 @@ class LiveEngine:
             return None, exc
 
     def _on_real_quote_timed(self, order: Order, res: tuple):
+        self._pump_soon()
         result, rtt, pickup, t_done = res
         ack, exc = result
         if exc is not None and http_status(exc) not in (None, 429):
@@ -1658,6 +1675,7 @@ class LiveEngine:
 
     def _on_cancel_result(self, order_id: int, result: tuple, reason: str = "retry", rtt: float | None = None,
                           pickup: float | None = None, done_wait: float | None = None):
+        self._pump_soon()
         ok, exc = result
         q = self.om.quotes.get(order_id)
         self._oev("cancel_ack", q, order_id=order_id, reason=reason, rtt_s=rtt, pickup_s=pickup,
@@ -1919,6 +1937,30 @@ class LiveEngine:
             # Takes first (P1), then whatever creates the quote budget allows.
             self._flush_pending(processing_s)
             self.pump_quotes()
+
+    def _pump_soon(self):
+        """Pump on the loop's next turn, once however many acks land in this
+        one. An answer frees its side's held-back create (OrderManager.missing)
+        and confirms cancels the queue waits on; without this they went out on
+        the next dispatch or PUMP_INTERVAL_S tick, 45 ms p50 after the ack
+        (2026-10-30). call_soon, not pump(): an ack can arrive inside pump()
+        (shadow, tests) and re-entering it would send a level twice."""
+        if self._pump_queued:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._pump_queued = True
+        loop.call_soon(self._pump_from_ack)
+
+    def _pump_from_ack(self):
+        self._pump_queued = False
+        try:
+            self.pump_quotes()
+        except Exception:
+            print("[live] WARN: quote pump after ack failed:")
+            traceback.print_exc()
 
     def pump_quotes(self):
         """Send queued quote creates. Also called on a timer by the session,

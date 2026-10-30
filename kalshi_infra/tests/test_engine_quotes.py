@@ -717,3 +717,23 @@ def test_shadow_bucket_and_cancels_token_meter_creates():
     fair(eng)
     assert len(eng.om.live()) == 2
     assert {q.price for q in eng.om.live()} == {0.41}   # the touch level of each side first
+
+
+def test_acks_pump_once_on_the_next_loop_turn():
+    import asyncio
+    eng, _, _ = setup(real=True)
+    calls = []
+    eng.pump_quotes = lambda: calls.append(1)
+
+    async def run():
+        eng._pump_soon()
+        eng._pump_soon()
+        assert calls == []          # never inside the ack (it can arrive inside a pump)
+        await asyncio.sleep(0)
+        assert calls == [1]
+        eng._pump_soon()
+        await asyncio.sleep(0)
+        assert calls == [1, 1]
+    asyncio.run(run())
+    eng._pump_soon()                # no loop (tests, sync callers): nothing scheduled
+    assert calls == [1, 1]
