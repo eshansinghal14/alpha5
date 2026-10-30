@@ -913,3 +913,33 @@ def test_deep_fill_is_journaled_as_deep_and_completed(arbs, tmp_path):
     assert sum(x["pnl"] for x in r.shadow_ledger.settled if x["basket_id"] == live.basket_id) > 0
     rows = [json.loads(l) for f in (tmp_path / "ARBS" / "journal").glob("*.jsonl") for l in open(f)]
     assert any(x["kind"] == "fill" and x.get("fill_kind") == "deep" for x in rows)
+
+
+def test_basket_stays_busy_until_its_last_task_ends(arbs):
+    r, b = arbs
+
+    async def go():
+        short, long_ = asyncio.Event(), asyncio.Event()
+        r.spawn(short.wait(), b.basket_id)
+        r.spawn(long_.wait(), b.basket_id)
+        short.set()
+        await asyncio.sleep(0.01)
+        assert b.basket_id in r.busy           # the second task is still running
+        long_.set()
+        await drain(r)
+        assert b.basket_id not in r.busy
+    asyncio.run(go())
+
+
+def test_main_and_deep_fill_together_exit_once(arbs, tmp_path):
+    r, b = arbs
+    live = _live_gap(r, b, [(0.45, 10), (0.20, 5)])
+    main, deep = r.quotes[(live.basket_id, 0)], r.quotes[(live.basket_id, 0, "deep")]
+    r._quote_fill(main, main.size, main.size * main.price, None, "shadow")
+    r._quote_fill(deep, 5, 5 * deep.price, None, "shadow")
+    for _ in range(5):
+        _eval(r, live)
+    pos = r.shadow_ledger.baskets.get(live.basket_id)
+    assert pos is None or not pos.unhedged(live.tickers)
+    rows = [json.loads(l) for f in (tmp_path / "ARBS" / "journal").glob("*.jsonl") for l in open(f)]
+    assert sum(x["kind"] in ("complete", "unwind") for x in rows) == 1

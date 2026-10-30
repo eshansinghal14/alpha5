@@ -228,6 +228,7 @@ class ArbsRunner:
         self.journal_dir = os.path.join(self.root, "journal")
         self.quotes = _Quotes()                           # (basket_id, leg index) -> its quote
         self.busy: set[str] = set()
+        self.busy_n: dict[str, int] = {}                 # tasks running per basket
         self.baskets: dict[str, Basket] = {}
         self.tickers: list[str] = []
         self.wake = asyncio.Event()
@@ -357,6 +358,7 @@ class ArbsRunner:
     def spawn(self, coro, basket_id: str | None = None):
         if basket_id is not None:
             self.busy.add(basket_id)
+            self.busy_n[basket_id] = self.busy_n.get(basket_id, 0) + 1
 
         async def wrap():
             try:
@@ -367,7 +369,13 @@ class ArbsRunner:
                 self.alert("error", basket_id, f"internal error: {traceback.format_exc(limit=2)[-300:]}")
             finally:
                 if basket_id is not None:
-                    self.busy.discard(basket_id)
+                    # Busy until its last task ends: one task finishing first let
+                    # the basket be priced again with another's IOCs in flight, and
+                    # two exits overshot each other 25 times in 0.35 s (ALGQSC 10-30).
+                    self.busy_n[basket_id] -= 1
+                    if self.busy_n[basket_id] <= 0:
+                        del self.busy_n[basket_id]
+                        self.busy.discard(basket_id)
                     self.dirty.add(basket_id)
         t = asyncio.get_running_loop().create_task(wrap())
         self.tasks.add(t)
@@ -1325,11 +1333,6 @@ class ArbsRunner:
         if any(q.pending for q in qs):
             self.later(bid, 0.05)
             return
-        if any(q.deep for q in qs):
-            # Another fill there would add to what the exit has to cover. Not
-            # waited on: a live exit shouldn't sit behind a cancel.
-            self.spawn(self.cancel_quotes([q for q in qs if q.deep], "broken"), bid)
-            qs = [q for q in qs if not q.deep]
         legs = [self.leg_view(l.ticker, l.side) if self.is_open(l.ticker) else None for l in b.legs]
         others = [self.leg_view(l.ticker, OTHER[l.side]) if self.is_open(l.ticker) else None for l in b.legs]
         ex = pricing.exits(b.payout, pos.held(b.tickers), pos.broken_spent(b.tickers), legs, others)
@@ -1439,7 +1442,8 @@ class ArbsRunner:
         want = {j: (t, sd, n, pricing.rest_price(v) if v is not None else None)
                 for j, t, sd, n, v in self._exit_orders(b, path, ex, legs, others)}
         reserve = self.cfg.runtime.write_reserve_tokens
-        acts = []
+        # Another fill on a deep quote would add to what the exit has to cover.
+        acts = [self.cancel_quote(q, "broken") for q in qs if q.deep and not q.pending]
         for j, leg in enumerate(b.legs):
             q = self.quotes.get((b.basket_id, j))
             w = want.get(j)
