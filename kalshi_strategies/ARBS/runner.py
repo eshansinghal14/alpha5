@@ -123,6 +123,9 @@ ORDER_TOKENS, CANCEL_TOKENS = 10.0, 2.0
 # Startup sweep: retries per cancel on a 429, and the gap between cancels
 # (~100/s, under the 150/s our cancel tokens allow at the 300/s shard bucket).
 SWEEP_RETRIES, SWEEP_PACING_S = 5, 0.01
+# Least time between voluntary moves of a deep quote: it waits for a sweep,
+# so tracking every join in the gap only spends writes.
+DEEP_REQUOTE_S = 10.0
 PULL_BATCH = 20
 
 
@@ -1160,7 +1163,7 @@ class ArbsRunner:
                 acts.append(self.move_quote(q, plan, size if grow else None))
             else:
                 q.edge, q.max_price = plan.edge, plan.max_price
-        acts += self.manage_deep(b, vs, mains if live else {}, quote_need, now)
+        acts += self.manage_deep(b, vs, mains, quote_need, now, live and want)
         if acts:
             async def run(acts=acts):
                 await asyncio.gather(*acts)
@@ -1189,29 +1192,39 @@ class ArbsRunner:
                                          others_cost=p.others_cost), float(n)
         return None, 0
 
-    def manage_deep(self, b: Basket, vs, mains: dict, need: float, now: float) -> list:
-        """Deep quotes behind the arb quotes in `mains` (a live basket's);
-        any other deep quote of the basket is cancelled. Live sweeps ran past
-        our arb quote 90% of the time and 37% by 30c+ (trades 10-28..30);
-        on slow markets 1% did, so there a fill that deep is mostly news."""
+    def manage_deep(self, b: Basket, vs, mains: dict, need: float, now: float, on: bool) -> list:
+        """Deep quotes behind the arb quotes in `mains`, while `on` (a live
+        basket being quoted). Live sweeps ran past our arb quote 90% of the
+        time and 37% by 30c+ (trades 10-28..30); on slow markets 1% did, so
+        there a fill that deep is mostly news."""
         t, reserve, acts = self.cfg.trading, self.cfg.runtime.write_reserve_tokens, []
+        on = on and t.deep_quote_size >= 1
         for j, leg in enumerate(b.legs):
             dq = self.quotes.get((b.basket_id, j, "deep"))
             if dq is not None and dq.pending:
                 continue
-            plan, size = (None, 0) if j not in mains or t.deep_quote_size < 1 else \
-                self.deep_plan(b, vs, j, mains[j], need)
+            plan, size = self.deep_plan(b, vs, j, mains[j], need) if on and j in mains else (None, 0)
             if plan is None:
-                if dq is not None:
+                if dq is None:
+                    continue
+                # A resting deep quote stays while it clears the edge on its own:
+                # pulled every time the arb quote ahead of it blinked, half lived
+                # under 1.4 s and they took 13% of our writes (10-30 18:16-18:21).
+                keep = on and self.quoted_elsewhere(b.basket_id, leg.ticker, leg.side) is None and \
+                    (p := pricing.quote_leg(vs, j, b.payout, need, dq.remaining)) is not None and \
+                    dq.price <= p.max_price + _EPS
+                if keep:
+                    dq.max_price = p.max_price
+                else:
                     acts.append(self.cancel_quote(dq, "deep_off"))
             elif dq is None:
                 if not self.live or self.gw.can_afford(leg.ticker, "order", reserve):
                     acts.append(self.place_quote(self.new_quote(b, plan, size, deep=True)))
-            elif (dq.price > plan.max_price + _EPS or abs(dq.remaining - size) > _EPS
-                  or (vs[j].ticks.steps(plan.price, dq.price) >= t.requote_min_ticks
-                      and now - max(dq.moved_at, dq.placed_at) >= t.requote_cooldown_s)):
-                if not self.live or dq.price > plan.max_price + _EPS or \
-                        self.gw.can_afford(leg.ticker, "amend", reserve):
+            elif dq.price > plan.max_price + _EPS:
+                acts.append(self.move_quote(dq, plan, size))
+            elif ((abs(dq.remaining - size) > _EPS or vs[j].ticks.steps(plan.price, dq.price) >= t.requote_min_ticks)
+                  and now - max(dq.moved_at, dq.placed_at) >= DEEP_REQUOTE_S):
+                if not self.live or self.gw.can_afford(leg.ticker, "amend", reserve):
                     acts.append(self.move_quote(dq, plan, size))
             else:
                 dq.edge, dq.max_price = plan.edge, plan.max_price

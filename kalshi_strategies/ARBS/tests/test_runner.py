@@ -883,10 +883,6 @@ def test_deep_quote_rests_one_tick_over_the_next_bid_behind(arbs):
     main, deep = r.quotes[(live.basket_id, 0)], r.quotes[(live.basket_id, 0, "deep")]
     assert main.price == pytest.approx(0.40) and not main.deep
     assert deep.price == pytest.approx(0.21) and deep.size == 5 and deep.edge > main.edge
-    # Someone joins the gap: the deep quote moves up to stay first behind the arb quote.
-    book(r, "X-A", [(0.45, 10), (0.30, 5), (0.20, 5)], [(0.35, 10)])
-    _eval(r, live)
-    assert r.quotes[(live.basket_id, 0, "deep")].price == pytest.approx(0.31)
 
 
 def test_no_deep_quote_on_a_small_gap_or_a_slow_market(arbs):
@@ -951,3 +947,38 @@ def test_basket_of_a_retired_quote_id_is_kept_for_late_fills(arbs):
                                         "retired_at": time.time()}
     r.set_baskets([])                                    # the scan dropped it
     assert b.basket_id in r.baskets
+
+
+def test_deep_quote_outlives_its_arb_quote_while_it_clears_the_edge(arbs):
+    r, b = arbs
+    live = _live_gap(r, b, [(0.45, 10), (0.20, 5)])
+    deep = r.quotes[(live.basket_id, 0, "deep")]
+    # A bid joins right behind the arb quote: no gap to place a deep quote in any
+    # more, but the resting one at 0.21 still clears the edge, so it stays put.
+    book(r, "X-A", [(0.45, 10), (0.38, 5), (0.20, 5)], [(0.35, 10)])
+    _eval(r, live)
+    assert r.quotes.get((live.basket_id, 0, "deep")) is deep and deep.price == pytest.approx(0.21)
+
+
+def test_deep_quote_pulled_when_another_basket_quotes_the_side(arbs):
+    r, b = arbs
+    live = _live_gap(r, b, [(0.45, 10), (0.20, 5)])
+    other = R.Quote(basket_id="t:other", leg=0, ticker="X-A", side="yes", price=0.40, size=5, cid="c",
+                    edge=0.05, max_price=0.40, pending=False)
+    del r.quotes[(live.basket_id, 0)]
+    r.quotes[("t:other", 0)] = other
+    r.baskets["t:other"] = dataclasses.replace(b, basket_id="t:other")
+    _eval(r, live)
+    assert (live.basket_id, 0, "deep") not in r.quotes
+
+
+def test_deep_quote_reprices_at_most_every_deep_requote_s(arbs):
+    r, b = arbs
+    live = _live_gap(r, b, [(0.45, 10), (0.20, 5)])
+    # Someone joins the gap: the deep quote moves up to stay first behind the arb quote, but not at once.
+    book(r, "X-A", [(0.45, 10), (0.30, 5), (0.20, 5)], [(0.35, 10)])
+    _eval(r, live)
+    assert r.quotes[(live.basket_id, 0, "deep")].price == pytest.approx(0.21)      # placed just now: waits
+    r.quotes[(live.basket_id, 0, "deep")].placed_at -= R.DEEP_REQUOTE_S
+    _eval(r, live)
+    assert r.quotes[(live.basket_id, 0, "deep")].price == pytest.approx(0.31)
