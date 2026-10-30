@@ -926,3 +926,32 @@ def test_in_flight_hold_is_per_side():
     m.pump()
     assert ("no", 0.45) in [(q.side, q.price) for q in ex.creates]
     assert 0.38 not in [q.price for q in ex.creates if q.side == "yes"]
+
+def test_quote_book_side_index_matches_a_full_scan():
+    import random
+    rng = random.Random(7)
+    m = om.OrderManager(object())
+    ref: dict = {}
+    for step in range(5000):
+        r = rng.random()
+        if r < 0.55:
+            oid = rng.randrange(200)
+            q = om.Quote(oid, rng.choice("ABC"), rng.choice(("yes", "no")), 0.4, 1.0,
+                         role=rng.choice((om.EDGE, om.LIP)))
+            m.quotes[oid] = q
+            ref[oid] = q
+        elif r < 0.95 and ref:
+            oid = rng.choice(list(ref))
+            assert m.quotes.pop(oid) is ref.pop(oid)
+            assert m.quotes.pop(oid, None) is None
+        elif r < 0.96:
+            m.quotes.clear()
+            ref.clear()
+        for t in "ABC":
+            for sd in ("yes", "no"):
+                for role in (None, om.EDGE, om.LIP):
+                    want = [q for q in ref.values() if q.ticker == t and q.side == sd and (role is None or q.role == role)]
+                    assert m.live(t, sd, role) == want
+    assert dict(m.quotes) == ref
+    with pytest.raises(NotImplementedError):
+        m.quotes.update({})

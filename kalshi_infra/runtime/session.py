@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import functools
+import gc
 import time
 import traceback
 
@@ -112,6 +113,19 @@ def _now() -> pd.Timestamp:
 _DECISION_FIELDS = ("market_bid", "market_ask", "prob_raw", "prob_lo", "prob_hi", "net_position",
                     "eff_yes", "eff_no", "bid_final", "ask_final", "quote_bid", "quote_ask",
                     "lip_bid", "lip_ask", "block_bid", "block_ask", "atm_tradeable")
+
+
+# Collector pauses, any generation, process-wide: a collection stalls the loop
+# like a slow callback, and nothing else shows it.
+GC_PAUSES: collections.deque = collections.deque(maxlen=400)
+_gc_t0 = [0.0]
+
+
+def _gc_timer(phase, info):
+    if phase == "start":
+        _gc_t0[0] = time.perf_counter()
+    else:
+        GC_PAUSES.append(time.perf_counter() - _gc_t0[0])
 
 
 def _decision_key(row: dict) -> tuple:
@@ -434,6 +448,9 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
     reconcile_arm()
 
     timings = {k: collections.deque(maxlen=400) for k in ("reprice", "dispatch", "loop_lag")}
+    timings["gc"] = GC_PAUSES
+    if _gc_timer not in gc.callbacks:
+        gc.callbacks.append(_gc_timer)
 
     def _stat(d):
         if not d:

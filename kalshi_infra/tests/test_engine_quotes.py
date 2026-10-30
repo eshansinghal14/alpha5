@@ -737,3 +737,21 @@ def test_acks_pump_once_on_the_next_loop_turn():
     asyncio.run(run())
     eng._pump_soon()                # no loop (tests, sync callers): nothing scheduled
     assert calls == [1, 1]
+
+
+def test_worker_result_runs_on_the_loop_thread():
+    import asyncio
+    import concurrent.futures
+    import threading
+    eng, _, _ = setup(real=True)
+    pool = concurrent.futures.ThreadPoolExecutor(1)
+
+    async def run():
+        loop_thread = threading.get_ident()
+        landed = asyncio.get_running_loop().create_future()
+        eng._run_blocking(threading.get_ident,
+                          lambda worker: landed.set_result((worker, threading.get_ident())), executor=pool)
+        worker, done_thread = await asyncio.wait_for(landed, 2)
+        assert worker != loop_thread and done_thread == loop_thread
+    asyncio.run(run())
+    pool.shutdown()

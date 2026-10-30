@@ -121,6 +121,18 @@ def _order_pool():
     return _ORDER_POOL
 
 
+def _post(loop, fn, fut):
+    """Worker thread: hand `fut`'s result to `fn` on `loop` in one hop.
+    loop.run_in_executor takes three (copy the state onto an asyncio future,
+    run its done callbacks, then ours), each a full loop iteration: an order's
+    answer waited 3.8 ms p50 / 15 ms p90 for its callback (crypto, 2026-10-30)."""
+    res = fut.result()
+    try:
+        loop.call_soon_threadsafe(fn, res)
+    except RuntimeError:
+        pass                    # loop closed at shutdown
+
+
 # cancel_resting: pause between list-and-cancel passes, and the overall cap.
 # The cap exceeds the configured order timeout (5s) so any POST in flight at
 # shutdown has landed or timed out before the sweep can give up.
@@ -1199,11 +1211,11 @@ class LiveEngine:
     def _send_real_order(self, order: Order):
         """Fire `order` at Kalshi as an IOC take, off the event loop.
 
-        The POST is ~40ms of blocking I/O and this is called from a
-        call_later callback on the loop thread, so it goes to the default
-        executor; the response is recorded back on the loop thread (asyncio
-        future callbacks run there), which is what keeps Portfolio mutation
-        single-threaded against the strategy's own reads."""
+        The POST is blocking I/O and this is called from a call_later
+        callback on the loop thread, so it goes to the order pool; the
+        response is recorded back on the loop thread (_post), which is what
+        keeps Portfolio mutation single-threaded against the strategy's own
+        reads."""
         if not self.order_client.allow_now("order", reason="take"):
             self._unresolved(order, "rate_limited")
             return
@@ -1216,8 +1228,8 @@ class LiveEngine:
         if loop is None:
             self._on_real_result(order, self._place_blocking(order))
             return
-        fut = loop.run_in_executor(_order_pool(), self._place_blocking, order)
-        fut.add_done_callback(lambda f: self._on_real_result(order, f.result()))
+        _order_pool().submit(self._place_blocking, order).add_done_callback(
+            lambda f: _post(loop, lambda res: self._on_real_result(order, res), f))
 
     def _place_blocking(self, order: Order) -> tuple:
         """Runs on a worker thread -- must touch no engine state. Returns
@@ -1458,8 +1470,11 @@ class LiveEngine:
         if loop is None:
             done(work())
             return
-        loop.run_in_executor(executor, work).add_done_callback(
-            lambda f: loop.call_soon_threadsafe(done, f.result()) if not loop.is_closed() else None)
+        if executor is None:
+            loop.run_in_executor(None, work).add_done_callback(
+                lambda f: loop.call_soon_threadsafe(done, f.result()) if not loop.is_closed() else None)
+            return
+        executor.submit(work).add_done_callback(lambda f: _post(loop, done, f))
 
     def _schedule_shadow(self, order: Order):
         try:

@@ -120,6 +120,63 @@ class Quote:
         return max(self.size - self.filled, 0.0)
 
 
+class QuoteBook(dict):
+    """order_id -> Quote, also indexed by (ticker, side) so live() reads one
+    side instead of scanning every quote: those scans were ~19% of the crypto
+    loop's busy time (py-spy, 2026-10-30). Kept right only because quotes are
+    added and removed through [] =, pop, del and clear (popitem, update and
+    setdefault are refused), and a Quote's ticker and side never change."""
+
+    def __init__(self):
+        super().__init__()
+        self.by_side: dict[tuple[str, str], dict[int, Quote]] = {}
+
+    def __setitem__(self, oid, q):
+        old = dict.get(self, oid)
+        super().__setitem__(oid, q)
+        key = (q.ticker, q.side)
+        if old is not None and (old.ticker, old.side) != key:
+            # Re-used id on another side (never in live code): rebuild that
+            # side in the dict's own order, which keeps the id's old slot.
+            self._unindex(oid, old)
+            self.by_side[key] = {k: v for k, v in dict.items(self) if (v.ticker, v.side) == key}
+            return
+        self.by_side.setdefault(key, {})[oid] = q
+
+    def _unindex(self, oid, q):
+        side = self.by_side.get((q.ticker, q.side))
+        if side is not None:
+            side.pop(oid, None)
+            if not side:
+                del self.by_side[(q.ticker, q.side)]
+
+    _MISSING = object()
+
+    def pop(self, oid, default=_MISSING):
+        if oid in self:
+            q = super().pop(oid)
+            self._unindex(oid, q)
+            return q
+        if default is QuoteBook._MISSING:
+            raise KeyError(oid)
+        return default
+
+    def __delitem__(self, oid):
+        self.pop(oid)
+
+    def clear(self):
+        super().clear()
+        self.by_side.clear()
+
+    def _refuse(self, *a, **k):
+        raise NotImplementedError("QuoteBook: add with [] = and remove with pop/del/clear")
+
+    popitem = update = setdefault = _refuse
+
+    def side(self, ticker: str, side: str):
+        return self.by_side.get((ticker, side), {}).values()
+
+
 @dataclasses.dataclass
 class Desired:
     """What the quoter wants on one (ticker, side): prices nearest the touch
@@ -254,7 +311,7 @@ class OrderManager:
         self.ahead_grace_fn = None
         self.lip_hold_s = 1.0
         self.lip_hold_fn = None
-        self.quotes: dict[int, Quote] = {}
+        self.quotes = QuoteBook()
         self.desired: dict[tuple[str, str], Desired] = {}
         self.lip: dict[tuple[str, str], LipTarget | None] = {}
         self._reject_until: dict[tuple[str, str, str, float], float] = {}
@@ -289,6 +346,8 @@ class OrderManager:
     def live(self, ticker: str | None = None, side: str | None = None, role: str | None = None) -> list[Quote]:
         """Every quote not yet confirmed gone. All of it can still fill, so
         all of it counts for risk."""
+        if ticker is not None and side is not None:
+            return [q for q in self.quotes.side(ticker, side) if role is None or q.role == role]
         return [q for q in self.quotes.values()
                 if (ticker is None or q.ticker == ticker) and (side is None or q.side == side)
                 and (role is None or q.role == role)]
