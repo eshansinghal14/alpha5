@@ -847,3 +847,18 @@ def test_resting_quote_grows_when_the_room_does(arbs):
     book(r, "X-B", [(0.40, 10)], [(0.45, 1), (0.44, 40)])     # 40 more behind it at 0.56
     _eval(r, b)
     assert r.quotes[(b.basket_id, 0)].size == 5     # quote_size in the fixture
+
+
+def test_bad_fill_pauses_quoting_on_the_event(arbs):
+    r, b = arbs
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, bad_fill_cooldown_s=60.0)
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    _eval(r, b)
+    assert r.basket_quotes(b.basket_id)
+    r.cool(b)
+    _eval(r, b)
+    assert not r.basket_quotes(b.basket_id) and r.summary()["cooldowns"]["X"] > 0
+    r.cooling.clear()
+    _eval(r, b)
+    assert r.basket_quotes(b.basket_id)

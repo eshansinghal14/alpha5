@@ -62,8 +62,13 @@ class TradingParams:
     requote_min_ticks: int = param("Move a resting quote only when the wanted price differs by this many "
                                    "ticks (a price past the edge limit always moves).", min=1, max=50, step=1,
                                    editable=False)
-    requote_cooldown_s: float = param("Least time between voluntary moves of one quote.", min=0.0, step=0.5,
-                                      editable=False)
+    requote_cooldown_s: float = param("Least time between voluntary moves (reprice or resize) of one resting "
+                                      "quote. A new quote after a fill isn't a move: see bad_fill_cooldown_s.",
+                                      min=0.0, step=0.5)
+    bad_fill_cooldown_s: float = param("After a broken basket exits worse than planned (or on a fast move), "
+                                       "quotes on every basket touching its events are pulled and not placed "
+                                       "again for this long: one swing then costs one fill, not several. "
+                                       "Exits and takes go on.", min=0.0, max=3600.0, step=5.0)
 
 
 @section

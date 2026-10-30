@@ -134,6 +134,10 @@ def _tables(series: str, s: dict):
                                     "fills": st.column_config.Column(width="medium")})
     else:
         st.caption("None.")
+    cd = s.get("cooldowns") or {}
+    if cd:
+        st.caption("Quoting paused after a bad fill (trading.bad_fill_cooldown_s): "
+                   + ", ".join(f"{e} {left}s" for e, left in sorted(cd.items(), key=lambda kv: -kv[1])))
     st.markdown("##### Resting quotes")
     q = s.get("quotes") or []
     if q:

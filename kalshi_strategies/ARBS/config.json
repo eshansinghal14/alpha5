@@ -16,6 +16,7 @@
     "max_dollars": 500.0,
     "requote_min_ticks": 1,
     "requote_cooldown_s": 2.0,
+    "bad_fill_cooldown_s": 60.0,
     "take_cooldown_s": 1.0
   },
   "completion": {
