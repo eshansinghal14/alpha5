@@ -86,14 +86,15 @@ class Quote:
     moved_at: float = 0.0
     pending: bool = True        # create in flight
     kind: str = "arb"           # or "complete" / "unwind": resting on a broken basket's exit
+    deep: bool = False          # the small second quote in the gap behind a live leg's arb quote
 
     @property
     def remaining(self) -> float:
         return max(0.0, self.size - self.filled)
 
     @property
-    def key(self) -> tuple[str, int]:
-        return self.basket_id, self.leg
+    def key(self) -> tuple:
+        return (self.basket_id, self.leg, "deep") if self.deep else (self.basket_id, self.leg)
 
 
 class _Dirty(set):
@@ -803,14 +804,15 @@ class ArbsRunner:
             per = q.edge + pricing.maker_cost(q.price, (m.maker_rate if m else None) or 0.0)
             self.seed_exit(q.basket_id, -per * q.filled)
         self.n["quote_fills"] += 1
-        self._book(q.basket_id, q.ticker, q.side, size, cost, "quote", source=source, order_id=q.exchange_id,
-                   trade_id=trade_id)
+        self._book(q.basket_id, q.ticker, q.side, size, cost, "deep" if q.deep else "quote", source=source,
+                   order_id=q.exchange_id, trade_id=trade_id)
         if q.remaining <= _EPS and self.quotes.get(q.key) is q:
             self._retire(q)
 
     def basket_quotes(self, basket_id: str) -> list[Quote]:
         b = self.baskets[basket_id]
-        return [q for j in range(len(b.legs)) if (q := self.quotes.get((basket_id, j))) is not None]
+        return [q for j in range(len(b.legs)) for k in ((basket_id, j), (basket_id, j, "deep"))
+                if (q := self.quotes.get(k)) is not None]
 
     def _retire(self, q: Quote):
         if self.quotes.get(q.key) is q:
@@ -833,13 +835,13 @@ class ArbsRunner:
         size, cost = float(f["size"]), float(f["price"]) * float(f["size"]) + float(f.get("fee") or 0.0)
         b = self.baskets.get(info["basket_id"])
         leg = b.tickers.index(info["ticker"]) if b is not None and info["ticker"] in b.tickers else -1
-        q = self.quotes.get((info["basket_id"], leg))
+        q = self.quotes.get((info["basket_id"], leg, "deep") if info.get("deep") else (info["basket_id"], leg))
         if q is not None and q.exchange_id == oid:
             self._quote_fill(q, size, cost, tid, source)
         else:
             self.n["quote_fills"] += 1
-            self._book(info["basket_id"], info["ticker"], info["side"], size, cost, "quote", source=source,
-                       order_id=oid, trade_id=tid, late=True)
+            self._book(info["basket_id"], info["ticker"], info["side"], size, cost,
+                       "deep" if info.get("deep") else "quote", source=source, order_id=oid, trade_id=tid, late=True)
         return True
 
     def _on_fill(self, f: dict):
@@ -1089,9 +1091,12 @@ class ArbsRunner:
         quote_need = edge_dollars(b.payout, t.min_edge + t.quote_edge_add) + (t.live_edge_add if live else 0.0)
         reserve = self.cfg.runtime.write_reserve_tokens
         acts = []
+        mains: dict[int, pricing.QuotePlan] = {}
         for j, leg in enumerate(b.legs):
             q = self.quotes.get((b.basket_id, j))
             if q is not None and q.pending:
+                mains[j] = pricing.QuotePlan(leg=j, price=q.price, max_price=q.max_price, edge=q.edge,
+                                             others_cost=0.0)
                 continue
             plan, size = None, 0.0
             # As big as the other legs' books can complete at the edge needed,
@@ -1119,6 +1124,8 @@ class ArbsRunner:
                 if q is not None:
                     acts.append(self.cancel_quote(q, "duplicate"))
                 continue
+            if ex < 1:
+                mains[j] = plan
             if q is None:
                 if self.live and not self.gw.can_afford(leg.ticker, "order", reserve):
                     continue
@@ -1139,10 +1146,62 @@ class ArbsRunner:
                 acts.append(self.move_quote(q, plan, size if grow else None))
             else:
                 q.edge, q.max_price = plan.edge, plan.max_price
+        acts += self.manage_deep(b, vs, mains if live else {}, quote_need, now)
         if acts:
             async def run(acts=acts):
                 await asyncio.gather(*acts)
             self.spawn(run(), b.basket_id)
+
+    def deep_plan(self, b: Basket, vs, j: int, main: pricing.QuotePlan, need: float) -> tuple:
+        """(plan, size) for a second quote one tick over the next other bid
+        behind the arb quote on leg j, or (None, 0) when that gap is under
+        deep_min_gap_ticks or the price can't complete even 1 bundle at `need`."""
+        t, leg, lv = self.cfg.trading, b.legs[j], vs[j]
+        bk = self.feed.ladder(leg.ticker)
+        if bk is None:
+            return None, 0
+        bids = dict(bk.yes_bids if leg.side == "yes" else bk.no_bids)
+        for p, q in self._own(leg.ticker, leg.side).items():
+            bids[p] = bids.get(p, 0.0) - q
+        behind = [p for p, q in bids.items() if q > _EPS and p < main.price - _EPS]
+        price = lv.ticks.up(max(behind)) if behind else lv.ticks.lo
+        if lv.ticks.steps(price, main.price) < t.deep_min_gap_ticks:
+            return None, 0
+        for n in range(int(t.deep_quote_size), 0, -1):
+            p = pricing.quote_leg(vs, j, b.payout, need, float(n))
+            if p is not None and price <= p.max_price + _EPS:
+                edge = b.payout - p.others_cost - pricing.maker_cost(price, lv.maker_rate)
+                return pricing.QuotePlan(leg=j, price=price, max_price=p.max_price, edge=edge,
+                                         others_cost=p.others_cost), float(n)
+        return None, 0
+
+    def manage_deep(self, b: Basket, vs, mains: dict, need: float, now: float) -> list:
+        """Deep quotes behind the arb quotes in `mains` (a live basket's);
+        any other deep quote of the basket is cancelled. Live sweeps ran past
+        our arb quote 90% of the time and 37% by 30c+ (trades 10-28..30);
+        on slow markets 1% did, so there a fill that deep is mostly news."""
+        t, reserve, acts = self.cfg.trading, self.cfg.runtime.write_reserve_tokens, []
+        for j, leg in enumerate(b.legs):
+            dq = self.quotes.get((b.basket_id, j, "deep"))
+            if dq is not None and dq.pending:
+                continue
+            plan, size = (None, 0) if j not in mains or t.deep_quote_size < 1 else \
+                self.deep_plan(b, vs, j, mains[j], need)
+            if plan is None:
+                if dq is not None:
+                    acts.append(self.cancel_quote(dq, "deep_off"))
+            elif dq is None:
+                if not self.live or self.gw.can_afford(leg.ticker, "order", reserve):
+                    acts.append(self.place_quote(self.new_quote(b, plan, size, deep=True)))
+            elif (dq.price > plan.max_price + _EPS or abs(dq.remaining - size) > _EPS
+                  or (vs[j].ticks.steps(plan.price, dq.price) >= t.requote_min_ticks
+                      and now - max(dq.moved_at, dq.placed_at) >= t.requote_cooldown_s)):
+                if not self.live or dq.price > plan.max_price + _EPS or \
+                        self.gw.can_afford(leg.ticker, "amend", reserve):
+                    acts.append(self.move_quote(dq, plan, size))
+            else:
+                dq.edge, dq.max_price = plan.edge, plan.max_price
+        return acts
 
     def may_quote(self, b: Basket, now: pd.Timestamp) -> bool:
         return b.quoting_allowed(now) and (self.cfg.trading.quote_live_events or not self.live_now(b, now))
@@ -1150,7 +1209,7 @@ class ArbsRunner:
     def quoted_elsewhere(self, basket_id: str, ticker: str, side: str) -> Quote | None:
         """Another basket's arb quote resting on this market side, if any."""
         for q in self.quotes.on(ticker, side):
-            if q.basket_id != basket_id and q.kind == "arb":
+            if q.basket_id != basket_id and q.kind == "arb" and not q.deep:
                 return q
         return None
 
@@ -1266,6 +1325,11 @@ class ArbsRunner:
         if any(q.pending for q in qs):
             self.later(bid, 0.05)
             return
+        if any(q.deep for q in qs):
+            # Another fill there would add to what the exit has to cover. Not
+            # waited on: a live exit shouldn't sit behind a cancel.
+            self.spawn(self.cancel_quotes([q for q in qs if q.deep], "broken"), bid)
+            qs = [q for q in qs if not q.deep]
         legs = [self.leg_view(l.ticker, l.side) if self.is_open(l.ticker) else None for l in b.legs]
         others = [self.leg_view(l.ticker, OTHER[l.side]) if self.is_open(l.ticker) else None for l in b.legs]
         ex = pricing.exits(b.payout, pos.held(b.tickers), pos.broken_spent(b.tickers), legs, others)
@@ -1402,11 +1466,11 @@ class ArbsRunner:
                 await asyncio.gather(*acts)
             self.spawn(run(), b.basket_id)
 
-    def new_quote(self, b: Basket, plan: pricing.QuotePlan, size: float) -> Quote:
+    def new_quote(self, b: Basket, plan: pricing.QuotePlan, size: float, deep: bool = False) -> Quote:
         leg = b.legs[plan.leg]
         q = Quote(basket_id=b.basket_id, leg=plan.leg, ticker=leg.ticker, side=leg.side, price=plan.price,
                   size=size, cid=str(uuid.uuid4()), edge=plan.edge, max_price=plan.max_price,
-                  placed_at=time.time())
+                  placed_at=time.time(), deep=deep)
         self.quotes[q.key] = q
         self._commit_cache = None
         return q
@@ -1419,7 +1483,7 @@ class ArbsRunner:
             q.pending = False
             self.n["quotes_placed"] += 1
             self.journal({"kind": "quote", "basket_id": b.basket_id, "ticker": q.ticker, "side": q.side,
-                          "price": q.price, "size": size, "edge": round(q.edge, 4)})
+                          "price": q.price, "size": size, "edge": round(q.edge, 4), **_deep(q)})
             return
         t0 = time.time()
         ack, exc, sent = await self.gw.rest(q.ticker, q.side, q.price, size, q.cid)
@@ -1448,13 +1512,14 @@ class ArbsRunner:
         elif ack.fill is not None and ack.fill.size > 0:
             self._quote_fill(q, ack.fill.size, ack.fill.price * ack.fill.size + ack.fill.fee, None, "create")
         self.journal({"kind": "quote", "basket_id": b.basket_id, "ticker": q.ticker, "side": q.side,
-                          "price": q.price, "size": size, "edge": round(q.edge, 4), "order_id": q.exchange_id})
+                          "price": q.price, "size": size, "edge": round(q.edge, 4), "order_id": q.exchange_id,
+                      **_deep(q)})
 
     def _register(self, q: Quote, oid: str | None):
         q.exchange_id, q.pending = oid, False
         if oid:
             self.real_ledger.quote_ids[oid] = {"basket_id": q.basket_id, "ticker": q.ticker, "side": q.side,
-                                               "retired_at": None}
+                                               "retired_at": None, **_deep(q)}
             self.ids_dirty = True
         self._replay_orphans()
 
@@ -1511,7 +1576,7 @@ class ArbsRunner:
         self.n["quote_moves"] += 1
         self.charge(q.basket_id, ORDER_TOKENS)
         self.journal({"kind": "move", "basket_id": q.basket_id, "ticker": q.ticker, "from": old, "to": plan.price,
-                      "size": q.size})
+                      "size": q.size, **_deep(q)})
 
     async def cancel_quote(self, q: Quote, reason: str):
         self.n["quote_cancels"] += 1
@@ -1522,7 +1587,7 @@ class ArbsRunner:
                 self._order_err(q.basket_id, f"cancel {q.ticker}", exc, q.ticker)
                 return            # stays tracked; the next pass retries
         self._retire(q)
-        self.journal({"kind": "cancel", "basket_id": q.basket_id, "ticker": q.ticker, "reason": reason})
+        self.journal({"kind": "cancel", "basket_id": q.basket_id, "ticker": q.ticker, "reason": reason, **_deep(q)})
 
     async def pull_all(self, reason: str):
         qs = [q for q in self.quotes.values() if not q.pending]
@@ -1887,7 +1952,7 @@ class ArbsRunner:
                    "size": q.size, "filled": q.filled, "edge": round(q.edge, 4),
                    "ret": round(edge_return(self.baskets[q.basket_id].payout, q.edge), 4), "max_price": q.max_price,
                    "age_s": round(time.time() - q.placed_at), "pending": q.pending, "order_id": q.exchange_id,
-                   "kind": q.kind}
+                   "kind": "deep" if q.deep else q.kind}
                   for q in self.quotes.values()]
         return {
             "series": self.S, "event_ticker": "ARBS", "last_update": _utc().isoformat(),
@@ -1989,6 +2054,10 @@ def flips(baskets: list[Basket]) -> dict[str, str]:
         if f is not None and abs(b.payout + f.payout - len(b.legs)) < _EPS:
             out[b.basket_id] = f.basket_id
     return out
+
+
+def _deep(q: Quote) -> dict:
+    return {"deep": True} if q.deep else {}
 
 
 def datetime_iso(ts: float) -> str:

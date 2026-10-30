@@ -12,6 +12,8 @@
     "take_live_events": false,
     "live_edge_add": 0.01,
     "live_quote_size": 5,
+    "deep_quote_size": 5,
+    "deep_min_gap_ticks": 5,
     "max_bundles_per_basket": 50,
     "max_dollars": 500.0,
     "requote_min_ticks": 1,

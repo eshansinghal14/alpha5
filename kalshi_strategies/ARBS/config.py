@@ -51,6 +51,12 @@ class TradingParams:
                                    "baskets are taken regardless.")
     live_quote_size: int = param("Bundles per resting quote, and most bundles per take, on a live event.",
                                  min=1, max=10000, step=1)
+    deep_quote_size: int = param("Bundles in the second quote a live (or same-day) basket rests one tick over "
+                                 "the next bid behind each arb quote, where a sweep through the arb quote "
+                                 "lands. 0 = off.", min=0, max=1000, step=1)
+    deep_min_gap_ticks: int = param("Least ticks between the arb quote and the deep quote's price; a smaller "
+                                    "gap gains too little over the arb quote to be worth the order.",
+                                    min=1, max=99, step=1)
     max_bundles_per_basket: int = param("Most bundles held in one basket (complete or not).", min=0, max=100000,
                                         step=1)
     max_dollars: float = param("Most dollars in the strategy: cost paid on held baskets, plus per quoted "

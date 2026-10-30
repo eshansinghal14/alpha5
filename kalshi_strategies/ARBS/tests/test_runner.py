@@ -455,7 +455,7 @@ def test_live_events_quoted_only_when_enabled_and_smaller(arbs):
     assert not r.quotes
     r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_live_events=True, live_quote_size=2)
     _eval(r, live)
-    assert {q.size for q in r.quotes.values()} == {2}
+    assert {q.size for q in r.quotes.values() if not q.deep} == {2}
 
 
 def test_held_basket_survives_dropping_out_of_the_spec(arbs, tmp_path):
@@ -862,3 +862,54 @@ def test_bad_fill_pauses_quoting_on_the_event(arbs):
     r.cooling.clear()
     _eval(r, b)
     assert r.basket_quotes(b.basket_id)
+
+
+def _live_gap(r, b, a_yes_bids):
+    """b as a live basket; A's arb quote sits at its 0.40 limit under bids at 0.45."""
+    live = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
+    r.set_baskets([live])
+    r.hot = [live.basket_id]
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_live_events=True, live_quote_size=2, live_edge_add=0.0,
+                                        deep_quote_size=5, deep_min_gap_ticks=5, requote_cooldown_s=0.0)
+    book(r, "X-A", a_yes_bids, [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])      # B's YES ask 0.55
+    _eval(r, live)
+    return live
+
+
+def test_deep_quote_rests_one_tick_over_the_next_bid_behind(arbs):
+    r, b = arbs
+    live = _live_gap(r, b, [(0.45, 10), (0.20, 5)])
+    main, deep = r.quotes[(live.basket_id, 0)], r.quotes[(live.basket_id, 0, "deep")]
+    assert main.price == pytest.approx(0.40) and not main.deep
+    assert deep.price == pytest.approx(0.21) and deep.size == 5 and deep.edge > main.edge
+    # Someone joins the gap: the deep quote moves up to stay first behind the arb quote.
+    book(r, "X-A", [(0.45, 10), (0.30, 5), (0.20, 5)], [(0.35, 10)])
+    _eval(r, live)
+    assert r.quotes[(live.basket_id, 0, "deep")].price == pytest.approx(0.31)
+
+
+def test_no_deep_quote_on_a_small_gap_or_a_slow_market(arbs):
+    r, b = arbs
+    live = _live_gap(r, b, [(0.45, 10), (0.37, 5)])        # 0.38 is 2 ticks behind 0.40
+    assert (live.basket_id, 0) in r.quotes and (live.basket_id, 0, "deep") not in r.quotes
+    r.set_baskets([b])
+    r.hot = [b.basket_id]
+    book(r, "X-A", [(0.45, 10), (0.20, 5)], [(0.35, 10)])
+    _eval(r, b)
+    assert (b.basket_id, 0) in r.quotes and not any(q.deep for q in r.quotes.values())
+
+
+def test_deep_fill_is_journaled_as_deep_and_completed(arbs, tmp_path):
+    r, b = arbs
+    live = _live_gap(r, b, [(0.45, 10), (0.20, 5)])
+    deep = r.quotes[(live.basket_id, 0, "deep")]
+    r.quotes.pop((live.basket_id, 0))                      # only the deep quote is hit
+    r._quote_fill(deep, 5, 5 * deep.price, None, "shadow")
+    _eval(r, live)
+    # Closed by the cheaper exit (here netting out into A's 0.45 bid), at a profit.
+    pos = r.shadow_ledger.baskets.get(live.basket_id)
+    assert pos is None or not pos.unhedged(live.tickers)
+    assert sum(x["pnl"] for x in r.shadow_ledger.settled if x["basket_id"] == live.basket_id) > 0
+    rows = [json.loads(l) for f in (tmp_path / "ARBS" / "journal").glob("*.jsonl") for l in open(f)]
+    assert any(x["kind"] == "fill" and x.get("fill_kind") == "deep" for x in rows)
