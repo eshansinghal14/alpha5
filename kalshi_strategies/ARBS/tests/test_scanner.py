@@ -175,3 +175,13 @@ def test_daily_series_live_from_the_start_of_its_day():
     assert b.is_live(pd.Timestamp("2026-10-30T05:00:00Z"))          # its measurement day began
     b = next(iter(baskets(run([e], freqs={"KXHIGHNY": "one_off"})).values()))
     assert not b.is_live(pd.Timestamp("2026-10-30T20:00:00Z"))      # not a daily series: occurrence only
+
+
+def test_daily_rule_skips_events_with_a_kickoff():
+    e = event("KXCS2MAP-26OCT31X-1", "MECNET", [mkt("KXCS2MAP-26OCT31X-1-A", occurrence_datetime="2026-10-31T22:00:00Z"),
+                                                mkt("KXCS2MAP-26OCT31X-1-B", occurrence_datetime="2026-10-31T22:00:00Z")],
+              series="KXCS2MAP") | {"strike_date": "2026-11-01T04:00:00Z"}
+    b = next(iter(baskets(run([e], freqs={"KXCS2MAP": "daily"},
+                              starts={"KXCS2MAP-26OCT31X-1": "2026-10-31T20:00:00Z"})).values()))
+    assert not b.is_live(pd.Timestamp("2026-10-31T12:00:00Z"))       # not from the day's start
+    assert b.is_live(pd.Timestamp("2026-10-31T20:00:00Z"))           # from kickoff

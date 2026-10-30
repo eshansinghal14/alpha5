@@ -236,8 +236,10 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
         # expected END, not its kickoff, hence the milestone start.
         live = [pd.Timestamp(t) for t in [m.get("occurrence_datetime") for m in ms]
                 + [(starts or {}).get(e["event_ticker"])] if t]
+        # Not for an event with a kickoff: Kalshi files CS2 maps as daily, which
+        # made 61 matches live up to a day before they started (10-30).
         period = PERIODS.get((freqs or {}).get(e.get("series_ticker")))
-        if period is not None and e.get("strike_date"):
+        if period is not None and e.get("strike_date") and not (starts or {}).get(e["event_ticker"]):
             live.append(pd.Timestamp(e["strike_date"]) - period)
         for r in got:
             r.update(expected_settlement_utc=s.isoformat(), quote_until_utc=None, resume_quoting_utc=None,
