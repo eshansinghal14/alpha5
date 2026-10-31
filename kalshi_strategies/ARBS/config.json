@@ -12,6 +12,7 @@
     "take_live_events": false,
     "live_edge_add": 0.01,
     "live_quote_size": 5,
+    "live_order_groups": false,
     "deep_quote_size": 5,
     "deep_min_gap_ticks": 5,
     "max_bundles_per_basket": 50,

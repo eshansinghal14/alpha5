@@ -677,7 +677,7 @@ class KalshiOrderClient:
         """
         return self._parse_fill(order, self._create(order, time_in_force="immediate_or_cancel"))
 
-    def place_resting(self, order: Order) -> RestingAck:
+    def place_resting(self, order: Order, order_group_id: str | None = None) -> RestingAck:
         """Send `order` as a RESTING limit order: it joins the book and stays
         there until it fills or `cancel` pulls it.
 
@@ -695,7 +695,8 @@ class KalshiOrderClient:
         after fees. The next decision re-quotes against the new book. `fill`
         on the ack stays for safety but should never be set.
         """
-        payload = self._create(order, time_in_force="good_till_canceled", post_only=True)
+        payload = self._create(order, time_in_force="good_till_canceled", post_only=True,
+                               order_group_id=order_group_id)
         o = payload.get("order") if isinstance(payload.get("order"), dict) else payload
         # Read BEFORE parsing the fill: an unparseable fill must not also cost
         # us the id that pulls the order back off the book.
@@ -706,7 +707,8 @@ class KalshiOrderClient:
             return RestingAck(exchange_order_id=exchange_order_id, fill=None, parse_error=exc)
         return RestingAck(exchange_order_id=exchange_order_id, fill=fill)
 
-    def _create(self, order: Order, time_in_force: str, post_only: bool = False) -> dict:
+    def _create(self, order: Order, time_in_force: str, post_only: bool = False,
+                order_group_id: str | None = None) -> dict:
         """POST one create-order and return its JSON. `time_in_force` is
         required by the API: "immediate_or_cancel" for takes,
         "good_till_canceled" for resting quotes."""
@@ -725,8 +727,9 @@ class KalshiOrderClient:
         }
         if post_only:
             body["post_only"] = True
-        if self.order_group_id is not None:
-            body["order_group_id"] = self.order_group_id
+        group = order_group_id if order_group_id is not None else self.order_group_id
+        if group is not None:
+            body["order_group_id"] = group
         path = ORDERS_PATH
         resp = self._session.post(BASE_URL + path, headers=self._headers("POST", path),
                                   json=body, timeout=self.timeout_s)

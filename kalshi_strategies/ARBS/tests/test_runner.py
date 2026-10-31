@@ -1071,3 +1071,124 @@ def test_leg_view_cache_follows_book_updates_across_passes(arbs):
     v2 = r.leg_view("X-A", "yes")
     assert v2 is not v1 and v2.asks[0][0] == pytest.approx(0.60)
     r._in_pass = False
+
+
+def _live_groups(r, b, log):
+    """b as a live basket, real trading, order groups on; a gateway that logs calls."""
+    live = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
+    r.set_baskets([live])
+    r.hot = [live.basket_id]
+    r.live = True
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_live_events=True, live_quote_size=2,
+                                        live_edge_add=0.0, live_order_groups=True, deep_quote_size=0)
+    ids = iter(range(1000))
+
+    async def rest(ticker, side, price, size, cid, group=None):
+        log.append(("rest", ticker, group))
+        from kalshi_infra.kalshi.orders import RestingAck
+        return RestingAck(exchange_order_id=f"o{next(ids)}", fill=None), None, True
+
+    async def group_call(ticker, method, *args):
+        log.append((method,) + args)
+        return ("g1" if method == "create_order_group" else None), None
+
+    async def cancel(ticker, oid, reason):
+        log.append(("cancel_start", oid))
+        await asyncio.sleep(0.02)
+        log.append(("cancel_end", oid))
+        return True, None, True
+
+    async def ioc(ticker, side, limit, size, *, force, reason):
+        log.append(("ioc", ticker))
+        return None, None, True
+    r.gw.rest, r.gw.group_call, r.gw.cancel, r.gw.ioc = rest, group_call, cancel, ioc
+    r.gw.can_afford = lambda *a, **k: True
+    return live
+
+
+def test_live_quotes_join_their_events_order_group(arbs):
+    r, b = arbs
+    log = []
+    live = _live_groups(r, b, log)
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    _eval(r, live)                                           # first quotes open the group, go ungrouped
+    assert ("create_order_group", R.ORDER_GROUP_LIMIT) in log and r.groups["X"]["id"] == "g1"
+    r.quotes.clear()
+    _eval(r, live)
+    assert "g1" in {e[2] for e in log if e[0] == "rest"}
+    assert all(q.group == "g1" for q in r.quotes.values())
+    r.live = False
+
+
+def test_two_grouped_contracts_trip_the_group_which_is_pulled_and_reset(arbs):
+    r, b = arbs
+    log = []
+    live = _live_groups(r, b, log)
+    r.groups["X"] = {"id": "g1", "ticker": "X-A", "tripped_at": None, "resetting": False,
+                     "fills": collections.deque(), "used": time.time()}
+    r._group_ev["g1"] = "X"
+    qa = R.Quote(basket_id=live.basket_id, leg=0, ticker="X-A", side="yes", price=0.3, size=5, cid="a",
+                 edge=0.05, max_price=0.3, pending=False, exchange_id="oa", group="g1")
+    qb = R.Quote(basket_id=live.basket_id, leg=1, ticker="X-B", side="yes", price=0.4, size=5, cid="b",
+                 edge=0.05, max_price=0.4, pending=False, exchange_id="ob", group="g1")
+    r.quotes[qa.key], r.quotes[qb.key] = qa, qb
+
+    async def go():
+        r._quote_fill(qa, 1, 0.3, None, "ws")
+        assert r.groups["X"]["tripped_at"] is None          # 1 contract: not past the limit
+        r._quote_fill(qa, 1, 0.3, None, "ws")
+        assert r.groups["X"]["tripped_at"] is not None
+        await drain(r)
+    asyncio.run(go())
+    assert ("reset_order_group", "g1") in log and r.groups["X"]["tripped_at"] is None
+    assert ("cancel_start", "ob") in log and qb.key not in r.quotes
+    r.live = False
+
+
+def test_live_exit_does_not_wait_for_grouped_quotes_cancels(arbs):
+    r, b = arbs
+    log = []
+    live = _live_groups(r, b, log)
+    _broken(r, live)
+    r.real_ledger.record(live.basket_id, live.tickers, "X-A", "yes", 5, 2.0, time.time())
+    q = R.Quote(basket_id=live.basket_id, leg=1, ticker="X-B", side="yes", price=0.1, size=5, cid="b",
+                edge=0.05, max_price=0.1, pending=False, exchange_id="ob", group="g1")
+    r.quotes[q.key] = q
+    _eval(r, live)
+    kinds = [e[0] for e in log]
+    assert "ioc" in kinds and kinds.index("ioc") < kinds.index("cancel_end")
+    r.live = False
+
+
+def test_live_exit_waits_for_an_ungrouped_quotes_cancel(arbs):
+    r, b = arbs
+    log = []
+    live = _live_groups(r, b, log)
+    _broken(r, live)
+    r.real_ledger.record(live.basket_id, live.tickers, "X-A", "yes", 5, 2.0, time.time())
+    q = R.Quote(basket_id=live.basket_id, leg=1, ticker="X-B", side="yes", price=0.1, size=5, cid="b",
+                edge=0.05, max_price=0.1, pending=False, exchange_id="ob")
+    r.quotes[q.key] = q
+    _eval(r, live)
+    kinds = [e[0] for e in log]
+    assert kinds.index("cancel_end") < kinds.index("ioc")
+    r.live = False
+
+
+def test_live_exit_does_not_wait_out_a_grouped_create_in_flight(arbs):
+    r, b = arbs
+    log = []
+    live = _live_groups(r, b, log)
+    _broken(r, live)
+    r.real_ledger.record(live.basket_id, live.tickers, "X-A", "yes", 5, 2.0, time.time())
+    q = R.Quote(basket_id=live.basket_id, leg=1, ticker="X-B", side="yes", price=0.1, size=5, cid="b",
+                edge=0.05, max_price=0.1, pending=True, group="g1")
+    r.quotes[q.key] = q
+    _eval(r, live)
+    assert any(e[0] == "ioc" for e in log)
+    q.group = None                                           # ungrouped: waits as before
+    log.clear()
+    _eval(r, live)
+    assert not any(e[0] == "ioc" for e in log)
+    r.live = False

@@ -36,7 +36,8 @@ import pandas as pd
 from kalshi_infra.api_functions import kalshi_get
 from kalshi_infra.config import ConfigStore, atomic_write_json
 from kalshi_infra.kalshi import fees as kfees
-from kalshi_infra.kalshi.orders import RealFill, error_code, http_status, is_market_paused, is_post_only_reject
+from kalshi_infra.kalshi.orders import (RealFill, error_code, http_status, is_market_paused, is_order_group_reject,
+                                        is_post_only_reject)
 from kalshi_infra.kalshi.orders import KEEPALIVE_S, write_budget_tokens_per_s
 from kalshi_infra.trading.engine import MARKET_PAUSE_RETRY_S
 from kalshi_infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
@@ -87,6 +88,7 @@ class Quote:
     pending: bool = True        # create in flight
     kind: str = "arb"           # or "complete" / "unwind": resting on a broken basket's exit
     deep: bool = False          # the small second quote in the gap behind a live leg's arb quote
+    group: str | None = None    # Kalshi order group it rests in (live events, live_order_groups)
 
     @property
     def remaining(self) -> float:
@@ -131,6 +133,12 @@ DEEP_REQUOTE_S = 10.0
 # p99 was 176 ms with whole passes, 10-30/31).
 EVAL_SLICE_S = 0.005
 IDS_COMPACT_S = 3600.0
+# Kalshi trips a group once MORE than this many contracts match in 15 s; 0 is
+# refused (invalid_parameters, 10-31), so a 1-lot fill doesn't trip it.
+ORDER_GROUP_LIMIT = 1
+ORDER_GROUP_WINDOW_S = 15.0
+# A group with nothing resting in it this long is deleted.
+ORDER_GROUP_IDLE_S = 600.0
 PULL_BATCH = 20
 
 
@@ -280,6 +288,11 @@ class ArbsRunner:
         # delta goes through _on_quote), our own quotes and in-flight IOCs on
         # the market are unchanged.
         self._lv_cache: dict[tuple[str, str], tuple] = {}
+        # event -> {id, ticker, tripped_at, resetting, fills, used}: one order
+        # group per live event its quotes share; group id -> event.
+        self.groups: dict[str, dict] = {}
+        self._group_ev: dict[str, str] = {}
+        self._group_retry: dict[str, float] = {}
         self.book_time: dict[str, float] = {}     # ticker -> monotonic time of its last book update
         self.paused_until: dict[str, float] = {}  # ticker -> monotonic time Kalshi's pause is next retried
         self.exchange_paused = False              # Kalshi's exchange-wide trading_active is off
@@ -840,6 +853,8 @@ class ArbsRunner:
 
     def _quote_fill(self, q: Quote, size: float, cost: float, trade_id, source: str):
         q.filled += size
+        if q.group:
+            self._group_fill(q.group, size)
         if q.kind == "arb":
             # Priced so the other legs cost payout - edge - this leg's cost a bundle.
             m = self.meta.get(q.ticker)
@@ -1398,7 +1413,12 @@ class ArbsRunner:
         Otherwise post-only bids rest on that exit's legs, re-pegged each pass:
         a fill completes or nets out below today's asks."""
         c, bid = self.cfg.completion, b.basket_id
-        if any(q.pending for q in qs):
+        # An in-flight create could land and fill alongside the exit. A grouped
+        # one on a live basket can't add much: the fill that would overshoot
+        # trips the group, which cancels it (and a create into a tripped group
+        # is refused), so the exit goes now rather than 50 ms on.
+        grouped_ok = self.live_now(b, _utc())
+        if any(q.pending and not (grouped_ok and q.group) for q in qs):
             self.later(bid, 0.05)
             return
         legs = [self.leg_view(l.ticker, l.side) if self.is_open(l.ticker) else None for l in b.legs]
@@ -1466,9 +1486,10 @@ class ArbsRunner:
     async def exit_now(self, b: Basket, path: str, ex: pricing.Exits, legs, others, qs, cost: float, why: str):
         bid = b.basket_id
         live_qs = [q for q in qs if not q.pending]
-        if live_qs:
+        grouped = [q for q in live_qs if q.group]
+        if len(grouped) < len(live_qs):
             # A resting exit bid filling alongside these IOCs would overshoot.
-            await self.cancel_quotes(live_qs, "exit")
+            await self.cancel_quotes([q for q in live_qs if not q.group], "exit")
         lim = ex.complete_limits if path == "complete" else ex.unwind_limits
         orders = [(j, t, sd, n, v, lim[j]) for j, t, sd, n, v in self._exit_orders(b, path, ex, legs, others)]
         self.n["completions" if path == "complete" else "unwinds"] += 1
@@ -1487,7 +1508,11 @@ class ArbsRunner:
             self.unflag_live(b)
         held = self.hold([(t, sd, n) for _, t, sd, n, _, _ in orders])
         try:
-            res = await asyncio.gather(*(self._ioc(t, sd, p, n, path, v) for _, t, sd, n, v, p in orders))
+            # Grouped quotes are pulled alongside: the fills that would overshoot
+            # trip the group, which Kalshi cancels before we could.
+            res = await asyncio.gather(*(self._ioc(t, sd, p, n, path, v) for _, t, sd, n, v, p in orders),
+                                       *(self.cancel_quote(q, "exit") for q in grouped))
+            res = res[:len(orders)]
         finally:
             self.release(held)
         for (_, t, sd, _, _, _), (fill, exc) in zip(orders, res):
@@ -1557,8 +1582,13 @@ class ArbsRunner:
             self.journal({"kind": "quote", "basket_id": b.basket_id, "ticker": q.ticker, "side": q.side,
                           "price": q.price, "size": size, "edge": round(q.edge, 4), **_deep(q)})
             return
+        group = self.quote_group(b, q)
+        if group is False:
+            self.quotes.pop(q.key, None)      # its group is tripped until reset
+            return
+        q.group = group
         t0 = time.time()
-        ack, exc, sent = await self.gw.rest(q.ticker, q.side, q.price, size, q.cid)
+        ack, exc, sent = await self.gw.rest(q.ticker, q.side, q.price, size, q.cid, group=group)
         self.order_times.append({"kind": "rest", "reason": q.kind, "ticker": q.ticker, "sent": t0,
                                  "answered": time.time(), "order_id": None if ack is None else ack.exchange_order_id})
         if not sent:
@@ -1569,6 +1599,12 @@ class ArbsRunner:
             if is_post_only_reject(exc):
                 self.n["post_only_rejects"] += 1
                 self.quotes.pop(q.key, None)
+                return
+            if group and is_order_group_reject(exc):
+                self.quotes.pop(q.key, None)
+                ev = self._group_ev.get(group)
+                if ev is not None:
+                    self._group_trip(ev, "create refused")
                 return
             if http_status(exc) is None:
                 await self._find_lost(q)
@@ -1586,6 +1622,114 @@ class ArbsRunner:
         self.journal({"kind": "quote", "basket_id": b.basket_id, "ticker": q.ticker, "side": q.side,
                           "price": q.price, "size": size, "edge": round(q.edge, 4), "order_id": q.exchange_id,
                       **_deep(q)})
+
+    # ------------------------------------------------------------------ order groups
+
+    def quote_group(self, b: Basket, q: Quote):
+        """Group id for a new quote, None for none, False to hold it (its
+        group is tripped and resetting). Live arb/deep quotes of a single-event
+        basket only."""
+        if not (self.live and self.cfg.trading.live_order_groups and q.kind == "arb"
+                and self.live_now(b, _utc())):
+            return None
+        evs = self.events_of(b)
+        if len(evs) != 1:
+            return None
+        ev = next(iter(evs))
+        g = self.groups.get(ev)
+        if g is None:
+            self._open_group(ev, q.ticker)
+            return None                   # this one goes ungrouped; the next joins
+        if g["id"] is None:
+            return None
+        if g["tripped_at"] is not None:
+            return False
+        g["used"] = time.time()
+        return g["id"]
+
+    def _open_group(self, ev: str, ticker: str):
+        if time.time() < self._group_retry.get(ev, 0.0):
+            return
+        self.groups[ev] = {"id": None, "ticker": ticker, "tripped_at": None, "resetting": False,
+                           "fills": collections.deque(), "used": time.time()}
+
+        async def create():
+            gid, exc = await self.gw.group_call(ticker, "create_order_group", ORDER_GROUP_LIMIT)
+            if exc is not None:
+                self.groups.pop(ev, None)
+                self._group_retry[ev] = time.time() + 60.0
+                self.alert("warn", None, f"order group for {ev} not created ({exc!r}); quoting without one")
+                return
+            self.groups[ev]["id"] = gid
+            self._group_ev[gid] = ev
+            self.journal({"kind": "order_group", "action": "create", "event": ev, "group": gid})
+        self.spawn(create())
+
+    def _group_fill(self, gid: str, size: float):
+        """Count a grouped fill as Kalshi does; past the limit the group has tripped."""
+        ev = self._group_ev.get(gid)
+        g = self.groups.get(ev) if ev is not None else None
+        if g is None or g["id"] != gid or g["tripped_at"] is not None:
+            return
+        now = time.time()
+        f = g["fills"]
+        f.append((now, size))
+        while f and f[0][0] < now - ORDER_GROUP_WINDOW_S:
+            f.popleft()
+        total = sum(s for _, s in f)
+        if total > ORDER_GROUP_LIMIT + _EPS:
+            self._group_trip(ev, f"{total:g} contracts matched in {ORDER_GROUP_WINDOW_S:g} s")
+
+    def _group_trip(self, ev: str, why: str):
+        g = self.groups[ev]
+        if g["tripped_at"] is not None:
+            return
+        g["tripped_at"] = time.time()
+        gone = [q for q in self.quotes.values() if q.group == g["id"] and not q.pending]
+        self.n["order_group_trips"] = self.n.get("order_group_trips", 0) + 1
+        self.journal({"kind": "order_group", "action": "trip", "event": ev, "group": g["id"], "why": why,
+                      "quotes": len(gone)})
+        # Kalshi has cancelled these; our cancels confirm (404) and drop them
+        # here. No basket id: an exit must not wait behind them.
+        if gone:
+            self.spawn(self.cancel_quotes(gone, "order_group"))
+        self.spawn(self._group_reset(ev))
+
+    async def _group_reset(self, ev: str):
+        g = self.groups.get(ev)
+        if g is None or g["resetting"] or g["id"] is None:
+            return
+        g["resetting"] = True
+        try:
+            _, exc = await self.gw.group_call(g["ticker"], "reset_order_group", g["id"])
+        finally:
+            g["resetting"] = False
+        if exc is not None:
+            self.alert("warn", None, f"order group for {ev} not reset ({exc!r}); retrying")
+            asyncio.get_running_loop().call_later(1.0, lambda: self.spawn(self._group_reset(ev)))
+            return
+        g["tripped_at"] = None
+        g["fills"].clear()
+        self.journal({"kind": "order_group", "action": "reset", "event": ev, "group": g["id"]})
+        self.dirty |= {bid for t, m in self.meta.items() if m.event == ev for bid in self.by_ticker.get(t, ())}
+
+    def tidy_groups(self):
+        """Delete groups with nothing resting for ORDER_GROUP_IDLE_S (or all, once off)."""
+        on = self.cfg.trading.live_order_groups
+        resting = {q.group for q in self.quotes.values() if q.group}
+        for ev, g in list(self.groups.items()):
+            if g["id"] is None or g["id"] in resting or g["resetting"]:
+                continue
+            if on and time.time() - g["used"] < ORDER_GROUP_IDLE_S:
+                continue
+            del self.groups[ev]
+            self._group_ev.pop(g["id"], None)
+
+            async def delete(g=g, ev=ev):
+                _, exc = await self.gw.group_call(g["ticker"], "delete_order_group", g["id"])
+                self.journal({"kind": "order_group", "action": "delete", "event": ev, "group": g["id"],
+                              "error": None if exc is None else repr(exc)})
+            self.spawn(delete())
 
     def _register(self, q: Quote, oid: str | None):
         q.exchange_id, q.pending = oid, False
@@ -1783,6 +1927,7 @@ class ArbsRunner:
                     self.hot = hot
                 while self.hot_churn and self.hot_churn[0][0] < time.time() - 3600:
                     self.hot_churn.popleft()
+                self.tidy_groups()
             except Exception:
                 traceback.print_exc()
             await asyncio.sleep(self.cfg.watch.rank_interval_s)
@@ -2056,6 +2201,8 @@ class ArbsRunner:
                           for m in (1, 10, 60)},
             "hot_cost_tps": self.hot_cost, "write_budget_tps": self.write_budget(),
             "cooldowns": {e: round(u - time.time()) for e, u in self.cooling.items() if u > time.time()},
+            "order_groups": {e: {"id": g["id"], "tripped": g["tripped_at"] is not None}
+                             for e, g in self.groups.items()},
             "flagged_live": {t: datetime_iso(ts) for t, ts in self.flagged.items()},
             "missed": sorted(({**m, "usd": round(m["usd"], 2)} for m in self.missed.values()),
                              key=lambda m: -m["usd"])[:50],

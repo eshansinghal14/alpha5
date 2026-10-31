@@ -89,13 +89,13 @@ class Gateway:
             self._note_ioc(fill.exchange_order_id)
         return fill, None, True
 
-    async def rest(self, ticker, side, price, size, cid: str):
+    async def rest(self, ticker, side, price, size, cid: str, group: str | None = None):
         c = self.client(ticker)
         if c is None or not c.allow_now("order", reason="quote"):
             return None, None, False
         o = self._order(ticker, side, price, size, "quote", cid=cid)
         try:
-            return await self.write(c.place_resting, o), None, True
+            return await self.write(c.place_resting, o, order_group_id=group), None, True
         except Exception as e:
             if http_status(e) == 429:
                 c.note_rate_limited("quote")
@@ -112,6 +112,17 @@ class Gateway:
             if http_status(e) == 429:
                 c.note_rate_limited("move")
             return None, e, True
+
+    async def group_call(self, ticker, method: str, *args):
+        """(result, exc) of an order-group create/reset/delete on ticker's shard."""
+        c = self.client(ticker)
+        if c is None:
+            return None, RuntimeError(f"no order client for {ticker}")
+        c.allow_now("order", force=True, reason="order_group")
+        try:
+            return await self.write(getattr(c, method), *args), None
+        except Exception as e:
+            return None, e
 
     async def cancel(self, ticker, exchange_id, reason: str):
         """Always sent (force): a refused cancel leaves risk on the book."""

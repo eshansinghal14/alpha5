@@ -51,6 +51,10 @@ class TradingParams:
                                    "baskets are taken regardless.")
     live_quote_size: int = param("Bundles per resting quote, and most bundles per take, on a live event.",
                                  min=1, max=10000, step=1)
+    live_order_groups: bool = param("Put a live event's quotes in one Kalshi order group (limit 1): once 2 "
+                                    "contracts match in 15 s, Kalshi cancels the rest inside the matching "
+                                    "engine, before the rest of a sweep lands, and exits go out without "
+                                    "waiting on our own cancels.")
     deep_quote_size: int = param("Bundles in the second quote a live (or same-day) basket rests one tick over "
                                  "the next bid behind each arb quote, where a sweep through the arb quote "
                                  "lands. 0 = off.", min=0, max=1000, step=1)
