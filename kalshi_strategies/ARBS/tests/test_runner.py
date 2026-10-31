@@ -1205,3 +1205,16 @@ def test_book_update_on_a_broken_basket_marks_it_urgent(arbs):
     r.dirty.discard(b.basket_id)
     r._on_quote(bk)
     assert b.basket_id in r.urgent
+
+
+def test_upside_only_where_an_outcome_pays_more(arbs):
+    r, b = arbs
+    import dataclasses
+    book(r, "X-A", [(0.40, 10)], [(0.56, 10)])        # A mid 0.42
+    book(r, "X-B", [(0.50, 10)], [(0.46, 10)])        # B mid 0.52
+    no = dataclasses.replace(b, type="mutually_exclusive_no", legs=(Leg("X-A", "no"), Leg("X-B", "no")))
+    assert r.upside(no, 10) == pytest.approx(10 * (0.58 + 0.48 - 1.0))   # both NO pay when neither wins
+    assert r.upside(b, 10) == 0.0                                        # a complete set pays 1 every time
+    tie = dataclasses.replace(b, payout=0.5, exact=False)                # payout lowered for a tie
+    assert r.upside(tie, 10) == pytest.approx(10 * (0.94 - 0.5))
+    assert r.upside(no, 0) == 0.0

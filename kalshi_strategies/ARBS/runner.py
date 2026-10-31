@@ -132,6 +132,9 @@ DEEP_REQUOTE_S = 10.0
 # lands mid-pass isn't even read until the pass yields (fill -> exit decision
 # p99 was 176 ms with whole passes, 10-30/31). A yield costs microseconds.
 EVAL_SLICE_S = 0.001
+# Relationship types whose bundles can pay more than their worst case:
+# complete sets and exact identities pay the same in every outcome.
+UPSIDE_TYPES = ("mutually_exclusive_no", "implication", "mutual_exclusion")
 IDS_COMPACT_S = 3600.0
 # Kalshi trips a group once MORE than this many contracts match in 15 s; 0 is
 # refused (invalid_parameters, 10-31), so a 1-lot fill doesn't trip it.
@@ -2166,6 +2169,21 @@ class ArbsRunner:
                 out += q * bid - kfees.fee(bid, q, (m.taker_rate if m else None) or 0.0)
         return out
 
+    def upside(self, b: Basket, bundles: float) -> float:
+        """Expected payout above the locked worst case, at mid prices: only
+        for baskets where some outcome pays more (a draw, an unlisted winner,
+        a ladder landing between its rungs). 0 without a two-sided book."""
+        if bundles <= 0 or (b.exact and b.type not in UPSIDE_TYPES):
+            return 0.0
+        total = 0.0
+        for leg in b.legs:
+            v = self.feed.book(leg.ticker)
+            if v is None or v.bid is None or v.ask is None:
+                return 0.0
+            mid = (v.bid + v.ask) / 2.0
+            total += mid if leg.side == "yes" else 1.0 - mid
+        return bundles * max(0.0, total - b.payout)
+
     def summary(self) -> dict:
         # Real positions stay on screen after a disarm; shadow ones only show
         # when there is no real money held.
@@ -2180,10 +2198,11 @@ class ArbsRunner:
             broken = self.sale_value(pos, un) - pos.broken_spent(tickers) if un else 0.0
             # Every contract held, sold at its bid now.
             curr = self.sale_value(pos, {t: q for t, q in zip(tickers, pos.held(tickers)) if q > 0}) - pos.cost()
+            upside = self.upside(b, n) if b else 0.0
             holdings.append({"basket_id": bid, "type": b.type if b else "", "payout": b.payout if b else None,
                              "bundles": n, "held": dict(zip(tickers, pos.held(tickers))),
                              "cost": round(pos.cost(), 4), "locked_pnl": None if locked is None else round(locked, 4),
-                             "broken_pnl": round(broken, 4), "curr_pnl": round(curr, 4),
+                             "broken_pnl": round(broken, 4), "curr_pnl": round(curr, 4), "upside": round(upside, 4),
                              "unhedged": pos.unhedged(tickers),
                              "broken_s": None if pos.broken_since is None else round(time.time() - pos.broken_since),
                              "completion": self.completion_note.get(bid)})
@@ -2207,6 +2226,7 @@ class ArbsRunner:
             "pnl": {"settled": round(sum(r["pnl"] for r in settled), 4),
                     "locked": round(sum(h["locked_pnl"] or 0.0 for h in holdings), 4),
                     "broken": round(sum(h["broken_pnl"] for h in holdings), 4),
+                    "upside": round(sum(h["upside"] for h in holdings), 4),
                     "held_cost": round(sum(h["cost"] for h in holdings), 4),
                     "committed": round(self.committed(), 4), "max_dollars": self.cfg.trading.max_dollars},
             "holdings": holdings, "quotes": quotes, "hot": self.hot, "ranking": self.ranking[:60],

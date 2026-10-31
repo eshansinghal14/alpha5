@@ -104,10 +104,15 @@ def _metrics(s: dict):
     c[0].metric("Total PnL", _usd(settled + unrealized),
                 help="Settled (payouts and unwound contracts, minus everything paid incl. fees) plus expected "
                      "unrealized.")
-    c[1].metric("Expected unrealized", _usd(unrealized),
-                f"{_usd(broken)} on {n_broken} unfinished" if n_broken else None,
+    upside = p.get("upside") or 0.0
+    note = [f"{_usd(upside)} upside"] if upside >= 0.005 else []
+    if n_broken:
+        note.append(f"{_usd(broken)} on {n_broken} unfinished")
+    c[1].metric("Expected unrealized", _usd(unrealized), " · ".join(note) or None,
                 help="What complete bundles held lock in at settlement, plus unfinished baskets' extra legs at "
-                     "what they'd sell for now.")
+                     "what they'd sell for now. Upside (not in the totals): what bundles that can pay more than "
+                     "their locked payout (a draw, an unlisted winner, a ladder between rungs) are expected to "
+                     "add, at mid prices.")
     c[2].metric("Capital used", f"${p.get('committed', 0):,.2f}", f"of ${p.get('max_dollars', 0):,.0f}",
                 delta_color="off", help="Cost of held baskets (resting quotes aren't counted; each is sized to fit what's left).")
     c[3].metric("Baskets tradeable", f"{s.get('n_tradeable')}/{s.get('n_baskets')}",

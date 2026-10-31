@@ -29,6 +29,7 @@ class Basket:
     resume_quoting: pd.Timestamp | None
     settles: pd.Timestamp | None = None
     live_from: pd.Timestamp | None = None      # a game's start: its quotes are picked off on each score
+    exact: bool = True                         # False: payout is the tie/rounding case, other outcomes pay more
 
     @property
     def tickers(self) -> list[str]:
@@ -54,7 +55,7 @@ def basket_to_dict(b: Basket) -> dict:
     return {"basket_id": b.basket_id, "relationship_id": b.relationship_id, "type": b.type, "cluster": b.cluster,
             "legs": [[l.ticker, l.side] for l in b.legs], "payout": b.payout,
             "settles": None if b.settles is None else b.settles.isoformat(),
-            "live_from": None if b.live_from is None else b.live_from.isoformat()}
+            "live_from": None if b.live_from is None else b.live_from.isoformat(), "exact": b.exact}
 
 
 def basket_from_dict(d: dict) -> Basket:
@@ -63,7 +64,7 @@ def basket_from_dict(d: dict) -> Basket:
     return Basket(basket_id=d["basket_id"], relationship_id=d["relationship_id"], type=d["type"],
                   cluster=d["cluster"], legs=tuple(Leg(t, s) for t, s in d["legs"]), payout=float(d["payout"]),
                   quote_until=None, resume_quoting=None, settles=_ts(d.get("settles")),
-                  live_from=_ts(d.get("live_from")))
+                  live_from=_ts(d.get("live_from")), exact=d.get("exact", True))
 
 
 def _settles(rel: dict) -> pd.Timestamp | None:
@@ -103,7 +104,7 @@ def parse_spec(doc: dict, exclude: list[str] | None = None) -> list[Basket]:
                               type=rel["type"], cluster=rel.get("cluster") or "", legs=legs, payout=payout,
                               quote_until=_ts(rel.get("quote_until_utc")),
                               resume_quoting=_ts(rel.get("resume_quoting_utc")), settles=_settles(rel),
-                              live_from=_ts(rel.get("live_from_utc"))))
+                              live_from=_ts(rel.get("live_from_utc")), exact=b.get("exact") is not False))
     return out
 
 
