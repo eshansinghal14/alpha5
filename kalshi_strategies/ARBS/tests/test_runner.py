@@ -1010,3 +1010,11 @@ def test_no_deep_quote_behind_a_fresh_arb_quote(arbs):
     book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
     _eval(r, live)
     assert (live.basket_id, 0) in r.quotes and not any(q.deep for q in r.quotes.values())
+
+
+def test_deep_gap_is_in_cents_not_ticks(arbs):
+    r, b = arbs
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, deep_min_gap_ticks=5)
+    assert not r.deep_gap(0.002, 0.010)        # 8 ticks of a 0.1c tail, under a cent
+    assert not r.deep_gap(0.31, 0.35)
+    assert r.deep_gap(0.30, 0.35)

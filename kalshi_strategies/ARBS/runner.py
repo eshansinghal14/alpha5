@@ -1182,7 +1182,7 @@ class ArbsRunner:
             bids[p] = bids.get(p, 0.0) - q
         behind = [p for p, q in bids.items() if q > _EPS and p < main.price - _EPS]
         price = lv.ticks.up(max(behind)) if behind else lv.ticks.lo
-        if lv.ticks.steps(price, main.price) < t.deep_min_gap_ticks:
+        if not self.deep_gap(price, main.price):
             return None, 0
         for n in range(int(t.deep_quote_size), 0, -1):
             p = pricing.quote_leg(vs, j, b.payout, need, float(n))
@@ -1191,6 +1191,13 @@ class ArbsRunner:
                 return pricing.QuotePlan(leg=j, price=price, max_price=p.max_price, edge=edge,
                                          others_cost=p.others_cost), float(n)
         return None, 0
+
+    def deep_gap(self, deep: float, main: float) -> bool:
+        """Is `deep` at least deep_min_gap_ticks cents under `main`? Cents, not
+        the market's ticks: on a tapered market's 0.1c tails 5 ticks is half a
+        cent, and an arb quote stepping 0.1c at a time pulled and re-placed a
+        golf longshot's deep quote 89 times in 4 min (10-31 00:03)."""
+        return main - deep >= self.cfg.trading.deep_min_gap_ticks * 0.01 - _EPS
 
     def manage_deep(self, b: Basket, vs, mains: dict, need: float, now: float, on: bool) -> list:
         """Deep quotes behind the arb quotes in `mains`, while `on` (a live
@@ -1213,7 +1220,7 @@ class ArbsRunner:
                 # Not once our arb quote has come down to it: that is just more
                 # size at the arb price (KXHIGHMIA 10-30 filled both at 0.73).
                 keep = on and self.quoted_elsewhere(b.basket_id, leg.ticker, leg.side) is None and \
-                    (j not in mains or vs[j].ticks.steps(dq.price, mains[j].price) >= t.deep_min_gap_ticks) and \
+                    (j not in mains or self.deep_gap(dq.price, mains[j].price)) and \
                     (p := pricing.quote_leg(vs, j, b.payout, need, dq.remaining)) is not None and \
                     dq.price <= p.max_price + _EPS
                 if keep:
