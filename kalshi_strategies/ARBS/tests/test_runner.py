@@ -1218,3 +1218,5 @@ def test_upside_only_where_an_outcome_pays_more(arbs):
     tie = dataclasses.replace(b, payout=0.5, exact=False)                # payout lowered for a tie
     assert r.upside(tie, 10) == pytest.approx(10 * (0.94 - 0.5))
     assert r.upside(no, 0) == 0.0
+    started = dataclasses.replace(no, live_from=pd.Timestamp.now(tz="UTC") - pd.Timedelta(minutes=5))
+    assert r.upside(started, 10) == 0.0
