@@ -46,7 +46,7 @@ $REPO/.venv/bin/python -W ignore -m kalshi_infra.runtime.trading_digest --hours 
 TOOLS=(Read Grep Glob "Bash(/opt/alpha5/.venv/bin/python:*)" "Bash(grep:*)" "Bash(tail:*)" "Bash(head:*)"
        "Bash(ls:*)" "Bash(wc:*)" "Bash(cat:*)" "Bash(date:*)" "Bash(journalctl:*)" "Bash(systemctl status:*)"
        "Bash(free:*)" "Bash(df:*)")
-CLAUDE_CODE_OAUTH_TOKEN=$(cat /etc/alpha5/claude-token) timeout "$LIMIT" \
+CLAUDE_CODE_OAUTH_TOKEN=$(tr -d '\r\n ' < /etc/alpha5/claude-token) timeout "$LIMIT" \
   "$HOME/.local/bin/claude" -p "$(cat "$OUT/prompt.txt")" --model "$MODEL" --max-turns "$TURNS" \
     --allowedTools "${TOOLS[@]}" --disallowedTools Write Edit NotebookEdit WebFetch WebSearch \
     < "$OUT/digest.txt" > "$OUT/reply.txt" 2> "$OUT/claude.err"
