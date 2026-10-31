@@ -1,0 +1,8 @@
+[Unit]
+Description=alpha5: hourly Claude health check of live trading, emailed on alert
+
+[Timer]
+OnCalendar=*-*-* *:05:00
+
+[Install]
+WantedBy=timers.target

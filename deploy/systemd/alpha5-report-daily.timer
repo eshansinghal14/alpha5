@@ -1,0 +1,8 @@
+[Unit]
+Description=alpha5: 8am ET Claude report on the last 24h of trading, emailed
+
+[Timer]
+OnCalendar=*-*-* 08:00:00 America/New_York
+
+[Install]
+WantedBy=timers.target

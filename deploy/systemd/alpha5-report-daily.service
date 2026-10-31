@@ -1,0 +1,17 @@
+[Unit]
+Description=alpha5: 8am ET Claude report on the last 24h of trading, emailed (deploy/claude_report.sh)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=alpha5-report
+Environment=HOME=/var/lib/alpha5-report
+ExecStart=/bin/bash /opt/alpha5/deploy/claude_report.sh daily
+TimeoutStartSec=40min
+Nice=19
+IOSchedulingClass=idle
+# Not trading: first for the OOM killer, and capped (Claude Code plus its
+# python queries) so it can't take memory from the trading processes.
+OOMScoreAdjust=1000
+MemoryMax=1500M
+MemorySwapMax=0
