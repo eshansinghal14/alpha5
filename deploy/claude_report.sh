@@ -43,8 +43,12 @@ $REPO/.venv/bin/python -W ignore -m kalshi_infra.runtime.trading_digest --hours 
   fi
 } > "$OUT/prompt.txt"
 
-TOOLS=(Read Grep Glob "Bash(/opt/alpha5/.venv/bin/python:*)" "Bash(grep:*)" "Bash(tail:*)" "Bash(head:*)"
+# The OS user is the real boundary (no secrets, no write access to anything
+# trading reads); this list just keeps Claude to reading.
+TOOLS=(Read Grep Glob "Bash(/opt/alpha5/.venv/bin/python:*)" "Bash(.venv/bin/python:*)" "Bash(cd:*)"
+       "Bash(grep:*)" "Bash(tail:*)" "Bash(head:*)" "Bash(cut:*)" "Bash(sort:*)" "Bash(uniq:*)" "Bash(echo:*)"
        "Bash(ls:*)" "Bash(wc:*)" "Bash(cat:*)" "Bash(date:*)" "Bash(journalctl:*)" "Bash(systemctl status:*)"
+       "Bash(systemctl show:*)" "Bash(git log:*)" "Bash(git show:*)" "Bash(git diff:*)" "Bash(git status:*)"
        "Bash(free:*)" "Bash(df:*)")
 CLAUDE_CODE_OAUTH_TOKEN=$(tr -d '\r\n ' < /etc/alpha5/claude-token) timeout "$LIMIT" \
   "$HOME/.local/bin/claude" -p "$(cat "$OUT/prompt.txt")" --model "$MODEL" --max-turns "$TURNS" \
