@@ -159,10 +159,28 @@ def load(series: str) -> pd.DataFrame:
     return replay(rows, basket_info(root))
 
 
-def bundle_log(series: str, days: int = 2, gap_s: float = 30.0) -> pd.DataFrame:
-    """Live fills, one row per burst on a basket (fills within gap_s of the
-    last), newest first. pnl: unwound pairs ($1 each) plus whole bundles at
-    their payout, less cost; None for a burst that left the basket incomplete."""
+def _net(legs: dict, meta) -> tuple[float, float, float | None]:
+    """(unwound pairs, whole bundles, pnl-less-cost or None) for a row's legs.
+    Both sides of a market are an unwind, paid out $1 a pair at once; what's
+    left after netting is whole bundles, or an unfinished basket (None)."""
+    pairs, left = 0.0, {}
+    for t in {t for t, _ in legs}:
+        y, n = legs.get((t, "yes"), 0.0), legs.get((t, "no"), 0.0)
+        pairs += min(y, n)
+        if abs(y - n) > _EPS:
+            left[t] = abs(y - n)
+    if not left:
+        return pairs, 0.0, pairs
+    if meta is None or len(left) < meta[1] or len({round(q, 6) for q in left.values()}) != 1:
+        return pairs, 0.0, None
+    b = next(iter(left.values()))
+    return pairs, b, pairs + b * meta[0]
+
+
+def bundle_log(series: str, days: int = 2) -> pd.DataFrame:
+    """Live fills, one row per arb (a basket's fills from flat until flat
+    again: whole bundles or all unwound), newest first. A row still open
+    leaves the basket incomplete: bundles and pnl None."""
     root = os.path.join(LIVE_ROOT, series)
     rows = []
     for f in sorted(glob.glob(os.path.join(root, "journal", "*.jsonl")))[-days:]:
@@ -177,44 +195,33 @@ def bundle_log(series: str, days: int = 2, gap_s: float = 30.0) -> pd.DataFrame:
                         rows.append(r)
     info = basket_info(root)
     settles = basket_settles(root)
-    bursts: list[dict] = []
-    last: dict[str, dict] = {}
+    arbs: list[dict] = []
+    open_: dict[str, dict] = {}
     for r in sorted(rows, key=lambda r: r["t"]):
         bid = r["basket_id"]
-        cur = last.get(bid)
-        if cur is None or r["t"] - cur["t_last"] > gap_s:
-            cur = last[bid] = {"t": r["t"], "t_last": r["t"], "basket_id": bid, "how": set(), "legs": {}, "cost": 0.0,
-                               "settles": r.get("settles")}
-            bursts.append(cur)
-        cur["t_last"] = r["t"]
+        cur = open_.get(bid)
+        if cur is None:
+            cur = open_[bid] = {"t": r["t"], "basket_id": bid, "how": set(), "legs": {}, "cost": 0.0,
+                                "settles": r.get("settles"), "meta": info.get(bid) or guess_info(bid)}
+            arbs.append(cur)
         cur["how"].add(r.get("fill_kind") or "")
         key = (r["ticker"], r["side"])
         cur["legs"][key] = cur["legs"].get(key, 0.0) + float(r["size"])
         cur["cost"] += float(r["cost"])
+        if _net(cur["legs"], cur["meta"])[2] is not None:
+            del open_[bid]
     out = []
-    for c in reversed(bursts):
-        meta = info.get(c["basket_id"]) or guess_info(c["basket_id"])
-        tickers = {t for t, _ in c["legs"]}
-        # Both sides of a market: an unwind, the pair paid out $1 each at once.
-        # What's left after netting pairs is whole bundles, or an unfinished basket.
-        pairs, left = 0.0, {}
-        for t in tickers:
-            y, n = c["legs"].get((t, "yes"), 0.0), c["legs"].get((t, "no"), 0.0)
-            pairs += min(y, n)
-            if abs(y - n) > _EPS:
-                left[t] = abs(y - n)
-        rest = {round(q, 6) for q in left.values()}
-        whole = (meta is not None and len(left) >= meta[1] and len(rest) == 1) or not left
-        bundles = next(iter(left.values())) if left and whole else 0.0
-        pnl = pairs + bundles * meta[0] - c["cost"] if whole and meta is not None else None
+    for c in reversed(arbs):
+        _, bundles, back = _net(c["legs"], c["meta"])
+        pnl = None if back is None else back - c["cost"]
         st = pd.Timestamp(c["settles"]) if c.get("settles") else settles.get(c["basket_id"])
         out.append({"time": pd.Timestamp(c["t"], unit="s", tz="UTC"),
-                    # Time to expected settlement when the burst began.
+                    # Time to expected settlement when the arb began.
                     "tte": None if st is None else _tte((st - pd.Timestamp(c["t"], unit="s", tz="UTC")).total_seconds()),
                     # Series tickers, the part of a market ticker Kalshi's search finds.
                     "series": " ".join(dict.fromkeys(t.split("-", 1)[0] for t, _ in c["legs"])),
                     "basket_id": c["basket_id"], "how": "+".join(sorted(h for h in c["how"] if h)),
-                    "bundles": bundles if whole and bundles else None, "cost": round(c["cost"], 2),
+                    "bundles": bundles or None, "cost": round(c["cost"], 2),
                     "pnl": None if pnl is None else round(pnl, 2),
                     "return": None if pnl is None or c["cost"] <= 0 else f"{pnl / c['cost']:.2%}",
                     "fills": ", ".join(f"{t.split('-', 1)[-1]} {s} {q:g}" for (t, s), q in c["legs"].items())})

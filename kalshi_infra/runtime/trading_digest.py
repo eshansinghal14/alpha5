@@ -134,15 +134,15 @@ def arbs_section(since: pd.Timestamp, now: pd.Timestamp) -> list[str]:
         return out
     log = log[log.time >= since]
     done = log[log.pnl.notna()]
-    out.append(f"{len(log)} bursts ({len(log) - len(done)} left a basket incomplete), "
-               f"complete-burst PnL ${done.pnl.sum():+.2f} on ${done.cost.sum():.2f} cost, {int((done.pnl < 0).sum())} losers")
+    out.append(f"{len(log)} arbs ({len(log) - len(done)} left a basket incomplete), "
+               f"complete-arb PnL ${done.pnl.sum():+.2f} on ${done.cost.sum():.2f} cost, {int((done.pnl < 0).sum())} losers")
     if len(done):
-        by = done.groupby("series").agg(bursts=("pnl", "size"), pnl=("pnl", "sum"), cost=("cost", "sum"))
-        out.append("by series (complete bursts), worst first:\n" + by.sort_values("pnl").head(15).round(2).to_string())
+        by = done.groupby("series").agg(arbs=("pnl", "size"), pnl=("pnl", "sum"), cost=("cost", "sum"))
+        out.append("by series (complete arbs), worst first:\n" + by.sort_values("pnl").head(15).round(2).to_string())
         cols = ["time", "series", "how", "cost", "pnl", "fills"]
-        out.append("worst bursts:\n" + done.nsmallest(5, "pnl")[cols].to_string(index=False))
+        out.append("worst arbs:\n" + done.nsmallest(5, "pnl")[cols].to_string(index=False))
     if len(log) > len(done):
-        out.append("incomplete bursts (latest 5):\n"
+        out.append("incomplete arbs (latest 5):\n"
                    + log[log.pnl.isna()].head(5)[["time", "series", "how", "cost", "fills"]].to_string(index=False))
     return out
 

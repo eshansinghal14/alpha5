@@ -31,7 +31,7 @@ def test_capital_nets_a_markets_yes_and_no_held_in_different_baskets():
     assert replay(rows, info).capital.iloc[-1] == pytest.approx(0.8)
 
 
-def test_bundle_log_groups_bursts_newest_first(tmp_path, monkeypatch):
+def test_bundle_log_one_row_per_arb_newest_first(tmp_path, monkeypatch):
     import json
     from kalshi_viz import arbs_pnl
     monkeypatch.setattr(arbs_pnl, "LIVE_ROOT", str(tmp_path))
@@ -39,19 +39,32 @@ def test_bundle_log_groups_bursts_newest_first(tmp_path, monkeypatch):
     j = tmp_path / "ARBS" / "journal"
     j.mkdir(parents=True)
     rows = [fill(100, "b", "S-A", "yes", 5, 2.0) | {"fill_kind": "quote"},
-            fill(101, "b", "S-B", "yes", 5, 2.5) | {"fill_kind": "complete"},
-            fill(500, "b", "S-A", "yes", 3, 1.2) | {"fill_kind": "take"},       # a later burst, one leg so far
-            fill(900, "b", "S-B", "yes", 2, 0.9) | {"fill_kind": "take"},
-            fill(900.1, "b", "S-B", "no", 2, 1.2) | {"fill_kind": "unwind"}]
+            fill(100.1, "b", "S-B", "yes", 5, 2.5) | {"fill_kind": "complete"},
+            fill(105, "b", "S-A", "yes", 3, 1.2) | {"fill_kind": "quote"},      # seconds later: its own arb
+            fill(105.1, "b", "S-B", "yes", 3, 1.5) | {"fill_kind": "complete"},
+            fill(500, "b", "S-A", "yes", 2, 0.8) | {"fill_kind": "take"},       # one leg, then unwound much later
+            fill(900, "b", "S-A", "no", 2, 1.1) | {"fill_kind": "unwind"}]
     (j / "2026-10-29.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
     log = arbs_pnl.bundle_log("ARBS")
-    assert list(log.how) == ["take+unwind", "take", "complete+quote"]
-    assert pd.isna(log.bundles.iloc[0]) and log.pnl.iloc[0] == pytest.approx(2 - 2.1)
-    assert pd.isna(log.bundles.iloc[1]) and pd.isna(log.pnl.iloc[1])
+    assert list(log.how) == ["take+unwind", "complete+quote", "complete+quote"]
+    assert pd.isna(log.bundles.iloc[0]) and log.pnl.iloc[0] == pytest.approx(2 - 1.9)
+    assert log.bundles.iloc[1] == 3 and log.pnl.iloc[1] == pytest.approx(0.3)
     assert log.bundles.iloc[2] == 5 and log.pnl.iloc[2] == pytest.approx(0.5)
 
 
-def test_bundle_log_counts_bundles_and_unwound_pairs_in_one_burst(tmp_path, monkeypatch):
+def test_bundle_log_leaves_an_unfinished_arb_open(tmp_path, monkeypatch):
+    import json
+    from kalshi_viz import arbs_pnl
+    monkeypatch.setattr(arbs_pnl, "LIVE_ROOT", str(tmp_path))
+    monkeypatch.setattr(arbs_pnl, "basket_info", lambda root: {"b": (1.0, 2)})
+    j = tmp_path / "ARBS" / "journal"
+    j.mkdir(parents=True)
+    (j / "2026-10-29.jsonl").write_text(json.dumps(fill(1, "b", "S-A", "yes", 3, 1.2) | {"fill_kind": "take"}) + "\n")
+    log = arbs_pnl.bundle_log("ARBS")
+    assert len(log) == 1 and pd.isna(log.bundles.iloc[0]) and pd.isna(log.pnl.iloc[0])
+
+
+def test_bundle_log_counts_bundles_and_unwound_pairs_in_one_arb(tmp_path, monkeypatch):
     import json
     from kalshi_viz import arbs_pnl
     monkeypatch.setattr(arbs_pnl, "LIVE_ROOT", str(tmp_path))
