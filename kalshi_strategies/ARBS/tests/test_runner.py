@@ -1,4 +1,5 @@
 """Runner decisions in shadow mode on hand-built books (no network)."""
+import collections
 import json
 import asyncio
 import dataclasses
@@ -1018,3 +1019,43 @@ def test_deep_gap_is_in_cents_not_ticks(arbs):
     assert not r.deep_gap(0.002, 0.010)        # 8 ticks of a 0.1c tail, under a cent
     assert not r.deep_gap(0.31, 0.35)
     assert r.deep_gap(0.30, 0.35)
+
+
+def test_eval_pass_runs_a_basket_with_a_fill_first_and_yields_after_its_slice(arbs, monkeypatch):
+    r, b = arbs
+    others = [dataclasses.replace(b, basket_id=f"t:o{i}") for i in range(30)]
+    r.set_baskets([b] + others)
+    order = []
+    monkeypatch.setattr(r, "evaluate", lambda x: order.append(x.basket_id))
+    r.exit_hist[b.basket_id] = collections.deque([(time.time(), 0.0)])
+    monkeypatch.setattr(R, "EVAL_SLICE_S", -1.0)          # every pass yields after one basket
+
+    async def go():
+        r.dirty |= {o.basket_id for o in others} | {b.basket_id}
+        task = asyncio.create_task(r.eval_loop())
+        for _ in range(4):
+            await asyncio.sleep(0)
+        seen = list(order)
+        await asyncio.sleep(0.05)
+        task.cancel()
+        return seen
+    first = asyncio.run(go())
+    assert first[0] == b.basket_id
+    assert len(first) < 31                                   # passes yield between baskets
+    assert sorted(order) == sorted([b.basket_id] + [o.basket_id for o in others])   # and still drain
+
+
+def test_leg_view_cache_in_a_pass_follows_our_own_quotes(arbs):
+    r, b = arbs
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    r._in_pass = True
+    v1 = r.leg_view("X-A", "yes")
+    assert r.leg_view("X-A", "yes") is v1
+    q = R.Quote(basket_id=b.basket_id, leg=0, ticker="X-A", side="yes", price=0.30, size=4, cid="c",
+                edge=0.0, max_price=0.30, pending=False)
+    r.quotes[q.key] = q                                      # our own bid comes out of the book
+    v2 = r.leg_view("X-A", "yes")
+    assert v2 is not v1 and v2.bid == pytest.approx(0.30)
+    r.hold([("X-A", "yes", 3)])                              # an IOC in flight eats the ask
+    assert r.leg_view("X-A", "yes").asks[0][1] == pytest.approx(7)
+    r._in_pass = False

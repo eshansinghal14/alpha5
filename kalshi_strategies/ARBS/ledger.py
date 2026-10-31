@@ -66,6 +66,10 @@ class Ledger:
         # ledger they made every fill's save ~40 ms (0.9 MB, 10-29), and nine
         # fills in one burst booked 240 ms late.
         self.ids_path = None if path is None else os.path.splitext(path)[0] + "_quote_ids.json"
+        # Changes since the last full write, one line each: rewriting the whole
+        # file each second held the loop 44 ms (11k ids, 10-31).
+        self.ids_log_path = None if path is None else os.path.splitext(path)[0] + "_quote_ids.log.jsonl"
+        self._ids_pending: set[str] = set()
         self.baskets: dict[str, BasketPos] = {}
         # exchange order id -> {basket_id, ticker, side, retired_at}: every
         # quote we placed, so a maker fill (websocket, REST backstop, or one
@@ -87,6 +91,14 @@ class Ledger:
         if os.path.exists(self.ids_path):
             with open(self.ids_path, encoding="utf-8") as fh:
                 self.quote_ids = json.load(fh)
+        if os.path.exists(self.ids_log_path):
+            with open(self.ids_log_path, encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        oid, rec = json.loads(line)
+                    except ValueError:
+                        continue                  # a line cut short by a crash
+                    self.quote_ids[oid] = rec
         self.last_fill_ts = d.get("last_fill_ts")
         self.seen_trades = set(d.get("seen_trades", []))
         self.settled = d.get("settled", [])
@@ -104,13 +116,31 @@ class Ledger:
             "settled": self.settled,
         }, indent=None)
 
+    def note_quote_id(self, oid: str):
+        """Mark a quote id added or changed, for the next flush_quote_ids."""
+        self._ids_pending.add(oid)
+
+    def flush_quote_ids(self):
+        """Append the noted ids' current records to the log."""
+        if not self.ids_log_path or not self._ids_pending:
+            return
+        lines = "".join(json.dumps([oid, self.quote_ids[oid]]) + "\n"
+                        for oid in self._ids_pending if oid in self.quote_ids)
+        with open(self.ids_log_path, "a", encoding="utf-8") as fh:
+            fh.write(lines)
+        self._ids_pending.clear()
+
     def save_quote_ids(self, now: float):
+        """Full write, then an empty log. Log records are whole, so a crash
+        between the two only replays what the file already holds."""
         if not self.ids_path:
             return
         # A retired quote's late fills arrive within seconds; an hour is ample.
         self.quote_ids = {k: v for k, v in self.quote_ids.items()
                           if v.get("retired_at") is None or now - v["retired_at"] < 3600}
         atomic_write_json(self.ids_path, self.quote_ids, indent=None)
+        open(self.ids_log_path, "w").close()
+        self._ids_pending.clear()
 
     def close(self, basket_id: str, row: dict):
         """Move a fully settled basket to the settled history."""

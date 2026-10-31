@@ -224,8 +224,11 @@ def _replace_with_retry(tmp: str, path: str, attempts: int = 10, delay_s: float 
 def atomic_write_json(path: str, obj, indent: int | None = 2):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     tmp = f"{path}.tmp-{os.getpid()}"
+    # dumps, not dump: dump always streams through the pure-Python encoder, and
+    # ARBS's 2 MB quote-id file took ~12% of its event loop that way (10-31).
+    text = json.dumps(obj, indent=indent)
     with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(obj, fh, indent=indent)
+        fh.write(text)
         fh.write("\n")
     _replace_with_retry(tmp, path)
 

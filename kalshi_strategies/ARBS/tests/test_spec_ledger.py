@@ -46,3 +46,22 @@ def test_quote_ids_saved_apart_and_pruned_after_an_hour(tmp_path):
 def test_quote_ids_read_from_an_old_ledger(tmp_path):
     (tmp_path / "l.json").write_text(json.dumps({"baskets": {}, "quote_ids": {"o": {"retired_at": None}}}))
     assert set(Ledger(str(tmp_path / "l.json")).quote_ids) == {"o"}
+
+
+def test_quote_id_changes_logged_and_replayed_until_the_next_full_write(tmp_path):
+    led = Ledger(str(tmp_path / "l.json"))
+    led.quote_ids = {"a": {"basket_id": "b", "retired_at": None}}
+    led.save()
+    led.save_quote_ids(now=100.0)
+    led.quote_ids["n"] = {"basket_id": "b", "retired_at": None}
+    led.note_quote_id("n")
+    led.quote_ids["a"]["retired_at"] = 150.0
+    led.note_quote_id("a")
+    led.flush_quote_ids()
+    with open(tmp_path / "l_quote_ids.log.jsonl", "a") as fh:
+        fh.write('["cut", {"bas')                              # a crash mid-line
+    again = Ledger(str(tmp_path / "l.json"))
+    assert set(again.quote_ids) == {"a", "n"} and again.quote_ids["a"]["retired_at"] == 150.0
+    again.save_quote_ids(now=200.0)
+    assert (tmp_path / "l_quote_ids.log.jsonl").read_text() == ""
+    assert set(Ledger(str(tmp_path / "l.json")).quote_ids) == {"a", "n"}

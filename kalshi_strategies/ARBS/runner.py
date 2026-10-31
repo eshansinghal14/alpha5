@@ -126,6 +126,11 @@ SWEEP_RETRIES, SWEEP_PACING_S = 5, 0.01
 # Least time between voluntary moves of a deep quote: it waits for a sweep,
 # so tracking every join in the gap only spends writes.
 DEEP_REQUOTE_S = 10.0
+# Longest an eval pass runs before letting the websocket reader in: a fill that
+# lands mid-pass isn't even read until the pass yields (fill -> exit decision
+# p99 was 176 ms with whole passes, 10-30/31).
+EVAL_SLICE_S = 0.005
+IDS_COMPACT_S = 3600.0
 PULL_BATCH = 20
 
 
@@ -271,6 +276,9 @@ class ArbsRunner:
         # ticker -> book updates seen; basket_id -> (its legs' counts, held)
         # at its last exit attempt. An exit is retried only once one changed.
         self.book_seq: dict[str, int] = {}
+        # (ticker, side) -> (key, LegView) for the current eval pass only: no book
+        # changes inside a pass, so only our own quotes and in-flight IOCs can.
+        self._lv_cache: dict[tuple[str, str], tuple] = {}
         self.book_time: dict[str, float] = {}     # ticker -> monotonic time of its last book update
         self.paused_until: dict[str, float] = {}  # ticker -> monotonic time Kalshi's pause is next retried
         self.exchange_paused = False              # Kalshi's exchange-wide trading_active is off
@@ -707,6 +715,19 @@ class ArbsRunner:
             return None
         if bk.last_snapshot_time["yes"] is None or bk.last_snapshot_time["no"] is None:
             return None
+        if self._in_pass:
+            # Many baskets share a leg; each view copies and sorts the whole book.
+            key = (tuple(self._own(ticker, "yes").items()), tuple(self._own(ticker, "no").items()),
+                   self.inflight.get((ticker, side)), m.taker_rate, m.maker_rate, m.ticks)
+            hit = self._lv_cache.get((ticker, side))
+            if hit is not None and hit[0] == key:
+                return hit[1]
+            v = self._leg_view(bk, m, ticker, side)
+            self._lv_cache[(ticker, side)] = (key, v)
+            return v
+        return self._leg_view(bk, m, ticker, side)
+
+    def _leg_view(self, bk, m: Meta, ticker: str, side: str) -> pricing.LegView | None:
         yb, nb = dict(bk.yes_bids), dict(bk.no_bids)
         for s, book in (("yes", yb), ("no", nb)):
             for p, q in self._own(ticker, s).items():
@@ -836,7 +857,7 @@ class ArbsRunner:
             del self.quotes[q.key]
         if q.exchange_id and q.exchange_id in self.real_ledger.quote_ids:
             self.real_ledger.quote_ids[q.exchange_id]["retired_at"] = time.time()
-            self.ids_dirty = True
+            self.real_ledger.note_quote_id(q.exchange_id)
 
     def apply_real_fill(self, f: dict, source: str) -> bool:
         """A Kalshi fill dict (ws or REST). Booked only if it is one of our
@@ -1023,9 +1044,17 @@ class ArbsRunner:
             await self.wake.wait()
             self.wake.clear()
             self._replay_orphans()
-            todo, self.dirty = self.dirty, set()
+            # A basket with a fill to exit goes first: it waited behind every
+            # basket whose book ticked.
+            todo = sorted(self.dirty, key=lambda bid: bid not in self.exit_hist)
+            self.dirty = set()
             self._in_pass, self._commit_cache = True, None
-            for bid in todo:
+            self._lv_cache.clear()
+            start = time.perf_counter()
+            for i, bid in enumerate(todo):
+                if i and time.perf_counter() - start > EVAL_SLICE_S:
+                    self.dirty |= set(todo[i:])
+                    break
                 if bid in self.busy:
                     continue
                 b = self.baskets.get(bid)
@@ -1558,7 +1587,7 @@ class ArbsRunner:
         if oid:
             self.real_ledger.quote_ids[oid] = {"basket_id": q.basket_id, "ticker": q.ticker, "side": q.side,
                                                "retired_at": None, **_deep(q)}
-            self.ids_dirty = True
+            self.real_ledger.note_quote_id(oid)
         self._replay_orphans()
 
     async def _find_lost(self, q: Quote):
@@ -1667,7 +1696,7 @@ class ArbsRunner:
                 self.dirty.add(q.basket_id)
             if oid in self.real_ledger.quote_ids:
                 self.real_ledger.quote_ids[oid]["retired_at"] = time.time()
-                self.ids_dirty = True
+                self.real_ledger.note_quote_id(oid)
             await asyncio.sleep(SWEEP_PACING_S)
 
     # ------------------------------------------------------------------ ranking
@@ -2031,14 +2060,20 @@ class ArbsRunner:
         }
 
     async def ledger_flush_loop(self):
+        """Quote id changes appended each second; the whole file rewritten (and
+        pruned) at start, then hourly."""
+        compacted = 0.0
         while True:
             await asyncio.sleep(1.0)
-            if self.ids_dirty:
-                self.ids_dirty = False
-                try:
+            try:
+                if self.ids_dirty or time.time() - compacted >= IDS_COMPACT_S:
+                    self.ids_dirty = False
                     self.real_ledger.save_quote_ids(time.time())
-                except Exception as e:
-                    _log(f"WARN: quote id save failed ({e!r})")
+                    compacted = time.time()
+                else:
+                    self.real_ledger.flush_quote_ids()
+            except Exception as e:
+                _log(f"WARN: quote id save failed ({e!r})")
 
     async def summary_loop(self):
         while True:
