@@ -276,8 +276,9 @@ class ArbsRunner:
         # ticker -> book updates seen; basket_id -> (its legs' counts, held)
         # at its last exit attempt. An exit is retried only once one changed.
         self.book_seq: dict[str, int] = {}
-        # (ticker, side) -> (key, LegView) for the current eval pass only: no book
-        # changes inside a pass, so only our own quotes and in-flight IOCs can.
+        # (ticker, side) -> (key, LegView), valid while the book (book_seq: every
+        # delta goes through _on_quote), our own quotes and in-flight IOCs on
+        # the market are unchanged.
         self._lv_cache: dict[tuple[str, str], tuple] = {}
         self.book_time: dict[str, float] = {}     # ticker -> monotonic time of its last book update
         self.paused_until: dict[str, float] = {}  # ticker -> monotonic time Kalshi's pause is next retried
@@ -717,11 +718,14 @@ class ArbsRunner:
             return None
         if self._in_pass:
             # Many baskets share a leg; each view copies and sorts the whole book.
-            key = (tuple(self._own(ticker, "yes").items()), tuple(self._own(ticker, "no").items()),
-                   self.inflight.get((ticker, side)), m.taker_rate, m.maker_rate, m.ticks)
+            key = (self.book_seq.get(ticker), tuple(self._own(ticker, "yes").items()),
+                   tuple(self._own(ticker, "no").items()), self.inflight.get((ticker, side)),
+                   m.taker_rate, m.maker_rate, m.ticks)
             hit = self._lv_cache.get((ticker, side))
             if hit is not None and hit[0] == key:
+                self.n["leg_view_hits"] += 1
                 return hit[1]
+            self.n["leg_view_misses"] += 1
             v = self._leg_view(bk, m, ticker, side)
             self._lv_cache[(ticker, side)] = (key, v)
             return v
@@ -1049,7 +1053,8 @@ class ArbsRunner:
             todo = sorted(self.dirty, key=lambda bid: bid not in self.exit_hist)
             self.dirty = set()
             self._in_pass, self._commit_cache = True, None
-            self._lv_cache.clear()
+            if len(self._lv_cache) > 20000:
+                self._lv_cache.clear()
             start = time.perf_counter()
             for i, bid in enumerate(todo):
                 if i and time.perf_counter() - start > EVAL_SLICE_S:

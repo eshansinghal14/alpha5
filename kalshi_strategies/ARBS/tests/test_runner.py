@@ -1059,3 +1059,15 @@ def test_leg_view_cache_in_a_pass_follows_our_own_quotes(arbs):
     r.hold([("X-A", "yes", 3)])                              # an IOC in flight eats the ask
     assert r.leg_view("X-A", "yes").asks[0][1] == pytest.approx(7)
     r._in_pass = False
+
+
+def test_leg_view_cache_follows_book_updates_across_passes(arbs):
+    r, b = arbs
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    r._in_pass = True
+    v1 = r.leg_view("X-A", "yes")
+    book(r, "X-A", [(0.30, 10)], [(0.40, 10)])               # a delta: the feed calls _on_quote
+    r.book_seq["X-A"] = r.book_seq.get("X-A", 0) + 1
+    v2 = r.leg_view("X-A", "yes")
+    assert v2 is not v1 and v2.asks[0][0] == pytest.approx(0.60)
+    r._in_pass = False
