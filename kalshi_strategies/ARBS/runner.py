@@ -723,9 +723,9 @@ class ArbsRunner:
                    m.taker_rate, m.maker_rate, m.ticks)
             hit = self._lv_cache.get((ticker, side))
             if hit is not None and hit[0] == key:
-                self.n["leg_view_hits"] += 1
+                self.n["leg_view_hits"] = self.n.get("leg_view_hits", 0) + 1
                 return hit[1]
-            self.n["leg_view_misses"] += 1
+            self.n["leg_view_misses"] = self.n.get("leg_view_misses", 0) + 1
             v = self._leg_view(bk, m, ticker, side)
             self._lv_cache[(ticker, side)] = (key, v)
             return v
