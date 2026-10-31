@@ -130,8 +130,8 @@ SWEEP_RETRIES, SWEEP_PACING_S = 5, 0.01
 DEEP_REQUOTE_S = 10.0
 # Longest an eval pass runs before letting the websocket reader in: a fill that
 # lands mid-pass isn't even read until the pass yields (fill -> exit decision
-# p99 was 176 ms with whole passes, 10-30/31).
-EVAL_SLICE_S = 0.005
+# p99 was 176 ms with whole passes, 10-30/31). A yield costs microseconds.
+EVAL_SLICE_S = 0.001
 IDS_COMPACT_S = 3600.0
 # Kalshi trips a group once MORE than this many contracts match in 15 s; 0 is
 # refused (invalid_parameters, 10-31), so a 1-lot fill doesn't trip it.
@@ -249,6 +249,8 @@ class ArbsRunner:
         self.tickers: list[str] = []
         self.wake = asyncio.Event()
         self._dirty = _Dirty((), self.wake)
+        # Baskets with a fill to exit: evaluated before anything in dirty.
+        self.urgent: set[str] = set()
         # basket_id -> its ranking row, refreshed whenever the basket is
         # evaluated (its books changed), so the rank pass only sorts.
         self.rank_rows: dict[str, dict] = {}
@@ -361,6 +363,14 @@ class ArbsRunner:
         if items:
             self.wake.set()
 
+    def mark(self, basket_id: str):
+        """Dirty, or urgent for a basket with a fill to exit."""
+        if basket_id in self.exit_hist:
+            self.urgent.add(basket_id)
+            self.wake.set()
+        else:
+            self.dirty.add(basket_id)
+
     def later(self, basket_id: str, delay: float):
         """Re-evaluate a basket after `delay` without spinning the eval loop."""
         asyncio.get_running_loop().call_later(delay, self.dirty.add, basket_id)
@@ -404,7 +414,7 @@ class ArbsRunner:
                     if self.busy_n[basket_id] <= 0:
                         del self.busy_n[basket_id]
                         self.busy.discard(basket_id)
-                    self.dirty.add(basket_id)
+                    self.mark(basket_id)
         t = asyncio.get_running_loop().create_task(wrap())
         self.tasks.add(t)
         t.add_done_callback(self.tasks.discard)
@@ -794,7 +804,7 @@ class ArbsRunner:
         self.book_time[book.ticker] = time.monotonic()
         self.liq.on_book(book.ticker, time.monotonic(), book.ask, book.ask_depth, book.bid, book.bid_depth)
         for bid in self.by_ticker.get(book.ticker, ()):
-            self.dirty.add(bid)
+            self.mark(bid)
 
     def _on_trade(self, ticker, trade):
         self.liq.on_trade(ticker, trade.size)
@@ -860,6 +870,7 @@ class ArbsRunner:
             m = self.meta.get(q.ticker)
             per = q.edge + pricing.maker_cost(q.price, (m.maker_rate if m else None) or 0.0)
             self.seed_exit(q.basket_id, -per * q.filled)
+        self.urgent.add(q.basket_id)
         self.n["quote_fills"] += 1
         self._book(q.basket_id, q.ticker, q.side, size, cost, "deep" if q.deep else "quote", source=source,
                    order_id=q.exchange_id, trade_id=trade_id)
@@ -1063,28 +1074,30 @@ class ArbsRunner:
             await self.wake.wait()
             self.wake.clear()
             self._replay_orphans()
-            # A basket with a fill to exit goes first: it waited behind every
-            # basket whose book ticked.
-            todo = sorted(self.dirty, key=lambda bid: bid not in self.exit_hist)
-            self.dirty = set()
             self._in_pass, self._commit_cache = True, None
             if len(self._lv_cache) > 20000:
                 self._lv_cache.clear()
+            # One basket at a time off the sets (no sort or copy of thousands
+            # each slice), urgent first: a basket with a fill to exit waited
+            # behind every basket whose book ticked.
             start = time.perf_counter()
-            for i, bid in enumerate(todo):
-                if i and time.perf_counter() - start > EVAL_SLICE_S:
-                    self.dirty |= set(todo[i:])
-                    break
-                if bid in self.busy:
-                    continue
+            while self.urgent or self.dirty:
+                if self.urgent:
+                    bid = self.urgent.pop()
+                    self.dirty.discard(bid)
+                else:
+                    bid = self.dirty.pop()
                 b = self.baskets.get(bid)
-                if b is None:
-                    continue
-                try:
-                    self.evaluate(b)
-                except Exception:
-                    _log(f"eval error {bid}:")
-                    traceback.print_exc()
+                if b is not None and bid not in self.busy:
+                    try:
+                        self.evaluate(b)
+                    except Exception:
+                        _log(f"eval error {bid}:")
+                        traceback.print_exc()
+                if time.perf_counter() - start > EVAL_SLICE_S:
+                    break
+            if self.urgent or self.dirty:
+                self.wake.set()
             self._in_pass, self._commit_cache = False, None
             # Let the websocket reader run before the next pass.
             await asyncio.sleep(0)

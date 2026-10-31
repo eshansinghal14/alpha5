@@ -1031,7 +1031,8 @@ def test_eval_pass_runs_a_basket_with_a_fill_first_and_yields_after_its_slice(ar
     monkeypatch.setattr(R, "EVAL_SLICE_S", -1.0)          # every pass yields after one basket
 
     async def go():
-        r.dirty |= {o.basket_id for o in others} | {b.basket_id}
+        r.dirty |= {o.basket_id for o in others}
+        r.mark(b.basket_id)                                  # has a fill to exit: urgent
         task = asyncio.create_task(r.eval_loop())
         for _ in range(4):
             await asyncio.sleep(0)
@@ -1192,3 +1193,15 @@ def test_live_exit_does_not_wait_out_a_grouped_create_in_flight(arbs):
     _eval(r, live)
     assert not any(e[0] == "ioc" for e in log)
     r.live = False
+
+
+def test_book_update_on_a_broken_basket_marks_it_urgent(arbs):
+    r, b = arbs
+    import types
+    bk = types.SimpleNamespace(ticker="X-A", bid=0.3, ask=0.35, bid_depth=10, ask_depth=10)
+    r._on_quote(bk)
+    assert b.basket_id in r.dirty and b.basket_id not in r.urgent
+    r.exit_hist[b.basket_id] = collections.deque([(time.time(), 0.0)])
+    r.dirty.discard(b.basket_id)
+    r._on_quote(bk)
+    assert b.basket_id in r.urgent
