@@ -1,0 +1,20 @@
+[Unit]
+Description=alpha5 CME crypto futures recorder (Databento live mbp-1, latency research)
+After=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/opt/alpha5
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/alpha5/.venv/bin/python -u -W ignore -m kalshi_strategies.KXCRYPTOLEAD15M.research.latency.cme_live_rec
+# Research only: below trading for CPU and first for the OOM killer.
+Nice=10
+OOMScoreAdjust=1000
+MemoryMax=500M
+Restart=always
+RestartSec=30
+StandardOutput=append:/opt/alpha5/data/live/cme_rec.log
+StandardError=inherit
+
+[Install]
+WantedBy=multi-user.target

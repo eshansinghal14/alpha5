@@ -19,3 +19,5 @@ ib_async==2.1.0
 # Dashboard (served on localhost only, viewed through an SSH tunnel).
 streamlit==1.39.0
 bokeh==3.10.0
+# CME crypto futures live feed (Coin Race lead signal; research/latency/cme_live_rec.py).
+databento==0.89.0
