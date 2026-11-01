@@ -1,9 +1,9 @@
 DAILY REPORT for the last 24 hours, read by the owner at 8am ET.
 
 Body, in this order:
-1. Headline: total PnL across strategies and one line per strategy (PnL, settled vs open, fills, events, won%).
-2. Markouts per strategy: mo0 (spread captured), mo1, mo10, mo60, maker vs taker, and what they say about
-   adverse selection. Compare with the previous days in the digest.
+1. Summary: 2-3 bullets with the day's verdict (total PnL, which strategy drove it, anything abnormal).
+2. Markouts: what mo0/mo1/mo10/mo60 say about adverse selection per strategy, compared with the previous days
+   in the digest, and per coin / series where they differ.
 3. Notable trades: the worst events / bursts and WHY they lost (picked off after a spot move, quote left
    through a jump, an unwind into a thin book, ...). Check the fills/decisions/bbo for the worst one or two.
 4. Operations: halts, restarts, order errors, 429s, feed drops, audit mismatches, memory/disk.

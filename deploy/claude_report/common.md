@@ -21,7 +21,11 @@ Where to look for more:
   and this job is capped at ~1.4 GB: ALWAYS read parquet with a column subset and filter to the tickers/times you
   need; never load a whole day of bbo or decisions (millions of rows).
 
-Your reply is emailed as plain text. Its FIRST two lines must be exactly:
+Your reply is emailed as HTML. Above it the email already shows, computed from the same data, a PnL table and a
+markout table per strategy and the cumulative PnL / markout charts, so don't restate those numbers line by line:
+quote only what supports a point. Its FIRST two lines must be exactly:
 STATUS: OK            (or STATUS: ALERT)
 SUBJECT: <one short line, under 80 characters, plain ASCII>
-then a blank line, then the body. No markdown tables; short lines; dollar figures with signs.
+then a blank line, then the body in Markdown: "## " section headings, short bullets, **bold** for the key number
+or verdict in a bullet, and a small Markdown table where comparing a few items (coins, series) is clearer.
+Dollar figures with signs (+$12.30 / -$4.10).

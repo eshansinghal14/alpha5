@@ -1,5 +1,6 @@
 #!/bin/bash
-# Scheduled Claude review of live trading, emailed through SNS.
+# Scheduled Claude review of live trading, emailed as HTML with charts through
+# SES (kalshi_infra.runtime.report_email); plain text through SNS if that fails.
 #   daily:  8am ET report, always emailed (alpha5-report-daily.timer)
 #   hourly: health check, emailed only on STATUS: ALERT (alpha5-report-hourly.timer)
 # Runs as alpha5-report (deploy/setup_report.sh): it can read the repo and data/
@@ -13,6 +14,7 @@ STATE=/var/lib/alpha5-report
 OUT=$STATE/$MODE
 REGION=us-east-2
 TOPIC=$(cat /etc/alpha5/report-topic-arn)
+EMAIL=$(cat /etc/alpha5/report-email 2>/dev/null)
 mkdir -p "$OUT"
 cd "$REPO"
 
@@ -20,10 +22,10 @@ cd "$REPO"
 exec 9>"$STATE/run.lock"
 if [ "$MODE" = hourly ]; then
   flock -n 9 || { echo "another review is running; skipped"; exit 0; }
-  HOURS=1 MODEL=sonnet TURNS=15 LIMIT=12m
+  HOURS=1 CHART_HOURS=6 MODEL=sonnet TURNS=15 LIMIT=12m
 else
   flock -w 900 9 || { echo "lock wait timed out"; exit 1; }
-  HOURS=24 MODEL=opus TURNS=40 LIMIT=25m
+  HOURS=24 CHART_HOURS=24 MODEL=opus TURNS=40 LIMIT=25m
 fi
 
 send() {  # subject, body file
@@ -31,6 +33,14 @@ send() {  # subject, body file
   subj=$(printf '%s' "$1" | tr -cd '[:print:]' | cut -c1-99)
   aws sns publish --region "$REGION" --topic-arn "$TOPIC" --subject "$subj" \
       --message "file://$2" --output text >/dev/null
+}
+
+send_html() {  # subject, Markdown body file; falls back to plain text
+  if [ -n "$EMAIL" ] && $REPO/.venv/bin/python -W ignore -m kalshi_infra.runtime.report_email \
+      --subject "$1" --body "$2" --hours "$CHART_HOURS" --sender "$EMAIL" --to "$EMAIL" 2> "$OUT/email.err"; then
+    return 0
+  fi
+  send "$1" "$2"
 }
 
 $REPO/.venv/bin/python -W ignore -m kalshi_infra.runtime.trading_digest --hours "$HOURS" \
@@ -80,9 +90,9 @@ find "$OUT" -name 'reply-*.txt' -mtime +14 -delete
 
 if [ "$MODE" = daily ]; then
   tag=$([ "$STATUS" = ALERT ] && echo "[alpha5 ALERT]" || echo "[alpha5]")
-  send "$tag Daily $DAY: $SUBJECT" "$OUT/body.txt"
+  send_html "$tag Daily $DAY: $SUBJECT" "$OUT/body.txt"
 elif [ "$STATUS" = ALERT ]; then
   echo "$NOW $SUBJECT" >> "$OUT/alerts.log"
-  send "[alpha5 ALERT] $SUBJECT" "$OUT/body.txt"
+  send_html "[alpha5 ALERT] $SUBJECT" "$OUT/body.txt"
 fi
 echo "$MODE review done: $STATUS $SUBJECT"
