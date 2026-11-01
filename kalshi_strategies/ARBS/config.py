@@ -155,6 +155,8 @@ class RuntimeParams:
                                    "(data/live/ARBS/liquidity/).", min=30.0, step=30.0, editable=False)
     feed_down_pull_s: float = param("Pull every quote once the Kalshi websocket has been down this long.",
                                     min=0.0, step=1.0, editable=False)
+    record_prints: bool = param("Log trade-time book snapshots on basket legs (data/live/ARBS/prints/), for "
+                                "replaying edge and size settings offline.")
 
 
 @section

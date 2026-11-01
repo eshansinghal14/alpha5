@@ -1220,3 +1220,24 @@ def test_upside_only_where_an_outcome_pays_more(arbs):
     assert r.upside(no, 0) == 0.0
     started = dataclasses.replace(no, live_from=pd.Timestamp.now(tz="UTC") - pd.Timedelta(minutes=5))
     assert r.upside(started, 10) == 0.0
+
+
+def test_print_recorded_only_where_a_quote_could_make_edge(arbs):
+    r, b = arbs
+    from kalshi_backtest.core import Trade
+    book(r, "X-A", [(0.40, 10)], [(0.55, 10)])
+    book(r, "X-B", [(0.45, 10)], [(0.50, 10)])           # YES B ask 0.50
+    now = pd.Timestamp.now(tz="UTC")
+
+    async def go():
+        r._on_trade("X-A", Trade("X-A", now, 0.45, 3, "no"))      # 0.45 + 0.50 < 1: a quote there clears
+        r._on_trade("X-A", Trade("X-A", now, 0.44, 2, "no"))      # same sweep: merged into that row
+        r._on_trade("X-B", Trade("X-B", now, 0.62, 5, "no"))      # 0.62 + YES A ask 0.45 > 1.01
+        await asyncio.sleep(1.1)
+    asyncio.run(go())
+    rows = r.prints.take(time.time() + 1.0)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["ticker"] == "X-A" and row["side"] == "yes" and [p[1:] for p in row["prints"]] == [[0.45, 3], [0.44, 2]]
+    assert row["baskets"] == [[b.basket_id, 1.0, False]]
+    assert row["books"]["X-B"]["no"] == [[0.5, 10]] and set(row["after"]) == {"0.03", "1.0"}

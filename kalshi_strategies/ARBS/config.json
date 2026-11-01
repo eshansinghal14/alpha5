@@ -52,6 +52,7 @@
     "meta_refresh_s": 300.0,
     "max_order_errors": 5,
     "liquidity_log_s": 300.0,
-    "feed_down_pull_s": 5.0
+    "feed_down_pull_s": 5.0,
+    "record_prints": true
   }
 }

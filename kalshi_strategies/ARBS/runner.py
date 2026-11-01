@@ -48,6 +48,7 @@ from kalshi_strategies.ARBS.execution import Gateway
 from kalshi_strategies.ARBS.feed import MultiFeed
 from kalshi_strategies.ARBS.ledger import Ledger
 from kalshi_strategies.ARBS.liquidity import Liquidity
+from kalshi_strategies.ARBS.prints import AFTER_S, Prints, top as prints_top
 from kalshi_strategies.ARBS.spec import Basket, basket_from_dict, basket_to_dict, load_spec, merge, parse_spec
 
 _EPS = 1e-9
@@ -135,6 +136,12 @@ EVAL_SLICE_S = 0.001
 # Relationship types whose bundles can pay more than their worst case:
 # complete sets and exact identities pay the same in every outcome.
 UPSIDE_TYPES = ("mutually_exclusive_no", "implication", "mutual_exclusion")
+# A print is recorded when a quote at its price, completed at the other legs'
+# asks, comes within this of the payout: fees aside, some edge setting fills.
+PRINT_SLACK = 0.01
+PRINT_MAX_BASKETS = 10
+PRINT_MAX_TICKERS = 20
+PRINTS_FLUSH_S = 10.0
 IDS_COMPACT_S = 3600.0
 # Kalshi trips a group once MORE than this many contracts match in 15 s; 0 is
 # refused (invalid_parameters, 10-31), so a 1-lot fill doesn't trip it.
@@ -322,6 +329,7 @@ class ArbsRunner:
                   "moves_refused": 0}
         self.started = _utc()
         self.liq = Liquidity(self.root)
+        self.prints = Prints(self.root)
         self.flow = _Flow()
         # basket_id -> per leg (price, edge per bundle, size) we'd quote, or None.
         self.quote_px: dict[str, list] = {}
@@ -815,6 +823,12 @@ class ArbsRunner:
         if maker:
             self.flow.add(ticker, maker, trade.size, time.time())
             self.note_missed(ticker, maker, trade)
+            if self.cfg.runtime.record_prints:
+                # Research logging: never in the way of the trade handling.
+                try:
+                    self.record_print(ticker, maker, trade)
+                except Exception:
+                    self.n["print_errors"] = self.n.get("print_errors", 0) + 1
         if self.live:
             return
         for q in list(self.quotes.values()):
@@ -823,6 +837,67 @@ class ArbsRunner:
                 n = min(q.remaining, trade.size)
                 m = self.meta[ticker]
                 self._quote_fill(q, n, n * q.price + kfees.fee(q.price, n, m.maker_rate or 0.0), None, "shadow")
+
+    def _best_ask(self, ticker: str, side: str) -> float | None:
+        bk = self.feed.ladder(ticker)
+        if bk is None:
+            return None
+        opp = bk.no_bids if side == "yes" else bk.yes_bids
+        return 1.0 - max(opp) if opp else None
+
+    def _snap(self, tickers) -> dict:
+        out = {}
+        for t in tickers:
+            bk = self.feed.ladder(t)
+            if bk is not None:
+                out[t] = {"yes": prints_top(bk.yes_bids), "no": prints_top(bk.no_bids)}
+        return out
+
+    def record_print(self, ticker: str, side: str, trade):
+        """See prints.py. `side` is the maker's: the side a resting quote of
+        ours would have bought."""
+        start = time.perf_counter()
+        now = time.time()
+        if self.prints.merge(now, ticker, side, trade.price, trade.size):
+            return
+        qual = []
+        for bid in self.by_ticker.get(ticker, ()):
+            b = self.baskets.get(bid)
+            if b is None or not any(l.ticker == ticker and l.side == side for l in b.legs):
+                continue
+            others = 0.0
+            for l in b.legs:
+                if l.ticker == ticker:
+                    continue
+                a = self._best_ask(l.ticker, l.side)
+                if a is None:
+                    break
+                others += a
+            else:
+                if trade.price + others <= b.payout + PRINT_SLACK:
+                    qual.append([bid, b.payout, self.live_now(b, _utc())])
+                    if len(qual) >= PRINT_MAX_BASKETS:
+                        break
+        if qual:
+            tickers = list(dict.fromkeys(t for q in qual for t in self.baskets[q[0]].tickers))[:PRINT_MAX_TICKERS]
+            own = {t: o for t in tickers if (o := {s: self._own(t, s) for s in ("yes", "no") if self._own(t, s)})}
+            row = self.prints.start(now, ticker, side, trade.price, trade.size, qual, self._snap(tickers), own)
+            if row is not None:
+                loop = asyncio.get_running_loop()
+                for d in AFTER_S:
+                    loop.call_later(d, lambda d=d: row["after"].__setitem__(str(d), self._snap(tickers)))
+        self.n["print_record_ms"] = self.n.get("print_record_ms", 0.0) + (time.perf_counter() - start) * 1000
+
+    async def prints_loop(self):
+        loop = asyncio.get_running_loop()
+        while True:
+            await asyncio.sleep(PRINTS_FLUSH_S)
+            try:
+                rows = self.prints.take(time.time())
+                self.n["prints_recorded"], self.n["prints_dropped"] = self.prints.rows, self.prints.dropped
+                await loop.run_in_executor(self.pool, self.prints.write, rows, f"{_utc():%Y-%m-%d}")
+            except Exception as e:
+                _log(f"WARN: print log failed ({e!r})")
 
     # ------------------------------------------------------------------ fills
 
@@ -2293,7 +2368,7 @@ class ArbsRunner:
         trading, stopper, stop = TradingModeWatcher(self.S), StopWatcher(), asyncio.Event()
         coros = [self.feed.run(), self.eval_loop(), self.rank_loop(), self.meta_loop(), self.fill_poll_loop(),
                  self.audit_loop(), self.guard_loop(), self.summary_loop(), self.scan_loop(),
-                 self.liquidity_loop(), self.exchange_loop(), self.write_share_loop(), self.ledger_flush_loop(),
+                 self.liquidity_loop(), self.prints_loop(), self.exchange_loop(), self.write_share_loop(), self.ledger_flush_loop(),
                  self.keepalive_loop(), self.control_loop(trading, stopper, stop)]
         tasks = [asyncio.create_task(c) for c in coros]
         try:
