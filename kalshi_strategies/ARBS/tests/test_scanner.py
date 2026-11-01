@@ -185,3 +185,17 @@ def test_daily_rule_skips_events_with_a_kickoff():
                               starts={"KXCS2MAP-26OCT31X-1": "2026-10-31T20:00:00Z"})).values()))
     assert not b.is_live(pd.Timestamp("2026-10-31T12:00:00Z"))       # not from the day's start
     assert b.is_live(pd.Timestamp("2026-10-31T20:00:00Z"))           # from kickoff
+
+
+
+def test_live_window_by_category():
+    win = {"Elections": ["2026-11-03T22:00:00Z", "2026-11-06T00:00:00Z"]}
+    vote = event("SENATEX-26", "MECNET", buckets("SENATEX-26")) | {"category": "Elections"}
+    game = event("KXGAME-26", "MECNET", buckets("KXGAME-26")) | {"category": "Sports"}
+    args = dict(mecnet_max_legs=6, ladder_span=3, complete_set_exclude=[], overrides={}, live_windows=win)
+    got = baskets(scanner.scan([vote, game], now=NOW, **args))
+    night = pd.Timestamp("2026-11-03T23:00:00Z")
+    assert all(b.is_live(night) == ("SENATEX" in bid) for bid, b in got.items())
+    assert all(not b.is_live(pd.Timestamp("2026-11-03T21:00:00Z")) for b in got.values())
+    later = baskets(scanner.scan([vote], now=pd.Timestamp("2026-11-07", tz="UTC"), **args))
+    assert not any(b.is_live(pd.Timestamp("2026-11-08", tz="UTC")) for b in later.values())

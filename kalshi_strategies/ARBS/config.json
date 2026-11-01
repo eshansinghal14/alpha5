@@ -39,7 +39,9 @@
     "interval_s": 120.0,
     "mecnet_max_legs": 6,
     "ladder_span": 3,
-    "complete_set_exclude": []
+    "complete_set_exclude": [],
+    "live_windows": {"Elections": ["2026-11-03T22:00:00Z", "2026-11-06T00:00:00Z"],
+                     "Politics": ["2026-11-03T22:00:00Z", "2026-11-06T00:00:00Z"]}
   },
   "runtime": {
     "control_poll_s": 1.0,

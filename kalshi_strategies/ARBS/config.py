@@ -124,6 +124,9 @@ class ScanParams:
     complete_set_exclude: list[str] = param("Series whose MECNET buckets are not traded as complete sets "
                                             "(buy every YES / every NO), though they look like they cover "
                                             "every outcome.", editable=False)
+    live_windows: dict[str, list[str]] = param("Kalshi category -> [from, until] UTC: its events are live "
+                                               "(live size, edge and exits) from `from`, for scans before "
+                                               "`until` (election results night).", editable=False)
 
 
 @section

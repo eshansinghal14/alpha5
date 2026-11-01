@@ -210,10 +210,12 @@ def ladder(event: dict, markets: list[dict], span: int) -> list[dict]:
 def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_span: int,
          complete_set_exclude: list[str], overrides: dict[str, str], shards=(0,),
          skip_series: set[str] = frozenset(), starts: dict[str, str] | None = None,
-         freqs: dict[str, str] | None = None) -> dict:
+         freqs: dict[str, str] | None = None, live_windows: dict[str, list[str]] | None = None) -> dict:
     """Every relationship found, each with its event's expected settlement
     and 24h volume for `select`. `starts`: event -> when it goes live
-    (fetch_starts); `freqs`: series -> frequency (fetch_frequencies)."""
+    (fetch_starts); `freqs`: series -> frequency (fetch_frequencies);
+    `live_windows`: Kalshi category -> [from, until], its events live from
+    `from` while the scan runs before `until`."""
     rels, tickers = [], set()
     for e in events:
         if e.get("collateral_return_type") not in ("MECNET", "DIRECNET") or e.get("series_ticker") in skip_series \
@@ -241,6 +243,12 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
         period = PERIODS.get((freqs or {}).get(e.get("series_ticker")))
         if period is not None and e.get("strike_date") and not (starts or {}).get(e["event_ticker"]):
             live.append(pd.Timestamp(e["strike_date"]) - period)
+        # Kalshi dates most election events to the seat's start (Jan 2027), so
+        # occurrence_datetime never makes results night live: the window does.
+        # Past `until` it drops out, so a later race isn't held at live size.
+        w = (live_windows or {}).get(e.get("category"))
+        if w and now < pd.Timestamp(w[1]):
+            live.append(pd.Timestamp(w[0]))
         for r in got:
             r.update(expected_settlement_utc=s.isoformat(), quote_until_utc=None, resume_quoting_utc=None,
                      live_from_utc=min(live).isoformat() if live else None, volume_24h=vol)
@@ -286,7 +294,7 @@ def run(cfg, hand_doc: dict, spec_path: str, held: set[str] = frozenset()) -> di
     doc = scan(fetch_events(), now=now, mecnet_max_legs=cfg.scan.mecnet_max_legs,
                ladder_span=cfg.scan.ladder_span, complete_set_exclude=cfg.scan.complete_set_exclude,
                shards=set(cfg.scan.shards), skip_series=other_series(), starts=fetch_starts(now),
-               freqs=fetch_frequencies(),
+               freqs=fetch_frequencies(), live_windows=cfg.scan.live_windows,
                overrides={s: v["expected_settlement_month"]
                           for s, v in (hand_doc.get("settlement_basis_by_series") or {}).items()})
     have = {r["relationship_id"] for r in doc["relationships"]}
