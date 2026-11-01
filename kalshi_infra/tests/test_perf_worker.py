@@ -105,3 +105,9 @@ def test_worker_output_is_what_the_dashboard_reads(tmp_path, monkeypatch):
     perf.write_error("S", "boom")
     r2 = perf.read_result("S")
     assert r2.error == "boom" and len(r2.fills) == 1
+
+
+def test_event_close_reads_the_repeated_fall_back_hour_as_standard_time():
+    assert perf.event_close("KXCRYPTOLEAD15M-26NOV010115-BTC") == pd.Timestamp("2026-11-01 06:15", tz="UTC")
+    assert perf.event_close("KXCRYPTOLEAD15M-26MAR080215-BTC") == pd.Timestamp("2026-03-08 07:00", tz="UTC")
+    assert perf.event_close("KXCRYPTOLEAD15M-26OCT120300-BTC") == pd.Timestamp("2026-10-12 07:00", tz="UTC")

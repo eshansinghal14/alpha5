@@ -78,7 +78,11 @@ def event_close(ticker: str) -> pd.Timestamp | None:
         t = pd.to_datetime(parts[1].replace("H", ""), format="%y%b%d%H%M")
     except ValueError:
         return None
-    return pd.Timestamp(t).tz_localize("America/New_York").tz_convert("UTC")
+    # The fall-back hour (01:00-01:59 on DST's last day) happens twice and the
+    # ticker doesn't say which; the later reading only delays the settlement
+    # check. Raising on it stalled every refresh (2026-11-01).
+    return pd.Timestamp(t).tz_localize("America/New_York", ambiguous=False,
+                                       nonexistent="shift_forward").tz_convert("UTC")
 
 
 def _days(series: str) -> list[str]:
