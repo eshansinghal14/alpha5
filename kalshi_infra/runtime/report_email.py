@@ -10,8 +10,10 @@ as a raw MIME message so the charts are embedded, not attached.
 from __future__ import annotations
 
 import argparse
+import base64
 import html
 import io
+import json
 import math
 import os
 import subprocess
@@ -193,11 +195,15 @@ def build(subject: str, body_md: str, hours: float, sender: str, to: str, charts
 
 
 def send(msg: MIMEMultipart, region: str = "us-east-2") -> None:
-    with tempfile.NamedTemporaryFile("wb", suffix=".eml", delete=False) as fh:
-        fh.write(msg.as_bytes())
+    # CLI v2 takes the raw message base64-encoded; fileb:// isn't read inside
+    # the Data= shorthand ("Invalid base64").
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        json.dump({"Data": base64.b64encode(msg.as_bytes()).decode()}, fh)
     try:
-        subprocess.run(["aws", "ses", "send-raw-email", "--region", region, "--raw-message",
-                        f"Data=fileb://{fh.name}", "--output", "text"], check=True, capture_output=True, timeout=60)
+        r = subprocess.run(["aws", "ses", "send-raw-email", "--region", region, "--raw-message",
+                            f"file://{fh.name}", "--output", "text"], capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            raise RuntimeError(f"ses send-raw-email failed: {r.stderr.strip()}")
     finally:
         os.unlink(fh.name)
 
