@@ -34,16 +34,28 @@ class TopHistory:
             d[-1] = s
         else:
             d.append(s)
-        while d and now - d[0][0] > HIST_S:
+        # Keep one sample from before the window: the book it opened on.
+        while len(d) > 1 and now - d[1][0] > HIST_S:
             d.popleft()
 
     def context(self, tickers, now: float) -> dict:
-        """ticker -> [[seconds before now, bid, bid depth, ask, ask depth], ...], oldest first."""
+        """ticker -> [[seconds before now, bid, bid depth, ask, ask depth], ...],
+        oldest first. The first sample can be older than HIST_S: the book as it
+        stood when the window opened (a quiet market has nothing newer)."""
         out = {}
         for t in tickers:
             d = self.h.get(t)
-            if d:
-                out[t] = [[round(now - s[0], 3), *s[1:]] for s in d if now - s[0] <= HIST_S]
+            if not d:
+                continue
+            rows, before = [], None
+            for s in d:
+                if now - s[0] > HIST_S:
+                    before = s
+                else:
+                    rows.append([round(now - s[0], 3), *s[1:]])
+            if before is not None:
+                rows.insert(0, [round(now - before[0], 3), *before[1:]])
+            out[t] = rows
         return out
 
     def add(self, row: dict):

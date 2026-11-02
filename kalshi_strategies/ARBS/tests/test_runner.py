@@ -1259,7 +1259,8 @@ def test_fill_logs_top_of_book_history_without_our_own_size(arbs):
     r._quote_fill(q, 2, 0.8, None, "ws")
     row = r.top_hist.take()[0]
     assert row["kind"] == "fill" and row["size"] == 2 and row["ticker"] == "X-A"
-    assert [s[2] for s in row["context"]["X-B"]][-2:] == [35, 5]
+    assert [s[2] for s in row["context"]["X-B"]] == [99, 35, 5]     # the book before the window, then changes
+    assert row["context"]["X-B"][0][0] >= 30.0
     bk = types.SimpleNamespace(ticker="X-A", bid=0.4, bid_depth=12, ask=0.45, ask_depth=8)
     r._note_top(bk)
     assert r.top_hist.h["X-A"][-1][2] == 12 - 3                   # our 3 left resting at 0.40 taken out
