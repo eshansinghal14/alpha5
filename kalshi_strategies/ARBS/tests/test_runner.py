@@ -1241,3 +1241,25 @@ def test_print_recorded_only_where_a_quote_could_make_edge(arbs):
     assert row["ticker"] == "X-A" and row["side"] == "yes" and [p[1:] for p in row["prints"]] == [[0.45, 3], [0.44, 2]]
     assert row["baskets"] == [[b.basket_id, 1.0, False]]
     assert row["books"]["X-B"]["no"] == [[0.5, 10]] and set(row["after"]) == {"0.03", "1.0"}
+
+
+def test_fill_logs_top_of_book_history_without_our_own_size(arbs):
+    r, b = arbs
+    import types
+    from kalshi_strategies.ARBS.depth import TopHistory
+    r.top_hist = TopHistory(str(r.root))
+    t0 = time.time()
+    r.top_hist.on_book("X-B", t0 - 30.0, 0.40, 99, 0.6, 99)       # ages out
+    r.top_hist.on_book("X-B", t0 - 3.0, 0.45, 40, 0.5, 30)
+    r.top_hist.on_book("X-B", t0 - 3.01, 0.45, 35, 0.5, 30)       # within 50 ms: replaces the last sample
+    r.top_hist.on_book("X-B", t0 - 1.0, 0.45, 5, 0.5, 30)         # the others pulled
+    q = R.Quote(basket_id=b.basket_id, leg=0, ticker="X-A", side="yes", price=0.40, size=5, cid="c", edge=0.05,
+                max_price=0.40, pending=False, exchange_id="oid")
+    r.quotes[q.key] = q
+    r._quote_fill(q, 2, 0.8, None, "ws")
+    row = r.top_hist.take()[0]
+    assert row["kind"] == "fill" and row["size"] == 2 and row["ticker"] == "X-A"
+    assert [s[2] for s in row["context"]["X-B"]][-2:] == [35, 5]
+    bk = types.SimpleNamespace(ticker="X-A", bid=0.4, bid_depth=12, ask=0.45, ask_depth=8)
+    r._note_top(bk)
+    assert r.top_hist.h["X-A"][-1][2] == 12 - 3                   # our 3 left resting at 0.40 taken out

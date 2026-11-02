@@ -26,6 +26,7 @@ import gzip
 import json
 import math
 import os
+import random
 import sys
 import time
 import traceback
@@ -47,6 +48,7 @@ from kalshi_strategies.ARBS.config import SPEC_PATH
 from kalshi_strategies.ARBS.execution import Gateway
 from kalshi_strategies.ARBS.feed import MultiFeed
 from kalshi_strategies.ARBS.ledger import Ledger
+from kalshi_strategies.ARBS.depth import TopHistory
 from kalshi_strategies.ARBS.liquidity import Liquidity
 from kalshi_strategies.ARBS.prints import AFTER_S, Prints, top as prints_top
 from kalshi_strategies.ARBS.spec import Basket, basket_from_dict, basket_to_dict, load_spec, merge, parse_spec
@@ -330,6 +332,7 @@ class ArbsRunner:
         self.started = _utc()
         self.liq = Liquidity(self.root)
         self.prints = Prints(self.root)
+        self.top_hist = TopHistory(self.root)
         self.flow = _Flow()
         # basket_id -> per leg (price, edge per bundle, size) we'd quote, or None.
         self.quote_px: dict[str, list] = {}
@@ -814,6 +817,11 @@ class ArbsRunner:
         self.book_seq[book.ticker] = self.book_seq.get(book.ticker, 0) + 1
         self.book_time[book.ticker] = time.monotonic()
         self.liq.on_book(book.ticker, time.monotonic(), book.ask, book.ask_depth, book.bid, book.bid_depth)
+        if self.cfg.runtime.record_prints:
+            try:
+                self._note_top(book)
+            except Exception:
+                self.n["print_errors"] = self.n.get("print_errors", 0) + 1
         for bid in self.by_ticker.get(book.ticker, ()):
             self.mark(bid)
 
@@ -837,6 +845,22 @@ class ArbsRunner:
                 n = min(q.remaining, trade.size)
                 m = self.meta[ticker]
                 self._quote_fill(q, n, n * q.price + kfees.fee(q.price, n, m.maker_rate or 0.0), None, "shadow")
+
+    def _note_top(self, book):
+        """Top of book for depth.py, others' depth only: our quote at the
+        touch would read as a maker staying when the rest pulled."""
+        t = book.ticker
+        mine_b = self._own(t, "yes").get(round(book.bid, 4), 0.0) if book.bid is not None else 0.0
+        mine_a = self._own(t, "no").get(round(1.0 - book.ask, 4), 0.0) if book.ask is not None else 0.0
+        self.top_hist.on_book(t, time.time(), book.bid, (book.bid_depth or 0.0) - mine_b, book.ask,
+                              (book.ask_depth or 0.0) - mine_a)
+
+    def _context_row(self, kind: str, q: Quote, **kw) -> dict:
+        b = self.baskets.get(q.basket_id)
+        now = time.time()
+        return {"t": now, "kind": kind, "basket_id": q.basket_id, "ticker": q.ticker, "side": q.side,
+                "price": q.price, "deep": q.deep, "live": bool(b and self.live_now(b, _utc())),
+                "context": self.top_hist.context(b.tickers if b else [q.ticker], now), **kw}
 
     def _best_ask(self, ticker: str, side: str) -> float | None:
         bk = self.feed.ladder(ticker)
@@ -895,7 +919,13 @@ class ArbsRunner:
             try:
                 rows = self.prints.take(time.time())
                 self.n["prints_recorded"], self.n["prints_dropped"] = self.prints.rows, self.prints.dropped
-                await loop.run_in_executor(self.pool, self.prints.write, rows, f"{_utc():%Y-%m-%d}")
+                # The no-fill base rate: one resting quote's basket per flush.
+                resting = [q for q in self.quotes.values() if not q.pending and q.remaining > 0]
+                if resting and self.cfg.runtime.record_prints:
+                    self.top_hist.add(self._context_row("control", random.choice(resting)))
+                day = f"{_utc():%Y-%m-%d}"
+                await loop.run_in_executor(self.pool, self.prints.write, rows, day)
+                await loop.run_in_executor(self.pool, self.top_hist.write, self.top_hist.take(), day)
             except Exception as e:
                 _log(f"WARN: print log failed ({e!r})")
 
@@ -941,6 +971,11 @@ class ArbsRunner:
 
     def _quote_fill(self, q: Quote, size: float, cost: float, trade_id, source: str):
         q.filled += size
+        if self.cfg.runtime.record_prints:
+            try:
+                self.top_hist.add(self._context_row("fill", q, size=size, source=source))
+            except Exception:
+                self.n["print_errors"] = self.n.get("print_errors", 0) + 1
         if q.group:
             self._group_fill(q.group, size)
         if q.kind == "arb":
