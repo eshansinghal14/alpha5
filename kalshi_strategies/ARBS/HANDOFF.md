@@ -97,7 +97,7 @@ are on `ec2-live` (box at `6396726`).
 trading: min_edge 0.03, quote_edge_add 0.01, min_exit_edge 0.01, exit_ref_days 14,
 days_till_expiry 90, quote_size 50, quote_live_events true, take_live_events false,
 live_edge_add 0.015, live_quote_size 10, max_bundles_per_basket 1000, max_dollars 9000,
-requote_min_ticks 1, requote_cooldown_s 2, bad_fill_cooldown_s 0 (off), take_cooldown_s 5.
+requote_min_ticks 1, requote_hold_up 0.01, requote_cooldown_s 2, take_cooldown_s 5.
 completion: chase_ticks 3, chase_window_s 0.1, max_broken_baskets 3.
 watch: queue_window_s 10800, rank_interval_s 10. scan: max_markets 1000, interval 120 s.
 runtime: max_write_tokens_per_s 150, _solo 250, write_reserve_tokens 20, feed_down_pull_s 5.
@@ -170,7 +170,7 @@ the budget); settled baskets. Times are America/New_York.
 
 | # | Idea | Status | Evidence / next step |
 |---|---|---|---|
-| 1 | Pause quoting an event after a bad exit (`bad_fill_cooldown_s`) | **Built, off (0)** | Replay: 60 s skipped 163 fills, saved $31.6 on 36 losers, gave up $53.1 on 127 winners. Shorter (0.25–10 s) is ≈ break-even to negative excluding weather. Caveat: that replay's episode accounting was flawed (it overstated weather losses); redo with bundle-log bursts before revisiting. |
+| 1 | Pause quoting an event after a bad exit (`bad_fill_cooldown_s`) | **Removed** (was off at 0) | Replay: 60 s skipped 163 fills, saved $31.6 on 36 losers, gave up $53.1 on 127 winners. Shorter (0.25–10 s) is ≈ break-even to negative excluding weather. Caveat: that replay's episode accounting was flawed (it overstated weather losses); redo with bundle-log bursts before revisiting. |
 | 2 | Same-day weather/gas treated as live | **Done** (`1eda1e7`) | Weather −$3.03 total, all from one SF fill after 9 pm local (−$5.05, 50 lots). Watch `arbs_daily_live_report.py`: it also catches Trump approval (daily, +$5.11, no losers) — consider an exception list (config) if it keeps making money as non-live. |
 | 3 | Stop quoting a live basket when a leg is ≥97¢ / ≤3¢ | **Rejected** | Replay: would skip 33 bursts worth +$8.23 (21 winners). A leg at 0.99 is usually a lopsided game, not a decided one. If decided-game pick-offs matter, key on the book (one side empty / spread blown), not price. |
 | 4 | NHL: bigger live edge or off | Open | 78 bursts, +$3.26 on $721 (0.5%), 30 losers. |

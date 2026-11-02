@@ -20,7 +20,6 @@
     "requote_min_ticks": 1,
     "requote_hold_up": 0.01,
     "requote_cooldown_s": 2.0,
-    "bad_fill_cooldown_s": 0.0,
     "take_cooldown_s": 1.0
   },
   "completion": {

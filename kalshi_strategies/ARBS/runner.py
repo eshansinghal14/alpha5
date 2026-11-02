@@ -357,10 +357,6 @@ class ArbsRunner:
         # news). Cleared by a clean completion or an even take on it.
         self.flagged: dict[str, float] = {}
         self.unpriced_alert_at: dict[str, float | None] = {}
-        # event -> unix time quoting may resume after a bad fill there: a fill
-        # was requoted at once into the same swing, filled again and again
-        # (KXIDNSLGAME PERPJE 45 bundles in ~1 s, 10-30 09:52 ET, -$3.59).
-        self.cooling: dict[str, float] = {}   # basket_id -> broken_since alerted for
         self._horizon: tuple[float, pd.Timestamp] | None = None
         # Live order round trips, flushed with the liquidity log (orders_*.jsonl.gz).
         self.order_times: list[dict] = []
@@ -1147,22 +1143,6 @@ class ArbsRunner:
     def events_of(self, b: Basket) -> set[str]:
         return {self.meta[t].event for t in b.tickers if t in self.meta and self.meta[t].event}
 
-    def cool(self, b: Basket):
-        """Pull and hold quotes on every basket touching b's events."""
-        secs = self.cfg.trading.bad_fill_cooldown_s
-        if secs <= 0:
-            return
-        evs = self.events_of(b)
-        until = time.time() + secs
-        for e in evs:
-            self.cooling[e] = max(self.cooling.get(e, 0.0), until)
-        for t, m in self.meta.items():
-            if m.event in evs:
-                self.dirty.update(self.by_ticker.get(t, ()))
-
-    def cooling_left(self, b: Basket, now: float) -> float:
-        return max((self.cooling.get(e, 0.0) - now for e in self.events_of(b)), default=0.0)
-
     def flag_live(self, b: Basket, why: str):
         new = [t for t in b.tickers if t not in self.flagged]
         for t in new:
@@ -1295,9 +1275,7 @@ class ArbsRunner:
         t = self.cfg.trading
         ex = self.exit_room(b)
         now_ts = _utc()
-        cooling = self.cooling_left(b, now) > 0
-        want = (t.enable_quoting and (b.basket_id in self.hot or ex >= 1) and self.may_quote(b, now_ts)
-                and not cooling)
+        want = t.enable_quoting and (b.basket_id in self.hot or ex >= 1) and self.may_quote(b, now_ts)
         live = self.live_now(b, now_ts)
         cap = float(t.live_quote_size if live else t.quote_size)
         quote_need = edge_dollars(b.payout, t.min_edge + t.quote_edge_add) + (t.live_edge_add if live else 0.0)
@@ -1327,7 +1305,7 @@ class ArbsRunner:
                     plan = pricing.quote_leg(vs, j, b.payout, quote_need, size)
             if plan is None:
                 if q is not None:
-                    acts.append(self.cancel_quote(q, "no_edge" if want else "cooldown" if cooling else "not_hot"))
+                    acts.append(self.cancel_quote(q, "no_edge" if want else "not_hot"))
                 continue
             other = self.quoted_elsewhere(b.basket_id, leg.ticker, leg.side)
             if other is not None and (q is None or other.placed_at < q.placed_at):
@@ -1647,8 +1625,6 @@ class ArbsRunner:
                       "orders": {t: [sd, n, p] for _, t, sd, n, _, p in orders}})
         if worse is not None and worse > _EPS:
             self.alert("warn", bid, f"{path} ${worse:.2f} worse than planned ({why})")
-        if (worse is not None and worse > _EPS) or why == "fast move":
-            self.cool(b)
         if path == "unwind" or why == "fast move":
             self.flag_live(b, f"a {why} {path}")
         elif why == "at plan":
@@ -2366,7 +2342,6 @@ class ArbsRunner:
             "hot_churn": {f"{m}m": sum(e for t, e, _ in self.hot_churn if t >= time.time() - 60 * m)
                           for m in (1, 10, 60)},
             "hot_cost_tps": self.hot_cost, "write_budget_tps": self.write_budget(),
-            "cooldowns": {e: round(u - time.time()) for e, u in self.cooling.items() if u > time.time()},
             "order_groups": {e: {"id": g["id"], "tripped": g["tripped_at"] is not None}
                              for e, g in self.groups.items()},
             "flagged_live": {t: datetime_iso(ts) for t, ts in self.flagged.items()},
