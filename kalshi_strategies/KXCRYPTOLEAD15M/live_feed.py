@@ -17,7 +17,7 @@ import time
 
 from kalshi_strategies.KXCRYPTOLEAD15M.cf_index import CfIndex
 from kalshi_strategies.KXCRYPTOLEAD15M.composite import CompositeBus
-from kalshi_strategies.KXCRYPTOLEAD15M.perp_nowcast import PERPS, PerpNowcast
+from kalshi_strategies.KXCRYPTOLEAD15M.perp_nowcast import LEAD, PERPS, SHADOW, PerpNowcast
 from kalshi_strategies.KXCRYPTOLEAD15M.prints import (AUTO_SOURCES, HL_BURST_USD_1S, MOVE_SOURCE, PERP_BURST_USD_1S,
                                                        PERP_SOURCES, REFRESH_S, load_thresholds, save_thresholds,
                                                        SAMPLE_S, BurstCalibrator, BurstDetector, PrintLog,
@@ -98,6 +98,8 @@ class SpotFeed:
         self.bursts = BurstDetector(COINS)
         # Shadow only: logged on decision rows, never priced on (perp_nowcast.py).
         self.perp_nowcast = PerpNowcast()
+        # Read on every call: a config edit to nowcast_leads applies at once.
+        self.perp_nowcast.leads_fn = lambda: tuple(getattr(self.cfg.pricing, "nowcast_leads", None) or (LEAD,))
         self._perp_woke: dict[str, float] = {}
         self.prints = PrintLog(persist=persist)
         self.trips = TripLog(persist=persist)
@@ -362,7 +364,14 @@ class SpotFeed:
         return True
 
     def _on_book(self, vb):
-        if vb.venue in PERPS:
+        if vb.venue in SHADOW and vb.venue not in self.perp_nowcast.leads_fn():
+            # Logged only (model extras x_<venue>_gap_bp): never wakes or prices.
+            if not vb.is_resyncing and not vb.is_crossed():
+                mid = vb.book_mid()
+                if mid is not None:
+                    self.perp_nowcast.on_perp(vb.venue, vb.coin, mid, vb.receive_ts)
+            return
+        if vb.venue in PERPS or vb.venue in SHADOW:
             if not vb.is_resyncing and not vb.is_crossed():
                 mid = vb.book_mid()
                 if mid is not None:

@@ -114,8 +114,8 @@ def _child_main(plan: dict[str, list[str]]):
     import asyncio
     import signal
     from .venues import ADAPTERS, LEADING_VENUES
-    from ..prints import (PERP_BURST_USD_1S, PERP_SOURCES, REFRESH_S, SAMPLE_S, BurstCalibrator, LeadTrigger,
-                          seed_move_rows)
+    from ..prints import (MOVE_VENUES, PERP_BURST_USD_1S, REFRESH_S, SAMPLE_S, SOLO_MOVE_VENUES, BurstCalibrator,
+                          LeadTrigger, seed_move_rows)
 
     # The pipe is the protocol; anything an adapter prints goes to stderr,
     # which the parent leaves on the console/run log.
@@ -150,9 +150,10 @@ def _child_main(plan: dict[str, list[str]]):
     prints: list[tuple] = []
     adapters = []
     coins_all = sorted({c for cs in plan.values() for c in cs})
-    perps = tuple(v for v in PERP_SOURCES if v in plan)
-    trigger = LeadTrigger(coins_all, perps)
-    move_cal = {v: BurstCalibrator(coins_all, None) for v in perps}
+    perps = tuple(v for v in MOVE_VENUES if v in plan)
+    solo = tuple(v for v in SOLO_MOVE_VENUES if v in plan)
+    trigger = LeadTrigger(coins_all, perps, solo=solo)
+    move_cal = {v: BurstCalibrator(coins_all, None) for v in perps + solo}
     move_cal_ready = [False]
 
     def apply_control():

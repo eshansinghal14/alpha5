@@ -39,6 +39,11 @@ import numpy as np
 # OKX alone covers the veto and the stale-Binance fallback.
 PERPS = ("binance_perp", "okx_perp")
 LEAD = "binance_perp"
+# Tracked (price, basis), never in nowcast(); in increment() only when listed
+# in pricing.nowcast_leads. CME reached this box first on most moves: Binance
+# moves showed on CME 22-49 ms earlier (BTC/ETH/SOL/XRP, live 11-01 23:00 -
+# 11-02 03:00 UTC, research/latency/cme_live_rec.py).
+SHADOW = ("cme",)
 # Binance vs OKX, both net of basis. Above the cap so a real lead (|gap| p90
 # 1.4bp, SOL 10-20) isn't vetoed while OKX catches up. 6 h replay 10-20: it
 # fired 73-122/h (~0.2s each) and spot 1s later sided with the others 66-85%.
@@ -67,31 +72,46 @@ class PerpNowcast:
         self._basis: dict[tuple[str, str], collections.deque] = {}     # (venue, coin) -> (t, log perp - log spot)
         self._bsum: dict[tuple[str, str], float] = {}
         self._spot: dict[str, float] = {}                              # coin -> latest log spot
-        # Latest-mover state per coin: Binance's log price when spot last
-        # moved, so `increment` is only what Binance did since then.
-        self._lead_at_spot: dict[str, float] = {}
+        # Latest-mover state per (venue, coin): the venue's log price when
+        # spot last moved, so `increment` is only what it did since then.
+        self._lead_at_spot: dict[tuple[str, str], float] = {}
+        # Venues increment() tries, first fresh one wins (the owner's
+        # pricing.nowcast_leads; SpotFeed sets this).
+        self.leads_fn = lambda: (LEAD,)
+        self.lead_used: dict[str, str | None] = {}
 
     def on_spot(self, coin: str, mid: float | None):
         if mid is not None and mid > 0:
             self._spot[coin] = math.log(mid)
-            p = self._px.get((LEAD, coin))
-            if p is not None:
-                self._lead_at_spot[coin] = p[0]
+            for v in PERPS + SHADOW:
+                p = self._px.get((v, coin))
+                if p is not None:
+                    self._lead_at_spot[(v, coin)] = p[0]
 
-    def increment(self, coin: str, now: float, spot_mid: float | None) -> tuple[float | None, float | None]:
-        """Latest-mover nowcast (shadow): spot plus Binance's move since spot
-        last moved, capped at CAP_BP. Unlike nowcast(), a spot move is never
-        pulled back toward the perp level while Binance hasn't updated: the
-        increment resets to 0 on every spot move. Returns (price, inc_bp);
-        inc None when Binance is stale or hasn't printed since startup."""
+    def increment(self, coin: str, now: float, spot_mid: float | None,
+                  leads: tuple[str, ...] | None = None) -> tuple[float | None, float | None]:
+        """Latest-mover nowcast: spot plus the lead venue's move since spot
+        last moved, capped at CAP_BP. The lead is the first of `leads`
+        (default leads_fn()) that is fresh, so CME priced while open falls
+        back to Binance on weekends and in its daily halt; `lead_used[coin]`
+        says which. Unlike nowcast(), a spot move is never pulled back toward
+        the lead's level: the increment resets to 0 on every spot move.
+        Returns (price, inc_bp); inc None when no lead is fresh."""
         if spot_mid is None or spot_mid <= 0:
             return None, None
-        p, ref = self._px.get((LEAD, coin)), self._lead_at_spot.get(coin)
-        if p is None or ref is None or now - p[1] > FRESH_S:
-            return spot_mid, None
-        cap = CAP_BP * 1e-4
-        inc = max(-cap, min(cap, p[0] - ref))
-        return spot_mid * math.exp(inc), inc * 1e4
+        record = leads is None
+        for v in leads if leads is not None else self.leads_fn():
+            p, ref = self._px.get((v, coin)), self._lead_at_spot.get((v, coin))
+            if p is None or ref is None or now - p[1] > FRESH_S:
+                continue
+            cap = CAP_BP * 1e-4
+            inc = max(-cap, min(cap, p[0] - ref))
+            if record:
+                self.lead_used[coin] = v
+            return spot_mid * math.exp(inc), inc * 1e4
+        if record:
+            self.lead_used[coin] = None
+        return spot_mid, None
 
     def on_perp(self, venue: str, coin: str, price: float, t: float):
         if price <= 0:
@@ -107,6 +127,17 @@ class PerpNowcast:
         self._bsum[k] = self._bsum.get(k, 0.0) + (lp - s)
         while q and q[0][0] < t - BASIS_S:
             self._bsum[k] -= q.popleft()[1]
+
+    def venue_gap(self, venue: str, coin: str, now: float, spot_mid: float | None) -> tuple[float | None, float | None]:
+        """(venue's basis-adjusted gap to spot in bp, unclipped; its book age
+        in s) or (None, age) before it has MIN_BASIS_N basis samples."""
+        p, q = self._px.get((venue, coin)), self._basis.get((venue, coin))
+        if p is None or spot_mid is None or spot_mid <= 0:
+            return None, None
+        age = now - p[1]
+        if not q or len(q) < MIN_BASIS_N:
+            return None, age
+        return (p[0] - self._bsum[(venue, coin)] / len(q) - math.log(spot_mid)) * 1e4, age
 
     def nowcast(self, coin: str, now: float, spot_mid: float | None) -> tuple[float | None, float | None, int]:
         if spot_mid is None or spot_mid <= 0:
@@ -136,4 +167,4 @@ class PerpNowcast:
         return spot_mid * math.exp(gap), gap * 1e4, len(vals)
 
 
-__all__ = ["PerpNowcast", "PERPS", "LEAD", "CHECK_BP", "CAP_BP", "BASIS_S", "FRESH_S", "MIN_VENUES"]
+__all__ = ["PerpNowcast", "PERPS", "LEAD", "SHADOW", "CHECK_BP", "CAP_BP", "BASIS_S", "FRESH_S", "MIN_VENUES"]

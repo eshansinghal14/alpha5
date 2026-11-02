@@ -62,6 +62,11 @@ class CryptoPricingParams:
         "but exposed worse flow (+$1,880 to +$2,040). Key \"perp_move\" is the price-move trigger "
         "(prints.MOVE_*): 2 of 3 perp venues moving >= their own p99.5 of |0.5s move| one way.",
         editable=False)
+    nowcast_leads: list[str] = param(
+        "Venues the latest-mover nowcast (perp_priced_markets) follows, in order: the first whose book "
+        "is fresh (perp_nowcast.FRESH_S) is the lead. [\"cme\", \"binance_perp\"] prices on CME while it "
+        "trades and on Binance otherwise (weekends, CME's daily halt; CME has no HYPE). Live 11-01 23:00 - "
+        "11-02 03:00 UTC: CME reached this box 22-49 ms before Binance on its moves.", editable=False)
     perp_priced_markets: list[str] | None = param(
         "Coins whose x is the latest-mover perp nowcast (perp_nowcast.increment: spot + Binance's move "
         "since spot last moved, capped 2bp) instead of the spot mid. Race decisions 10-20 16:30-19:30 UTC: "

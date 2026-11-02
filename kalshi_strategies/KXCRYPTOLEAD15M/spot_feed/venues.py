@@ -645,6 +645,132 @@ class _OkxTrades(OkxPerpAdapter):
         self._parent._print(*a)
 
 
+# ---------------------------------------------------------------------------
+# CME crypto futures (Databento GLBX.MDP3 live)
+# ---------------------------------------------------------------------------
+
+CME_MONTHS = "FGHJKMNQUVXZ"
+# Coins per contract (definition unit_of_measure_qty, 2026-11-01).
+CME_UNITS = {"BTC": 5.0, "MBT": 0.1, "ETH": 50.0, "MET": 0.1, "SOL": 500.0, "MSL": 25.0,
+             "XRP": 50_000.0, "MXP": 2_500.0}
+# The next month is followed from this many days before the front one's
+# expiry: activity moves to it in the final week.
+CME_ROLL_DAYS = 5
+# The front month is re-derived this often; a change resubscribes.
+CME_RESUBSCRIBE_S = 3600.0
+# No record for this long with the session down means reconnect. Quiet is
+# normal (weekends, the daily halt), so silence alone never reconnects.
+CME_CHECK_S = 30.0
+_UNDEF_PRICE = 2**63 - 1
+
+
+def cme_expiry(year: int, month: int) -> float:
+    """Approximate expiry (epoch s): the month's last Friday 16:00 UTC, as the
+    definitions show for V6/X6. A holiday can move it a day earlier (Z6:
+    Thursday 12-24), which the roll margin absorbs."""
+    import calendar
+    import datetime as dt
+    last = calendar.monthrange(year, month)[1]
+    d = dt.date(year, month, last)
+    d -= dt.timedelta(days=(d.weekday() - 4) % 7)
+    return dt.datetime(d.year, d.month, d.day, 16, tzinfo=dt.timezone.utc).timestamp()
+
+
+def cme_front(root: str, now: float) -> str:
+    """Raw symbol of the contract `root` is followed on at `now` (epoch s),
+    e.g. MBTX6: this month's until CME_ROLL_DAYS before its expiry, then the next."""
+    import datetime as dt
+    t = dt.datetime.fromtimestamp(now, dt.timezone.utc)
+    y, m = t.year, t.month
+    while now >= cme_expiry(y, m) - CME_ROLL_DAYS * 86400:
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return f"{root}{CME_MONTHS[m - 1]}{y % 10}"
+
+
+class CmeFuturesAdapter(_PerpSignal):
+    """Each coin's front-month CME future from Databento's live GLBX.MDP3
+    mbp-1: its touch as a 1-level book and its trades as prints, venue "cme".
+    A signal like the perps, never priced or medianed. CME is shut on weekends
+    and for an hour each weekday; the books then just stop updating.
+
+    Databento's async iterator polls its queue every 100 ms, so records come
+    through its reader-thread callback instead, stamped on arrival there."""
+    venue = "cme"
+    # Root followed per coin: the contract whose top of book changed most,
+    # 10-29 13-21 UTC (MBT 282k, ETH 87k, MSL 42k, MXP 42k mid changes).
+    # CME has no HYPE contract.
+    symbols = {"BTC": "MBT", "ETH": "ETH", "SOL": "MSL", "XRP": "MXP"}
+
+    async def run(self, on_update: OnUpdate):
+        import databento as db
+        from kalshi_infra import keys
+        loop = asyncio.get_running_loop()
+        while True:
+            subs = {cme_front(self.symbols[c], time.time()): c for c in self.coins}
+            q: asyncio.Queue = asyncio.Queue()
+            client = None
+            try:
+                client = db.Live(key=keys.DATABENTO_API_KEY)
+                client.subscribe(dataset="GLBX.MDP3", schema="mbp-1", symbols=sorted(subs), stype_in="raw_symbol")
+                client.add_callback(lambda r: loop.call_soon_threadsafe(q.put_nowait, (time.monotonic(), r)))
+                for pb in self._books.values():
+                    pb.clear()
+                self._last_touch.clear()
+                client.start()
+                ids: dict[int, tuple[str, float]] = {}
+                until = time.monotonic() + CME_RESUBSCRIBE_S
+                while time.monotonic() < until:
+                    try:
+                        as_of, rec = await asyncio.wait_for(q.get(), CME_CHECK_S)
+                    except asyncio.TimeoutError:
+                        if not client.is_connected():
+                            raise ConnectionError("databento session closed")
+                        continue
+                    self.n_msgs += 1
+                    await self._call(self._record(rec, ids, subs, as_of, on_update))
+                    self._mark_fresh(as_of)
+                continue        # resubscribe on the (possibly rolled) front month
+            except Exception as e:
+                self.last_error = repr(e)
+                print(f"[spot/cme] {e!r}; reconnecting", flush=True)
+            finally:
+                if client is not None:
+                    try:
+                        client.terminate()
+                    except Exception:
+                        pass
+            for pb in self._books.values():
+                pb.is_resyncing = True
+            self.n_resyncs += 1
+            await asyncio.sleep(RECONNECT_DELAY_S * 5)
+
+    def _record(self, r, ids: dict, subs: dict, as_of: float, on_update):
+        """One Databento record. Duck-typed so tests need no databento."""
+        if hasattr(r, "stype_out_symbol"):                      # SymbolMappingMsg
+            sym = r.stype_out_symbol if r.stype_out_symbol in subs else r.stype_in_symbol
+            coin = subs.get(sym)
+            if coin is not None:
+                ids[r.instrument_id] = (coin, CME_UNITS[sym[:-2]])
+            return None
+        if not hasattr(r, "levels"):
+            if hasattr(r, "err"):                                # ErrorMsg
+                raise ConnectionError(f"databento: {r.err}")
+            return None
+        hit = ids.get(r.instrument_id)
+        if hit is None:
+            return None
+        coin, unit = hit
+        exch = r.ts_event / 1e9
+        if str(r.action) == "T" and r.price != _UNDEF_PRICE:
+            self._print(coin, r.price / 1e9, r.size * unit, str(r.sequence),
+                        "BUY" if str(r.side) == "B" else "SELL", as_of, exch)
+        lv = r.levels[0]
+        if lv.bid_px == _UNDEF_PRICE or lv.ask_px == _UNDEF_PRICE:
+            return None
+        return self._bbo(coin, lv.bid_px / 1e9, lv.bid_sz * unit, lv.ask_px / 1e9, lv.ask_sz * unit,
+                         as_of, exch, on_update)
+
+
 # Venues that are signals only: never in a median, never priced. Hyperliquid
 # is no longer run (the adapter stays): its prints reached us p50 ~400ms after
 # trade time (us-east-2, 10-20 16:00 UTC) vs Binance ~80ms, its prior-0.5s
@@ -652,11 +778,14 @@ class _OkxTrades(OkxPerpAdapter):
 # (10-19), and it only pulled HYPE. Bybit is no longer run either (10-20):
 # slowest perp to us (p50 113-145ms vs Binance ~75, OKX ~80-120), second
 # heaviest feed, and OKX alone covers the nowcast check and the move trigger.
-LEADING_VENUES = ("binance_perp", "okx_perp")
+# CME (Databento) joined 2026-11-01 as a signal: its match engine leads the
+# perps for BTC/ETH/SOL/XRP and reaches this box ~5 ms after capture.
+LEADING_VENUES = ("binance_perp", "okx_perp", "cme")
 
 ADAPTERS = {a.venue: a for a in (KrakenAdapter, BitstampAdapter, GeminiAdapter, CryptoComAdapter, BullishAdapter,
-                                 HyperliquidAdapter, BinancePerpAdapter, BybitPerpAdapter, OkxPerpAdapter)}
+                                 HyperliquidAdapter, BinancePerpAdapter, BybitPerpAdapter, OkxPerpAdapter,
+                                 CmeFuturesAdapter)}
 
 __all__ = ["KrakenAdapter", "BitstampAdapter", "GeminiAdapter", "CryptoComAdapter", "BullishAdapter",
            "HyperliquidAdapter", "BinancePerpAdapter", "BybitPerpAdapter", "OkxPerpAdapter",
-           "LEADING_VENUES", "ADAPTERS"]
+           "CmeFuturesAdapter", "cme_front", "LEADING_VENUES", "ADAPTERS"]

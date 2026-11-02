@@ -34,7 +34,11 @@ HL_BURST_USD_1S = {"BTC": 200_700, "ETH": 625_400, "SOL": 13_100, "XRP": 5_000, 
 # Offshore perps. No static fallback: each stays record-only until its own
 # BurstCalibrator has MIN_CALIB_S of live samples. These trade 10-50x Coinbase
 # volume, so borrowing Coinbase's or Hyperliquid's numbers would trip constantly.
-PERP_SOURCES = ("binance_perp", "okx_perp")      # Bybit dropped 10-20 (spot_feed.venues.LEADING_VENUES)
+PERP_SOURCES = ("binance_perp", "okx_perp", "cme")   # Bybit dropped 10-20 (spot_feed.venues.LEADING_VENUES)
+# The perp_move trigger needs MOVE_AGREE of these. CME is kept out of that
+# vote and trips on its own move instead ("cme_move"): it leads them.
+MOVE_VENUES = ("binance_perp", "okx_perp")
+SOLO_MOVE_VENUES = ("cme",)
 PERP_BURST_USD_1S: dict[str, dict[str, float]] = {v: {} for v in PERP_SOURCES}
 
 
@@ -372,9 +376,11 @@ class LeadTrigger:
     on_print returns trip rows (kind, source, coin, level, thr, onset); a row
     is emitted on the onset and then every TRIP_RESEND_S while it holds."""
 
-    def __init__(self, coins, perps, window_s: float = MOVE_WINDOW_S, agree: int = MOVE_AGREE):
+    def __init__(self, coins, perps, window_s: float = MOVE_WINDOW_S, agree: int = MOVE_AGREE, solo=()):
         self.coins = list(coins)
         self.perps = tuple(perps)
+        # Venues whose move over window_s trips by itself, as "<venue>_move".
+        self.solo = tuple(solo)
         self.det: dict[str, BurstDetector] = {}
         self.trail = PriceTrail(window_s)
         self.agree = agree
@@ -415,6 +421,18 @@ class LeadTrigger:
         if kind in self.perps:
             self.trail.add((kind, coin), as_of, price)
             out += self._move(kind, coin, as_of)
+        elif kind in self.solo:
+            self.trail.add((kind, coin), as_of, price)
+            out += self._solo_move(kind, coin, as_of)
+        return out
+
+    def _solo_move(self, kind, coin, now) -> list[tuple]:
+        out: list[tuple] = []
+        src = f"{kind}_move"
+        thr = (self.move_thr.get(kind) or {}).get(coin)
+        m = self.trail.move_bp((kind, coin), now)
+        hit = thr is not None and m is not None and abs(m) >= thr
+        self._emit(out, ("move", src, coin), hit, now, ("move", src, coin, abs(m or 0.0), thr or 0.0))
         return out
 
     def _move(self, kind, coin, now) -> list[tuple]:

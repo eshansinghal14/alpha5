@@ -476,6 +476,8 @@ class CoinRaceModel:
             m_spot = self.bus.mid_nowcast(c)
             _, p_gap, p_n = pnc.nowcast(c, mono, m_spot) if pnc is not None else (None, None, 0)
             _, p_inc = pnc.increment(c, mono, m_spot) if pnc is not None else (None, None)
+            cme_gap, cme_age = pnc.venue_gap("cme", c, mono, m_spot) if pnc is not None else (None, None)
+            _, cme_inc = pnc.increment(c, mono, m_spot, leads=("cme",)) if pnc is not None else (None, None)
             held = p.vol_source == "implied" and self.vol_src.get(c) == "held"
             # Not clipped to [0, 1]: the band is an edge distance, and clipping
             # would erase the edge on tail coins (fair 0.002, band 0.015).
@@ -491,6 +493,9 @@ class CoinRaceModel:
                                                   "cb_mid": self.bus.feeds[c].shadow_cb_mid,
                                                   "med_mid": self.bus.feeds[c].shadow_med_mid,
                                                   "perp_gap_bp": p_gap, "perp_n": p_n, "perp_inc_bp": p_inc,
+                                                  "cme_gap_bp": cme_gap, "cme_inc_bp": cme_inc,
+                                                  "lead": pnc.lead_used.get(c) if pnc is not None else None,
+                                                  "cme_age_ms": None if cme_age is None else cme_age * 1000,
                                                   "priced_on": self.priced_on.get(c, "spot"),
                                                   "held_vol_ratio": self.held_vol_ratio.get(c),
                                                   **self.shadow_vol.get(c, {})})

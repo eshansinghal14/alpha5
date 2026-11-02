@@ -94,6 +94,10 @@ class UpDownPricingParams:
     perp_pricing: bool = param(
         "Price on a perp nowcast (perp_nowcast.py, which one: perp_mode); plain spot when Binance is stale. "
         "Off: priced on spot, both perp fairs logged only.")
+    nowcast_leads: list[str] = param(
+        "Venues the \"latest\" nowcast follows, in order: the first whose book is fresh is the lead "
+        "(KXCRYPTOLEAD15M.config's nowcast_leads; one per process, from whichever series owns the feed).",
+        editable=False)
     perp_mode: str = param(
         "Which nowcast perp_pricing prices on. \"latest\": spot + Binance's move since spot last moved, "
         "capped 2bp, so a spot-led move is never pulled back. \"gap\": how far Binance (net of its 30s "
