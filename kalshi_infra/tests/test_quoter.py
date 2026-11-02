@@ -36,7 +36,7 @@ def risk(**r):
 def cfg(risk_kw=None, **q):
     base = dict(order_lots=1.0, max_position=10.0, constant_edge=0.01, constant_edge_ref_s=None, edge_fraction=1.0,
                 lean_dollars=0.02, max_markets=None, atm_hysteresis=0,
-                enable_taking=True, enable_quoting=True, quoting_edge=0.0, max_improve_ticks=1, quote_levels_behind=0,
+                enable_taking=True, enable_quoting=True, quoting_edge=0.0, max_improve_ticks=1, quote_levels_behind=0, take_move_window_s=None,
                 skip_quote_depth_ahead=None, max_book_delta=None, quote_keep_inside=0.0, quote_ahead_grace_s=1.0,
                 cancels_token=20.0, requote_delay_s=1.0, max_write_tokens_per_s=None,
                 order_group_limit=None, order_group_reset_s=0.2)
@@ -204,6 +204,40 @@ def test_take_hold_resets_when_signal_lapses(monkeypatch):
     step(q, ctx, {"A": Fair(0.60, 0.59, 0.61)}, Book("A", 0.40, 0.55))
     step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, dt=0.3)
     step(q, ctx, {"A": Fair(0.60, 0.59, 0.61)}, dt=0.3)
+    assert takes(ctx) == []
+
+
+def test_move_mode_skips_a_fair_that_is_just_off_a_still_touch():
+    q, ctx = Quoter(cfg(take_move_window_s=1.0), Model(), FREE, close_time=None), Ctx()
+    step(q, ctx, {"A": Fair(0.60, 0.59, 0.61)}, Book("A", 0.40, 0.55))
+    step(q, ctx, {"A": Fair(0.60, 0.59, 0.61)}, dt=0.5)
+    assert takes(ctx) == []                       # fair clears the ask, but never moved
+
+
+def test_move_mode_takes_a_fair_jump_the_touch_has_not_followed(monkeypatch):
+    monkeypatch.setattr(quoter_mod, "TAKE_HOLD_S", 0.5)
+    q, ctx = Quoter(cfg(take_move_window_s=1.0), Model(), FREE, close_time=None), Ctx()
+    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, Book("A", 0.45, 0.52))
+    step(q, ctx, {"A": Fair(0.60, 0.59, 0.61)}, dt=0.2)   # +10c, edge 0.01+0.01+0.002 lean
+    assert [o[:3] for o in takes(ctx)] == [("A", "yes", 0.52)]   # no hold wait
+    step(q, ctx, {"A": Fair(0.61, 0.60, 0.62)}, dt=0.1)
+    assert len(takes(ctx)) == 1                   # one per side per hold window
+
+
+def test_move_mode_measures_from_when_the_touch_was_set():
+    q, ctx = Quoter(cfg(take_move_window_s=1.0), Model(), FREE, close_time=None), Ctx()
+    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, Book("A", 0.45, 0.52))
+    step(q, ctx, {"A": Fair(0.60, 0.59, 0.61)}, Book("A", 0.45, 0.56), dt=0.2)   # ask followed
+    assert takes(ctx) == []
+    step(q, ctx, {"A": Fair(0.61, 0.60, 0.62)}, dt=0.1)
+    assert takes(ctx) == []                       # +1c since the ask moved: under the edge
+
+
+def test_move_mode_window_caps_the_lookback():
+    q, ctx = Quoter(cfg(take_move_window_s=1.0), Model(), FREE, close_time=None), Ctx()
+    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, Book("A", 0.45, 0.52))
+    for p in (0.515, 0.53, 0.545, 0.56):                 # 6c of drift, 1.5c per window
+        step(q, ctx, {"A": Fair(p, p - 0.01, p + 0.01)}, dt=1.1)
     assert takes(ctx) == []
 
 

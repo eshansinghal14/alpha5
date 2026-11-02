@@ -51,6 +51,13 @@ class QuotingParams:
                                 "untouched, so the strategy runs maker-only.")
     enable_quoting: bool = param("Rest quotes as well as taking. Off withdraws existing quotes on "
                                  "each market's next decision.")
+    take_move_window_s: float | None = param(
+        "Take only on a fair move the touch hasn't followed: besides fair clearing the touch by the "
+        "take edge, our fair's change since the touch we'd take was last set (looking back at most "
+        "this many seconds) must clear the take edge on its own. A fair that is simply mispriced vs "
+        "a touch that never moved doesn't take. No signal-hold wait in this mode (the book would "
+        "have followed by then); still at most one take per side per hold window. null = fair vs "
+        "touch only, with the hold.", min=0.05, max=10, step=0.05)
     quoting_edge: float = param(
         "Extra $ edge for a RESTING quote, on top of constant_edge + band + lean (a quote pays the "
         "maker fee instead of the taker fee).",

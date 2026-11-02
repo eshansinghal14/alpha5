@@ -42,6 +42,7 @@ decision log (`block_bid` / `block_ask`) and counts it in `block_counts`.
 from __future__ import annotations
 
 import math
+from collections import deque
 
 import pandas as pd
 
@@ -110,6 +111,10 @@ class Quoter:
         self._atm_set: set[str] = set()
         self._take_since: dict[tuple[str, str], float] = {}
         self._take_last: dict[tuple[str, str], float] = {}
+        # take_move_window_s: per ticker, (time, prob) each time the fair
+        # changed; per (ticker, side), the touch price we'd take and since when.
+        self._prob_hist: dict[str, deque[tuple[float, float]]] = {}
+        self._touch_set: dict[tuple[str, str], tuple[float, float]] = {}
         self._last_signal_age: float | None = None
         self.block_counts: dict[str, int] = {}
         self.debug_log: list[dict] = []
@@ -337,19 +342,50 @@ class Quoter:
         self._atm_set = set(members[:n])
         return ticker in self._atm_set
 
-    def _take_ok(self, key, now_s: float) -> bool:
-        """Signal has held for TAKE_HOLD_S, and at most one take per side per
-        window after that."""
+    def _take_ok(self, key, now_s: float, hold: bool = True) -> bool:
+        """Signal has held for TAKE_HOLD_S (when `hold`), and at most one take
+        per side per window after that."""
         w = TAKE_HOLD_S
         if w <= 0:
             return True
         since = self._take_since.setdefault(key, now_s)
-        if now_s - since < w:
+        if hold and now_s - since < w:
             return False
         if now_s - self._take_last.get(key, -1e18) < w:
             return False
         self._take_last[key] = now_s
         return True
+
+    def _note_touch(self, ticker: str, side: str, price: float | None, now_s: float):
+        prev = self._touch_set.get((ticker, side))
+        if price is None:
+            self._touch_set.pop((ticker, side), None)
+        elif prev is None or prev[0] != price:
+            self._touch_set[(ticker, side)] = (price, now_s)
+
+    def _note_prob(self, ticker: str, prob: float, now_s: float, window: float):
+        h = self._prob_hist.setdefault(ticker, deque())
+        if not h or h[-1][1] != prob:
+            h.append((now_s, prob))
+        # Keep one entry at or before the window start: the fair in force then.
+        while len(h) > 1 and h[1][0] <= now_s - window:
+            h.popleft()
+
+    def _fair_move(self, ticker: str, side: str, prob: float, now_s: float, window: float) -> float:
+        """How far the fair moved toward taking `side` since that touch was set
+        (at most `window` back). An unseen touch counts as just set: 0."""
+        t = self._touch_set.get((ticker, side))
+        if t is None:
+            return 0.0
+        ref_t = max(t[1], now_s - window)
+        ref = None
+        for ts, p in self._prob_hist.get(ticker, ()):
+            if ts > ref_t:
+                break
+            ref = p
+        if ref is None:
+            return 0.0
+        return prob - ref if side == "yes" else ref - prob
 
     # ------------------------------------------------------------------
     # Decision
@@ -363,6 +399,11 @@ class Quoter:
         market_bid = book.bid if book is not None else None
         market_ask = book.ask if book is not None else None
         self._refresh_ours(ctx, ticker)
+        move_w = getattr(q, "take_move_window_s", None)
+        if move_w is not None:
+            # A take buys yes at the ask and no at the bid.
+            self._note_touch(ticker, "yes", market_ask, now_s)
+            self._note_touch(ticker, "no", market_bid, now_s)
 
         gate = None
         if fair is None:
@@ -460,8 +501,16 @@ class Quoter:
         taking = q.enable_taking
         want_b = taking and block_bid is None and market_ask is not None and bid_res >= market_ask and cap_yes
         want_a = taking and block_ask is None and market_bid is not None and ask_res <= market_bid and cap_no
-        bid_final = market_ask if (want_b and self._take_ok(key_b, now_s)) else None
-        ask_final = market_bid if (want_a and self._take_ok(key_a, now_s)) else None
+        move_b = move_a = None
+        if move_w is not None:
+            self._note_prob(ticker, prob, now_s, move_w)
+            move_b = self._fair_move(ticker, "yes", prob, now_s, move_w)
+            move_a = self._fair_move(ticker, "no", prob, now_s, move_w)
+            want_b = want_b and move_b >= bid_edge
+            want_a = want_a and move_a >= ask_edge
+        hold = move_w is None
+        bid_final = market_ask if (want_b and self._take_ok(key_b, now_s, hold)) else None
+        ask_final = market_bid if (want_a and self._take_ok(key_a, now_s, hold)) else None
         if not want_b:
             self._take_since.pop(key_b, None)
         if not want_a:
@@ -590,7 +639,7 @@ class Quoter:
                           lean_bid=lean_bid, lean_ask=lean_ask, fee_bid=fee_bid, fee_ask=fee_ask,
                           pos=pos, net=net, eff_yes=eff_yes, eff_no=eff_no, ratio=_ratio(net),
                           bid_res=bid_res, ask_res=ask_res, bid_final=bid_final, ask_final=ask_final,
-                          inflight_yes=inflight_yes, inflight_no=inflight_no,
+                          move_b=move_b, move_a=move_a, inflight_yes=inflight_yes, inflight_no=inflight_no,
                           resting_yes=resting_yes, resting_no=resting_no,
                           cap_yes=cap_yes, cap_no=cap_no, mfee_bid=mfee_bid, mfee_ask=mfee_ask,
                           qres_bid=qres_bid, qres_ask=qres_ask, quote_bid=quote_bid, quote_ask=quote_ask,
@@ -1149,6 +1198,8 @@ class Quoter:
             "eff_yes": v.get("eff_yes"), "eff_no": v.get("eff_no"), "ratio": v.get("ratio"),
             "bid_reservation": v.get("bid_res"), "ask_reservation": v.get("ask_res"),
             "bid_final": v.get("bid_final"), "ask_final": v.get("ask_final"),
+            # take_move_window_s: the fair's move since the touch was set, toward each side's take.
+            "take_move_bid": v.get("move_b"), "take_move_ask": v.get("move_a"),
             "inflight_yes": v.get("inflight_yes"), "inflight_no": v.get("inflight_no"),
             "resting_yes": v.get("resting_yes"), "resting_no": v.get("resting_no"),
             "cap_allows_yes": v.get("cap_yes"), "cap_allows_no": v.get("cap_no"),
