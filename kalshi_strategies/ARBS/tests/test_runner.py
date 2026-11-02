@@ -799,6 +799,36 @@ def test_write_cost_counts_top_of_book_changes(arbs):
     assert r.write_cost(b, now) == pytest.approx(10_000.0 / R.WRITE_COST_TAU_S, rel=0.01)
 
 
+def test_quote_holds_a_small_move_up_but_follows_down(arbs):
+    r, b = arbs
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, requote_cooldown_s=0.0, requote_hold_up=0.01)
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    _eval(r, b)
+    q = r.quotes[(b.basket_id, 0)]
+    assert q.price == pytest.approx(0.31)
+    book(r, "X-A", [(0.31, 10)], [(0.35, 10)])          # joined: wants 0.32, holds
+    _eval(r, b)
+    assert q.price == pytest.approx(0.31)
+    book(r, "X-A", [(0.32, 10)], [(0.35, 10)])          # outbid: wants 0.33, 2c up
+    _eval(r, b)
+    assert q.price == pytest.approx(0.33)
+    book(r, "X-A", [(0.31, 10)], [(0.35, 10)])          # bid falls 1c: follows down
+    _eval(r, b)
+    assert q.price == pytest.approx(0.32)
+
+
+def test_write_cost_skips_top_changes_quotes_hold(arbs):
+    r, b = arbs
+    hold = r._moves_quotes
+    assert not hold((0.30, 0.40), (0.31, 0.40))         # bid up 1c
+    assert not hold((0.30, 0.40), (0.30, 0.39))         # ask down 1c
+    assert hold((0.30, 0.40), (0.29, 0.40))             # bid down
+    assert hold((0.30, 0.40), (0.30, 0.41))             # ask up
+    assert hold((0.30, 0.40), (0.32, 0.40))             # bid up 2c
+    assert hold(None, (0.30, 0.40)) and hold((None, 0.40), (0.30, 0.40))
+
+
 def test_bad_exit_flags_markets_live_until_a_clean_fill(arbs):
     r, b = arbs
     now = pd.Timestamp.now(tz="UTC")

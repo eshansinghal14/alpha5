@@ -73,6 +73,12 @@ class TradingParams:
     requote_min_ticks: int = param("Move a resting quote only when the wanted price differs by this many "
                                    "ticks (a price past the edge limit always moves).", min=1, max=50, step=1,
                                    editable=False)
+    # 11-01/02: 41% of 1c up moves came straight back within 30 s, and a
+    # quote moving up is mostly answering someone joining its price, where
+    # it's already first in the queue.
+    requote_hold_up: float = param("A resting quote isn't moved up when the price it wants is at most this many "
+                                   "dollars higher (0.01 = 1c). Moves down always go out.", min=0.0, max=0.05,
+                                   step=0.005, editable=False)
     requote_cooldown_s: float = param("Least time between voluntary moves (reprice or resize) of one resting "
                                       "quote. A new quote after a fill isn't a move: see bad_fill_cooldown_s.",
                                       min=0.0, step=0.5)

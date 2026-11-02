@@ -809,11 +809,31 @@ class ArbsRunner:
         vs = [self.leg_view(l.ticker, l.side) for l in b.legs]
         return None if any(v is None for v in vs) else vs
 
+    def _moves_quotes(self, old, new) -> bool:
+        """Whether a top-of-book change would move a quote under
+        requote_hold_up: a yes bid rising or an ask falling within it only
+        asks quotes (this market's, or other legs' through their edge limit)
+        to go up, which they hold."""
+        if old is None:
+            return True
+        hold = self.cfg.trading.requote_hold_up + _EPS
+        for was, now, up_is_hold in ((old[0], new[0], True), (old[1], new[1], False)):
+            if was is None or now is None:
+                if was != now:
+                    return True
+                continue
+            d = now - was
+            if abs(d) > hold or (d < -_EPS if up_is_hold else d > _EPS):
+                return True
+        return False
+
     def _on_quote(self, book):
         top = (book.bid, book.ask)
-        if self.last_top.get(book.ticker) != top:
+        old = self.last_top.get(book.ticker)
+        if old != top:
             self.last_top[book.ticker] = top
-            self.top_moves.setdefault(book.ticker, _Rate()).add(1.0, time.time())
+            if self._moves_quotes(old, top):
+                self.top_moves.setdefault(book.ticker, _Rate()).add(1.0, time.time())
         self.book_seq[book.ticker] = self.book_seq.get(book.ticker, 0) + 1
         self.book_time[book.ticker] = time.monotonic()
         self.liq.on_book(book.ticker, time.monotonic(), book.ask, book.ask_depth, book.bid, book.bid_depth)
@@ -1332,7 +1352,8 @@ class ArbsRunner:
             # quote placed small kept its size through every later move
             # (KXRT-MON-30 stayed 1 lot with 629 behind the other leg, 10-29).
             grow = size >= 2.0 * q.remaining and cooled
-            if past_limit or grow or (ticks >= t.requote_min_ticks and cooled):
+            held = q.price < plan.price <= q.price + t.requote_hold_up + _EPS
+            if past_limit or grow or (ticks >= t.requote_min_ticks and cooled and not held):
                 if self.live and not past_limit and not self.gw.can_afford(leg.ticker, "amend", reserve):
                     continue
                 acts.append(self.move_quote(q, plan, size if grow else None))
