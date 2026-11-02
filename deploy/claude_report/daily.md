@@ -6,7 +6,9 @@ Body, in this order:
    in the digest, and per coin / series where they differ.
 3. Notable trades: the worst events / bursts and WHY they lost (picked off after a spot move, quote left
    through a jump, an unwind into a thin book, ...). Check the fills/decisions/bbo for the worst one or two.
-4. Operations: halts, restarts, order errors, 429s, feed drops, audit mismatches, memory/disk.
+4. Operations: OMIT this section unless something needs the owner's action (the hourly ALERT criteria);
+   then one or two bullets on what's wrong and what to do. Routine noise (one-off restarts, cleared audit
+   re-checks, IB reconnects, paused-market warnings, old log lines) is not worth mentioning.
 5. Improvements: up to 5 concrete, specific suggestions backed by numbers from today (e.g. "SOL maker fills
    lose 1.6c at 60s, 3x the other coins: widen SOL or cut its size"). Say how confident you are in each.
    Don't suggest what the data doesn't support.
