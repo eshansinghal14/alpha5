@@ -59,7 +59,7 @@ SPREAD_HELP = "Mid 1ms before the fill minus our price, fee included: the half-s
 
 
 def _common(g: dict):
-    """The rows every column shows, so the three line up."""
+    """The rows every column shows, so the columns line up."""
     st.metric("1s markout", _c(g["mo1"]), f"10s {_c(g['mo10'])} · 60s {_c(g['mo60'])}", delta_color="off",
               help=MO_HELP)
     st.metric("Spread at fill", _c(g["mo0"]), delta_color="off", help=SPREAD_HELP)
@@ -80,13 +80,23 @@ def _overall(g: dict, lip: bool):
     _common(g)
 
 
-def _regular(g: dict):
-    st.markdown("**Regular quoting**")
+def _quoting(g: dict):
+    st.markdown("**Quoting**")
     if not g["fills"]:
-        st.caption("No regular fills in this window.")
+        st.caption("No quote fills in this window.")
         return
     st.metric("PnL", _usd(g["pnl"]), f"{_usd(g['per_h'])}/h", delta_color="off",
-              help=PNL_HELP + " Edge quotes and takes; everything not on the LIP quote.")
+              help=PNL_HELP + " Edge quotes filled as maker; LIP quotes are their own column.")
+    _common(g)
+
+
+def _taking(g: dict):
+    st.markdown("**Taking**")
+    if not g["fills"]:
+        st.caption("No takes filled in this window.")
+        return
+    st.metric("PnL", _usd(g["pnl"]), f"{_usd(g['per_h'])}/h", delta_color="off",
+              help=PNL_HELP + " Our takes (IOC orders that crossed the touch).")
     _common(g)
 
 
@@ -169,13 +179,15 @@ def render(series: str, lip: bool = False):
         s = perf.summarize(df, since)
         lf = r.lip if lip else None
         sp = perf.summarize_split(df, lf, since)
-        cols = st.columns(3 if lip else 2)
+        cols = st.columns(4 if lip else 3)
         with cols[0]:
             _overall(sp["all"], lip)
         with cols[1]:
-            _regular(sp["regular"])
+            _quoting(sp["quoting"])
+        with cols[2]:
+            _taking(sp["taking"])
         if lip:
-            with cols[2]:
+            with cols[3]:
                 _lip(sp["lip"])
         _chart(df, since, WINDOWS[win], lf)
         _edge_share(perf.summarize_edge(df, r.prints, since))

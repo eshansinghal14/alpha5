@@ -44,6 +44,15 @@ def test_split_regular_is_everything_off_the_lip_quote():
     assert math.isclose(a["pnl_incl_lip"], a["pnl"] + 0.50)
 
 
+def test_split_regular_into_quoting_and_taking():
+    s = perf.summarize_split(_fills())
+    q, t = s["quoting"], s["taking"]
+    assert (q["fills"], q["contracts"], t["fills"], t["contracts"]) == (1, 4.0, 1, 2.0)
+    assert math.isclose(t["mo1"], -2.0) and math.isclose(t["pnl"], -0.04)
+    assert math.isclose(q["pnl"] + t["pnl"], s["regular"]["pnl"])
+    assert perf.summarize_split(pd.DataFrame())["taking"]["fills"] == 0
+
+
 def test_split_without_lip_frame_or_fills():
     s = perf.summarize_split(_fills())
     assert "reward" not in s["lip"] and "pnl_incl_lip" not in s["all"]

@@ -1609,3 +1609,25 @@ def test_reducing_quote_moves_up_to_the_touch_at_the_cap():
     # The bid prices in its own lot (short 9 once it fills): lean -0.018, edge
     # 0.03 + 0.01 - 0.018 = 0.022 below fair -> 0.47, joining the 0.47 touch.
     assert ladder(ctx, "yes") == [0.47]
+
+
+def _cutoff_cfg(**q):
+    c = cfg(**q)
+    c.trading_time = P.TradingTimeParams(real_trading_delay_s=0.0, real_trading_cutoff_s=60.0)
+    return c
+
+
+def test_inside_the_cutoff_taking_keeps_going_and_quotes_come_down():
+    q = Quoter(_cutoff_cfg(), Model(), FREE, close_time=T0 + pd.Timedelta(seconds=30))
+    ctx = Ctx()
+    step(q, ctx, {"A": Fair(0.60, 0.59, 0.61)}, Book("A", 0.40, 0.55))
+    assert len(takes(ctx)) == 1
+    assert ladder(ctx, "yes") == [] and ladder(ctx, "no") == []
+    assert q.debug_log[-1]["quote_block"] == "real_cutoff"
+
+
+def test_cutoff_leaves_quotes_alone_when_taking_is_off():
+    q = Quoter(_cutoff_cfg(enable_taking=False), Model(), FREE, close_time=T0 + pd.Timedelta(seconds=30))
+    ctx = Ctx()
+    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, Book("A", 0.40, 0.60))
+    assert ladder(ctx, "yes") != []              # the session disarms instead; paper keeps quoting

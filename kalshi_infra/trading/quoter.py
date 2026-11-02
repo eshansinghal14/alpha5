@@ -284,8 +284,15 @@ class Quoter:
         if left >= ref:
             return q.constant_edge
         # Floored at 1s: at the close the multiplier would be unbounded, and no
-        # quote rests there anyway (real_trading_cutoff_s).
+        # quote rests there anyway (real_trading_cutoff_s), but takes do.
         return q.constant_edge * math.sqrt(ref / max(left, 1.0))
+
+    def takes_only(self, now: pd.Timestamp) -> bool:
+        """Inside real_trading_cutoff_s with taking on: the session stays armed
+        for takes and quotes (edge and LIP) are withdrawn, real or paper."""
+        cut = self.cfg.trading_time.real_trading_cutoff_s
+        return (self.cfg.quoting.enable_taking and cut > 0 and self.close_time is not None
+                and (self.close_time - now).total_seconds() <= cut)
 
     def _alt_signal_age(self) -> float | None:
         fn = getattr(self.model, "signal_age_alt_s", None)
@@ -561,6 +568,8 @@ class Quoter:
         quoting = q.enable_quoting
         qblock = getattr(self.model, "quote_block", None)
         quote_gate = qblock(ticker, now_s) if qblock is not None else None
+        if not quote_gate and self.takes_only(now):
+            quote_gate = "real_cutoff"
         if quote_gate:
             self._block(quote_gate)
             quoting = False

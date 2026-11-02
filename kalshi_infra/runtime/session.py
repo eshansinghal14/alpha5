@@ -406,8 +406,10 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
     opened_at = ev.open_time if ev.open_time is not None else pd.Timestamp.now(tz="UTC")
 
     def inside_real_cutoff() -> bool:
+        # With taking on the cutoff only pulls quotes (Quoter.takes_only), so
+        # real takes keep going into the close.
         cut, rem = cfg.trading_time.real_trading_cutoff_s, remaining_s()
-        return cut > 0 and rem is not None and rem <= cut
+        return cut > 0 and rem is not None and rem <= cut and not cfg.quoting.enable_taking
 
     def inside_real_delay() -> bool:
         d = cfg.trading_time.real_trading_delay_s

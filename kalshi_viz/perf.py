@@ -608,11 +608,12 @@ def _group(d: pd.DataFrame, hours: float) -> dict:
 
 def summarize_split(df: pd.DataFrame, lip: pd.DataFrame | None = None,
                     since: pd.Timestamp | None = None) -> dict:
-    """{"all", "regular", "lip"}: fills, contracts, pnl ($, settled else open
-    at mid), per_h, taker and markouts (c/contract, fee incl.) per group.
+    """{"all", "regular", "quoting", "taking", "lip"}: fills, contracts, pnl
+    ($, settled else open at mid), per_h, taker and markouts (c/contract, fee
+    incl.) per group.
 
     regular is every fill not on the LIP quote, takes included, so regular +
-    lip = all. Fills from before the role column existed can't be told apart
+    lip = all; it splits into quoting (maker) + taking (taker). Fills from before the role column existed can't be told apart
     and count as regular. With `lip` (accrual frame), "lip" also gets reward
     (an estimate from the scoring replica, not money received), net = reward
     + LIP-fill PnL, net_mo10 / net_mo60 = reward + the fills' 10s / 60s
@@ -624,7 +625,9 @@ def summarize_split(df: pd.DataFrame, lip: pd.DataFrame | None = None,
     start = since if since is not None else (min(times) if times else now)
     hours = max((now - start).total_seconds() / 3600, 1e-9)
     is_lip = (d["role"] == "lip") if len(d) and "role" in d.columns else pd.Series(False, index=d.index)
-    out = {"all": _group(d, hours), "regular": _group(d[~is_lip], hours), "lip": _group(d[is_lip], hours)}
+    taker = (d.liquidity == "taker") if len(d) else pd.Series(False, index=d.index)
+    out = {"all": _group(d, hours), "regular": _group(d[~is_lip], hours), "lip": _group(d[is_lip], hours),
+           "quoting": _group(d[~is_lip & ~taker], hours), "taking": _group(d[~is_lip & taker], hours)}
     if lip is not None:
         reward = float(L.usd.sum()) if L is not None else 0.0
         g = out["lip"]
