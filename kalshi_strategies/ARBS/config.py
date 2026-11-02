@@ -1,6 +1,6 @@
 """ARBS config: every value lives in config.json, hot-reloaded within
 runtime.control_poll_s. Only the strategy knobs are on the dashboard form;
-plumbing (poll rates, write budget, requote pacing) is editable=False and
+plumbing (poll rates, write budget) is editable=False and
 changed in config.json by hand."""
 from __future__ import annotations
 
@@ -71,8 +71,7 @@ class TradingParams:
                                    "every leg; this is how long to wait for a thin touch to refill at the same "
                                    "price before taking again.", min=0.0, step=0.5)
     requote_min_ticks: int = param("Move a resting quote only when the wanted price differs by this many "
-                                   "ticks (a price past the edge limit always moves).", min=1, max=50, step=1,
-                                   editable=False)
+                                   "ticks (a price past the edge limit always moves).", min=1, max=50, step=1)
     # 11-01/02: 41% of 1c up moves came straight back within 30 s, and a
     # quote moving up is mostly answering someone joining its price, where
     # it's already first in the queue.
