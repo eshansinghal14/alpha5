@@ -25,6 +25,7 @@ from kalshi_strategies.CRYPTO15M.shared_feed import extend, hold, implied_ema
 from kalshi_strategies.CRYPTO15M.pricer import implied_mu, prob_up
 from kalshi_strategies.KXCRYPTOLEAD15M.cf_index import STALE_S as CF_STALE_S
 from kalshi_strategies.KXCRYPTOLEAD15M.model import BASIS_MIN_S, BASIS_WINDOW_S
+from kalshi_strategies.KXCRYPTOLEAD15M.perp_nowcast import TOUCH_VENUES
 from kalshi_strategies.KXCRYPTOLEAD15M.series import START_END_AVG_S
 from kalshi_strategies.KXCRYPTOLEAD15M.settlement_tracker import EventWindow
 
@@ -338,8 +339,17 @@ class UpDownModel:
             I_i = I + (dxi * (n_eff - n_end) / L if tau < L else 0.0)
             inc_r = prob_up(x + sh + dxi, I_i, tau, rate, nu=p.t_nu, basis_sd=bsd, reaction_s=p.reaction_latency_s)
         inc_prob = None if inc_r is None else inc_r.prob
+        take_prob = None
         if p.perp_pricing and p.perp_mode == "latest" and inc_r is not None:
             priced_on, r = "latest", inc_r
+            if lead in TOUCH_VENUES:
+                # Takes price on the whole-touch shift in full; quotes on TOUCH_WEIGHT of it.
+                _, full_inc = pnc.increment(self.coin, mono, mid, leads=(lead,), full=True)
+                if full_inc is not None and full_inc != p_inc:
+                    dxf = full_inc * 1e-4
+                    I_f = I + (dxf * (n_eff - n_end) / L if tau < L else 0.0)
+                    take_prob = prob_up(x + sh + dxf, I_f, tau, rate, nu=p.t_nu, basis_sd=bsd,
+                                        reaction_s=p.reaction_latency_s).prob
         elif p.perp_pricing and p.perp_mode == "gap" and perp_r is not None:
             priced_on, r = "perp", perp_r
         else:
@@ -350,7 +360,8 @@ class UpDownModel:
         self.withheld_reason = None
         k = p.ci_vol_multiplier
         return {self.ticker: Fair(prob=r.prob, lo=r.prob - k * r.theo_vol, hi=r.prob + k * r.theo_vol,
-                                  extras={"coin": self.coin, "theo_vol": r.theo_vol, "tau": tau, "phase": r.phase,
+                                  take_prob=take_prob,
+                                  extras={"take_prob": take_prob, "coin": self.coin, "theo_vol": r.theo_vol, "tau": tau, "phase": r.phase,
                                           "x_bp": x * 1e4, "mu_bp": r.mu * 1e4, "sd_bp": r.sd * 1e4,
                                           "shift_bp": sh * 1e4, "shift_ema_bp": self._shift * 1e4,
                                           "start": start, "start_src": self.start_src, "cf_basis_bp": b * 1e4,

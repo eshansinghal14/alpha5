@@ -465,7 +465,8 @@ class Quoter:
         # Floored at 0 before the fee: a negative lean may bring a side to fair, never past it.
         bid_edge = max(const + ci_bid + lean_bid, 0.0) + fee_bid
         ask_edge = max(const + ci_ask + lean_ask, 0.0) + fee_ask
-        bid_res, ask_res = prob - bid_edge, prob + ask_edge
+        tprob = prob if fair.take_prob is None else min(max(fair.take_prob, FAIR_CLIP_EPS), 1.0 - FAIR_CLIP_EPS)
+        bid_res, ask_res = tprob - bid_edge, tprob + ask_edge
 
         block_bid = block_ask = None
         if not self._atm_tradeable(ticker):
@@ -510,9 +511,9 @@ class Quoter:
         want_a = taking and block_ask is None and market_bid is not None and ask_res <= market_bid and cap_no
         move_b = move_a = None
         if move_w is not None:
-            self._note_prob(ticker, prob, now_s, move_w)
-            move_b = self._fair_move(ticker, "yes", prob, now_s, move_w)
-            move_a = self._fair_move(ticker, "no", prob, now_s, move_w)
+            self._note_prob(ticker, tprob, now_s, move_w)
+            move_b = self._fair_move(ticker, "yes", tprob, now_s, move_w)
+            move_a = self._fair_move(ticker, "no", tprob, now_s, move_w)
             want_b = want_b and move_b >= bid_edge
             want_a = want_a and move_a >= ask_edge
         hold = move_w is None

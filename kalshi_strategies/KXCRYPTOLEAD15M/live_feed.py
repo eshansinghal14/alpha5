@@ -369,13 +369,13 @@ class SpotFeed:
             if not vb.is_resyncing and not vb.is_crossed():
                 mid = vb.book_mid()
                 if mid is not None:
-                    self.perp_nowcast.on_perp(vb.venue, vb.coin, mid, vb.receive_ts)
+                    self.perp_nowcast.on_perp(vb.venue, vb.coin, mid, vb.receive_ts, vb.best_bid(), vb.best_ask())
             return
         if vb.venue in PERPS or vb.venue in SHADOW:
             if not vb.is_resyncing and not vb.is_crossed():
                 mid = vb.book_mid()
                 if mid is not None:
-                    self.perp_nowcast.on_perp(vb.venue, vb.coin, mid, vb.receive_ts)
+                    self.perp_nowcast.on_perp(vb.venue, vb.coin, mid, vb.receive_ts, vb.best_bid(), vb.best_ask())
                     # Models priced on the nowcast reprice on a perp move too.
                     ms = self._wakes.get(vb.coin, ())
                     race = [m for m in ms if getattr(m, "perp_wakes", None) is not None and m.perp_wakes(vb.coin)]

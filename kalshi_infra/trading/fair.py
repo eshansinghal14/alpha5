@@ -23,6 +23,10 @@ class Fair:
     # Extra $ edge the model wants on this market right now (takes and
     # quotes), added to constant_edge. E.g. the race's held_vol_edge.
     edge_add: float = 0.0
+    # Fair the takes price on instead of `prob`, when the model has a faster
+    # read than it quotes on (KXBTC15M: CME's whole-touch shift in full, quotes
+    # at half). None = takes use `prob`.
+    take_prob: float | None = None
 
 
 @dataclasses.dataclass(frozen=True)

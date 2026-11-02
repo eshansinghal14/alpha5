@@ -44,6 +44,17 @@ LEAD = "binance_perp"
 # moves showed on CME 22-49 ms earlier (BTC/ETH/SOL/XRP, live 11-01 23:00 -
 # 11-02 03:00 UTC, research/latency/cme_live_rec.py).
 SHADOW = ("cme",)
+# A touch venue's increment counts only when its whole touch moved since spot
+# last did: bid and ask the same way, by the smaller of the two. A one-sided
+# change (a level filled or pulled) moves the mid half a tick, and spot
+# followed 3% of it within 1s; whole-touch shifts were followed 59-64% (BTC
+# CME moves >= 2bp in 250ms, 11-01 23:00 - 11-02 21:00 UTC).
+TOUCH_VENUES = ("cme",)
+# Weight on a touch venue's increment when pricing (takes use it in full).
+# Same data, 1s ahead: at 0.5 it predicted BTC spot (0.9971 of no-lead error)
+# and the KXBTC15M mid (0.9954) better than Binance (1.0031, 0.9998); at 1.0
+# it was worse than no lead.
+TOUCH_WEIGHT = 0.5
 # Binance vs OKX, both net of basis. Above the cap so a real lead (|gap| p90
 # 1.4bp, SOL 10-20) isn't vetoed while OKX catches up. 6 h replay 10-20: it
 # fired 73-122/h (~0.2s each) and spot 1s later sided with the others 66-85%.
@@ -75,6 +86,9 @@ class PerpNowcast:
         # Latest-mover state per (venue, coin): the venue's log price when
         # spot last moved, so `increment` is only what it did since then.
         self._lead_at_spot: dict[tuple[str, str], float] = {}
+        # TOUCH_VENUES: latest (log bid, log ask), and as of the last spot move.
+        self._touch: dict[tuple[str, str], tuple[float, float]] = {}
+        self._touch_at_spot: dict[tuple[str, str], tuple[float, float]] = {}
         # Venues increment() tries, first fresh one wins (the owner's
         # pricing.nowcast_leads; SpotFeed sets this).
         self.leads_fn = lambda: (LEAD,)
@@ -87,25 +101,44 @@ class PerpNowcast:
                 p = self._px.get((v, coin))
                 if p is not None:
                     self._lead_at_spot[(v, coin)] = p[0]
+                tb = self._touch.get((v, coin))
+                if tb is not None:
+                    self._touch_at_spot[(v, coin)] = tb
+
+    def _touch_shift(self, venue: str, coin: str) -> float | None:
+        now_t, ref = self._touch.get((venue, coin)), self._touch_at_spot.get((venue, coin))
+        if now_t is None or ref is None:
+            return None
+        db, da = now_t[0] - ref[0], now_t[1] - ref[1]
+        if db == 0 or da == 0 or (db > 0) != (da > 0):
+            return 0.0
+        return math.copysign(min(abs(db), abs(da)), db)
 
     def increment(self, coin: str, now: float, spot_mid: float | None,
-                  leads: tuple[str, ...] | None = None) -> tuple[float | None, float | None]:
+                  leads: tuple[str, ...] | None = None, full: bool = False) -> tuple[float | None, float | None]:
         """Latest-mover nowcast: spot plus the lead venue's move since spot
         last moved, capped at CAP_BP. The lead is the first of `leads`
         (default leads_fn()) that is fresh, so CME priced while open falls
         back to Binance on weekends and in its daily halt; `lead_used[coin]`
         says which. Unlike nowcast(), a spot move is never pulled back toward
         the lead's level: the increment resets to 0 on every spot move.
-        Returns (price, inc_bp); inc None when no lead is fresh."""
+        A TOUCH_VENUES lead counts only its whole-touch shift, at TOUCH_WEIGHT
+        unless `full`. Returns (price, inc_bp); inc None when no lead is fresh."""
         if spot_mid is None or spot_mid <= 0:
             return None, None
-        record = leads is None
+        record = leads is None and not full
         for v in leads if leads is not None else self.leads_fn():
             p, ref = self._px.get((v, coin)), self._lead_at_spot.get((v, coin))
             if p is None or ref is None or now - p[1] > FRESH_S:
                 continue
             cap = CAP_BP * 1e-4
-            inc = max(-cap, min(cap, p[0] - ref))
+            if v in TOUCH_VENUES:
+                move = self._touch_shift(v, coin)
+                if move is None:
+                    continue
+                inc = max(-cap, min(cap, move)) * (1.0 if full else TOUCH_WEIGHT)
+            else:
+                inc = max(-cap, min(cap, p[0] - ref))
             if record:
                 self.lead_used[coin] = v
             return spot_mid * math.exp(inc), inc * 1e4
@@ -113,12 +146,15 @@ class PerpNowcast:
             self.lead_used[coin] = None
         return spot_mid, None
 
-    def on_perp(self, venue: str, coin: str, price: float, t: float):
+    def on_perp(self, venue: str, coin: str, price: float, t: float,
+                bid: float | None = None, ask: float | None = None):
         if price <= 0:
             return
         k = (venue, coin)
         lp = math.log(price)
         self._px[k] = (lp, t)
+        if bid is not None and ask is not None and bid > 0 and ask > 0:
+            self._touch[k] = (math.log(bid), math.log(ask))
         s = self._spot.get(coin)
         if s is None:
             return
@@ -167,4 +203,4 @@ class PerpNowcast:
         return spot_mid * math.exp(gap), gap * 1e4, len(vals)
 
 
-__all__ = ["PerpNowcast", "PERPS", "LEAD", "SHADOW", "CHECK_BP", "CAP_BP", "BASIS_S", "FRESH_S", "MIN_VENUES"]
+__all__ = ["PerpNowcast", "PERPS", "LEAD", "SHADOW", "TOUCH_VENUES", "TOUCH_WEIGHT", "CHECK_BP", "CAP_BP", "BASIS_S", "FRESH_S", "MIN_VENUES"]

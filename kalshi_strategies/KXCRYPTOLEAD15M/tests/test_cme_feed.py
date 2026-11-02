@@ -83,21 +83,40 @@ def test_cme_is_tracked_for_logging_but_never_in_the_nowcast():
     assert n.nowcast("BTC", 3.0, 81000.0) == (81000.0, None, 0)          # no PERPS data: spot unchanged
 
 
+def _cme(n, px, t, half_spread=2.5):
+    n.on_perp("cme", "BTC", px, t, px - half_spread, px + half_spread)
+
+
 def _leads_setup():
     n = pn.PerpNowcast()
     n.leads_fn = lambda: ("cme", "binance_perp")
-    n.on_perp("cme", "BTC", 81400.0, 0.0)
+    _cme(n, 81400.0, 0.0)
     n.on_perp("binance_perp", "BTC", 81050.0, 0.0)
     n.on_spot("BTC", 81000.0)                                   # both leads referenced at this spot move
     return n
 
 
-def test_increment_follows_cme_while_fresh_then_falls_back_to_binance():
+def test_cme_prices_half_its_whole_touch_shift_and_takes_all_of_it():
     n = _leads_setup()
-    n.on_perp("cme", "BTC", 81400.0 * math.exp(1e-4), 0.5)      # CME +1bp
-    n.on_perp("binance_perp", "BTC", 81050.0, 0.5)              # Binance flat
+    _cme(n, 81400.0 * math.exp(1e-4), 0.5)                      # bid and ask both +1bp
+    n.on_perp("binance_perp", "BTC", 81050.0, 0.5)
     _, inc = n.increment("BTC", 0.6, 81000.0)
-    assert inc == pytest.approx(1.0) and n.lead_used["BTC"] == "cme"
+    assert inc == pytest.approx(0.5, rel=1e-3) and n.lead_used["BTC"] == "cme"
+    _, full = n.increment("BTC", 0.6, 81000.0, leads=("cme",), full=True)
+    assert full == pytest.approx(1.0, rel=1e-3) and n.lead_used["BTC"] == "cme"
+
+
+def test_one_sided_cme_change_is_no_move():
+    n = _leads_setup()
+    n.on_perp("cme", "BTC", 81402.5, 0.5, 81397.5, 81407.5)     # only the ask ticked up
+    assert n.increment("BTC", 0.6, 81000.0)[1] == 0.0
+    n.on_perp("cme", "BTC", 81405.0, 0.6, 81402.5, 81407.5)     # both up: the smaller side counts
+    _, full = n.increment("BTC", 0.7, 81000.0, full=True)
+    assert full == pytest.approx(math.log(81407.5 / 81402.5) * 1e4, rel=1e-3)
+
+
+def test_increment_falls_back_to_binance_when_cme_is_stale():
+    n = _leads_setup()
     n.on_perp("binance_perp", "BTC", 81050.0, 0.5 + pn.FRESH_S)
     _, inc = n.increment("BTC", 0.6 + pn.FRESH_S, 81000.0)      # CME book now stale: Binance leads
     assert inc == pytest.approx(0.0) and n.lead_used["BTC"] == "binance_perp"
@@ -105,7 +124,7 @@ def test_increment_follows_cme_while_fresh_then_falls_back_to_binance():
 
 def test_cme_increment_resets_on_a_spot_move():
     n = _leads_setup()
-    n.on_perp("cme", "BTC", 81400.0 * math.exp(1e-4), 0.5)
+    _cme(n, 81400.0 * math.exp(1e-4), 0.5)
     n.on_spot("BTC", 81000.0 * math.exp(1e-4))                  # spot catches up
     assert n.increment("BTC", 0.6, 81000.0 * math.exp(1e-4))[1] == pytest.approx(0.0)
 

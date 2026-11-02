@@ -1631,3 +1631,11 @@ def test_cutoff_leaves_quotes_alone_when_taking_is_off():
     ctx = Ctx()
     step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, Book("A", 0.40, 0.60))
     assert ladder(ctx, "yes") != []              # the session disarms instead; paper keeps quoting
+
+
+def test_takes_price_on_take_prob_quotes_on_prob():
+    q, ctx = Quoter(cfg(), Model(), FREE, close_time=None), Ctx()
+    f = Fair(0.50, 0.49, 0.51, take_prob=0.60)
+    step(q, ctx, {"A": f}, Book("A", 0.40, 0.55))
+    assert [o[:3] for o in takes(ctx)] == [("A", "yes", 0.55)]   # 0.60 clears the ask; 0.50 wouldn't
+    assert ladder(ctx, "yes")[0] < 0.50                          # the quote stays on prob
