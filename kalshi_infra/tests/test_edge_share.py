@@ -72,7 +72,7 @@ def test_edge_share_end_to_end(tmp_path, monkeypatch):
     df = p.refresh()
     assert list(df.theo.round(2)) == [0.50, 0.60]
     pr = p.prints_frame()
-    assert list(pr.trade_id) == ["P1", "P2"]   # P3 (shadow, no theo) isn't kept
+    assert list(pr["prints"]) == [1, 1] and list(pr["size"]) == [10.0, 5.0]   # P3 (shadow, no theo) isn't kept
 
     E = perf.summarize_edge(df, pr)
     assert E["prints"] == 2
@@ -96,3 +96,32 @@ def test_edge_share_empty(tmp_path, monkeypatch):
     monkeypatch.setattr(perf, "LIVE_ROOT", str(tmp_path))
     E = perf.summarize_edge(pd.DataFrame(), perf.Perf("none").prints_frame())
     assert E["prints"] == 0 and math.isnan(E["share"])
+
+
+def test_print_journaled_twice_counts_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(perf, "LIVE_ROOT", str(tmp_path))
+    dec = [{"time": _t(s), "ticker": "E-A", "prob": 0.50, "live": True} for s in (0, 200)]
+    row = {"time": _t(10), "ticker": "E-A", "trade_id": "P1", "yes_price": 0.45, "size": 10.0}
+    bbo = [{"time": _t(s), "ticker": "E-A", "bid": 0.44, "ask": 0.46, "bid_depth": 1.0, "ask_depth": 1.0}
+           for s in (0, 500)]
+    _journal(tmp_path, dec, [], [row], bbo)
+    p = perf.Perf("S")
+    p.refresh()
+    _journal(tmp_path, [], [], [dict(row), dict(row, trade_id="P2", time=_t(70))], [])   # overlapping part
+    p.refresh()
+    E = perf.summarize_edge(pd.DataFrame(), p.prints_frame())
+    assert E["prints"] == 2 and math.isclose(E["market_lots"], 20.0) and math.isclose(E["market_usd"], 1.0)
+
+
+def test_old_state_with_a_row_per_print_is_bucketed(tmp_path, monkeypatch):
+    import pickle
+    monkeypatch.setattr(perf, "LIVE_ROOT", str(tmp_path))
+    p = perf.Perf("S")
+    p.__dict__["_prints"] = pd.DataFrame({"time": [_t(1), _t(20), _t(90)], "ticker": ["E-A"] * 3,
+                                          "trade_id": ["P1", "P2", "P3"], "yes_price": [0.45, 0.40, 0.60],
+                                          "size": [10.0, 2.0, 1.0], "theo": [0.50, 0.50, 0.50]})
+    del p.__dict__["_seen"]
+    q = pickle.loads(pickle.dumps(p))
+    pr = q.prints_frame()
+    assert list(pr["prints"]) == [2, 1] and set(q._seen) == {"P1", "P2", "P3"}
+    assert math.isclose(perf.summarize_edge(pd.DataFrame(), pr)["market_usd"], 0.5 + 0.2 + 0.1)

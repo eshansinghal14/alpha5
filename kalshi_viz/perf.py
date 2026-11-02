@@ -60,6 +60,14 @@ THEO_TOL = pd.Timedelta("5min")
 # days are on S3 (deploy/archive_s3.sh), so a bump drops their fills unless
 # they are restored first.
 STATE_VERSION = 2
+# Priced prints are kept as per-minute sums, not one row each: edge share only
+# needs contracts and size x |theo - price| per window, and KXBTC15M's tape
+# reached 1.8M rows (~340 MB, copied and rewritten every refresh) by 11-02.
+PRINT_BUCKET = "1min"
+# How long a trade_id is remembered for dropping a print journaled twice. A
+# repeat only comes from two parts of one session overlapping a reconnect.
+SEEN_KEEP = pd.Timedelta("1h")
+_PRINT_COLS = {"time": "datetime64[ns, UTC]", "prints": "int64", "size": "float64", "edge_usd": "float64"}
 
 
 def _markable_mid(bid: pd.Series, ask: pd.Series) -> pd.Series:
@@ -83,6 +91,21 @@ def event_close(ticker: str) -> pd.Timestamp | None:
     # check. Raising on it stalled every refresh (2026-11-01).
     return pd.Timestamp(t).tz_localize("America/New_York", ambiguous=False,
                                        nonexistent="shift_forward").tz_convert("UTC")
+
+
+def _empty_prints() -> pd.DataFrame:
+    return pd.DataFrame({c: pd.Series(dtype=t) for c, t in _PRINT_COLS.items()})
+
+
+def bucket_prints(x: pd.DataFrame) -> pd.DataFrame:
+    """Priced prints (time, yes_price, size, theo) as per-minute sums: prints,
+    size, edge_usd (size x |theo - yes_price|)."""
+    x = x[x.theo.notna()]
+    if x.empty:
+        return _empty_prints()
+    out = pd.DataFrame({"time": x.time.dt.floor(PRINT_BUCKET), "prints": 1, "size": x["size"].astype(float),
+                        "edge_usd": x["size"] * (x.theo - x.yes_price).abs()})
+    return out.groupby("time", as_index=False).sum().astype(_PRINT_COLS)
 
 
 def _days(series: str) -> list[str]:
@@ -138,7 +161,8 @@ class Perf:
         self._dec: dict[str, tuple[pd.Timestamp, pd.Timestamp]] = {}
         self._trade_parts: set[str] = set()
         self._prints_pending: list[pd.DataFrame] = []
-        self._prints = pd.DataFrame(columns=["time", "ticker", "trade_id", "yes_price", "size", "theo"])
+        self._prints = _empty_prints()
+        self._seen: dict[str, int] = {}          # trade_id -> print time (ns), last SEEN_KEEP
         self._settle_path = os.path.join(self.root, "settlements.json")
         self._settle: dict[str, str] = self._load_settlements()
         self._settle_tried: dict[str, float] = {}
@@ -160,9 +184,14 @@ class Perf:
 
     def __setstate__(self, state):
         self.__dict__.update(state)
-        # States saved before _price_prints dropped unpriced prints.
-        if len(self._prints) and self._prints.theo.isna().any():
-            self._prints = self._prints[self._prints.theo.notna()].reset_index(drop=True)
+        self.__dict__.setdefault("_seen", {})
+        # States saved with one row per print: bucketed in place, since a
+        # STATE_VERSION bump would rescan and drop fills already archived to S3.
+        if "trade_id" in self._prints.columns:
+            raw = self._prints
+            recent = raw[raw.trade_id.notna() & (raw.time >= raw.time.max() - SEEN_KEEP)] if len(raw) else raw
+            self._seen = dict(zip(recent.trade_id.astype(str), recent.time.astype("int64")))
+            self._prints = bucket_prints(raw) if len(raw) else _empty_prints()
         self._lock = threading.Lock()
         self._theo_cache = {}
         self._settle_tried = {}
@@ -447,19 +476,31 @@ class Perf:
         # them grew KXBTC15M's tape to 2.3M rows (435 MB, 211k priced) and
         # OOM-killed alpha5-perf (10-20).
         done = [g[g.theo.notna()] for g in done]
-        if any(len(g) for g in done):
-            x = pd.concat(([self._prints] if len(self._prints) else []) + [g for g in done if len(g)],
-                          ignore_index=True)
+        done = [g for g in done if len(g)]
+        if done:
+            x = pd.concat(done, ignore_index=True)
             # A print is journaled once per process; a restart mid-event can't
             # replay it, but two parts of one day can still overlap a reconnect.
-            has_id = x.trade_id.notna()
-            self._prints = pd.concat([x[has_id].drop_duplicates(["ticker", "trade_id"]), x[~has_id]],
-                                     ignore_index=True).sort_values("time", ignore_index=True)
+            keep, ns = [], x.time.astype("int64").tolist()
+            for tid, t in zip(x.trade_id.tolist(), ns):
+                if not isinstance(tid, str):
+                    keep.append(True)
+                elif tid in self._seen:
+                    keep.append(False)
+                else:
+                    self._seen[tid] = t
+                    keep.append(True)
+            new = bucket_prints(x[keep])
+            if len(new):
+                both = pd.concat([self._prints, new], ignore_index=True) if len(self._prints) else new
+                self._prints = both.groupby("time", as_index=False).sum().astype(_PRINT_COLS)
+            cut = max(ns) - SEEN_KEEP.value
+            self._seen = {k: t for k, t in self._seen.items() if t >= cut}
         self._prints_pending = [p[~ready]] if (~ready).any() else []
 
     def prints_frame(self) -> pd.DataFrame:
-        """(time, ticker, trade_id, yes_price, size, theo): every public print
-        on this series' markets that we had an armed theo for."""
+        """(time, prints, size, edge_usd) per minute: the public prints on this
+        series' markets that we had an armed theo for (see bucket_prints)."""
         with self._lock:
             return self._prints.copy()
 
@@ -652,15 +693,17 @@ def summarize_edge(df: pd.DataFrame, prints: pd.DataFrame, since: pd.Timestamp |
     share: our edge / market edge (can go negative). vol_share: our
     contracts / market contracts over the same priced prints."""
     P = window(prints, since)
-    P = P[P.theo.notna()] if len(P) else P
+    if len(P) and "edge_usd" not in P.columns:
+        P = bucket_prints(P)
     d = window(df, since)
     d = d[d.theo.notna()] if len(d) and "theo" in d.columns else d.iloc[0:0]
-    mkt = float((P["size"] * (P.theo - P.yes_price).abs()).sum()) if len(P) else 0.0
+    mkt = float(P.edge_usd.sum()) if len(P) else 0.0
     mkt_lots = float(P["size"].sum()) if len(P) else 0.0
     edge = d.dir * (d.theo - d.yes_px) * d["size"] if len(d) else pd.Series(dtype=float)
     ours = float(edge.sum()) if len(d) else 0.0
     lots = float(d["size"].sum()) if len(d) else 0.0
-    out = {"prints": len(P), "market_usd": mkt, "market_lots": mkt_lots, "ours_usd": ours, "our_lots": lots,
+    n = int(P["prints"].sum()) if len(P) else 0
+    out = {"prints": n, "market_usd": mkt, "market_lots": mkt_lots, "ours_usd": ours, "our_lots": lots,
            "share": ours / mkt if mkt > 0 else math.nan,
            "vol_share": lots / mkt_lots if mkt_lots > 0 else math.nan,
            "market_c": 100 * mkt / mkt_lots if mkt_lots else math.nan,
