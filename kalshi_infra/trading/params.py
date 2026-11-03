@@ -60,8 +60,11 @@ class QuotingParams:
         "touch only, with the hold.", min=0.05, max=10, step=0.05)
     quoting_edge: float = param(
         "Extra $ edge for a RESTING quote, on top of constant_edge + band + lean (a quote pays the "
-        "maker fee instead of the taker fee).",
-        min=0, max=0.5, step=0.005)
+        "maker fee instead of the taker fee). Negative quotes tighter than takes: constant_edge then "
+        "sets the take edge and this takes it back off quotes. A quote's total edge floors at 0, so it "
+        "never prices through fair. KXBTC15M 11-03 02:50-07:45 UTC: maker fills a tick behind the touch "
+        "(>1c from mid) marked out -1.2c at 60s, at the touch +0.6c.",
+        min=-0.1, max=0.5, step=0.005)
     max_improve_ticks: int = param(
         "Max ticks the best quote may sit inside the near touch (others' orders, ours excluded). "
         "Caps edge handed over in a wide market (KXINX 2026-08-17 uncapped: 6% of quotes "

@@ -1665,3 +1665,18 @@ def test_a_fair_without_takes_only_quotes():
     q, ctx = Quoter(cfg(), Model(), FREE, close_time=None), Ctx()
     step(q, ctx, {"A": Fair(0.60, 0.59, 0.61, takes=False)}, Book("A", 0.40, 0.55))
     assert takes(ctx) == [] and ladder(ctx, "yes") != []
+
+
+def test_negative_quoting_edge_tightens_quotes_not_takes():
+    q, ctx = Quoter(cfg(constant_edge=0.03, quoting_edge=-0.03, lean_dollars=0.0, edge_fraction=0.0), Model(), FREE,
+                    close_time=None), Ctx()
+    step(q, ctx, {"A": Fair(0.505, 0.5, 0.51)}, Book("A", 0.48, 0.52))
+    assert takes(ctx) == []                        # 0.505 - 0.03 < 0.52
+    assert ladder(ctx, "yes")[0] == 0.49           # one tick over the touch, under the 0.505 fair
+
+
+def test_quote_edge_floors_at_zero_never_through_fair():
+    q, ctx = Quoter(cfg(constant_edge=0.0, quoting_edge=-0.05, lean_dollars=0.0, edge_fraction=0.0,
+                        max_improve_ticks=10), Model(), FREE, close_time=None), Ctx()
+    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, Book("A", 0.40, 0.60))
+    assert ladder(ctx, "yes")[0] <= 0.50 and ladder(ctx, "no")[0] <= 0.50
