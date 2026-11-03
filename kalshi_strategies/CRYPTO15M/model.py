@@ -111,7 +111,9 @@ class UpDownModel:
                 return None
             best.append(max(lv))
         bid, ask = round(best[0], 2), round(1.0 - best[1], 2)
-        return (bid, ask) if ask > bid else None
+        # A locked book (bid == ask) is the market agreeing on one price: a valid
+        # anchor. It withheld the fair 1.4% of 11-03 00:57-02:44 UTC as None.
+        return (bid, ask) if ask >= bid else None
 
     def _kmid(self) -> float | None:
         if self._kbid is None or self._kask is None or self._kask <= self._kbid:

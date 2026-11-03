@@ -343,3 +343,12 @@ def test_a_move_just_after_a_re_anchor_is_taken_as_already_priced():
     assert m.reprice(now + 0.05)[m.ticker].prob == pytest.approx(0.605, abs=1e-4)   # only 50ms of decay
     _feed(spot, "BTC", 1.0006)                                  # a later move counts
     assert m.reprice(now + 0.2)[m.ticker].prob > 0.61
+
+
+def test_locked_book_anchors_at_its_price():
+    now = time.time()
+    m, spot = _anchored(now)
+    m.on_book(_LBook(m.ticker, {0.55: 500.0}, {0.45: 400.0}))   # 0.55 / 0.55
+    assert m.reprice(now)[m.ticker].prob == pytest.approx(0.55, abs=1e-6)
+    m.on_book(_LBook(m.ticker, {0.56: 500.0}, {0.45: 400.0}))   # crossed: keeps the last anchor
+    assert m.reprice(now)[m.ticker].prob == pytest.approx(0.55, abs=1e-6)
