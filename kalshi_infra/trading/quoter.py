@@ -566,12 +566,17 @@ class Quoter:
         # During a jump hold the chase side quotes off the pre-jump fair, and
         # only ever more conservatively than the new one would.
         p_bid = p_ask = prob
+        if fair.take_prob is not None:
+            # The side a lead move exposes quotes off the full move (take_prob),
+            # the other stays on prob: the offer leaves at once on an up-shift,
+            # the bid doesn't chase it.
+            p_bid, p_ask = min(p_bid, tprob), max(p_ask, tprob)
         if jump is not None:
             anchor = min(max(jump[1], FAIR_CLIP_EPS), 1.0 - FAIR_CLIP_EPS)
             if jump[0] > 0:
-                p_bid = min(prob, anchor)
+                p_bid = min(p_bid, anchor)
             else:
-                p_ask = max(prob, anchor)
+                p_ask = max(p_ask, anchor)
         mfee_bid = self.fees.maker(p_bid - q_base_bid)
         mfee_ask = self.fees.maker(p_ask + q_base_ask)
         qres_bid = p_bid - (q_base_bid + mfee_bid)

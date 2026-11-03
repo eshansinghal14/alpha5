@@ -1680,3 +1680,11 @@ def test_quote_edge_floors_at_zero_never_through_fair():
                         max_improve_ticks=10), Model(), FREE, close_time=None), Ctx()
     step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, Book("A", 0.40, 0.60))
     assert ladder(ctx, "yes")[0] <= 0.50 and ladder(ctx, "no")[0] <= 0.50
+
+
+def test_a_lead_move_moves_the_exposed_quote_by_all_of_it():
+    q, ctx = Quoter(cfg(lean_dollars=0.0, edge_fraction=0.0, constant_edge=0.01, enable_taking=False,
+                        max_improve_ticks=5), Model(), FREE, close_time=None), Ctx()
+    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51, take_prob=0.54)}, Book("A", 0.40, 0.60))
+    assert ladder(ctx, "no")[0] == 0.45            # offer off 0.54: 0.55 yes, i.e. no bid 0.45
+    assert ladder(ctx, "yes")[0] == 0.45           # bid stays off 0.50 (0.49 limit), capped 5 ticks over 0.40
