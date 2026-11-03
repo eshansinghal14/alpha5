@@ -83,10 +83,17 @@ def prob_up(x: float, I: float, tau: float, rate: float, *, nu: float | None, ba
     return UpDownResult(p, mu, sd, te, phase, tv)
 
 
+def prob_from_mu(mu: float, sd: float, nu: float | None) -> float:
+    """P(up) for a final-return location `mu` and spread `sd` (prob_up's own map)."""
+    if sd <= 0:
+        return 1.0 if mu >= 0 else 0.0
+    return float(_cdf(mu / sd, nu))
+
+
 def implied_mu(p_market: float, sd: float, nu: float | None, clip: float = 0.03) -> float:
     """The mu that prices at `p_market` with this sd."""
     p = min(max(p_market, clip), 1.0 - clip)
     return sd * _ppf(p, nu)
 
 
-__all__ = ["UpDownResult", "prob_up", "implied_mu", "variance_clock"]
+__all__ = ["UpDownResult", "prob_up", "prob_from_mu", "implied_mu", "variance_clock"]

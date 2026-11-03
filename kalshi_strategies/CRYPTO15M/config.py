@@ -104,6 +104,25 @@ class UpDownPricingParams:
         "basis) is from spot, capped 2bp. Anything else prices on spot. KXSOL15M 10-20 03:00-04:12 UTC, "
         "7,837 informed takers: half-move -10ms latest, +20ms gap, -5ms spot; latest earlier than gap on "
         "40% of paired takers, later on 9%.")
+    fair_anchor: bool = param(
+        "Price on the Kalshi mid, moved by our model: at each change in others' touch the fair is set to "
+        "that mid (the location it implies at our sd), and from then on moves by the model's own change "
+        "in location (spot, the lead increment, the end average) and the passing time. Our level never "
+        "enters, only our moves and vol. Off: the model's own fair.")
+    anchor_max_spread: float = param(
+        "Re-anchor only while others' spread is at most this ($); a wider touch keeps the last anchor.",
+        min=0.01, max=0.2, step=0.01)
+    anchor_min_size: float = param(
+        "A level counts toward others' touch only with at least this many contracts left after our own "
+        "size: keeps a quote of ours the book shows before its ack from moving the anchor.",
+        min=0, step=0.5)
+    anchor_settle_s: float = param(
+        "For this long after a re-anchor the anchor follows our input: a move that reaches us after Kalshi "
+        "already priced it (Binance arrives ~72ms after its trade, 11-02) is not counted twice.",
+        min=0, max=2, step=0.05)
+    anchor_max_age_s: float = param(
+        "No fair (quotes and takes off) once the last anchor is older than this and the touch still "
+        "can't re-anchor.", min=1, step=5)
     market_shift_alpha: float = param(
         "Share of the market-implied shift in x (the one putting our fair on the Kalshi mid) applied, "
         "after EMA smoothing. 0 disables.", min=0, max=1, step=0.05)

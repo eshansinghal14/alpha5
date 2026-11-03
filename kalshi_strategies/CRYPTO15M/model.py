@@ -22,7 +22,8 @@ from kalshi_infra.kalshi.markets import EventInfo
 from kalshi_infra.trading.fair import Fair
 from kalshi_strategies.CRYPTO15M.implied_vol import observe
 from kalshi_strategies.CRYPTO15M.shared_feed import extend, hold, implied_ema
-from kalshi_strategies.CRYPTO15M.pricer import implied_mu, prob_up
+from kalshi_infra.trading.lip import others_ladder
+from kalshi_strategies.CRYPTO15M.pricer import implied_mu, prob_from_mu, prob_up, variance_clock
 from kalshi_strategies.KXCRYPTOLEAD15M.cf_index import STALE_S as CF_STALE_S
 from kalshi_strategies.KXCRYPTOLEAD15M.model import BASIS_MIN_S, BASIS_WINDOW_S
 from kalshi_strategies.KXCRYPTOLEAD15M.perp_nowcast import TOUCH_VENUES
@@ -60,6 +61,11 @@ class UpDownModel:
         self._newest_mono = 0.0
         self._kbid: float | None = None
         self._kask: float | None = None
+        # fair_anchor: others' touch (our own size out), and the anchor taken
+        # on it: (touch, market location, model core location then, time).
+        self._own_quotes = None
+        self._otouch: tuple[float, float] | None = None
+        self._anchor: tuple[tuple[float, float], float, float, float] | None = None
         # EMA of the market-implied shift in x (log units), see _market_shift.
         self._shift = 0.0
         self._shift_raw = 0.0
@@ -76,8 +82,36 @@ class UpDownModel:
     # --- inputs -------------------------------------------------------------
 
     def on_book(self, book):
-        if book.ticker == self.ticker:
-            self._kbid, self._kask = book.bid, book.ask
+        if book.ticker != self.ticker:
+            return
+        self._kbid, self._kask = book.bid, book.ask
+        if self.cfg.pricing.fair_anchor:
+            t = self._others_touch(book)
+            if t != self._otouch:
+                self._otouch = t
+                self._dirty = True          # re-anchors on this book's dispatch
+
+    def set_own_quotes(self, fn):
+        """fn(ticker, side) -> [(price, size)] of ours that Kalshi's book shows."""
+        self._own_quotes = fn
+
+    def _others_touch(self, book) -> tuple[float, float] | None:
+        """(bid, ask) in YES terms from others' size only, levels under
+        anchor_min_size ignored; None when a side is empty or crossed."""
+        lad = getattr(book, "ladder", None)
+        if lad is None:
+            return None if book.bid is None or book.ask is None else (book.bid, book.ask)
+        own = self._own_quotes
+        m = self.cfg.pricing.anchor_min_size
+        best = []
+        for side, levels in (("yes", lad.yes_bids), ("no", lad.no_bids)):
+            ours = list(own(self.ticker, side)) if own is not None else []
+            lv = [px for px, sz in others_ladder(dict(levels), ours).items() if sz >= m]
+            if not lv:
+                return None
+            best.append(max(lv))
+        bid, ask = round(best[0], 2), round(1.0 - best[1], 2)
+        return (bid, ask) if ask > bid else None
 
     def _kmid(self) -> float | None:
         if self._kbid is None or self._kask is None or self._kask <= self._kbid:
@@ -299,7 +333,7 @@ class UpDownModel:
         w = self.window
         tau = max(0.0, w.T - now_s)
         x = math.log(mid / start) - b
-        I, n_end = 0.0, 0
+        I, n_end, n_eff = 0.0, 0, 0.0
         if tau < L:
             vals = self.cf.window(self.coin, w.end_avg_begin, min(math.ceil(now_s), w.T))
             n_end = len(vals)
@@ -311,6 +345,11 @@ class UpDownModel:
             self._vol_off_check(now_s)
         self._burst_check()
         rate, vol_src = self._rate(now_s, max(tau, 1.0))
+        if rate is None and p.fair_anchor:
+            # Anchored, vol only scales our moves: realized stands in while
+            # the implied EMA warms up instead of withholding the fair.
+            rr = self._realized_rate(max(tau, 1.0))
+            rate, vol_src = (rr, "realized") if math.isfinite(rr) and rr > 0 else (None, vol_src)
         self.vol_src = vol_src
         if rate is None:
             return self._withhold("no_implied_vol")
@@ -358,15 +397,27 @@ class UpDownModel:
             und = x + p_gap * 1e-4
         else:
             priced_on, r = "spot", spot_r
+        anchor_x = None
+        model_prob = r.prob
+        if p.fair_anchor:
+            anchored = self._anchored(now_s, tau, I, x, p_inc if priced_on == "latest" else 0.0,
+                                      n_eff, n_end, r.sd, lead in TOUCH_VENUES and priced_on == "latest",
+                                      pnc, mid, mono)
+            if anchored is None:
+                return self._withhold("no_kalshi_anchor")
+            prob, take_prob, anchor_x = anchored
+            priced_on = "kalshi_anchor"
+        else:
+            prob = r.prob
         self.result = r
         self._newest_mono = max(books)
         self._dirty = False
         self.withheld_reason = None
         k = p.ci_vol_multiplier
         lat = self._cme_lat()
-        return {self.ticker: Fair(prob=r.prob, lo=r.prob - k * r.theo_vol, hi=r.prob + k * r.theo_vol,
+        return {self.ticker: Fair(prob=prob, lo=prob - k * r.theo_vol, hi=prob + k * r.theo_vol,
                                   take_prob=take_prob, underlying=und,
-                                  extras={"take_prob": take_prob, "coin": self.coin, "theo_vol": r.theo_vol, "tau": tau, "phase": r.phase,
+                                  extras={"take_prob": take_prob, "model_prob": model_prob, **(anchor_x or {}), "coin": self.coin, "theo_vol": r.theo_vol, "tau": tau, "phase": r.phase,
                                           "x_bp": x * 1e4, "mu_bp": r.mu * 1e4, "sd_bp": r.sd * 1e4,
                                           "shift_bp": sh * 1e4, "shift_ema_bp": self._shift * 1e4,
                                           "start": start, "start_src": self.start_src, "cf_basis_bp": b * 1e4,
@@ -381,6 +432,40 @@ class UpDownModel:
                                           "iv_fast_bp": None if not self.vol_check else self.vol_check["fast_bp"],
                                           "iv_z": None if not self.vol_check else self.vol_check["z"],
                                           "burst_ratio": self.burst_ratio})}
+
+    def _anchored(self, now_s, tau, I, x, inc_bp, n_eff, n_end, sd, take_full, pnc, mid, mono):
+        """(prob, take_prob, extras) priced on the Kalshi anchor, or None
+        without a usable one. The model's location without the market-shift
+        EMA ("core": end average + time weight x (spot + lead increment)) is
+        tracked from the anchor; the market's location there comes from the
+        mid at our sd."""
+        p = self.cfg.pricing
+        _, g, _ = variance_clock(tau)
+
+        def core(inc):
+            dx = (inc or 0.0) * 1e-4
+            I_x = I + (dx * (n_eff - n_end) / L if tau < L else 0.0)
+            return I_x + g * (x + dx)
+
+        mu_core = core(inc_bp)
+        t = self._otouch
+        if (t is not None and t[1] - t[0] <= p.anchor_max_spread + 1e-9
+                and (self._anchor is None or self._anchor[0] != t)):
+            self._anchor = (t, implied_mu(0.5 * (t[0] + t[1]), sd, p.t_nu, clip=0.005), mu_core, now_s)
+        a = self._anchor
+        if a is None or (now_s - a[3] > p.anchor_max_age_s and a[0] != t):
+            return None
+        if now_s - a[3] < p.anchor_settle_s:
+            a = self._anchor = (a[0], a[1], mu_core, a[3])
+        touch, mu_mkt, mu_ref, t_a = a
+        prob = prob_from_mu(mu_mkt + mu_core - mu_ref, sd, p.t_nu)
+        take = None
+        if take_full:
+            _, full = pnc.increment(self.coin, mono, mid, leads=("cme",), full=True)
+            if full is not None and full != inc_bp:
+                take = prob_from_mu(mu_mkt + core(full) - mu_ref, sd, p.t_nu)
+        return prob, take, {"anchor_mid": 0.5 * (touch[0] + touch[1]), "anchor_age_s": now_s - t_a,
+                            "anchor_move_bp": (mu_core - mu_ref) * 1e4}
 
     def _cme_lat(self) -> dict:
         """Where the newest CME touch spent its time before this fair (ms):

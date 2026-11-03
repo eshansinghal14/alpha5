@@ -1,6 +1,7 @@
 """UpDownModel gates and Fair shape, offline (no network, nothing persisted)."""
 import math
 import time
+import types
 
 import pandas as pd
 import pytest
@@ -266,3 +267,79 @@ def test_perp_pricing_falls_back_to_spot_without_fresh_perps():
     _feed(spot, "BTC")
     f = m.reprice(now)[m.ticker]
     assert f.extras["priced_on"] == "spot" and f.extras["perp_prob"] is None
+
+
+class _LBook:
+    """A Kalshi book with a ladder: yes bids and no bids, price -> size."""
+    def __init__(self, ticker, yes_bids, no_bids):
+        self.ticker = ticker
+        self.ladder = types.SimpleNamespace(yes_bids=dict(yes_bids), no_bids=dict(no_bids))
+        self.bid = max(yes_bids) if yes_bids else None
+        self.ask = round(1.0 - max(no_bids), 2) if no_bids else None
+
+
+def _anchored(now, **pricing):
+    pricing = {"anchor_settle_s": 0.0, **pricing}
+    m, spot = _setup(now, fair_anchor=True, anchor_max_spread=0.02, anchor_min_size=1.0,
+                     anchor_max_age_s=30.0, market_shift_alpha=0.0, **pricing)
+    _feed(spot, "BTC")
+    return m, spot
+
+
+def test_anchor_prices_on_the_kalshi_mid_not_our_level():
+    now = time.time()
+    m, spot = _anchored(now)                                    # model alone: ATM, 0.50
+    m.on_book(_LBook(m.ticker, {0.60: 500.0}, {0.39: 400.0}))   # Kalshi 0.60 / 0.61
+    f = m.reprice(now)[m.ticker]
+    assert f.prob == pytest.approx(0.605, abs=1e-6)
+    assert f.extras["model_prob"] == pytest.approx(0.5, abs=0.01)
+
+
+def test_anchor_moves_with_spot_from_the_market_level():
+    now = time.time()
+    m, spot = _anchored(now)
+    m.on_book(_LBook(m.ticker, {0.60: 500.0}, {0.39: 400.0}))
+    m.reprice(now)
+    _feed(spot, "BTC", 1.0003)                                  # +3bp, Kalshi hasn't moved
+    f = m.reprice(now)[m.ticker]
+    assert f.prob > 0.605 and f.extras["anchor_move_bp"] == pytest.approx(3.0, rel=0.05)
+    m.on_book(_LBook(m.ticker, {0.62: 500.0}, {0.37: 400.0}))   # Kalshi follows: re-anchored there
+    assert m.reprice(now)[m.ticker].prob == pytest.approx(0.625, abs=1e-6)
+
+
+def test_anchor_ignores_our_own_and_tiny_levels():
+    now = time.time()
+    m, spot = _anchored(now)
+    m.set_own_quotes(lambda t, side: [(0.62, 0.1)] if side == "yes" else [])
+    # 0.62 is our 0.1 lot; 0.61 holds 0.5 of someone's: neither is others' touch.
+    m.on_book(_LBook(m.ticker, {0.62: 0.1, 0.61: 0.5, 0.60: 500.0}, {0.39: 400.0}))
+    assert m.reprice(now)[m.ticker].prob == pytest.approx(0.605, abs=1e-6)
+
+
+def test_no_anchor_on_a_wide_book_withholds():
+    now = time.time()
+    m, spot = _anchored(now)
+    m.on_book(_LBook(m.ticker, {0.55: 500.0}, {0.40: 400.0}))   # 0.55 / 0.60: 5c wide
+    assert m.reprice(now)[m.ticker] is None and m.withheld_reason == "no_kalshi_anchor"
+
+
+def test_wide_book_keeps_the_last_anchor_until_it_ages_out():
+    now = time.time()
+    m, spot = _anchored(now)
+    m.on_book(_LBook(m.ticker, {0.60: 500.0}, {0.39: 400.0}))
+    m.reprice(now)
+    m.on_book(_LBook(m.ticker, {0.55: 500.0}, {0.39: 400.0}))   # widens: anchor kept
+    assert m.reprice(now + 1)[m.ticker].prob == pytest.approx(0.605, abs=0.01)
+    m._dirty = True
+    assert m.reprice(now + 31)[m.ticker] is None
+
+
+def test_a_move_just_after_a_re_anchor_is_taken_as_already_priced():
+    now = time.time()
+    m, spot = _anchored(now, anchor_settle_s=0.1)
+    m.on_book(_LBook(m.ticker, {0.60: 500.0}, {0.39: 400.0}))
+    m.reprice(now)
+    _feed(spot, "BTC", 1.0003)                                  # reaches us 50ms after Kalshi moved
+    assert m.reprice(now + 0.05)[m.ticker].prob == pytest.approx(0.605, abs=1e-4)   # only 50ms of decay
+    _feed(spot, "BTC", 1.0006)                                  # a later move counts
+    assert m.reprice(now + 0.2)[m.ticker].prob > 0.61

@@ -472,6 +472,10 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
 
     # --- Kalshi ---
     model_on_book = getattr(model, "on_book", None)   # optional: models that read the Kalshi book
+    set_own = getattr(model, "set_own_quotes", None)   # optional: models that net our size out of it
+    if set_own is not None:
+        # Only real quotes are in Kalshi's book; shadow ones never are.
+        set_own(lambda t, side: engine.om.on_book(t, side) if engine.live_trading else [])
 
     dispatch_book = coalesce_latest(lambda book: engine.dispatch(book, pd.Timestamp.now(tz="UTC")))
 
