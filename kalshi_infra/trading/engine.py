@@ -46,6 +46,7 @@ state here:
     event for anything still resting (cancel_resting).
 """
 import asyncio
+import os
 import collections
 import dataclasses
 import itertools
@@ -113,8 +114,16 @@ def _cancel_pool():
     return _CANCEL_POOL
 
 
+# ALPHA5_LEGACY_ORDER_PATH=1: the order path as it was before 2026-10-30
+# (creates/takes on the loop's default executor with its result hops, no pump
+# on ack), to test whether those changes cost the race's markouts.
+LEGACY_ORDER_PATH = os.environ.get("ALPHA5_LEGACY_ORDER_PATH") == "1"
+
+
 def _order_pool():
     global _ORDER_POOL
+    if LEGACY_ORDER_PATH:
+        return None
     if _ORDER_POOL is None:
         import concurrent.futures
         _ORDER_POOL = concurrent.futures.ThreadPoolExecutor(ORDER_WORKERS, thread_name_prefix="order")
@@ -1228,6 +1237,10 @@ class LiveEngine:
         if loop is None:
             self._on_real_result(order, self._place_blocking(order))
             return
+        if LEGACY_ORDER_PATH:
+            fut = loop.run_in_executor(None, self._place_blocking, order)
+            fut.add_done_callback(lambda f: self._on_real_result(order, f.result()))
+            return
         _order_pool().submit(self._place_blocking, order).add_done_callback(
             lambda f: _post(loop, lambda res: self._on_real_result(order, res), f))
 
@@ -1960,7 +1973,7 @@ class LiveEngine:
         the next dispatch or PUMP_INTERVAL_S tick, 45 ms p50 after the ack
         (2026-10-30). call_soon, not pump(): an ack can arrive inside pump()
         (shadow, tests) and re-entering it would send a level twice."""
-        if self._pump_queued:
+        if self._pump_queued or LEGACY_ORDER_PATH:
             return
         try:
             loop = asyncio.get_running_loop()

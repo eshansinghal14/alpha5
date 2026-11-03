@@ -756,3 +756,18 @@ def test_worker_result_runs_on_the_loop_thread():
         assert worker != loop_thread and done_thread == loop_thread
     asyncio.run(run())
     pool.shutdown()
+
+
+def test_legacy_order_path_does_not_pump_on_ack(monkeypatch):
+    import asyncio
+    from kalshi_infra.trading import engine as engine_mod
+    monkeypatch.setattr(engine_mod, "LEGACY_ORDER_PATH", True)
+    eng, _, _ = setup(real=True)
+    calls = []
+    eng.pump_quotes = lambda: calls.append(1)
+
+    async def run():
+        eng._pump_soon()
+        await asyncio.sleep(0)
+    asyncio.run(run())
+    assert calls == [] and engine_mod._order_pool() is None

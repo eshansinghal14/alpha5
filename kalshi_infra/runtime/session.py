@@ -22,6 +22,7 @@ import asyncio
 import collections
 import functools
 import gc
+import os
 import time
 import traceback
 
@@ -618,6 +619,8 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
                 traceback.print_exc()
 
     async def keepalive_loop():
+        if os.environ.get("ALPHA5_LEGACY_ORDER_PATH") == "1":
+            return
         while engine.order_client is not None:
             await asyncio.sleep(KEEPALIVE_S)
             try:

@@ -7,6 +7,8 @@ Wants=network-online.target
 User=ubuntu
 WorkingDirectory=/opt/alpha5
 Environment=PYTHONUNBUFFERED=1
+# A/B test 11-03: the pre-10-30 order path (engine.LEGACY_ORDER_PATH) for the race only.
+Environment=ALPHA5_LEGACY_ORDER_PATH=1
 Environment=PYTHONIOENCODING=utf-8
 # --resume-arm: a restart re-arms if the last dashboard request was an
 # arm with no STOP since (kalshi_infra.runtime.control.resumable_arm).
