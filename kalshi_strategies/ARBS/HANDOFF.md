@@ -62,7 +62,8 @@ are on `ec2-live` (box at `6396726`).
   that unwinds or exits on a fast move marks its markets live until a clean
   fill on them.
 - **Live treatment**: `live_quote_size` (10), `live_edge_add` on quotes/takes,
-  no takes (`take_live_events` false), broken baskets exit at once,
+  takes (`take_live_events`, on since 11-03 as a trial) capped at
+  `live_take_size` (1), broken baskets exit at once,
   closing held bundles needs the full arb edge.
 - **Takes**: non-live sends every leg at once; live (if enabled) sends the
   stalest book first and the rest only for what it filled. Cooldown 5 s per basket.
@@ -95,8 +96,8 @@ are on `ec2-live` (box at `6396726`).
 ## Config on the box (dashboard edits included)
 
 trading: min_edge 0.03, quote_edge_add 0.01, min_exit_edge 0.01, exit_ref_days 14,
-days_till_expiry 90, quote_size 50, quote_live_events true, take_live_events false,
-live_edge_add 0.015, live_quote_size 10, max_bundles_per_basket 1000, max_dollars 9000,
+days_till_expiry 90, quote_size 50, quote_live_events true, take_live_events true,
+live_edge_add 0.015, live_quote_size 10, live_take_size 1, max_bundles_per_basket 1000, max_dollars 9000,
 requote_min_ticks 1, requote_hold_up 0.01, requote_cooldown_s 2, take_cooldown_s 5.
 completion: chase_ticks 3, chase_window_s 0.1, max_broken_baskets 3.
 watch: queue_window_s 10800, rank_interval_s 10. scan: max_markets 1000, interval 120 s.

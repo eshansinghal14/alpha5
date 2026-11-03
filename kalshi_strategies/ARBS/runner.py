@@ -1252,7 +1252,7 @@ class ArbsRunner:
             ex = self.exit_room(b)
             # An apparent arb on a live game is usually one leg not yet
             # repriced after a score, already being taken by faster traders.
-            live_cap = t.live_quote_size if self.live_now(b, _utc()) else 10 ** 9
+            live_cap = t.live_take_size if self.live_now(b, _utc()) else 10 ** 9
             exit_need = self.exit_need(b, need, _utc())
             plan = None
             if ex >= 1 and g is not None and g >= exit_need - _EPS:

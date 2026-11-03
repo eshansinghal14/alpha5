@@ -547,7 +547,7 @@ def _live_takes(r, b):
     live = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
     r.set_baskets([live])
     r.hot = [live.basket_id]
-    r.cfg.trading = dataclasses.replace(r.cfg.trading, take_live_events=True, live_quote_size=100)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, take_live_events=True, live_take_size=100)
     return live
 
 
@@ -612,7 +612,7 @@ def test_take_capped_on_live_events(arbs):
     r, b = arbs
     live = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
     r.set_baskets([live])
-    r.cfg.trading = dataclasses.replace(r.cfg.trading, live_quote_size=1, take_live_events=True)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, live_take_size=1, live_quote_size=100, take_live_events=True)
     _cheap_book(r)
     _eval(r, live)
     assert r.shadow_ledger.baskets[live.basket_id].bundles(live.tickers) == 1

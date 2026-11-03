@@ -49,8 +49,9 @@ class TradingParams:
                                    "game is mostly one leg not yet repriced after a score, which faster traders "
                                    "take first: 6 of 7 live takes filled unevenly (10-29). Exits of broken "
                                    "baskets are taken regardless.")
-    live_quote_size: int = param("Bundles per resting quote, and most bundles per take, on a live event.",
-                                 min=1, max=10000, step=1)
+    live_quote_size: int = param("Bundles per resting quote on a live event.", min=1, max=10000, step=1)
+    live_take_size: int = param("Most bundles per take (or flip) on a live event, when take_live_events is on.",
+                                min=1, max=10000, step=1)
     live_order_groups: bool = param("Put a live event's quotes in one Kalshi order group (limit 1): once 2 "
                                     "contracts match in 15 s, Kalshi cancels the rest inside the matching "
                                     "engine, before the rest of a sweep lands, and exits go out without "
