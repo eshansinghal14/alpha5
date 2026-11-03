@@ -315,6 +315,8 @@ def main(argv=None):
     ap.add_argument("--no-services", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
     series_list, services = resolve(ap, args.series, args.only, fmap)
+    # What this process runs, for shared feeds that subscribe per series.
+    os.environ["ALPHA5_SERIES"] = ",".join(series_list)
 
     # Validate every config before starting anything.
     for s in series_list:

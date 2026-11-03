@@ -52,7 +52,11 @@ async def _spot(cfg, group: str):
     persist = PERSIST and group == CRYPTO_GROUP
     # Only this process's coins: the BTC process parsed every coin's Coinbase
     # level2 on its trading loop and ran a venue child for all five (11-03).
-    coins = {COIN_OF[t] for t, g in GROUP_OF.items() if g == group}
+    running = [t for t in os.environ.get("ALPHA5_SERIES", "").split(",") if t]
+    if any(t not in COIN_OF for t in running):
+        coins = None                       # the race (or another series) shares this feed: all coins
+    else:
+        coins = {COIN_OF[t] for t in running} or {COIN_OF[t] for t, g in GROUP_OF.items() if g == group}
     spot = await get_spot(cfg, persist=persist, tag="CRYPTO15M", coins=coins)
     if not spot._persist and not getattr(spot, "_thr_loaded", False):
         # Read-only feed: still start from the saved burst thresholds.
