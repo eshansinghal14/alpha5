@@ -104,6 +104,10 @@ class UpDownPricingParams:
         "basis) is from spot, capped 2bp. Anything else prices on spot. KXSOL15M 10-20 03:00-04:12 UTC, "
         "7,837 informed takers: half-move -10ms latest, +20ms gap, -5ms spot; latest earlier than gap on "
         "40% of paired takers, later on 9%.")
+    take_lead_only: bool = param(
+        "Take only on a fair carrying a CME whole-touch shift (take_prob); quotes are unaffected. Our spot "
+        "median is no faster than Kalshi's makers: anchored-fair takes on it marked out -3.0c at 10s, CME "
+        "shift takes -1.7c (KXBTC15M real, 11-03 00:28-00:55 UTC, 13 and 9 takes).")
     fair_anchor: bool = param(
         "Price on the Kalshi mid, moved by our model: at each change in others' touch the fair is set to "
         "that mid (the location it implies at our sd), and from then on moves by the model's own change "

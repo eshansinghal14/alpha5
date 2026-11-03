@@ -516,7 +516,7 @@ class Quoter:
         cap_no = net - inflight_no > -max_pos + 1e-9
 
         key_b, key_a = (ticker, "take_yes"), (ticker, "take_no")
-        taking = q.enable_taking
+        taking = q.enable_taking and fair.takes
         want_b = taking and block_bid is None and market_ask is not None and bid_res >= market_ask and cap_yes
         want_a = taking and block_ask is None and market_bid is not None and ask_res <= market_bid and cap_no
         move_b = move_a = None

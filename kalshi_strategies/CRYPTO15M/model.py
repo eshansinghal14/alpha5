@@ -417,6 +417,7 @@ class UpDownModel:
         lat = self._cme_lat()
         return {self.ticker: Fair(prob=prob, lo=prob - k * r.theo_vol, hi=prob + k * r.theo_vol,
                                   take_prob=take_prob, underlying=und,
+                                  takes=not p.take_lead_only or take_prob is not None,
                                   extras={"take_prob": take_prob, "model_prob": model_prob, **(anchor_x or {}), "coin": self.coin, "theo_vol": r.theo_vol, "tau": tau, "phase": r.phase,
                                           "x_bp": x * 1e4, "mu_bp": r.mu * 1e4, "sd_bp": r.sd * 1e4,
                                           "shift_bp": sh * 1e4, "shift_ema_bp": self._shift * 1e4,

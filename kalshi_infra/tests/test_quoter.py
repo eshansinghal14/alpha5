@@ -1659,3 +1659,9 @@ def test_move_mode_forgets_the_fair_across_a_gate():
     m.age = 0.0
     step(q, ctx, {"A": Fair(0.60, 0.59, 0.61)}, dt=0.2)
     assert takes(ctx) == []                       # first fair after the gate: nothing to measure from
+
+
+def test_a_fair_without_takes_only_quotes():
+    q, ctx = Quoter(cfg(), Model(), FREE, close_time=None), Ctx()
+    step(q, ctx, {"A": Fair(0.60, 0.59, 0.61, takes=False)}, Book("A", 0.40, 0.55))
+    assert takes(ctx) == [] and ladder(ctx, "yes") != []

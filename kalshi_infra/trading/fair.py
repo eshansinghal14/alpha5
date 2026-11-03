@@ -30,6 +30,8 @@ class Fair:
     # What the fair is priced off (any monotone scale, e.g. log price), for
     # quoting.take_move_window_s: a take needs it to have moved its way too.
     underlying: float | None = None
+    # False: no takes on this fair (quotes unaffected), e.g. no lead behind it.
+    takes: bool = True
 
 
 @dataclasses.dataclass(frozen=True)
