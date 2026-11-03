@@ -474,6 +474,7 @@ def test_error_code_reads_kalshi_body():
     assert error_code(bare) == "trading_is_paused"           # no response object: parsed from the text
     assert error_code(RuntimeError("boom")) is None
     assert not is_market_paused(requests.HTTPError('400 for x: {"error":{"code":"insufficient_balance"}}'))
+    assert is_market_paused(requests.HTTPError('409 for x: {"error":{"code":"MARKET_NOT_ACTIVE"}}'))
 
 
 def test_post_only_match_is_specific():

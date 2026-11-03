@@ -115,11 +115,13 @@ def error_code(exc) -> str | None:
 # Kalshi refusing orders on a market for now -- the market, not our request.
 # KXINXDUD 2026-10-22 03:00:05 ET: five 409 trading_is_paused in 3s tripped the
 # order-error breaker, and it stayed off ~10h after Kalshi reopened.
-PAUSE_CODES = ("trading_is_paused", "market_closed", "market_not_open")
+# The batch endpoint sends some in upper case: 409 MARKET_NOT_ACTIVE on a
+# suspended game tripped ARBS's breaker (KXSRBSLGAME 11-03 04:20).
+PAUSE_CODES = ("trading_is_paused", "market_closed", "market_not_open", "market_not_active")
 
 
 def is_market_paused(exc) -> bool:
-    return error_code(exc) in PAUSE_CODES
+    return (error_code(exc) or "").lower() in PAUSE_CODES
 
 
 def is_order_group_reject(exc) -> bool:

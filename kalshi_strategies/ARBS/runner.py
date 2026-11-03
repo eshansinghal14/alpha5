@@ -234,6 +234,7 @@ class Meta:
     event: str
     status: str = "unknown"
     result: str = ""
+    value: float | None = None        # a "scalar" result's YES payout per contract
     series: str | None = None
     shard: int | None = None
     taker_rate: float | None = None
@@ -321,6 +322,7 @@ class ArbsRunner:
         self.exit_hist: dict[str, collections.deque] = {}
         self.exit_planned: dict[str, float] = {}  # exit cost the fill or take was priced at
         self.order_errors = 0
+        self.unbooked: set[str] = set()                  # settled but unbookable, alerted once
         self.halt: str | None = None                     # until restart
         self.audit_strikes = 0
         self.audit_diff: dict | None = None
@@ -595,6 +597,8 @@ class ArbsRunner:
             if mt.status != m.get("status") and mt.status != "unknown":
                 self.journal({"kind": "status", "ticker": t, "from": mt.status, "to": m.get("status")})
             mt.status, mt.result = m.get("status") or "", m.get("result") or ""
+            v = m.get("settlement_value_dollars")
+            mt.value = float(v) if v not in (None, "") else None
             mt.ticks = pricing.Ticks.from_market(m.get("price_ranges"))
             self.meta[t] = mt
             events.setdefault(mt.event, []).append(mt)
@@ -2180,11 +2184,20 @@ class ArbsRunner:
                 res = {t: self.meta.get(t).result if self.meta.get(t) else "" for t in legs}
                 if not all(self.meta.get(t) and self.meta[t].status in SETTLED for t in legs):
                     continue
-                if any(r not in ("yes", "no") for r in res.values()):
-                    self.alert("error", bid, f"settled with result {res}; not booked, check by hand")
+                # A voided event settles "scalar": YES pays the market's value, NO the rest.
+                pays = {}
+                for t, lp in legs.items():
+                    if res[t] in ("yes", "no"):
+                        pays[t] = float(res[t] == lp.side)
+                    elif res[t] == "scalar" and self.meta[t].value is not None:
+                        pays[t] = self.meta[t].value if lp.side == "yes" else 1.0 - self.meta[t].value
+                if len(pays) < len(legs):
+                    if bid not in self.unbooked:
+                        self.unbooked.add(bid)
+                        self.alert("error", bid, f"settled with result {res}; not booked, check by hand")
                     continue
                 b = self.baskets.get(bid)
-                paid = sum(lp.qty for t, lp in legs.items() if res[t] == lp.side)
+                paid = sum(lp.qty * pays[t] for t, lp in legs.items())
                 cost = pos.cost()
                 row = {"basket_id": bid, "type": b.type if b else "", "settled_at": _utc().isoformat(),
                        "bundles": pos.bundles(list(legs)), "payout": round(paid, 4), "cost": round(cost, 4),

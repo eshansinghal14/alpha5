@@ -197,6 +197,21 @@ def test_settlement_books_pnl(arbs):
     assert r.shadow_ledger.settled[-1]["pnl"] == pytest.approx(0.2)
 
 
+def test_voided_event_settles_at_scalar_values(arbs):
+    r, b = arbs
+    r.shadow_ledger.record(b.basket_id, b.tickers, "X-A", "yes", 2, 0.8, time.time())
+    r.shadow_ledger.record(b.basket_id, b.tickers, "X-B", "yes", 2, 1.0, time.time())
+    r.meta["X-A"].status, r.meta["X-A"].result = "finalized", "scalar"
+    r.meta["X-B"].status, r.meta["X-B"].result = "finalized", "scalar"
+    r.meta["X-A"].value = 0.3
+    r.settle(); r.settle()
+    assert b.basket_id in r.shadow_ledger.baskets and len(r.alerts) == 1    # X-B has no value yet
+    r.meta["X-B"].value = 0.7
+    r.settle()
+    assert b.basket_id not in r.shadow_ledger.baskets
+    assert r.shadow_ledger.settled[-1]["pnl"] == pytest.approx(2 * 0.3 + 2 * 0.7 - 1.8)
+
+
 def test_resting_quotes_are_not_capital_used(arbs):
     r, b = arbs
     book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
