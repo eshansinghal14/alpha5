@@ -1639,3 +1639,23 @@ def test_takes_price_on_take_prob_quotes_on_prob():
     step(q, ctx, {"A": f}, Book("A", 0.40, 0.55))
     assert [o[:3] for o in takes(ctx)] == [("A", "yes", 0.55)]   # 0.60 clears the ask; 0.50 wouldn't
     assert ladder(ctx, "yes")[0] < 0.50                          # the quote stays on prob
+
+
+def test_move_mode_needs_the_underlying_to_move_its_way():
+    q, ctx = Quoter(cfg(take_move_window_s=1.0), Model(), FREE, close_time=None), Ctx()
+    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51, underlying=1.0)}, Book("A", 0.45, 0.52))
+    step(q, ctx, {"A": Fair(0.60, 0.59, 0.61, underlying=1.0)}, dt=0.2)    # fair jumped, spot didn't
+    assert takes(ctx) == []
+    step(q, ctx, {"A": Fair(0.61, 0.60, 0.62, underlying=1.001)}, dt=0.1)  # now spot moved up too
+    assert [o[:3] for o in takes(ctx)] == [("A", "yes", 0.52)]
+
+
+def test_move_mode_forgets_the_fair_across_a_gate():
+    m = Model()
+    q, ctx = Quoter(cfg(take_move_window_s=1.0), m, FREE, close_time=None), Ctx()
+    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, Book("A", 0.45, 0.52))
+    m.age = 5.0                                                            # stale: gated
+    step(q, ctx, {"A": Fair(0.55, 0.54, 0.56)}, dt=0.2)
+    m.age = 0.0
+    step(q, ctx, {"A": Fair(0.60, 0.59, 0.61)}, dt=0.2)
+    assert takes(ctx) == []                       # first fair after the gate: nothing to measure from

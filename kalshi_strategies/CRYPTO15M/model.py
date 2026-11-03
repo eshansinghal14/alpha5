@@ -340,8 +340,10 @@ class UpDownModel:
             inc_r = prob_up(x + sh + dxi, I_i, tau, rate, nu=p.t_nu, basis_sd=bsd, reaction_s=p.reaction_latency_s)
         inc_prob = None if inc_r is None else inc_r.prob
         take_prob = None
+        und = x
         if p.perp_pricing and p.perp_mode == "latest" and inc_r is not None:
             priced_on, r = "latest", inc_r
+            und = x + dxi
             if lead in TOUCH_VENUES:
                 # Takes price on the whole-touch shift in full; quotes on TOUCH_WEIGHT of it.
                 _, full_inc = pnc.increment(self.coin, mono, mid, leads=(lead,), full=True)
@@ -350,8 +352,10 @@ class UpDownModel:
                     I_f = I + (dxf * (n_eff - n_end) / L if tau < L else 0.0)
                     take_prob = prob_up(x + sh + dxf, I_f, tau, rate, nu=p.t_nu, basis_sd=bsd,
                                         reaction_s=p.reaction_latency_s).prob
+                    und = x + dxf
         elif p.perp_pricing and p.perp_mode == "gap" and perp_r is not None:
             priced_on, r = "perp", perp_r
+            und = x + p_gap * 1e-4
         else:
             priced_on, r = "spot", spot_r
         self.result = r
@@ -360,7 +364,7 @@ class UpDownModel:
         self.withheld_reason = None
         k = p.ci_vol_multiplier
         return {self.ticker: Fair(prob=r.prob, lo=r.prob - k * r.theo_vol, hi=r.prob + k * r.theo_vol,
-                                  take_prob=take_prob,
+                                  take_prob=take_prob, underlying=und,
                                   extras={"take_prob": take_prob, "coin": self.coin, "theo_vol": r.theo_vol, "tau": tau, "phase": r.phase,
                                           "x_bp": x * 1e4, "mu_bp": r.mu * 1e4, "sd_bp": r.sd * 1e4,
                                           "shift_bp": sh * 1e4, "shift_ema_bp": self._shift * 1e4,

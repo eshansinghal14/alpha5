@@ -27,6 +27,9 @@ class Fair:
     # read than it quotes on (KXBTC15M: CME's whole-touch shift in full, quotes
     # at half). None = takes use `prob`.
     take_prob: float | None = None
+    # What the fair is priced off (any monotone scale, e.g. log price), for
+    # quoting.take_move_window_s: a take needs it to have moved its way too.
+    underlying: float | None = None
 
 
 @dataclasses.dataclass(frozen=True)

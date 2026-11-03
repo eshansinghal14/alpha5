@@ -111,9 +111,9 @@ class Quoter:
         self._atm_set: set[str] = set()
         self._take_since: dict[tuple[str, str], float] = {}
         self._take_last: dict[tuple[str, str], float] = {}
-        # take_move_window_s: per ticker, (time, prob) each time the fair
-        # changed; per (ticker, side), the touch price we'd take and since when.
-        self._prob_hist: dict[str, deque[tuple[float, float]]] = {}
+        # take_move_window_s: per ticker, (time, prob, underlying) each time the
+        # fair changed; per (ticker, side), the touch price we'd take and since when.
+        self._prob_hist: dict[str, deque[tuple[float, float, float | None]]] = {}
         self._touch_set: dict[tuple[str, str], tuple[float, float]] = {}
         self._last_signal_age: float | None = None
         self.block_counts: dict[str, int] = {}
@@ -370,29 +370,35 @@ class Quoter:
         elif prev is None or prev[0] != price:
             self._touch_set[(ticker, side)] = (price, now_s)
 
-    def _note_prob(self, ticker: str, prob: float, now_s: float, window: float):
+    def _note_prob(self, ticker: str, prob: float, underlying: float | None, now_s: float, window: float):
         h = self._prob_hist.setdefault(ticker, deque())
-        if not h or h[-1][1] != prob:
-            h.append((now_s, prob))
+        if not h or h[-1][1] != prob or h[-1][2] != underlying:
+            h.append((now_s, prob, underlying))
         # Keep one entry at or before the window start: the fair in force then.
         while len(h) > 1 and h[1][0] <= now_s - window:
             h.popleft()
 
-    def _fair_move(self, ticker: str, side: str, prob: float, now_s: float, window: float) -> float:
+    def _fair_move(self, ticker: str, side: str, prob: float, underlying: float | None,
+                   now_s: float, window: float) -> float:
         """How far the fair moved toward taking `side` since that touch was set
-        (at most `window` back). An unseen touch counts as just set: 0."""
+        (at most `window` back). An unseen touch counts as just set: 0. With
+        Fair.underlying, 0 unless the underlying moved the same way too: a
+        fair moving on its own (vol, the market-shift EMA) is not a lead."""
         t = self._touch_set.get((ticker, side))
         if t is None:
             return 0.0
         ref_t = max(t[1], now_s - window)
         ref = None
-        for ts, p in self._prob_hist.get(ticker, ()):
-            if ts > ref_t:
+        for e in self._prob_hist.get(ticker, ()):
+            if e[0] > ref_t:
                 break
-            ref = p
+            ref = e
         if ref is None:
             return 0.0
-        return prob - ref if side == "yes" else ref - prob
+        sign = 1.0 if side == "yes" else -1.0
+        if underlying is not None and ref[2] is not None and sign * (underlying - ref[2]) <= 0:
+            return 0.0
+        return sign * (prob - ref[1])
 
     # ------------------------------------------------------------------
     # Decision
@@ -420,6 +426,10 @@ class Quoter:
         elif self._fair_suspect(ticker, now_s):
             gate = self._block("fair_suspect")
         if gate is not None:
+            # No fair history across a gate: the next move must be measured
+            # from a fair seen after it (a pre-gate fair made 68 of 320
+            # KXBTC15M takes on 11-02, -4.8c at 60s).
+            self._prob_hist.pop(ticker, None)
             for side in ("yes", "no"):
                 self._publish(ctx, ticker, side, None)
                 self._publish_lip(ctx, ticker, side, None)    # a stale fill is the big adverse one
@@ -511,9 +521,10 @@ class Quoter:
         want_a = taking and block_ask is None and market_bid is not None and ask_res <= market_bid and cap_no
         move_b = move_a = None
         if move_w is not None:
-            self._note_prob(ticker, tprob, now_s, move_w)
-            move_b = self._fair_move(ticker, "yes", tprob, now_s, move_w)
-            move_a = self._fair_move(ticker, "no", tprob, now_s, move_w)
+            und = fair.underlying
+            self._note_prob(ticker, tprob, und, now_s, move_w)
+            move_b = self._fair_move(ticker, "yes", tprob, und, now_s, move_w)
+            move_a = self._fair_move(ticker, "no", tprob, und, now_s, move_w)
             want_b = want_b and move_b >= bid_edge
             want_a = want_a and move_a >= ask_edge
         hold = move_w is None
