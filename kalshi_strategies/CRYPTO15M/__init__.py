@@ -50,7 +50,10 @@ def _pick_event(events, cfg):
 async def _spot(cfg, group: str):
     from kalshi_strategies.KXCRYPTOLEAD15M.prints import load_thresholds
     persist = PERSIST and group == CRYPTO_GROUP
-    spot = await get_spot(cfg, persist=persist, tag="CRYPTO15M")
+    # Only this process's coins: the BTC process parsed every coin's Coinbase
+    # level2 on its trading loop and ran a venue child for all five (11-03).
+    coins = {COIN_OF[t] for t, g in GROUP_OF.items() if g == group}
+    spot = await get_spot(cfg, persist=persist, tag="CRYPTO15M", coins=coins)
     if not spot._persist and not getattr(spot, "_thr_loaded", False):
         # Read-only feed: still start from the saved burst thresholds.
         for src, th in load_thresholds().items():

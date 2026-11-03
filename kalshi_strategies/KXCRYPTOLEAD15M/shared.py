@@ -27,9 +27,10 @@ def adopt_owner(spot, cfg):
     spot.health.recovery_s = p.recovery_s
 
 
-async def get_spot(cfg, *, persist: bool = True, tag: str = "crypto", owner: bool = False):
+async def get_spot(cfg, *, persist: bool = True, tag: str = "crypto", owner: bool = False, coins=None):
     """The process's SpotFeed, started, seeded and with its forecaster warmed.
-    `owner`: this series' config becomes the feed's (the race passes True)."""
+    `owner`: this series' config becomes the feed's (the race passes True).
+    `coins`: what the feed subscribes to when this call builds it (None: all)."""
     global _SPOT, _LOCK
     from kalshi_strategies.KXCRYPTOLEAD15M.live_feed import SpotFeed
     from kalshi_strategies.KXCRYPTOLEAD15M.model import warm_forecaster
@@ -41,7 +42,7 @@ async def get_spot(cfg, *, persist: bool = True, tag: str = "crypto", owner: boo
         if _SPOT is None:
             from kalshi_strategies.KXCRYPTOLEAD15M.corr_fit import CorrFit
             from kalshi_strategies.KXCRYPTOLEAD15M.implied_rates import ImpliedRates
-            _SPOT = SpotFeed(cfg, persist=persist)
+            _SPOT = SpotFeed(cfg, persist=persist, coins=coins)
             _SPOT.implied_rates = ImpliedRates()
             _SPOT.corr_fit = CorrFit()
             # Disk + REST before the socket's first tick, so an event adopted

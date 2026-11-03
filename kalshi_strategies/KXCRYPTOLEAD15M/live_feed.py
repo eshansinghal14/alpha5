@@ -42,9 +42,9 @@ VENUE_DRAIN_S = 0.05
 PERP_WAKE_BP = 0.5
 
 
-def venue_plan() -> dict[str, list[str]]:
-    """Non-Coinbase venues to run, and for which coins: whatever SPOT_VENUES
-    medians on, plus every leading-signal venue for every coin."""
+def venue_plan(coins=COINS) -> dict[str, list[str]]:
+    """Non-Coinbase venues to run, and for which of `coins`: whatever
+    SPOT_VENUES medians on, plus every leading-signal venue for each."""
     from kalshi_strategies.KXCRYPTOLEAD15M.series import CF_CONSTITUENTS
     from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed.venue_process import RECORD_IN_VENUE_PROCESS
     from kalshi_strategies.KXCRYPTOLEAD15M.spot_feed.venues import ADAPTERS
@@ -54,24 +54,27 @@ def venue_plan() -> dict[str, list[str]]:
     plan: dict[str, list[str]] = {}
     for coin, venues in source.items():
         for v in venues:
-            if v != "coinbase" and v in ADAPTERS:
+            if v != "coinbase" and v in ADAPTERS and coin in coins:
                 plan.setdefault(v, []).append(coin)
     for v in LEADING_VENUES:
-        plan[v] = list(COINS)
+        plan[v] = [c for c in COINS if c in coins]
     return plan
 
 
 class SpotFeed:
-    def __init__(self, cfg, *, persist: bool = True, venues: bool = True):
-        """`venues=False` keeps it Coinbase-only (tests, backtest)."""
+    def __init__(self, cfg, *, persist: bool = True, venues: bool = True, coins=None):
+        """`venues=False` keeps it Coinbase-only (tests, backtest). `coins`:
+        subscribe only these (a single-coin process); the per-coin state
+        still covers every coin, the others just never get data."""
+        self.feed_coins = tuple(c for c in COINS if coins is None or c in coins)
         p = cfg.pricing
         self.cfg = cfg
         self.bus = CompositeBus(coins=COINS, persist=persist,
                                 venues=SPOT_VENUES if venues else None,
                                 venue_stale_s=VENUE_STALE_S if venues else None,
                                 depth_priced=DEPTH_PRICED if venues else frozenset())
-        self.coinbase = CoinbaseAdapter(coins=list(COINS))
-        self.venues = VenueProcess(venue_plan()) if venues else None
+        self.coinbase = CoinbaseAdapter(coins=list(self.feed_coins))
+        self.venues = VenueProcess(venue_plan(self.feed_coins)) if venues else None
         self._venue_atexit = False
         self.hl_bursts = BurstDetector(COINS)
         # Offshore perps get their own windows: a sweep on one venue should
