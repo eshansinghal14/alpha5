@@ -225,7 +225,7 @@ def _child_main(plan: dict[str, list[str]]):
         last_touch[k] = touch
         latest.pop(k, None)
         try:
-            _write_frame(out, ([row], [], [], {}))
+            _write_frame(out, ([row], [], [], {"sent": time.time()}))
         except (BrokenPipeError, OSError):
             os._exit(0)
 
@@ -360,6 +360,9 @@ class VenueProcess:
         self._backoff = RESTART_MIN_S
         self.n_batches = 0
         self.n_books = 0
+        # Per (venue, coin), the last touch frame's wall times: venue receipt,
+        # child send, read off the pipe here, applied by drain. Latency logging.
+        self.last_lat: dict[tuple[str, str], tuple] = {}
         self.n_starts = 0
         self.n_dropped = 0
         self.last_exit: int | None = None
@@ -415,6 +418,8 @@ class VenueProcess:
                 frame = None
             if frame is None:
                 return
+            if len(frame) > 3 and isinstance(frame[3], dict):
+                frame[3]["arrived"] = time.time()
             with self._lock:
                 if len(self._frames) == self._frames.maxlen:
                     self.n_dropped += 1
@@ -490,6 +495,8 @@ class VenueProcess:
                                asks=tuple(OrderBookLevel(p, s) for p, s in asks),
                                receive_ts=recv_wall + off, exchange_ts=exch_ts, is_resyncing=resync)
                 self.n_books += 1
+                if "sent" in extra:
+                    self.last_lat[(venue, coin)] = (recv_wall, extra["sent"], extra.get("arrived"), time.time())
                 on_book(vb)
             if on_print is not None:
                 for kind, coin, t, recv_wall, exch_ts in ps:

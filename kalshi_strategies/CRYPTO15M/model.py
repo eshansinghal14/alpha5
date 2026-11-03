@@ -363,6 +363,7 @@ class UpDownModel:
         self._dirty = False
         self.withheld_reason = None
         k = p.ci_vol_multiplier
+        lat = self._cme_lat()
         return {self.ticker: Fair(prob=r.prob, lo=r.prob - k * r.theo_vol, hi=r.prob + k * r.theo_vol,
                                   take_prob=take_prob, underlying=und,
                                   extras={"take_prob": take_prob, "coin": self.coin, "theo_vol": r.theo_vol, "tau": tau, "phase": r.phase,
@@ -372,7 +373,7 @@ class UpDownModel:
                                           "cf_end_n": n_end, "spot_mid": mid, "kmid": self._kmid(),
                                           "perp_mid": p_px, "perp_gap_bp": p_gap, "perp_n": p_n,
                                           "perp_prob": None if perp_r is None else perp_r.prob,
-                                          "inc_bp": p_inc, "inc_prob": inc_prob, "lead": lead, "cme_inc_bp": cme_inc,
+                                          "inc_bp": p_inc, "inc_prob": inc_prob, "lead": lead, "cme_inc_bp": cme_inc, **lat,
                                           "spot_prob": spot_r.prob, "priced_on": priced_on,
                                           "vol_bp": math.sqrt(rate) * 1e4, "vol_src": vol_src,
                                           "realized_vol_bp": math.sqrt(self._realized_rate(max(tau, 1.0))) * 1e4,
@@ -380,6 +381,19 @@ class UpDownModel:
                                           "iv_fast_bp": None if not self.vol_check else self.vol_check["fast_bp"],
                                           "iv_z": None if not self.vol_check else self.vol_check["z"],
                                           "burst_ratio": self.burst_ratio})}
+
+    def _cme_lat(self) -> dict:
+        """Where the newest CME touch spent its time before this fair (ms):
+        child (receipt -> send), pipe (-> read here), drain (-> applied),
+        to_fair (-> now)."""
+        v = getattr(self.spot, "venues", None)
+        t = None if v is None else getattr(v, "last_lat", {}).get(("cme", self.coin))
+        if t is None or None in t:
+            return {}
+        recv, sent, arrived, applied = t
+        now = time.time()
+        return {"cme_child_ms": (sent - recv) * 1e3, "cme_pipe_ms": (arrived - sent) * 1e3,
+                "cme_drain_ms": (applied - arrived) * 1e3, "cme_to_fair_ms": (now - applied) * 1e3}
 
     # --- FairModel ----------------------------------------------------------------
 
