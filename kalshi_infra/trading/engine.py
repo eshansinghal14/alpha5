@@ -1138,6 +1138,13 @@ class LiveEngine:
         queue -- the same order of operations engine.py uses (measure the
         callback, then schedule its pending orders with that processing_s)."""
         self.orders.append(order)
+        if self.live_trading:
+            # Real takes go out now: the delay only models shadow fills, and
+            # waiting out the rest of the dispatch put us behind the makers
+            # pulling the quote (KXBTC15M 11-04: decision -> Kalshi match p50
+            # 8.5 ms; missed takes' quotes left p50 11.7 ms after the decision).
+            self._resolve_arrival(order, 0.0)
+            return
         self._pending_submissions.append(order)
 
     def _resolve_arrival(self, order: Order, delay_s: float):
@@ -1241,8 +1248,20 @@ class LiveEngine:
             fut = loop.run_in_executor(None, self._place_blocking, order)
             fut.add_done_callback(lambda f: self._on_real_result(order, f.result()))
             return
-        _order_pool().submit(self._place_blocking, order).add_done_callback(
-            lambda f: _post(loop, lambda res: self._on_real_result(order, res), f))
+        dec = order.decision_time.timestamp() if order.decision_time is not None else None
+        self._oev("take_sent", order_id=order.order_id, ticker=order.ticker, side=order.side, price=order.price,
+                  size=order.size, role="take", since_decision_s=None if dec is None else time.time() - dec)
+        _order_pool().submit(self._timed(lambda: self._place_blocking(order))).add_done_callback(
+            lambda f: _post(loop, lambda res: self._on_real_take_timed(order, res), f))
+
+    def _on_real_take_timed(self, order: Order, res: tuple):
+        result, rtt, pickup, t_done = res
+        fill, exc = result
+        self._oev("take_result", order_id=order.order_id, ticker=order.ticker, side=order.side, price=order.price,
+                  role="take", rtt_s=rtt, pickup_s=pickup, done_wait_s=time.perf_counter() - t_done,
+                  size=None if fill is None else fill.size,
+                  status="filled" if fill is not None else ("no_fill" if exc is None else f"err:{http_status(exc)}"))
+        self._on_real_result(order, result)
 
     def _place_blocking(self, order: Order) -> tuple:
         """Runs on a worker thread -- must touch no engine state. Returns
