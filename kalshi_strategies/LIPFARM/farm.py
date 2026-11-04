@@ -158,6 +158,7 @@ DUST_LOTS = 25.0
 # a 1.1-lot sentinel trips a limit-1 group exactly when it fills in full.
 SENTINEL_LOTS = 1.1
 GROUP_LIMIT = 1
+LAYOUT_HYSTERESIS = 0.1
 # Taker fee rate when a market's schedule can't be read (Kalshi's standard 0.07).
 DEFAULT_TAKER_RATE = 0.07
 
@@ -307,7 +308,8 @@ def market_rate(others, legs, params) -> float:
 
 
 def plan_market(ticker: str, others: dict[str, dict[float, float]], params: lip.LipParams, cfg: Cfg,
-                held: dict[str, float] | None = None, lots=None, tick=lambda p: 0.01) -> Plan | None:
+                held: dict[str, float] | None = None, lots=None, tick=lambda p: 0.01,
+                current: dict[str, str] | None = None) -> Plan | None:
     """How to quote this market now, or None. Joins others' best bids (never
     improves them). `held`: contracts we already hold per side; `lots`: bid
     size, one number or per side (exit_lots); a side sized under 1 isn't
@@ -347,7 +349,11 @@ def plan_market(ticker: str, others: dict[str, dict[float, float]], params: lip.
             continue
         trial = [(x, px, lots) for x, px in legs if x != s] + [(s, p, SENTINEL_LOTS), (s, deeper, lots)]
         r = book_score(others, trial, params)
-        if r.qualifies and r.expected_reward_this_snapshot_usd >= cfg.sentinel_keep * base - 1e-15:
+        # Hysteresis: a side keeps its current layout unless the other wins by
+        # LAYOUT_HYSTERESIS (scores near the line flipped it every pass, 11-04).
+        keep = cfg.sentinel_keep - (LAYOUT_HYSTERESIS if (current or {}).get(s) == "sentinel" else -LAYOUT_HYSTERESIS
+                                    if (current or {}).get(s) == "touch" else 0.0)
+        if r.qualifies and r.expected_reward_this_snapshot_usd >= keep * base - 1e-15:
             layout[s], big[s] = "sentinel", deeper
             sized = [(x, px, q) for x, px, q in sized if x != s] + [(s, p, SENTINEL_LOTS), (s, deeper, lots)]
     final = book_score(others, sized, params)
@@ -1133,8 +1139,12 @@ class Farm:
         if event_of(t) in self.held_events:
             return None
         v = pos.get(t, 0.0)
+        current = {}
+        for k in self.keys_of(t, hedges=False):
+            sd = unkey(k)[1]
+            current[sd] = "sentinel" if (is_sentinel(k) or current.get(sd) == "sentinel") else "touch"
         return plan_market(t, others, P, cfg, {"yes": max(v, 0.0), "no": max(-v, 0.0)}, exit_lots(others, cfg),
-                           tick=lambda px: self.tick(t, px))
+                           tick=lambda px: self.tick(t, px), current=current)
 
     def fresh_books(self, tickers) -> dict[str, dict]:
         """Others' books now: from the socket where it has the market, else REST."""
@@ -1171,13 +1181,15 @@ class Farm:
             P = self.params(t)
             pl = self.plan(t, others, P, cfg, pos)
             want = desired_orders(pl) if pl else {}
+            sides = {s for s, _ in pl.legs} if pl else set()
             for k in self.keys_of(t, hedges=False):
                 o = self.state["orders"][k]
-                if k not in want:
+                if unkey(k)[1] not in sides:
+                    # Only a side the plan dropped; a layout or price change waits for the cycle.
                     print(f"guard: pull {k} @{o['price']} (not in its plan now)")
                     self.cancel(k, reason="lipfarm:guard")
                     self.state.setdefault("cooldown", {})[t] = time.time() + GUARD_COOLDOWN_S
-                elif abs(want[k][0] - o["price"]) < 1e-9 and (is_sentinel(k) or not want[k][2]):
+                elif k in want and abs(want[k][0] - o["price"]) < 1e-9 and (is_sentinel(k) or not want[k][2]):
                     # Touch bids and sentinels belong at the back of their queue.
                     keep[k] = others
             self.rates[t] = self.our_rate(t, others, P)

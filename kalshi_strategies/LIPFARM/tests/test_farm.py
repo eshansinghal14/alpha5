@@ -558,3 +558,17 @@ def test_sentinel_and_bid_go_in_the_sides_group_and_a_sentinel_fill_trips_it(tmp
     assert not f.keys_of("Z-1-A", hedges=False) and f.state["cooldown"]["Z-1-A"] > time.time()
     f.group("Z-1-A", "yes")                                      # re-placing later resets the group first
     assert b.resets == ["g1"] and not f.state["groups"]["Z-1-A|yes"]["tripped"]
+
+
+def test_layout_has_hysteresis():
+    cfg = dataclasses.replace(CFG, sentinel_keep=0.8)
+    thin = {"yes": {0.40: 50.0, 0.39: 300.0, 0.37: 2000.0}, "no": {0.30: 3000.0, 0.28: 2000.0}}
+    base = plan_market("T", thin, P, dataclasses.replace(cfg, sentinel_keep=0.0), {}, 1000)
+    pl = plan_market("T", thin, P, cfg, {}, 1000)
+    # Find a sentinel_keep just above what the sentinel layout keeps: a touch side stays touch,
+    # a sentinel side stays sentinel.
+    ratio = pl.rate / plan_market("T", thin, P, dataclasses.replace(cfg, sentinel_keep=2.0), {}, 1000).rate
+    near = dataclasses.replace(cfg, sentinel_keep=ratio + 0.05)
+    assert plan_market("T", thin, P, near, {}, 1000, current={"yes": "touch"}).layout["yes"] == "touch"
+    assert plan_market("T", thin, P, near, {}, 1000, current={"yes": "sentinel"}).layout["yes"] == "sentinel"
+    assert base.layout["yes"] == "sentinel"
