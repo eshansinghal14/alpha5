@@ -80,6 +80,11 @@ class Cfg:
                         min=1.0, step=100.0)
     max_price: float = param("Cheap side only: quote a side only if its best bid is at most this.",
                              min=0.001, max=0.5, step=0.01)
+    min_spread: float = param("Quote a side only if its offer is at least this far above our bid: a 1c offer "
+                              "over a 1c bid gets sold into (11-04, 108 picks: fills cost 1.2-1.8x the LIP "
+                              "under 4c of spread, 0.6x from 4c).", min=0.0, max=0.5, step=0.01)
+    max_position: float = param("Stop quoting a market once we hold this many contracts in it (refills on a "
+                                "dumped market only add losers).", min=0.0, step=100.0)
     switch_margin: float = param("Stickiness: once a quoted market has passed Kalshi's $1 minimum payout "
                                  "this period, a new one replaces it only if it pays this much more "
                                  "(0.5 = 50% more $/s). Below $1 it is never replaced.", min=0.0, step=0.1)
@@ -133,15 +138,16 @@ def rate_at(others: dict[str, dict[float, float]], side: str, price: float, size
 
 
 def best_pick(ticker: str, others: dict[str, dict[float, float]], params: lip.LipParams,
-              lots: float, max_price: float) -> Pick | None:
+              lots: float, max_price: float, min_spread: float = 0.0) -> Pick | None:
     """Best cheap-side touch for `lots`, or None. Joins others' best bid (never
-    improves it); on an empty side, bids 0.01 if that doesn't cross."""
+    improves it); on an empty side, bids 0.01. The side's offer must be at
+    least `min_spread` above that bid."""
     best = None
     for side, opp in (("yes", "no"), ("no", "yes")):
         book = others[side]
         price = max(book) if book else 0.01
         ask = 1.0 - max(others[opp]) if others[opp] else 1.0
-        if price > max_price + 1e-9 or price >= ask - 1e-9:
+        if price > max_price + 1e-9 or ask - price < max(min_spread, 1e-9) - 1e-9:
             continue
         r = rate_at(others, side, price, lots, params)
         if r > 0 and (best is None or r > best.rate):
@@ -291,6 +297,7 @@ class Farm:
             got = list(ex.map(one, tickers))
         picks, rates, books = {}, {}, {}
         self.held_events = arbs_held_events()
+        pos = self.signed_positions()
         for t, ob in got:
             if ob is None or t not in self.programs:
                 continue
@@ -308,7 +315,10 @@ class Farm:
                 (float(r["start"]), float(r["end"]), float(r["step"])) for r in m.get("price_ranges") or []))
             if mine:
                 rates[t] = rate_at(others, mine["side"], mine["price"], mine["remaining"], P)
-            pk = None if event_of(t) in self.held_events else best_pick(t, others, P, cfg.lots, cfg.max_price)
+            pk = None if event_of(t) in self.held_events else best_pick(t, others, P, cfg.lots, cfg.max_price,
+                                                                          cfg.min_spread)
+            if pk and (pos.get(t, 0.0) if pk.side == "yes" else -pos.get(t, 0.0)) >= cfg.max_position - 1e-9:
+                pk = None
             if pk:
                 picks[t] = pk
         self.books, self.picks, self.rates = books, picks, rates

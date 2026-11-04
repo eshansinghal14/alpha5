@@ -69,7 +69,7 @@ def test_arm_quotes_for_real_and_disarm_pulls(tmp_path, monkeypatch):
     monkeypatch.setattr(f, "shard", lambda t: 0)
     f.set_live(True, "test")
     assert f.live and cancelled == ["old"]            # only our stray, never another strategy's
-    cfg = farm.Cfg(num_markets=1, lots=1000, max_price=0.05, switch_margin=0.5, scan_markets=1, refresh_s=30,
+    cfg = farm.Cfg(num_markets=1, lots=1000, max_price=0.05, min_spread=0.0, max_position=1e9, switch_margin=0.5, scan_markets=1, refresh_s=30,
                    programs_refresh_s=600)
     f.programs = {"Z-1-A": {"id": "p", "end_date": "2099-01-01T00:00:00Z"}}
     f.picks = {"Z-1-A": farm.Pick("Z-1-A", "no", 0.01, 0.001, 0.002)}
@@ -90,7 +90,7 @@ def test_sticky_until_one_dollar_then_switch_margin(tmp_path, monkeypatch):
 
     monkeypatch.setattr(farm, "ROOT", str(tmp_path))
     f = farm.Farm()
-    cfg = farm.Cfg(num_markets=1, lots=1000, max_price=0.05, switch_margin=0.5, scan_markets=1, refresh_s=30,
+    cfg = farm.Cfg(num_markets=1, lots=1000, max_price=0.05, min_spread=0.0, max_position=1e9, switch_margin=0.5, scan_markets=1, refresh_s=30,
                    programs_refresh_s=600)
     far = "2099-01-01T00:00:00Z"
     f.programs = {"OLD-1-A": {"id": "po", "end_date": far}, "NEW-1-A": {"id": "pn", "end_date": far},
@@ -146,7 +146,7 @@ def _live_farm(tmp_path, monkeypatch, bucket, lots=1000, placed_ago=120.0):
     f.state["orders"] = {"Z-1-A": {"oid": "oid0", "side": "no", "price": 0.01, "size": lots, "remaining": lots,
                                    "placed": __import__("time").time() - placed_ago}}
     f.books = {"Z-1-A": {"yes": {0.98: 5000.0}, "no": {0.01: 3000.0}}}
-    cfg = farm.Cfg(num_markets=1, lots=1000, max_price=0.05, switch_margin=0.5, scan_markets=1, refresh_s=30,
+    cfg = farm.Cfg(num_markets=1, lots=1000, max_price=0.05, min_spread=0.0, max_position=1e9, switch_margin=0.5, scan_markets=1, refresh_s=30,
                    programs_refresh_s=600)
     return farm, f, cfg, {"Z-1-A": farm.Pick("Z-1-A", "no", 0.01, 0.001, 0.002)}
 
@@ -179,3 +179,10 @@ def test_changed_lots_replaces_every_quote(tmp_path, monkeypatch):
     monkeypatch.setattr(farm, "CLAIMS_PATH", str(tmp_path / "live" / "claimed.json"))
     f.reconcile(cfg)                                  # cfg.lots = 1000, quote rests 500
     assert b.cancelled == ["oid0"] and [o.size for o in b.sent] == [1000]
+
+
+def test_min_spread_needs_the_offer_far_enough_above_our_bid():
+    # no bid 0.01; yes bid 0.97 -> no offer 0.03, 2c above us.
+    others = {"yes": {0.97: 5000.0}, "no": {0.01: 200.0}}
+    assert best_pick("T", others, P, 1000, 0.05, min_spread=0.02).price == 0.01
+    assert best_pick("T", others, P, 1000, 0.05, min_spread=0.03) is None

@@ -3,6 +3,8 @@
     "num_markets": 20,
     "lots": 1000,
     "max_price": 0.05,
+    "min_spread": 0.04,
+    "max_position": 1000,
     "switch_margin": 0.5,
     "scan_markets": 400,
     "refresh_s": 30,
