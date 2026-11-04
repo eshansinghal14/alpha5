@@ -15,8 +15,9 @@ ranked by LIP per dollar of resting bids. Kalshi holds no cash for resting
 orders (11-04: $9.6k resting on a $16.3k balance, balance unchanged), so
 `max_capital` caps what fills have left us holding: a bid that could fill us
 past it isn't placed, and one is pulled as soon as a fill makes that true.
-Each bid is at most `exit_vol_frac` of the market's 24 h volume, so a full fill
-is a size the market trades.
+Each bid is at most `exit_depth_frac` of the others' bids resting on its own
+side within `exit_depth_slip` of the touch: what an informed fill could be
+sold back into.
 
 On a fill we first look for a way to lock the position by taking: the same
 market's other side, or the other legs of any ARBS basket holding our leg
@@ -126,9 +127,15 @@ MAX_MOVES = 10
 # With the websocket up, fills and book updates wake the loop as they arrive
 # and this is only the idle tick.
 FILL_POLL_S = 1.0
-# Our bucket's burst: 6 orders at once (arming 18 bids takes ~25 s at 5/s).
-WRITE_BURST = 60.0
+# Our bucket's burst: 12 orders at once.
+WRITE_BURST = 120.0
 ORDER_TOKENS, CANCEL_TOKENS = 10.0, 2.0
+# An exit is re-priced only when outbid, at most this often: re-pricing on
+# every socket update into a penny-jumping bot spent ~250 orders exiting 13
+# contracts and starved every LIP bid of budget (AL14/PR05, 11-04 20:50-21:06).
+EXIT_REPRICE_S = 5.0
+# A position this small is sold into the book at once instead of resting an exit.
+DUST_LOTS = 25.0
 # Taker fee rate when a market's schedule can't be read (Kalshi's standard 0.07).
 DEFAULT_TAKER_RATE = 0.07
 
@@ -145,8 +152,11 @@ class Cfg:
                                      "into the book at once, at any price, instead of waiting on an exit bid "
                                      "(ORAN 11-04: 1000 of 1000 at 6c, then 1c within 10 min).", min=0.05,
                                      max=1.0, step=0.05)
-    exit_vol_frac: float = param("A bid is at most this fraction of its market's 24 h volume, so a full fill is "
-                                 "a size the market trades and can be exited.", min=0.01, max=10.0, step=0.1)
+    exit_depth_frac: float = param("A bid is at most this fraction of others' bids on its side within "
+                                   "exit_depth_slip of the touch: what a fill could be sold back into.",
+                                   min=0.05, max=10.0, step=0.1)
+    exit_depth_slip: float = param("How far below the touch counts as exit depth (dollars).", min=0.0, max=0.5,
+                                   step=0.01)
     wide_spread: float = param("Wide: quote both sides at the touch when ask - bid is at least this.",
                                min=0.01, max=0.98, step=0.01)
     decided_min: float = param("Decided: quote the expensive side when its best bid is at least this.",
@@ -264,6 +274,14 @@ def plan_market(ticker: str, others: dict[str, dict[float, float]], params: lip.
         return None
     return Plan(ticker, mode, tuple(legs), sc.expected_reward_this_snapshot_usd,
                 lots * sum(p for _, p in legs), params.period_reward_usd / params.snapshots_per_period, lots)
+
+
+def exit_lots(others: dict[str, dict[float, float]], cfg: Cfg) -> float:
+    """Bid size: cfg.lots, capped by the thinner side's exit depth (others'
+    bids within exit_depth_slip of that side's touch)."""
+    depths = [sum(q for p, q in book.items() if p >= max(book) - cfg.exit_depth_slip - 1e-9)
+              for book in (others["yes"], others["no"]) if book]
+    return min([cfg.lots] + [math.floor(cfg.exit_depth_frac * d) for d in depths]) if depths else 0.0
 
 
 def event_of(ticker: str) -> str:
@@ -395,7 +413,8 @@ class TokenBucket:
         self._refill()
         if not force and self.tokens < cost:
             return False
-        self.tokens -= cost
+        # Forced spends (exits, cancels) may borrow at most one burst.
+        self.tokens = max(self.tokens - cost, -self.capacity)
         now = time.monotonic()
         self.spent.append((now, cost))
         while self.spent and now - self.spent[0][0] > 600:
@@ -505,6 +524,7 @@ class Farm:
         self.pending: dict[str, tuple[float, float]] = {}      # leg key -> (price, lots) awaiting its claim
         self.dumping: set[str] = set()        # markets an informed fill hit: sell out now
         self.cfg_adverse = 0.8                # cfg.adverse_fill_frac, refreshed each loop
+        self.n_refused, self.last_refused_log = 0, 0.0
 
     # ---- mode ----
     def _open_mode(self, live: bool):
@@ -716,6 +736,11 @@ class Farm:
                 c.allow_now("order", force=True, reason=reason)
             else:
                 if not c.can_afford("order", reserve=reserve * c.tokens_per_s) or not self.bucket.take(ORDER_TOKENS):
+                    self.n_refused += 1
+                    if time.time() - self.last_refused_log > 60:
+                        self.last_refused_log = time.time()
+                        print(f"budget: {self.n_refused} bids refused so far (our bucket "
+                              f"{self.bucket.tokens:.0f}, shard {c.tokens_now():.0f})")
                     return False
                 if not c.allow_now("order", reason=reason):
                     self.bucket.refund(ORDER_TOKENS)
@@ -853,13 +878,16 @@ class Farm:
         return locked
 
     def dump(self, t: str):
-        """Informed fill: pull this market's LIP bids, cool it down, and sell
-        what we hold into others' bids, as deep as it takes."""
+        """Sell what we hold in t into others' bids, as deep as it takes. After
+        an informed fill (not just dust) also pull its LIP bids and cool it down."""
         self.dumping.discard(t)
-        for side, o in self.legs_of(t, hedges=False):
-            self.cancel(key(t, side), reason="lipfarm:adverse")
-        self.state.setdefault("cooldown", {})[t] = time.time() + GUARD_COOLDOWN_S
         v = self.free_positions().get(t, 0.0)
+        if abs(v) > DUST_LOTS:
+            for side, o in self.legs_of(t, hedges=False):
+                self.cancel(key(t, side), reason="lipfarm:adverse")
+            self.state.setdefault("cooldown", {})[t] = time.time() + GUARD_COOLDOWN_S
+        for k in [k for k in self.state["orders"] if is_hedge(k) and unkey(k)[0] == t]:
+            self.cancel(k, reason="lipfarm:dump")
         if abs(v) < 1.0:
             return
         held, other = ("yes", "no") if v > 0 else ("no", "yes")
@@ -884,6 +912,9 @@ class Farm:
         the other side's touch, under its offer. Live only."""
         if not self.live:
             return
+        for t, v in self.free_positions().items():
+            if abs(v) <= DUST_LOTS and t in self.books and t in self.meta:
+                self.dumping.add(t)
         for t in sorted(self.dumping):
             if t in self.books and t in self.meta:
                 self.dump(t)
@@ -904,13 +935,17 @@ class Farm:
             px = min(round(touch + self.tick(t, touch), 4), round(ask - self.tick(t, ask - 1e-9), 4))
             if px >= 0.001:
                 want[key(t, side, True)] = (px, abs(v))
+        now = time.time()
         for k, o in list(self.state["orders"].items()):
             if not is_hedge(k):
                 continue
             w = want.get(k)
-            if (w is None or abs(w[0] - o["price"]) > 1e-9 or o["remaining"] > w[1] + 1e-9
-                    or o["remaining"] < 0.5 * w[1]):
+            if w is None or o["remaining"] > w[1] + 1e-9 or o["remaining"] < 0.5 * w[1]:
                 self.cancel(k, reason="lipfarm:hedge")
+            elif w[0] > o["price"] + 1e-9 and now - o["placed"] >= EXIT_REPRICE_S:
+                self.cancel(k, reason="lipfarm:hedge")       # outbid: step up
+            else:
+                want.pop(k)                                   # still best, or re-priced too recently
         for k, (px, q) in want.items():
             if k not in self.state["orders"]:
                 t, side = unkey(k)
@@ -934,9 +969,7 @@ class Farm:
         if event_of(t) in self.held_events:
             return None
         v = pos.get(t, 0.0)
-        vol = float(self.meta.get(t, {}).get("volume_24h_fp") or 0.0)
-        lots = min(cfg.lots, math.floor(cfg.exit_vol_frac * vol))
-        return plan_market(t, others, P, cfg, {"yes": max(v, 0.0), "no": max(-v, 0.0)}, lots)
+        return plan_market(t, others, P, cfg, {"yes": max(v, 0.0), "no": max(-v, 0.0)}, exit_lots(others, cfg))
 
     def fresh_books(self, tickers) -> dict[str, dict]:
         """Others' books now: from the socket where it has the market, else REST."""

@@ -8,7 +8,7 @@ from kalshi_strategies.LIPFARM import farm
 from kalshi_strategies.LIPFARM.farm import parse_book, plan_market, remove_ours
 
 P = lip.LipParams(target_size=1000, discount_factor=0.5, period_reward_usd=86.4, snapshots_per_period=86400)
-CFG = farm.Cfg(max_capital=5000, num_markets=5, lots=1000, adverse_fill_frac=0.8, exit_vol_frac=1.0, wide_spread=0.20, decided_min=0.97,
+CFG = farm.Cfg(max_capital=5000, num_markets=5, lots=1000, adverse_fill_frac=0.8, exit_depth_frac=10.0, exit_depth_slip=0.03, wide_spread=0.20, decided_min=0.97,
                min_ahead=0.0, max_position=1e9, write_tokens_per_s=5.0, scan_markets=1, scan_rotate=0, refresh_s=30,
                programs_refresh_s=600)
 
@@ -102,6 +102,9 @@ class _Bucket:
 
     def can_afford(self, kind, reserve=0.0):
         return self.tokens >= self.COST[kind] + reserve
+
+    def tokens_now(self):
+        return self.tokens
 
     def allow_now(self, kind, force=False, reason=""):
         if force or self.tokens >= self.COST[kind]:
@@ -224,12 +227,14 @@ def test_fill_is_hedged_on_the_other_side_with_the_pair_under_one_dollar(tmp_pat
     assert "Z-1-A|no|h" in f.state["orders"]
     # The no touch moves to 0.05: the exit goes a tick above it, whatever the pair then costs.
     f.books = {"Z-1-A": {"yes": {0.90: 3000.0}, "no": {0.05: 5000.0}}}     # no offer 0.10
+    f.state["orders"]["Z-1-A|no|h"]["placed"] -= farm.EXIT_REPRICE_S         # outbid, and old enough
     f.hedge(CFG)
     assert b.cancelled == ["oid1"] and f.state["orders"]["Z-1-A|no|h"]["price"] == 0.06
-    # It never crosses: on a locked book (no bid = no offer = 0.05) it rests a tick under.
-    f.books = {"Z-1-A": {"yes": {0.95: 3000.0}, "no": {0.05: 5000.0}}}
+    # It never crosses: an offer 2c above stops it one tick under (step-ups only).
+    f.books = {"Z-1-A": {"yes": {0.93: 3000.0}, "no": {0.06: 5000.0}}}     # no offer 0.07
+    f.state["orders"]["Z-1-A|no|h"]["placed"] -= farm.EXIT_REPRICE_S
     f.hedge(CFG)
-    assert f.state["orders"]["Z-1-A|no|h"]["price"] == 0.04
+    assert f.state["orders"]["Z-1-A|no|h"]["price"] == 0.06
     # What we hold counts against max_capital: 600 x 0.97 = $582.
     assert abs(f.exposure() - 582.0) < 1e-9
 
@@ -361,15 +366,15 @@ def test_a_fill_pulls_bids_that_could_take_us_past_max_capital(tmp_path, monkeyp
     assert "Z-1-A|no|h" in f.state["orders"]                     # the exit stays
 
 
-def test_bid_size_capped_by_24h_volume(tmp_path, monkeypatch):
+def test_bid_size_capped_by_exit_depth(tmp_path, monkeypatch):
     b = _Bucket()
     f = _live(tmp_path, monkeypatch, b)
-    f.meta["Z-1-A"]["volume_24h_fp"] = "300"
+    cfg = dataclasses.replace(CFG, exit_depth_frac=1.0, exit_depth_slip=0.03)
     P1 = f.params("Z-1-A")
-    pl = f.plan("Z-1-A", {"yes": {0.97: 2000.0}, "no": {0.02: 5000.0}}, P1, CFG, {})
-    assert pl.lots == 300 and abs(pl.capital - 291.0) < 1e-9
-    f.meta["Z-1-A"]["volume_24h_fp"] = "0"
-    assert f.plan("Z-1-A", {"yes": {0.97: 2000.0}, "no": {0.02: 5000.0}}, P1, CFG, {}) is None
+    # yes: 2000 within 3c of 0.97; no: 300 at the 0.02 touch, 4700 deeper than 3c is ignored.
+    o = {"yes": {0.97: 2000.0}, "no": {0.02: 300.0}}
+    assert farm.exit_lots(o, cfg) == 300
+    assert farm.exit_lots({"yes": {0.97: 2000.0, 0.95: 500.0}, "no": {0.02: 5000.0}}, cfg) == 1000
 
 
 def test_sync_keeps_a_resting_order_the_list_missed_and_cancels_orphans(tmp_path, monkeypatch):
@@ -431,3 +436,37 @@ def test_partial_fill_keeps_the_passive_exit(tmp_path, monkeypatch):
     assert not f.dumping
     f.hedge(CFG)
     assert not [o for o in b.sent if o.intent == "take"] and "Z-1-A|no|h" in f.state["orders"]
+
+
+def test_exit_steps_up_only_when_outbid_and_not_too_often(tmp_path, monkeypatch):
+    b = _Bucket()
+    f = _live(tmp_path, monkeypatch, b)
+    _held(f, size=600.0)
+    f.books = {"Z-1-A": {"yes": {0.90: 3000.0}, "no": {0.05: 5000.0}}}     # no offer 0.10
+    f.hedge(CFG)
+    assert f.state["orders"]["Z-1-A|no|h"]["price"] == 0.06
+    f.books = {"Z-1-A": {"yes": {0.90: 3000.0}, "no": {0.03: 5000.0}}}     # touch drops: stay at 0.06
+    f.hedge(CFG)
+    f.books = {"Z-1-A": {"yes": {0.90: 3000.0}, "no": {0.07: 5000.0}}}     # outbid, but just placed: wait
+    f.hedge(CFG)
+    assert len(b.sent) == 1 and f.state["orders"]["Z-1-A|no|h"]["price"] == 0.06
+    f.state["orders"]["Z-1-A|no|h"]["placed"] -= farm.EXIT_REPRICE_S
+    f.hedge(CFG)
+    assert len(b.sent) == 2 and f.state["orders"]["Z-1-A|no|h"]["price"] == 0.08
+
+
+def test_dust_is_sold_into_the_book(tmp_path, monkeypatch):
+    b = _Bucket()
+    f = _live(tmp_path, monkeypatch, b, placed_ago=1.0)
+    _held(f, size=11.0)
+    f.books = {"Z-1-A": {"yes": {0.95: 300.0}, "no": {0.02: 5000.0}}}
+    f.hedge(CFG)
+    assert [(o.side, o.price, o.size) for o in b.sent if o.intent == "take"] == [("no", 0.05, 11)]
+    assert "Z-1-A|yes" in f.state["orders"]                     # dust isn't informed: LIP bids stay
+
+
+def test_forced_spends_borrow_at_most_one_burst():
+    bk = farm.TokenBucket(rate=0.0, capacity=60.0)
+    for _ in range(50):
+        bk.take(10.0, force=True)
+    assert bk.tokens == -60.0
