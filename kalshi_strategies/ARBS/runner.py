@@ -43,7 +43,7 @@ from kalshi_infra.kalshi.orders import KEEPALIVE_S, write_budget_tokens_per_s
 from kalshi_infra.trading.engine import MARKET_PAUSE_RETRY_S
 from kalshi_infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
 from kalshi_infra.runtime.persist import LIVE_ROOT, day_dir
-from kalshi_strategies.ARBS import pricing, scanner
+from kalshi_strategies.ARBS import live_params as lparams, pricing, replay, scanner
 from kalshi_strategies.ARBS.config import SPEC_PATH
 from kalshi_strategies.ARBS.execution import Gateway
 from kalshi_strategies.ARBS.feed import MultiFeed
@@ -144,6 +144,18 @@ UPSIDE_TYPES = ("mutually_exclusive_no", "implication", "mutual_exclusion")
 PRINT_SLACK = 0.01
 PRINT_MAX_BASKETS = 10
 PRINT_MAX_TICKERS = 20
+# Book ages a print row keeps (s before the print): our book->order reaction
+# sits in this range, so a replay can price a quote on the book it saw.
+PRINT_LAGS_S = (0.02, 0.05, 0.1, 0.25)
+# The shadow edge estimator prices each print's quote on the book this long
+# before it: book update -> amend/cancel sent 2.4/~10 ms p50/p90, Kalshi's ack
+# 8.5/~18 ms (order log, 11-04, 185k amends + 186k cancels).
+SHADOW_LAG_S = 0.02
+SHADOW_LOG_S = 300.0
+SHADOW_EVENT_KEEP_S = 600.0     # events in the summary: a print this recently
+SERIES_GROUPS_S = 3600.0
+# An event idle this long leaves the estimator: 12 of its 30-min half-lives.
+SHADOW_PRUNE_S = 6 * 3600.0
 PRINTS_FLUSH_S = 10.0
 IDS_COMPACT_S = 3600.0
 # Kalshi trips a group once MORE than this many contracts match in 15 s; 0 is
@@ -347,6 +359,15 @@ class ArbsRunner:
         self.liq = Liquidity(self.root)
         self.prints = Prints(self.root)
         self.top_hist = TopHistory(self.root)
+        # Shadow live edges (live_params_shadow). lp and lp_seen belong to the
+        # pool thread running _shadow_live; the loop reads only lp_view.
+        self.lp = lparams.LiveParams(list(lparams.DEFAULT_LEVELS), z=lparams.DEFAULT_Z,
+                                     hysteresis=lparams.DEFAULT_HYSTERESIS)
+        self.lp_seen: dict[str, tuple] = {}            # event -> (last print t, its edge, path)
+        self.lp_view: dict = {"groups": {}, "events": {}}
+        self.lp_logged = 0.0
+        self.series_group: dict[str, str] = {}
+        self.series_group_at = 0.0
         self.flow = _Flow()
         # basket_id -> per leg (price, edge per bundle, size) we'd quote, or None.
         self.quote_px: dict[str, list] = {}
@@ -633,6 +654,12 @@ class ArbsRunner:
             for mt in ms:
                 mt.series, mt.shard = ev["series_ticker"], int(ev["exchange_index"])
                 mt.taker_rate, mt.maker_rate = sched.taker_rate, sched.maker_rate
+        if self.cfg.runtime.live_params_shadow and time.time() - self.series_group_at >= SERIES_GROUPS_S:
+            try:
+                self.series_group = series_groups()
+                self.series_group_at = time.time()
+            except Exception as e:
+                _log(f"WARN: series groups read failed ({e!r})")
 
     async def meta_loop(self):
         while True:
@@ -916,8 +943,10 @@ class ArbsRunner:
     def _context_row(self, kind: str, q: Quote, **kw) -> dict:
         b = self.baskets.get(q.basket_id)
         now = time.time()
+        ev = self.meta[q.ticker].event if q.ticker in self.meta else None
         return {"t": now, "kind": kind, "basket_id": q.basket_id, "ticker": q.ticker, "side": q.side,
-                "price": q.price, "deep": q.deep, "live": bool(b and self.live_now(b, _utc())),
+                "price": q.price, "edge": round(q.edge, 4), "deep": q.deep,
+                "live": bool(b and self.live_now(b, _utc())), "shadow_edge": self.lp_view["events"].get(ev, "none"),
                 "context": self.top_hist.context(b.tickers if b else [q.ticker], now), **kw}
 
     def _best_ask(self, ticker: str, side: str) -> float | None:
@@ -965,10 +994,78 @@ class ArbsRunner:
             own = {t: o for t in tickers if (o := {s: self._own(t, s) for s in ("yes", "no") if self._own(t, s)})}
             row = self.prints.start(now, ticker, side, trade.price, trade.size, qual, self._snap(tickers), own)
             if row is not None:
+                row.update(self._print_state(ticker, side, tickers, now))
                 loop = asyncio.get_running_loop()
                 for d in AFTER_S:
                     loop.call_later(d, lambda d=d: row["after"].__setitem__(str(d), self._snap(tickers)))
         self.n["print_record_ms"] = self.n.get("print_record_ms", 0.0) + (time.perf_counter() - start) * 1000
+
+    def _print_state(self, ticker: str, side: str, tickers, now: float) -> dict:
+        """What a replay needs to judge the print as our quote would have met
+        it: each market's top PRINT_LAGS_S before ([lag, bid, others' bid
+        size, ask, others' ask size]: the book a quote resting then was priced
+        on), the pull rule's state on the printed side, and our own quote."""
+        pre = {}
+        for t in tickers:
+            rows = [[lag, *s] for lag in PRINT_LAGS_S if (s := self.top_hist.at(t, now - lag)) is not None]
+            if rows:
+                pre[t] = rows
+        c = self.cfg.trading
+        mine = None
+        for q in self.quotes.on(ticker, side):
+            if q.kind == "arb" and not q.deep:
+                g = self.groups.get(self.meta[ticker].event) if q.group and ticker in self.meta else None
+                mine = {"basket_id": q.basket_id, "price": q.price, "left": q.remaining, "edge": round(q.edge, 4),
+                        "age_s": round(now - max(q.placed_at, q.moved_at), 3), "pending": q.pending,
+                        "tripped": bool(g and g["tripped_at"] is not None)}
+                break
+        return {"pre": pre, "quote": mine,
+                "pull": {"on": self.pulled.get((ticker, side), 0.0) > time.monotonic(),
+                         "ratio": self.top_hist.pull_ratio(ticker, side, now, c.pull_window_s)}}
+
+    def _lp_path(self, ticker: str) -> tuple[str, str, str]:
+        m = self.meta.get(ticker)
+        series = (m.series if m else None) or ticker.split("-", 1)[0]
+        event = (m.event if m else "") or ticker.rsplit("-", 1)[0]
+        return self.series_group.get(series, "unknown"), series, event
+
+    def _rates(self, ticker: str) -> tuple[float, float]:
+        m = self.meta.get(ticker)
+        return ((m.taker_rate if m and m.taker_rate is not None else 0.07),
+                (m.maker_rate if m and m.maker_rate is not None else 0.0))
+
+    def _shadow_live(self, rows: list[dict]) -> tuple[dict, int]:
+        """Pool thread. Score each live print at every candidate edge (as a
+        quote priced SHADOW_LAG_S before it, at live_quote_size, with the pull
+        rule's gate), choose the event's edge before learning from the print,
+        then learn. Returns the view for the loop and the rows that raised."""
+        t = self.cfg.trading
+        errs = 0
+        for r in rows:
+            try:
+                s = replay.score(r, self._rates, self.lp.edges, t.live_quote_size, lag=SHADOW_LAG_S, live_only=True)
+                if s is None or not any(s["fills"]):
+                    continue
+                ratio = (r.get("pull") or {}).get("ratio")
+                if t.pull_drop > 0 and ratio is not None and ratio < 1.0 - t.pull_drop:
+                    fills = pnl = [0.0] * len(s["fills"])       # the pull rule had this side cancelled
+                else:
+                    fills, pnl = s["fills"], s["pnl"]
+                path = self._lp_path(r["ticker"])
+                edge = self.lp.choose(path, r["t"])
+                self.lp.observe(path, r["t"], fills, pnl)
+                self.lp_seen[path[2]] = (r["t"], edge, path)
+            except Exception:
+                errs += 1
+        now = time.time()
+        self.lp.prune(now, SHADOW_PRUNE_S)
+        for ev in [e for e, v in self.lp_seen.items() if now - v[0] > SHADOW_EVENT_KEEP_S]:
+            del self.lp_seen[ev]
+        groups = {}
+        for g in {v[2][0] for v in self.lp_seen.values()}:
+            e, val, lcb = self.lp.best((g,), now)
+            groups[g] = {"edge": e, "value": round(val, 4), "lcb": round(lcb, 4)}
+        return {"groups": groups, "events": {ev: v[1] for ev, v in self.lp_seen.items()}}, errs
 
     async def prints_loop(self):
         loop = asyncio.get_running_loop()
@@ -977,6 +1074,12 @@ class ArbsRunner:
             try:
                 rows = self.prints.take(time.time())
                 self.n["prints_recorded"], self.n["prints_dropped"] = self.prints.rows, self.prints.dropped
+                if rows and self.cfg.runtime.live_params_shadow:
+                    self.lp_view, errs = await loop.run_in_executor(self.pool, self._shadow_live, rows)
+                    self.n["shadow_errors"] = self.n.get("shadow_errors", 0) + errs
+                    if time.time() - self.lp_logged >= SHADOW_LOG_S:
+                        self.lp_logged = time.time()
+                        self.journal({"kind": "live_params", **self.lp_view})
                 # The no-fill base rate: one resting quote's basket per flush.
                 resting = [q for q in self.quotes.values() if not q.pending and q.remaining > 0]
                 if resting and self.cfg.runtime.record_prints:
@@ -2559,6 +2662,7 @@ class ArbsRunner:
             "settled": settled[-200:], "alerts": self.alerts[-100:], "audit_diff": self.audit_diff,
             "order_errors": self.order_errors, "counts": self.n, "write_usage": self.gw.usage(), "write_cap": self.write_cap(),
             "config_status": self.store.status(), "scan": self.scan_status,
+            "live_params": self.lp_view["groups"],
         }
 
     async def ledger_flush_loop(self):
@@ -2627,6 +2731,21 @@ class ArbsRunner:
                               indent=None)
             self.pool.shutdown(wait=False)
             self.write_pool.shutdown(wait=False)
+
+
+def series_groups() -> dict[str, str]:
+    """Blocking (one paged call). series_ticker -> the group live_params
+    keys on: "S:<tags>" for Sports (S:Soccer, S:Hockey, ...), else Kalshi's
+    category."""
+    out, cursor = {}, None
+    while True:
+        d = kalshi_get("/trade-api/v2/series", params={"limit": 1000, **({"cursor": cursor} if cursor else {})})
+        for s in d.get("series") or []:
+            cat = s.get("category") or "unknown"
+            out[s["ticker"]] = "S:" + ",".join(s.get("tags") or []) if cat == "Sports" else cat
+        cursor = d.get("cursor")
+        if not cursor or not d.get("series"):
+            return out
 
 
 def flips(baskets: list[Basket]) -> dict[str, str]:

@@ -19,7 +19,9 @@ import os
 
 DEPTH = 5
 MERGE_S = 0.05
-AFTER_S = (0.03, 1.0)
+# 0.1: about when our completion lands (fill -> exit decision 35/62 ms p50/p90
+# plus ~10 ms order RTT, measured 10-30).
+AFTER_S = (0.03, 0.1, 1.0)
 # A row is written once its last snapshot is in.
 WRITE_AFTER_S = max(AFTER_S) + 0.5
 # Rows held unwritten at most: past it new prints are dropped (and counted).

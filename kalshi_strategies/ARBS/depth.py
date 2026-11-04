@@ -91,6 +91,36 @@ class TopHistory:
             out[t] = rows
         return out
 
+    def at(self, ticker: str, t: float):
+        """(bid, bid depth, ask, ask depth) in effect at time t, or None if the
+        history doesn't reach back that far."""
+        d = self.h.get(ticker)
+        if not d or d[0][0] > t:
+            return None
+        for s in reversed(d):
+            if s[0] <= t:
+                return s[1:]
+        return None
+
+    def pull_ratio(self, ticker: str, side: str, now: float, window: float) -> float | None:
+        """Others' depth at the side's best bid now over its peak at that same
+        price within `window` (the pull rule's measure, depth.PullWatch), for
+        any market whether quoted or not. None with no bid or no peak."""
+        d = self.h.get(ticker)
+        if not d:
+            return None
+
+        def touch(s):
+            if side == "yes":
+                return s[1], s[2]
+            return (None if s[3] is None else round(1.0 - s[3], 4)), s[4]
+
+        price, depth = touch(d[-1])
+        if price is None:
+            return None
+        peak = max((q for s in d if now - s[0] <= window for p, q in (touch(s),) if p == price), default=0.0)
+        return round(depth / peak, 3) if peak > 0 else None
+
     def add(self, row: dict):
         self.rows.append(row)
 

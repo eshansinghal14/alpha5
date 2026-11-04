@@ -189,6 +189,9 @@ class RuntimeParams:
                                     min=0.0, step=1.0, editable=False)
     record_prints: bool = param("Log trade-time book snapshots on basket legs (data/live/ARBS/prints/), for "
                                 "replaying edge and size settings offline.")
+    live_params_shadow: bool = param("Score each recorded live print at every edge (replay.py) and keep the "
+                                     "edge live_params.py would quote per sport, series and event, in the "
+                                     "summary and journal only: no order uses it. Needs record_prints.")
 
 
 @section

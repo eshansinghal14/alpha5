@@ -1451,7 +1451,42 @@ def test_print_recorded_only_where_a_quote_could_make_edge(arbs):
     row = rows[0]
     assert row["ticker"] == "X-A" and row["side"] == "yes" and [p[1:] for p in row["prints"]] == [[0.45, 3], [0.44, 2]]
     assert row["baskets"] == [[b.basket_id, 1.0, False]]
-    assert row["books"]["X-B"]["no"] == [[0.5, 10]] and set(row["after"]) == {"0.03", "1.0"}
+    assert row["books"]["X-B"]["no"] == [[0.5, 10]] and set(row["after"]) == {"0.03", "0.1", "1.0"}
+    assert row["quote"] is None and row["pull"] == {"on": False, "ratio": None}
+
+
+def test_print_row_keeps_the_book_a_resting_quote_saw(arbs):
+    r, b = arbs
+    from kalshi_strategies.ARBS.depth import TopHistory
+    r.top_hist = TopHistory(str(r.root))
+    now = time.time()
+    r.top_hist.on_book("X-B", now - 1.0, 0.45, 50, 0.50, 40)
+    r.top_hist.on_book("X-B", now - 0.03, 0.45, 50, 0.53, 40)        # B's ask jumps 30 ms before the print
+    r.top_hist.on_book("X-A", now - 1.5, 0.40, 100, 0.55, 10)
+    r.top_hist.on_book("X-A", now - 0.01, 0.40, 30, 0.55, 10)        # others pull at A's bid
+    q = R.Quote(basket_id=b.basket_id, leg=0, ticker="X-A", side="yes", price=0.42, size=5, cid="c", edge=0.04,
+                max_price=0.42, pending=False, placed_at=now - 2.0)
+    r.quotes[q.key] = q
+    r.pulled[("X-A", "yes")] = time.monotonic() + 1.0
+    s = r._print_state("X-A", "yes", ["X-A", "X-B"], now)
+    assert [[r[0], r[1], r[3]] for r in s["pre"]["X-B"]] == [[0.02, 0.45, 0.53], [0.05, 0.45, 0.50], [0.1, 0.45, 0.50],
+                                                          [0.25, 0.45, 0.50]]
+    assert s["pre"]["X-B"][0] == [0.02, 0.45, 50, 0.53, 40]
+    assert s["pull"] == {"on": True, "ratio": 0.3}
+    assert s["quote"]["price"] == 0.42 and s["quote"]["left"] == 5 and s["quote"]["age_s"] == 2.0
+    assert not s["quote"]["tripped"]
+
+
+def test_top_history_lookup_and_pull_ratio(tmp_path):
+    from kalshi_strategies.ARBS.depth import TopHistory
+    h = TopHistory(str(tmp_path))
+    h.on_book("X", 100.0, 0.45, 80, 0.50, 20)
+    h.on_book("X", 101.0, 0.46, 10, 0.50, 20)                      # a new price: not a pull
+    h.on_book("X", 102.0, 0.46, 4, 0.50, 5)
+    assert h.at("X", 99.0) is None and h.at("X", 100.5) == (0.45, 80, 0.50, 20)
+    assert h.pull_ratio("X", "yes", 102.0, 2.0) == 0.4             # 4 of the 10 seen at 0.46
+    assert h.pull_ratio("X", "no", 102.0, 2.0) == 0.25             # NO bid 0.50: 5 of 20
+    assert h.pull_ratio("X", "no", 102.0, 0.5) == 1.0              # the 20 is out of the window
 
 
 def test_fill_logs_top_of_book_history_without_our_own_size(arbs):
@@ -1507,3 +1542,41 @@ def test_dollar_room_follows_shard_cash_when_live(arbs):
     r.cash_at = time.time() - 10 * r.cfg.runtime.balance_poll_s * R.CASH_STALE_POLLS
     assert r.room_dollars(b) == 50.0 - r.committed()               # stale: back to max_dollars
     r.live = False
+
+
+def _live_print_row(b_ask_after_no_bid, ratio=None):
+    after = {"X-A": {"yes": [[0.40, 100]], "no": [[0.55, 100]]},
+             "X-B": {"yes": [[0.45, 100]], "no": [[b_ask_after_no_bid, 100]]}}
+    return {"t": time.time(), "ticker": "X-A", "side": "yes", "prints": [[0.0, 0.40, 50]],
+            "baskets": [["complete_set:X:buy_all_yes", 1.0, True]],
+            "books": {"X-A": {"yes": [[0.40, 100]], "no": [[0.55, 100]]},
+                      "X-B": {"yes": [[0.45, 100]], "no": [[0.50, 100]]}},
+            "pre": {"X-B": [[0.02, 0.45, 100, 0.50, 100]]},
+            "after": {"0.03": after, "0.1": after, "1.0": after},
+            "pull": {"on": False, "ratio": ratio}, "quote": None}
+
+
+def test_shadow_live_learns_an_event_and_reports_it(arbs):
+    r, b = arbs
+    r.series_group = {"X": "S:Soccer"}
+    r.meta["X-A"].series = "X"
+    view, errs = r._shadow_live([_live_print_row(0.50) for _ in range(50)])
+    assert errs == 0 and set(view["events"]) == {"X"} and set(view["groups"]) == {"S:Soccer"}
+    assert view["groups"]["S:Soccer"]["value"] > 0                 # quotes there would have made money
+    node = r.lp.nodes[("S:Soccer", "X", "X")]
+    assert node.w == pytest.approx(50, rel=0.01)
+
+
+def test_shadow_live_counts_a_pulled_side_as_no_fill(arbs):
+    r, b = arbs
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, pull_drop=0.5)
+    r._shadow_live([_live_print_row(0.50, ratio=0.2)])
+    assert sum(r.lp.nodes[()].f) == 0.0
+
+
+def test_series_groups_read_sports_tags(monkeypatch):
+    pages = [{"series": [{"ticker": "KXEPL", "category": "Sports", "tags": ["Soccer"]},
+                         {"ticker": "KXHOUSE", "category": "Elections", "tags": []}], "cursor": "c"},
+             {"series": [], "cursor": None}]
+    monkeypatch.setattr(R, "kalshi_get", lambda path, params=None: pages.pop(0))
+    assert R.series_groups() == {"KXEPL": "S:Soccer", "KXHOUSE": "Elections"}
