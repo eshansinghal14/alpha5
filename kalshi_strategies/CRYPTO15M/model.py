@@ -66,6 +66,8 @@ class UpDownModel:
         self._own_quotes = None
         self._otouch: tuple[float, float] | None = None
         self._anchor: tuple[tuple[float, float], float, float, float] | None = None
+        # cme_pull: monotonic time until which each side is pulled.
+        self._cme_pull_until = {"yes": 0.0, "no": 0.0}
         # EMA of the market-implied shift in x (log units), see _market_shift.
         self._shift = 0.0
         self._shift_raw = 0.0
@@ -528,7 +530,22 @@ class UpDownModel:
             return "fair_in_tail"
         if self._kbid is None or self._kask is None or self._kbid < lo or self._kask > hi:
             return "book_in_tail"
+        if p.cme_pull_bp is not None and self._cme_pulled(side, p):
+            return "cme_pull"
         return None
+
+    def _cme_pulled(self, side: str, p) -> bool:
+        """A CME up-shift exposes our offer (the NO bid), a down-shift our YES bid."""
+        pnc = getattr(self.spot, "perp_nowcast", None)
+        if pnc is None:
+            return False
+        mono = time.monotonic()
+        sh = pnc.touch_shift("cme", self.coin, mono, p.cme_pull_window_s)
+        if sh >= p.cme_pull_bp:
+            self._cme_pull_until["no"] = mono + p.cme_pull_hold_s
+        elif sh <= -p.cme_pull_bp:
+            self._cme_pull_until["yes"] = mono + p.cme_pull_hold_s
+        return mono < self._cme_pull_until[side]
 
     def quote_block(self, ticker, now_s):
         until = (self.spot.burst_until_by_coin.get(self.coin, 0.0) if self.cfg.pricing.burst_own_coin_only

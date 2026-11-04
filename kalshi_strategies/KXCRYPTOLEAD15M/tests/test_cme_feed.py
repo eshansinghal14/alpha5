@@ -134,3 +134,14 @@ def test_explicit_leads_do_not_overwrite_the_recorded_lead():
     n.increment("BTC", 0.1, 81000.0)
     n.increment("BTC", 0.1, 81000.0, leads=("binance_perp",))   # logging call
     assert n.lead_used["BTC"] == "cme"
+
+
+def test_touch_shift_holds_through_spot_ticks():
+    n = _leads_setup()
+    _cme(n, 81400.0 * math.exp(1e-4), 0.10)                     # whole touch +1bp
+    n.on_spot("BTC", 81001.0)                                   # spot ticks: increment resets...
+    assert n.increment("BTC", 0.11, 81001.0, leads=("cme",))[1] == 0.0
+    assert n.touch_shift("cme", "BTC", 0.11, 0.3) == pytest.approx(1.0, rel=1e-3)   # ...the shift doesn't
+    n.on_perp("cme", "BTC", 81400.0 * math.exp(1e-4), 0.12, 81397.5 * math.exp(1e-4), 81402.5 * math.exp(2e-4))
+    assert n.touch_shift("cme", "BTC", 0.12, 0.3) == pytest.approx(1.0, rel=1e-3)   # smaller side counts
+    assert n.touch_shift("cme", "BTC", 0.12 + pn.FRESH_S + 0.1, 0.3) == 0.0           # stale book: nothing

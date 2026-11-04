@@ -55,6 +55,8 @@ TOUCH_VENUES = ("cme",)
 # and the KXBTC15M mid (0.9954) better than Binance (1.0031, 0.9998); at 1.0
 # it was worse than no lead.
 TOUCH_WEIGHT = 0.5
+# How much touch history touch_shift() can look back over (s).
+TOUCH_HIST_S = 2.0
 # Binance vs OKX, both net of basis. Above the cap so a real lead (|gap| p90
 # 1.4bp, SOL 10-20) isn't vetoed while OKX catches up. 6 h replay 10-20: it
 # fired 73-122/h (~0.2s each) and spot 1s later sided with the others 66-85%.
@@ -89,6 +91,8 @@ class PerpNowcast:
         # TOUCH_VENUES: latest (log bid, log ask), and as of the last spot move.
         self._touch: dict[tuple[str, str], tuple[float, float]] = {}
         self._touch_at_spot: dict[tuple[str, str], tuple[float, float]] = {}
+        # TOUCH_VENUES: (t, log bid, log ask) over the last TOUCH_HIST_S, for touch_shift().
+        self._touch_hist: dict[tuple[str, str], collections.deque] = {}
         # Venues increment() tries, first fresh one wins (the owner's
         # pricing.nowcast_leads; SpotFeed sets this).
         self.leads_fn = lambda: (LEAD,)
@@ -113,6 +117,23 @@ class PerpNowcast:
         if db == 0 or da == 0 or (db > 0) != (da > 0):
             return 0.0
         return math.copysign(min(abs(db), abs(da)), db)
+
+    def touch_shift(self, venue: str, coin: str, now: float, window: float) -> float:
+        """bp the venue's whole touch moved over the last `window` s: the smaller
+        of the bid and ask moves when both went the same way, else 0. Unlike
+        increment() it doesn't reset on a spot move."""
+        h = self._touch_hist.get((venue, coin))
+        if not h or now - h[-1][0] > FRESH_S:
+            return 0.0
+        ref = h[0]
+        for e in h:
+            if e[0] > now - window:
+                break
+            ref = e
+        db, da = h[-1][1] - ref[1], h[-1][2] - ref[2]
+        if db == 0 or da == 0 or (db > 0) != (da > 0):
+            return 0.0
+        return math.copysign(min(abs(db), abs(da)), db) * 1e4
 
     def increment(self, coin: str, now: float, spot_mid: float | None,
                   leads: tuple[str, ...] | None = None, full: bool = False) -> tuple[float | None, float | None]:
@@ -155,6 +176,10 @@ class PerpNowcast:
         self._px[k] = (lp, t)
         if bid is not None and ask is not None and bid > 0 and ask > 0:
             self._touch[k] = (math.log(bid), math.log(ask))
+            h = self._touch_hist.setdefault(k, collections.deque())
+            h.append((t, self._touch[k][0], self._touch[k][1]))
+            while len(h) > 1 and h[1][0] <= t - TOUCH_HIST_S:
+                h.popleft()
         s = self._spot.get(coin)
         if s is None:
             return

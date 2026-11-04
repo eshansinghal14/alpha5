@@ -104,6 +104,15 @@ class UpDownPricingParams:
         "basis) is from spot, capped 2bp. Anything else prices on spot. KXSOL15M 10-20 03:00-04:12 UTC, "
         "7,837 informed takers: half-move -10ms latest, +20ms gap, -5ms spot; latest earlier than gap on "
         "40% of paired takers, later on 9%.")
+    cme_pull_bp: float | None = param(
+        "Pull the side a CME whole-touch shift exposes (quotes and takes; the bid on a down-shift) once CME's "
+        "touch has moved this many bp over cme_pull_window_s, held cme_pull_hold_s after the last such shift. "
+        "Unlike the lead increment it doesn't reset on a spot tick. KXBTC15M maker fills 11-04 00:00-17:15 "
+        "UTC: 3,553 of 13,486 came 0-300ms after a >=0.5bp whole-touch shift against them, -0.7c/lot at "
+        "10s vs -0.3c for the rest; 2,687 of those had 30-300ms of warning. null = off.",
+        min=0.1, max=10, step=0.1)
+    cme_pull_window_s: float = param("Window for cme_pull_bp.", min=0.01, max=2, step=0.05)
+    cme_pull_hold_s: float = param("How long a cme_pull lasts after the last qualifying shift.", min=0, max=5, step=0.05)
     take_lead_only: bool = param(
         "Take only on a fair carrying a CME whole-touch shift (take_prob); quotes are unaffected. Our spot "
         "median is no faster than Kalshi's makers: anchored-fair takes on it marked out -3.0c at 10s, CME "

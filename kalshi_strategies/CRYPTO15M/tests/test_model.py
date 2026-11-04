@@ -1,4 +1,5 @@
 """UpDownModel gates and Fair shape, offline (no network, nothing persisted)."""
+import collections
 import math
 import time
 import types
@@ -352,3 +353,21 @@ def test_locked_book_anchors_at_its_price():
     assert m.reprice(now)[m.ticker].prob == pytest.approx(0.55, abs=1e-6)
     m.on_book(_LBook(m.ticker, {0.56: 500.0}, {0.45: 400.0}))   # crossed: keeps the last anchor
     assert m.reprice(now)[m.ticker].prob == pytest.approx(0.55, abs=1e-6)
+
+
+def test_cme_shift_pulls_the_exposed_side_for_the_hold():
+    now = time.time()
+    m, spot = _anchored(now, cme_pull_bp=0.5, cme_pull_window_s=0.3, cme_pull_hold_s=0.3)
+    m.on_book(_LBook(m.ticker, {0.60: 500.0}, {0.39: 400.0}))
+    f = m.reprice(now)[m.ticker]
+    pnc, mono = spot.perp_nowcast, time.monotonic()
+    pnc.on_perp("cme", "BTC", 80000.0, mono - 0.2, 79997.5, 80002.5)
+    pnc.on_perp("cme", "BTC", 80008.0, mono, 80005.5, 80010.5)            # whole touch +1bp: an up-shift
+    assert m.side_block(m.ticker, "no", f, now) == "cme_pull"            # our offer is exposed
+    assert m.side_block(m.ticker, "yes", f, now) is None
+    # Later: CME flat over the window and the hold run out.
+    t = time.monotonic()
+    lb, la = math.log(80005.5), math.log(80010.5)
+    pnc._touch_hist[("cme", "BTC")] = collections.deque([(t - 0.5, lb, la), (t, lb, la)])
+    m._cme_pull_until["no"] = t - 1
+    assert m.side_block(m.ticker, "no", f, now) is None
