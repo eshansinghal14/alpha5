@@ -55,6 +55,8 @@ class LipParams:
     period_reward_usd: float      # per-period, DOLLARS
     snapshots_per_period: int
     max_reward_usd: float | None = None   # per-account cap for the period
+    # (start, end, step) from the market's price_ranges; empty = whole cents.
+    price_ranges: tuple = ()
 
 
 @dataclasses.dataclass
@@ -87,6 +89,19 @@ class LipBookScore:
     reward_per_snapshot_usd: float    # period_reward_usd / snapshots_per_period
     expected_reward_this_snapshot_usd: float   # our combined score contribution
                                                # given both sides qualify
+
+
+def ticks_between(hi: float, lo: float, price_ranges: tuple = ()) -> int:
+    """Ticks from `lo` up to `hi`. The discount is per tick ("the number of
+    ticks away", Kalshi LIP help), and 0.1c markets tick 0.1c in their tails."""
+    if hi <= lo:
+        return 0
+    if not price_ranges:
+        return int(round((hi - lo) / TICK))
+    n = 0.0
+    for start, end, step in price_ranges:
+        n += max(0.0, min(hi, end) - max(lo, start)) / step
+    return int(round(n))
 
 
 def _score_side(levels: list[LipLevel], params: LipParams) -> LipSideScore:
@@ -130,7 +145,7 @@ def _score_side(levels: list[LipLevel], params: LipParams) -> LipSideScore:
     our_score = 0.0
     all_score = 0.0
     for lv in levels[:stop_idx + 1]:
-        weight = DF ** max(0, int(round((reference_price - lv.price) / TICK)))
+        weight = DF ** max(0, ticks_between(reference_price, lv.price, params.price_ranges))
         all_score += lv.size * weight
         our_score += min(lv.mine, lv.size) * weight
         scored.append(lv)

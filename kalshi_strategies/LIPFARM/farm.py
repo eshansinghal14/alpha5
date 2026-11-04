@@ -3,12 +3,14 @@ LIP farmer. Rests one post-only bid of `lots` on the CHEAP side's touch
 (best bid <= `max_price`) of the `num_markets` LIP markets whose reward to
 us, at today's book, is highest in $/s. Never quotes the expensive side.
 
-    python -m kalshi_strategies.LIPFARM.farm            # shadow: no orders, accrues as if resting
-    python -m kalshi_strategies.LIPFARM.farm --live     # REAL MONEY
+    python -m kalshi_strategies.LIPFARM.farm                # shadow until armed from the dashboard
+    python -m kalshi_strategies.LIPFARM.farm --live         # armed from the start: REAL MONEY
+    python -m kalshi_strategies.LIPFARM.farm --resume-arm   # re-arm if the last request was an arm (EC2 unit)
 
-Params in config.json (re-read every cycle). Journal in
-data/live/LIPFARM/<mode>/state.json survives restarts; status.json /
-status.csv hold the latest table. "Expected LIP" is our modelled share
+Arm/disarm is the dashboard's button (trading_mode.json, as for every
+series); STOP.json disarms and exits. Params in config.json (dashboard
+sidebar, re-read every cycle). Journal in data/live/LIPFARM/<mode>/state.json
+survives restarts; data/live/LIPFARM/status.json holds the latest table. "Expected LIP" is our modelled share
 (lip.py) integrated over time, not what Kalshi pays: payouts under $1 per
 market-period are dropped, and others' size between our scans is unseen.
 
@@ -32,8 +34,10 @@ import pandas as pd
 import urllib3
 
 from kalshi_backtest.core import Order
-from kalshi_infra import DATA_ROOT
 from kalshi_infra.api_functions import kalshi_get
+from kalshi_infra.config import load, param, section
+from kalshi_infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
+from kalshi_infra.runtime.persist import LIVE_ROOT
 from kalshi_infra.trading import lip
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -42,9 +46,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "config.json")
 CID_PREFIX = "lipf-"
 BOOK_WORKERS = 8
-ARBS_ROOT = os.path.join(DATA_ROOT, "live", "ARBS")
+NAME = "LIPFARM"
+ROOT = os.path.join(LIVE_ROOT, NAME)
+ARBS_ROOT = os.path.join(LIVE_ROOT, "ARBS")
 # Read by ARBS's scanner (ARBS.scanner.lipfarm_claimed): it selects no event here.
-CLAIMS_PATH = os.path.join(DATA_ROOT, "live", "LIPFARM", "live", "claimed.json")
+CLAIMS_PATH = os.path.join(ROOT, "live", "claimed.json")
 # After a claim, an ARBS selection must be written at least CLAIM_SETTLE_S
 # later (so its scan read the claim), and then RELOAD_S must pass for the ARBS
 # runner to load it and pull its quotes, before we quote there.
@@ -52,19 +58,27 @@ CLAIM_SETTLE_S = 5.0
 RELOAD_S = 30.0
 
 
-@dataclasses.dataclass
+@section
 class Cfg:
-    num_markets: int
-    lots: float
-    max_price: float
-    scan_markets: int
-    refresh_s: float
-    programs_refresh_s: float
+    num_markets: int = param("Markets quoted: the ones paying us most LIP per second at today's book.",
+                             min=0, step=1)
+    lots: float = param("Contracts per quote, one quote per market at the cheap side's best bid.",
+                        min=1.0, step=100.0)
+    max_price: float = param("Cheap side only: quote a side only if its best bid is at most this.",
+                             min=0.001, max=0.5, step=0.01)
+    scan_markets: int = param("Books read each cycle: the largest LIP pools.", min=1, step=50)
+    refresh_s: float = param("Seconds between cycles.", min=5.0, editable=False)
+    programs_refresh_s: float = param("Seconds between re-reads of the LIP program list.", min=60.0,
+                                      editable=False)
 
     @classmethod
     def load(cls) -> "Cfg":
-        with open(CONFIG_PATH) as f:
-            return cls(**json.load(f))
+        return load(LipFarmConfig, CONFIG_PATH).farm
+
+
+@section
+class LipFarmConfig:
+    farm: Cfg
 
 
 @dataclasses.dataclass
@@ -169,22 +183,43 @@ def remove_ours(book: dict[float, float], price: float, size: float) -> dict[flo
 
 
 class Farm:
-    def __init__(self, live: bool):
-        self.live = live
-        self.dir = os.path.join(DATA_ROOT, "live", "LIPFARM", "live" if live else "shadow")
-        os.makedirs(self.dir, exist_ok=True)
-        self.state_path = os.path.join(self.dir, "state.json")
-        self.state = self._load_state()
+    def __init__(self):
+        self._open_mode(False)
+        self.arm_requested = False
         self.programs: dict[str, dict] = {}
         self.meta: dict[str, dict] = {}
         self.clients: dict[int, object] = {}
         self.books: dict[str, dict[str, dict[float, float]]] = {}
         self.picks: dict[str, Pick] = {}
-        self.rates: dict[str, float] = {}       # ticker -> our current $/s for the resting order
         self.held_events: set[str] = set()
         self.waiting: list[str] = []
         self.last_programs = 0.0
+
+    # ---- mode ----
+    def _open_mode(self, live: bool):
+        self.live = live
+        self.dir = os.path.join(ROOT, "live" if live else "shadow")
+        os.makedirs(self.dir, exist_ok=True)
+        self.state_path = os.path.join(self.dir, "state.json")
+        self.state = self._load_state()
+        self.rates: dict[str, float] = {}       # ticker -> our current $/s for the resting order
         self.last_accrue = time.time()
+
+    def set_live(self, want: bool, why: str):
+        """Switch shadow <-> live. Disarming pulls every real quote; positions are kept."""
+        self.arm_requested = want
+        if want == self.live:
+            return
+        print(f"{'ARM' if want else 'DISARM'}: {why}")
+        self.accrue()
+        for t in list(self.state["orders"]):
+            self.cancel(t)
+        if self.live:
+            self.write_claims({})       # held positions stay claimed from ARBS
+        self._save()
+        self._open_mode(want)
+        if want:
+            self.cancel_strays()
 
     # ---- persistence ----
     def _load_state(self) -> dict:
@@ -237,6 +272,7 @@ class Farm:
             if not cursor or not batch:
                 break
         self.programs = out
+        self._fetch_meta(self.candidates(cfg))
         self.last_programs = time.time()
 
     def candidates(self, cfg: Cfg) -> list[str]:
@@ -269,7 +305,11 @@ class Farm:
             if mine and self.live:
                 others[mine["side"]] = remove_ours(others[mine["side"]], mine["price"], mine["remaining"])
             books[t] = others
-            P = lip.params_from_program(self.programs[t])
+            m = self.meta.get(t, {})
+            if m and m.get("status") != "active":
+                continue
+            P = dataclasses.replace(lip.params_from_program(self.programs[t]), price_ranges=tuple(
+                (float(r["start"]), float(r["end"]), float(r["step"])) for r in m.get("price_ranges") or []))
             if mine:
                 rates[t] = rate_at(others, mine["side"], mine["price"], mine["remaining"], P)
             pk = None if event_of(t) in self.held_events else best_pick(t, others, P, cfg.lots, cfg.max_price)
@@ -429,15 +469,17 @@ class Farm:
         fill_pnl = sum(p["pnl"] for p in pos)
         at_risk = sum(o["price"] * o["remaining"] for o in self.state["orders"].values())
         hrs = (time.time() - self.state["t0"]) / 3600
-        summary = {"mode": "LIVE" if self.live else "shadow", "hours": hrs, "quoting": len(rows),
+        summary = {"mode": "LIVE" if self.live else "shadow", "live_trading": self.live,
+                   "arm_requested": self.arm_requested, "hours": hrs, "quoting": len(rows),
                    "our_usd_day_now": sum(r["our_usd_day"] for r in rows), "exp_lip_usd": tot_lip,
                    "fills": len(self.state["fills"]), "fill_lots": sum(p["lots"] for p in pos),
                    "fill_pnl_usd": fill_pnl, "net_usd": tot_lip + fill_pnl, "resting_cost_usd": at_risk,
                    "waiting_on_arbs": len(self.waiting), "arbs_events_skipped": len(self.held_events),
                    "updated_at": time.time()}
-        with open(os.path.join(self.dir, "status.json"), "w") as f:
+        tmp = os.path.join(ROOT, "status.json.tmp")
+        with open(tmp, "w") as f:
             json.dump({"summary": summary, "quotes": rows, "positions": pos, "waiting": self.waiting}, f, indent=1)
-        pd.DataFrame(rows).to_csv(os.path.join(self.dir, "status.csv"), index=False)
+        os.replace(tmp, os.path.join(ROOT, "status.json"))
 
         print(f"\n=== LIPFARM {summary['mode']} {pd.Timestamp.now(tz='UTC'):%Y-%m-%d %H:%M:%S}Z "
               f"| {hrs:.2f}h | quoting {len(rows)} | now ${summary['our_usd_day_now']:.0f}/day "
@@ -454,14 +496,22 @@ class Farm:
                       f"{p['mark']:6.3f} {p['pnl']:+8.2f}")
 
     # ---- loop ----
-    def run(self):
-        if self.live:
-            self.cancel_strays()
+    def run(self, arm: str | None):
+        modes, stop = TradingModeWatcher(NAME), StopWatcher()
+        if arm:
+            self.set_live(True, arm)
         try:
             while True:
                 cfg = Cfg.load()
                 t0 = time.time()
                 try:
+                    reason = stop.poll()
+                    if reason:
+                        print(f"STOP: {reason}")
+                        break
+                    want = modes.poll()
+                    if want is not None:
+                        self.set_live(want, f"dashboard {modes.origin()}")
                     if time.time() - self.last_programs > cfg.programs_refresh_s:
                         self.refresh_programs(cfg)
                     self.poll_fills()
@@ -485,9 +535,12 @@ class Farm:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--live", action="store_true", help="place real orders")
+    ap.add_argument("--live", action="store_true", help="arm at start: real orders")
+    ap.add_argument("--resume-arm", action="store_true",
+                    help="re-arm if the dashboard's last request was an arm and no STOP since")
     a = ap.parse_args()
-    Farm(live=a.live).run()
+    arm = "--live" if a.live else (resumable_arm(NAME) if a.resume_arm else None)
+    Farm().run(arm)
 
 
 if __name__ == "__main__":

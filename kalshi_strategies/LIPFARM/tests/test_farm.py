@@ -27,3 +27,45 @@ def test_subcent_prices_survive_parsing():
     yes, no = parse_book({"yes_dollars": [["0.9850", "10"]], "no_dollars": [["0.0040", "5"]]})
     assert yes == {0.985: 10.0} and no == {0.004: 5.0}
     assert remove_ours(no, 0.004, 5.0) == {}
+
+
+def test_arm_quotes_for_real_and_disarm_pulls(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from kalshi_strategies.LIPFARM import farm
+
+    monkeypatch.setattr(farm, "ROOT", str(tmp_path))
+    monkeypatch.setattr(farm, "CLAIMS_PATH", str(tmp_path / "live" / "claimed.json"))
+    sent, cancelled = [], []
+
+    class FakeClient:
+        def _resting(self, prefix):
+            return [("old", "X-1-A", "lipf-old"), ("arbs", "Y-1-A", "someone-else")]
+
+        def place_resting(self, order):
+            sent.append(order)
+            return SimpleNamespace(exchange_order_id=f"oid{len(sent)}", fill=None)
+
+        def cancel(self, oid, ticker):
+            cancelled.append(oid)
+            return True
+
+    f = farm.Farm()
+    monkeypatch.setattr(f, "client", lambda shard: FakeClient())
+    monkeypatch.setattr(f, "shard", lambda t: 0)
+    f.set_live(True, "test")
+    assert f.live and cancelled == ["old"]            # only our stray, never another strategy's
+    cfg = farm.Cfg(num_markets=1, lots=1000, max_price=0.05, scan_markets=1, refresh_s=30, programs_refresh_s=600)
+    f.picks = {"Z-1-A": farm.Pick("Z-1-A", "no", 0.01, 0.001, 0.002)}
+    # A claim not yet seen by an ARBS selection: nothing is sent.
+    monkeypatch.setattr(farm, "arbs_selected", lambda: (0.0, set()))
+    f.reconcile(cfg)
+    assert not sent and f.waiting == ["Z-1-A"]
+    # A selection written well after the claim, without the event: quote it.
+    monkeypatch.setattr(farm, "arbs_selected", lambda: (f.state["claims"]["Z-1-A"] + 10, set()))
+    monkeypatch.setattr(farm, "RELOAD_S", -1e9)
+    f.reconcile(cfg)
+    assert [(o.ticker, o.side, o.price, o.size) for o in sent] == [("Z-1-A", "no", 0.01, 1000)]
+    assert sent[0].client_order_id.startswith(farm.CID_PREFIX)
+    f.set_live(False, "test")
+    assert not f.live and cancelled == ["old", "oid1"]

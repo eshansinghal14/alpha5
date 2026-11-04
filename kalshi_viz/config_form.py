@@ -86,7 +86,7 @@ def render(series, markets: list[str] | None = None) -> None:
     changes, bad = {}, []
     with st.form(f"cfg_{series.ticker}"):
         for sec, ds in sections.items():
-            with st.expander(sec, expanded=sec == "quoting"):
+            with st.expander(sec, expanded=sec == "quoting" or len(sections) == 1):
                 for d in ds:
                     cur = get_dotted(cfg, d["name"])
                     if d["type"] == "list" and not markets:

@@ -242,3 +242,11 @@ def test_tracker_accrues_once_per_second_on_qualifying_book():
     # of the yes side, 0.1 of the snapshot's 2.0 total.
     assert math.isclose(tr.accrued_usd["T"], 0.1 * 9.0 / 900)
     assert tr.qualifying_fraction("T") == 1.0
+
+
+def test_ticks_count_the_markets_own_grid():
+    from kalshi_infra.trading.lip import ticks_between
+    assert ticks_between(0.05, 0.02) == 3
+    tapered = ((0.0, 0.1, 0.001), (0.1, 0.9, 0.01), (0.9, 1.0, 0.001))
+    assert ticks_between(0.012, 0.010, tapered) == 2
+    assert ticks_between(0.12, 0.095, tapered) == 7
