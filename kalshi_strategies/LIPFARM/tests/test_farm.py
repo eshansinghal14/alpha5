@@ -8,7 +8,7 @@ from kalshi_strategies.LIPFARM import farm
 from kalshi_strategies.LIPFARM.farm import parse_book, plan_market, remove_ours
 
 P = lip.LipParams(target_size=1000, discount_factor=0.5, period_reward_usd=86.4, snapshots_per_period=86400)
-CFG = farm.Cfg(max_capital=5000, num_markets=5, lots=1000, sentinel_keep=2.0, dump_slip_ticks=2, chase_ticks=2,
+CFG = farm.Cfg(max_capital=5000, num_markets=5, lots=1000, min_lots_frac=0.0, sentinel_keep=2.0, dump_slip_ticks=2, chase_ticks=2,
                adverse_fill_frac=0.8, exit_depth_frac=10.0, exit_depth_slip=0.03, wide_spread=0.20, min_leg_price=0.0, decided_min=0.97,
                min_ahead=0.0, max_position=1e9, write_tokens_per_s=5.0, scan_markets=1, scan_rotate=0, refresh_s=30,
                programs_refresh_s=600)
@@ -588,3 +588,10 @@ def test_sentinel_main_bid_never_goes_out_alone(tmp_path, monkeypatch):
     f.bucket.tokens = 40.0
     f.reconcile(CFG)
     assert [(o.price, o.size) for o in b.sent] == [(0.39, 1000), (0.40, farm.SENTINEL_LOTS)]
+
+
+def test_sides_sized_under_target_fifth_are_not_quoted():
+    cfg = dataclasses.replace(CFG, min_lots_frac=0.2)
+    others = {"yes": {0.97: 900.0}, "no": {0.02: 5000.0}}          # the yes side reaches Target with us
+    assert plan_market("T", others, P, cfg, {}, 199) is None        # Target 1000: under 200 lots
+    assert plan_market("T", others, P, cfg, {}, 200).lots == 200

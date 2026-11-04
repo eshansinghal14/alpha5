@@ -7,6 +7,7 @@
     "dump_slip_ticks": 2,
     "chase_ticks": 2,
     "adverse_fill_frac": 0.8,
+    "min_lots_frac": 0.2,
     "exit_depth_frac": 1.0,
     "exit_depth_slip": 0.03,
     "wide_spread": 0.2,

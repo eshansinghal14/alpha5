@@ -185,6 +185,10 @@ class Cfg:
                                      "into the book at once, at any price, instead of waiting on an exit bid "
                                      "(ORAN 11-04: 1000 of 1000 at 6c, then 1c within 10 min).", min=0.05,
                                      max=1.0, step=0.05)
+    min_lots_frac: float = param("Don't quote a side whose bid would be under this fraction of the market's "
+                                 "Target size: LIP stays small until a bid reaches Target/5, where it sets the "
+                                 "reference price (11-04: 1 to 49 lot bids earned ~$0).", min=0.0, max=1.0,
+                                 step=0.05)
     exit_depth_frac: float = param("A bid is at most this fraction of others' bids on its side within "
                                    "exit_depth_slip of the touch: what a fill could be sold back into.",
                                    min=0.05, max=10.0, step=0.1)
@@ -331,7 +335,7 @@ def plan_market(ticker: str, others: dict[str, dict[float, float]], params: lip.
         return None
     legs = [(s, p) for s, p in legs
             if others[s].get(p, 0.0) >= cfg.min_ahead - 1e-9 and held.get(s, 0.0) < cfg.max_position - 1e-9
-            and side_lots.get(s, 0.0) >= 1.0]
+            and side_lots.get(s, 0.0) >= max(1.0, cfg.min_lots_frac * params.target_size)]
     if not legs:
         return None
     lots = min(side_lots[s] for s, _ in legs)
