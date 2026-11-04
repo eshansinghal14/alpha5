@@ -93,6 +93,7 @@ class Quote:
     kind: str = "arb"           # or "complete" / "unwind": resting on a broken basket's exit
     deep: bool = False          # the small second quote in the gap behind a live leg's arb quote
     group: str | None = None    # Kalshi order group it rests in (live events, live_order_groups)
+    booked_to: str | None = None  # basket its last fill was booked into (see book_target)
 
     @property
     def remaining(self) -> float:
@@ -165,7 +166,9 @@ ORDER_GROUP_WINDOW_S = 15.0
 # A group with nothing resting in it this long is deleted.
 ORDER_GROUP_IDLE_S = 600.0
 PULL_BATCH = 20
-CROSS_MIN_GAIN = 0.01   # $ a cross between baskets must save over finishing each alone
+# Most other baskets sharing a quote's market side priced per leg per pass:
+# MECNET subsets put one market in dozens of baskets.
+MAX_ALTS = 8
 
 
 class _Rate:
@@ -333,6 +336,11 @@ class ArbsRunner:
         self.pull_watch = PullWatch()
         self.pulled: dict[tuple[str, str], float] = {}   # (ticker, side) -> monotonic time its pull ends
         self.pull_wake: dict[str, float] = {}            # basket_id -> pull end its re-evaluation is set for
+        # (basket_id, leg) -> the other basket its quote is priced through, and
+        # ticker -> baskets priced through a basket on it: their quotes move
+        # with that basket's books too.
+        self.via: dict[tuple[str, int], str] = {}
+        self.via_by_ticker: dict[str, set[str]] = {}
         self.completion_note: dict[str, dict] = {}
         # basket_id -> recent (time, exit cost) of a broken basket: the chase
         # reference. Exit cost is what finishing costs from here, net of the
@@ -354,7 +362,7 @@ class ArbsRunner:
         self.tasks: set[asyncio.Task] = set()
         self.n = {"takes": 0, "take_bundles": 0.0, "quotes_placed": 0, "quote_moves": 0, "quote_cancels": 0,
                   "quote_fills": 0, "completions": 0, "unwinds": 0, "exit_unpriced": 0, "post_only_rejects": 0,
-                  "moves_refused": 0, "pulls": 0, "crosses": 0}
+                  "moves_refused": 0, "pulls": 0, "alt_fills": 0}
         self.started = _utc()
         self.liq = Liquidity(self.root)
         self.prints = Prints(self.root)
@@ -886,6 +894,8 @@ class ArbsRunner:
             self._watch_pulls(book)
         for bid in self.by_ticker.get(book.ticker, ()):
             self.mark(bid)
+        for bid in self.via_by_ticker.get(book.ticker, ()):
+            self.mark(bid)
 
     def _watch_pulls(self, book):
         """Mark a market side pulled (see depth.PullWatch) while a live
@@ -1169,17 +1179,24 @@ class ArbsRunner:
                 self.n["print_errors"] = self.n.get("print_errors", 0) + 1
         if q.group:
             self._group_fill(q.group, size)
+        bid = q.basket_id
         if q.kind == "arb":
+            bid = q.booked_to = self.book_target(q, size)
             # Priced so the other legs cost payout - edge - this leg's cost a bundle.
             m = self.meta.get(q.ticker)
             per = q.edge + pricing.maker_cost(q.price, (m.maker_rate if m else None) or 0.0)
-            self.seed_exit(q.basket_id, -per * size)
+            self.seed_exit(bid, -per * size)
         elif q.kind in ("complete", "unwind"):
             self.exit_paid(q.basket_id, self.baskets[q.basket_id], q.side, q.ticker, size, cost)
-        self.urgent.add(q.basket_id)
+        self.urgent.add(bid)
         self.n["quote_fills"] += 1
-        self._book(q.basket_id, q.ticker, q.side, size, cost, "deep" if q.deep else "quote", source=source,
-                   order_id=q.exchange_id, trade_id=trade_id)
+        kw = {}
+        if bid != q.basket_id:
+            self.n["alt_fills"] += 1
+            self.dirty.add(q.basket_id)
+            kw["quoted_in"] = q.basket_id
+        self._book(bid, q.ticker, q.side, size, cost, "deep" if q.deep else "quote", source=source,
+                   order_id=q.exchange_id, trade_id=trade_id, **kw)
         if q.remaining <= _EPS and self.quotes.get(q.key) is q:
             self._retire(q)
 
@@ -1515,8 +1532,10 @@ class ArbsRunner:
             elif want:
                 room = min(cap, self.room_bundles(b, j), float(self.quote_size_by_dollars(b)))
                 size = pricing.depth_size(vs, j, b.payout, quote_need, float(int(room + _EPS)))
-                if size >= 1 and (q is None or q.remaining <= size + _EPS):
-                    plan = pricing.quote_leg(vs, j, b.payout, quote_need, size)
+                plan = pricing.quote_leg(vs, j, b.payout, quote_need, size) if size >= 1 else None
+                plan, size = self.best_plan(b, j, plan, size, room)
+                if q is not None and q.remaining > size + _EPS:
+                    plan = None
             if plan is None:
                 if q is not None:
                     acts.append(self.cancel_quote(q, "no_edge" if want else "not_hot"))
@@ -1640,6 +1659,86 @@ class ArbsRunner:
 
     def may_quote(self, b: Basket, now: pd.Timestamp) -> bool:
         return b.quoting_allowed(now) and (self.cfg.trading.quote_live_events or not self.live_now(b, now))
+
+    def alternatives(self, b: Basket, j: int) -> list[tuple[Basket, int]]:
+        """(basket, its leg) for other baskets holding leg j's market side
+        that a fill there could be booked into and completed through instead:
+        tradeable and quotable now, not excluded, busy or broken, with room."""
+        leg, now_ts, out = b.legs[j], _utc(), []
+        for oid in self.by_ticker.get(leg.ticker, ()):
+            y = self.baskets.get(oid)
+            if oid == b.basket_id or y is None or oid in self.busy or self.excluded(y):
+                continue
+            k = next((i for i, l in enumerate(y.legs) if l.ticker == leg.ticker and l.side == leg.side), None)
+            if k is None or not self.tradeable(y) or not self.may_quote(y, now_ts) or self.room_bundles(y) < 1:
+                continue
+            pos = self.ledger.baskets.get(oid)
+            if pos is not None and pos.unhedged(y.tickers):
+                continue
+            out.append((y, k))
+            if len(out) >= MAX_ALTS:
+                break
+        return out
+
+    def best_plan(self, b: Basket, j: int, plan, size: float, room: float):
+        """(plan, size) for b's quote on leg j, priced through whichever basket
+        with that market side allows the highest price: a fill is booked into
+        the basket that completes it cheapest (book_target), so the quote can
+        rest as high as the best of them clears its edge."""
+        t, now_ts = self.cfg.trading, _utc()
+        best, via = (plan, size), None
+        for y, k in self.alternatives(b, j):
+            vy = self.views(y)
+            if vy is None:
+                continue
+            need = edge_dollars(y.payout, t.min_edge + t.quote_edge_add) + \
+                (t.live_edge_add if self.live_now(y, now_ts) else 0.0)
+            r = min(room, self.room_bundles(y), float(self.quote_size_by_dollars(y)))
+            n = pricing.depth_size(vy, k, y.payout, need, float(int(r + _EPS)))
+            p = pricing.quote_leg(vy, k, y.payout, need, n) if n >= 1 else None
+            if p is not None and (best[0] is None or p.max_price > best[0].max_price + _EPS):
+                best, via = (dataclasses.replace(p, leg=j), n), y
+        self.set_via(b.basket_id, j, via)
+        return best
+
+    def set_via(self, basket_id: str, j: int, y: Basket | None):
+        old = self.via.get((basket_id, j))
+        if old == (y.basket_id if y else None):
+            return
+        if old is not None:
+            del self.via[(basket_id, j)]
+            if old in self.baskets and old not in {v for (bid, _), v in self.via.items() if bid == basket_id}:
+                for t in self.baskets[old].tickers:
+                    self.via_by_ticker.get(t, set()).discard(basket_id)
+        if y is not None:
+            self.via[(basket_id, j)] = y.basket_id
+            for t in y.tickers:
+                self.via_by_ticker.setdefault(t, set()).add(basket_id)
+
+    def book_target(self, q: Quote, size: float) -> str:
+        """The basket an arb quote's fill is booked into: of the quote's own
+        and its alternatives, the one whose finish cost at today's books rises
+        least. A fill joins a basket this quote already broke while that one
+        is still missing legs, so its fills complete together."""
+        for bid in (q.booked_to, q.basket_id):
+            y = self.baskets.get(bid) if bid else None
+            pos = self.ledger.baskets.get(bid) if y else None
+            if pos is not None and pos.unhedged(y.tickers):
+                return bid
+        b = self.baskets[q.basket_id]
+
+        def rise(y: Basket, k: int) -> float:
+            pos = self.ledger.baskets.get(y.basket_id)
+            held = pos.held(y.tickers) if pos else [0.0] * len(y.legs)
+            after = list(held)
+            after[k] += size
+            return self._finish_cost(y, after) - self._finish_cost(y, held)
+        best, cost = b.basket_id, rise(b, q.leg)
+        for y, k in self.alternatives(b, q.leg):
+            c = rise(y, k)
+            if c < cost - _EPS:
+                best, cost = y.basket_id, c
+        return best
 
     def quoted_elsewhere(self, basket_id: str, ticker: str, side: str) -> Quote | None:
         """Another basket's arb quote resting on this market side, if any."""
@@ -1765,8 +1864,6 @@ class ArbsRunner:
         if any(q.pending and not (grouped_ok and q.group) for q in qs):
             self.later(bid, 0.05)
             return
-        if c.cross_baskets and self.cross(b, pos):
-            return
         legs = [self.leg_view(l.ticker, l.side) if self.is_open(l.ticker) else None for l in b.legs]
         others = [self.leg_view(l.ticker, OTHER[l.side]) if self.is_open(l.ticker) else None for l in b.legs]
         ex = pricing.exits(b.payout, pos.held(b.tickers), pos.broken_spent(b.tickers), legs, others)
@@ -1825,52 +1922,6 @@ class ArbsRunner:
         others = [self.leg_view(l.ticker, OTHER[l.side]) if self.is_open(l.ticker) else None for l in b.legs]
         pick = pricing.exits(b.payout, held, 0.0, legs, others).cheaper()
         return math.inf if pick is None else pick[1] - b.payout * min(held)
-
-    def cross(self, b: Basket, pos) -> bool:
-        """Finish part of broken basket `b` from another broken basket's
-        excess, when that lowers the two baskets' finish cost: the same side
-        of a leg `b` needs moves across, or the other side of a leg `b` has in
-        excess closes both as a $1 pair (Kalshi netted it when bought). Booked
-        as fills, so the ledger, audit and bundle log see ordinary trades:
-        the giver nets out at its contracts' cost (pnl 0). True if it booked."""
-        held = pos.held(b.tickers)
-        done = min(held)
-        excess = [h - done for h in held]
-        need = [max(excess) - e for e in excess]
-        for j, leg in enumerate(b.legs):
-            for oid in self.by_ticker.get(leg.ticker, ()):
-                o, opos = self.baskets.get(oid), self.ledger.baskets.get(oid)
-                if oid == b.basket_id or o is None or opos is None or oid in self.busy:
-                    continue
-                oex = opos.unhedged(o.tickers).get(leg.ticker, 0.0)
-                if oex <= _EPS or any(q.pending for q in self.basket_quotes(oid)):
-                    continue
-                k = o.tickers.index(leg.ticker)
-                same = o.legs[k].side == leg.side
-                qty = float(int(min(need[j] if same else excess[j], oex) + _EPS))
-                if qty < 1:
-                    continue
-                oheld = opos.held(o.tickers)
-                after, oafter = list(held), list(oheld)
-                after[j] += qty if same else -qty
-                oafter[k] -= qty
-                before = self._finish_cost(b, held) + self._finish_cost(o, oheld)
-                gain = before - (self._finish_cost(b, after) + self._finish_cost(o, oafter) - (0.0 if same else qty))
-                if not gain > CROSS_MIN_GAIN:
-                    continue
-                basis = opos.legs[leg.ticker].newest_cost(qty)
-                side = o.legs[k].side
-                self.journal({"kind": "cross", "basket_id": b.basket_id, "from": oid, "ticker": leg.ticker,
-                              "side": side, "size": qty, "cost": round(basis, 4),
-                              "gain": None if math.isinf(gain) else round(gain, 4)})
-                # The giver buys the other side at payout - cost: a $1 pair at its own cost.
-                self.exit_paid(oid, o, OTHER[side], leg.ticker, qty, qty - basis)
-                self._book(oid, leg.ticker, OTHER[side], qty, qty - basis, "cross", from_basket=b.basket_id)
-                self.exit_paid(b.basket_id, b, side, leg.ticker, qty, basis)
-                self._book(b.basket_id, leg.ticker, side, qty, basis, "cross", from_basket=oid)
-                self.n["crosses"] += 1
-                return True
-        return False
 
     def exit_tick(self, b: Basket, path: str, ex: pricing.Exits, legs, others) -> float:
         """The coarsest tick among the exit's orders at their prices: a cent,

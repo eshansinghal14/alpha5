@@ -32,7 +32,6 @@
     "chase_ticks": 2,
     "chase_window_s": 1.0,
     "max_exit_misses": 5,
-    "cross_baskets": true,
     "max_broken_baskets": 3
   },
   "watch": {

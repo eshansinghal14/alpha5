@@ -75,15 +75,22 @@ the election-night section below supersedes it where they differ.
   baskets); cancels have reason `pull`; summary counter `pulls`. Track over
   the next days: fills avoided vs fill_context control rows; score per
   category (sports only once they're re-enabled).
-- **Cross-basket exits** (`completion.cross_baskets`, on, dashboard): a
-  broken basket first tries to finish from other broken baskets' excess
-  on its markets. Same side of a leg it needs: the contracts move across
-  (journal `cross` row; the receiver books a fill at their cost, the giver
-  an unwind at payout - cost, pnl 0). Opposite sides (Kalshi already netted
-  the pair to $1): both close, the pair's pnl on the receiver. Only when
-  the two baskets' cost to finish at today's books drops by >= $0.01
-  (`CROSS_MIN_GAIN`). Nothing is traded at Kalshi; the audit's net
-  position is unchanged. Summary counter `crosses`.
+- **Cheapest-basket completion** (replaced a short-lived cross_baskets,
+  which the 11-02..04 data showed would never fire: breaks last ~0.06 s, so
+  two are never open on one market). An arb quote on a market side is
+  priced through whichever basket with that side allows the highest price
+  (`best_plan`, up to `MAX_ALTS` 8 others; `via` maps the quote to it and
+  that basket's book updates re-evaluate it). A fill is booked into the
+  basket whose finish cost rises least at fill time (`book_target`; fill
+  row `quoted_in` = the quoting basket, counter `alt_fills`), then completed
+  there as usual. Estimated upper bound from the data: ~$140 per 3 days
+  from completion alone, plus tighter quotes.
+- **Maker completion (option 1) rejected**: resting the needed legs lost in
+  every simulated rule; after our fill the needed legs' asks rise (non-live
+  +0.6-1c within seconds, our size almost never trades at the rest price;
+  live +2.5c). Exit fees + spread take ~78% of edge at mid (1.4c fees,
+  3.6c spread, 1.4c net per bundle, 11-02..04) - but our fills carry
+  information, so that spread isn't collectable. Scripts `~/an/tmp/mc*.py`.
 - **Ops gotchas** learned: put box scratch scripts in `~/an/tmp` (a
   `/tmp/re.py` shadowed the stdlib); stream journals line by line (loading
   every day OOM-killed a script); orders gz may read EOF mid-append, retry;
