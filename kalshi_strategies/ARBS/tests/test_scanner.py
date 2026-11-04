@@ -199,3 +199,14 @@ def test_live_window_by_category():
     assert all(not b.is_live(pd.Timestamp("2026-11-03T21:00:00Z")) for b in got.values())
     later = baskets(scanner.scan([vote], now=pd.Timestamp("2026-11-07", tz="UTC"), **args))
     assert not any(b.is_live(pd.Timestamp("2026-11-08", tz="UTC")) for b in later.values())
+
+
+def test_select_yields_lipfarm_events_unless_held():
+    a = event("A-1", "MECNET", [mkt("A-1-X"), mkt("A-1-Y")])
+    b = event("B-1", "MECNET", [mkt("B-1-X"), mkt("B-1-Y")])
+    doc = scanner.scan([a, b], now=NOW, mecnet_max_legs=6, ladder_span=3, complete_set_exclude=[], overrides={})
+    got = scanner.select(doc, now=NOW, days=90, max_markets=1000, yield_events={"A-1"})
+    assert [r["relationship_id"] for r in got["relationships"]] == ["mecnet:B-1"]
+    got = scanner.select(doc, now=NOW, days=90, max_markets=1000, yield_events={"A-1"},
+                         held={"mecnet:A-1:no:X+Y"})
+    assert {r["relationship_id"] for r in got["relationships"]} == {"mecnet:A-1", "mecnet:B-1"}

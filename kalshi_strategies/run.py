@@ -50,13 +50,14 @@ SERVICE_RESTART_S = 3.0
 
 
 def folders() -> dict[str, object]:
-    """Strategy folder name -> its module, for every folder defining SERIES."""
+    """Strategy folder name -> its module, for every folder defining SERIES
+    or dashboard-only EXTRA_PAGES (SERIES then an empty dict)."""
     out = {}
     for m in pkgutil.iter_modules(kalshi_strategies.__path__):
         if not m.ispkg:
             continue
         mod = importlib.import_module(f"kalshi_strategies.{m.name}")
-        if getattr(mod, "SERIES", None):
+        if getattr(mod, "SERIES", None) or getattr(mod, "EXTRA_PAGES", None):
             out[m.name] = mod
     return out
 

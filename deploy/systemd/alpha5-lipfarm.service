@@ -1,0 +1,21 @@
+[Unit]
+Description=alpha5 LIPFARM cheap-side LIP quoting (shadow; add --live to ExecStart for real orders)
+After=network-online.target chrony.service
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/opt/alpha5
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+ExecStart=/opt/alpha5/.venv/bin/python -u -m kalshi_strategies.LIPFARM.farm
+Nice=10
+KillSignal=SIGINT
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/opt/alpha5/data/live/lipfarm.out.log
+StandardError=append:/opt/alpha5/data/live/lipfarm.err.log
+
+[Install]
+WantedBy=multi-user.target

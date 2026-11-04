@@ -1,0 +1,494 @@
+"""
+LIP farmer. Rests one post-only bid of `lots` on the CHEAP side's touch
+(best bid <= `max_price`) of the `num_markets` LIP markets whose reward to
+us, at today's book, is highest in $/s. Never quotes the expensive side.
+
+    python -m kalshi_strategies.LIPFARM.farm            # shadow: no orders, accrues as if resting
+    python -m kalshi_strategies.LIPFARM.farm --live     # REAL MONEY
+
+Params in config.json (re-read every cycle). Journal in
+data/live/LIPFARM/<mode>/state.json survives restarts; status.json /
+status.csv hold the latest table. "Expected LIP" is our modelled share
+(lip.py) integrated over time, not what Kalshi pays: payouts under $1 per
+market-period are dropped, and others' size between our scans is unseen.
+
+ARBS: we never quote an event ARBS holds, has quoted, or hand-specs (its
+sweep and position audit cover those tickers). Live, everything else we want
+goes in claimed.json, ARBS's scan drops those events, and we quote one only
+once a selection written after the claim has loaded without it.
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures as cf
+import dataclasses
+import json
+import os
+import time
+import traceback
+import uuid
+
+import pandas as pd
+import urllib3
+
+from kalshi_backtest.core import Order
+from kalshi_infra import DATA_ROOT
+from kalshi_infra.api_functions import kalshi_get
+from kalshi_infra.trading import lip
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(HERE, "config.json")
+CID_PREFIX = "lipf-"
+BOOK_WORKERS = 8
+ARBS_ROOT = os.path.join(DATA_ROOT, "live", "ARBS")
+# Read by ARBS's scanner (ARBS.scanner.lipfarm_claimed): it selects no event here.
+CLAIMS_PATH = os.path.join(DATA_ROOT, "live", "LIPFARM", "live", "claimed.json")
+# After a claim, an ARBS selection must be written at least CLAIM_SETTLE_S
+# later (so its scan read the claim), and then RELOAD_S must pass for the ARBS
+# runner to load it and pull its quotes, before we quote there.
+CLAIM_SETTLE_S = 5.0
+RELOAD_S = 30.0
+
+
+@dataclasses.dataclass
+class Cfg:
+    num_markets: int
+    lots: float
+    max_price: float
+    scan_markets: int
+    refresh_s: float
+    programs_refresh_s: float
+
+    @classmethod
+    def load(cls) -> "Cfg":
+        with open(CONFIG_PATH) as f:
+            return cls(**json.load(f))
+
+
+@dataclasses.dataclass
+class Pick:
+    ticker: str
+    side: str
+    price: float
+    rate: float        # our $/s with `lots` resting at price
+    pool_rate: float   # whole program's $/s
+
+
+def parse_book(ob: dict) -> tuple[dict[float, float], dict[float, float]]:
+    """(yes bids, no bids) as price -> size. 4 dp: some markets quote 0.1c ticks."""
+    def side(rows):
+        return {round(float(p), 4): float(s) for p, s in rows or [] if float(s) > 0}
+    return side(ob.get("yes_dollars")), side(ob.get("no_dollars"))
+
+
+def levels(book: dict[float, float], price: float | None = None, size: float = 0.0) -> list[lip.LipLevel]:
+    acc = {p: [s, 0.0] for p, s in book.items()}
+    if price is not None and size > 0:
+        lv = acc.setdefault(round(price, 4), [0.0, 0.0])
+        lv[0] += size
+        lv[1] += size
+    return sorted((lip.LipLevel(price=p, size=v[0], mine=v[1]) for p, v in acc.items()),
+                  key=lambda lv: -lv.price)
+
+
+def rate_at(others: dict[str, dict[float, float]], side: str, price: float, size: float,
+            params: lip.LipParams) -> float:
+    """Our $/s with `size` at `price` on `side`, given others' books."""
+    y = levels(others["yes"], price, size) if side == "yes" else levels(others["yes"])
+    n = levels(others["no"], price, size) if side == "no" else levels(others["no"])
+    return lip.reward_rate(y, n, params)
+
+
+def best_pick(ticker: str, others: dict[str, dict[float, float]], params: lip.LipParams,
+              lots: float, max_price: float) -> Pick | None:
+    """Best cheap-side touch for `lots`, or None. Joins others' best bid (never
+    improves it); on an empty side, bids 0.01 if that doesn't cross."""
+    best = None
+    for side, opp in (("yes", "no"), ("no", "yes")):
+        book = others[side]
+        price = max(book) if book else 0.01
+        ask = 1.0 - max(others[opp]) if others[opp] else 1.0
+        if price > max_price + 1e-9 or price >= ask - 1e-9:
+            continue
+        r = rate_at(others, side, price, lots, params)
+        if r > 0 and (best is None or r > best.rate):
+            best = Pick(ticker, side, price, r, params.period_reward_usd / params.snapshots_per_period)
+    return best
+
+
+def event_of(ticker: str) -> str:
+    return ticker.rsplit("-", 1)[0]
+
+
+def _json(path: str):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def arbs_held_events() -> set[str]:
+    """Events ARBS keeps trading whatever its scan selects: held or shadow-held
+    baskets, any basket it ever quoted (set_baskets keeps those), the hand
+    spec. Its sweep cancels resting orders on these and its audit halts on a
+    position it didn't book, so we never quote them."""
+    tickers: set[str] = set()
+    for name in ("ledger.json", "ledger_shadow.json"):
+        for b in ((_json(os.path.join(ARBS_ROOT, name)) or {}).get("baskets") or {}).values():
+            tickers |= set(b.get("legs") or {})
+    for rec in (_json(os.path.join(ARBS_ROOT, "ledger_quote_ids.json")) or {}).values():
+        tickers.add(rec.get("ticker") or "")
+    try:
+        from kalshi_strategies.ARBS.config import SPEC_PATH
+        from kalshi_strategies.ARBS.spec import load_spec
+        tickers |= {t for b in load_spec(SPEC_PATH) for t in b.tickers}
+    except Exception:
+        pass
+    return {event_of(t) for t in tickers if t}
+
+
+def arbs_selected() -> tuple[float, set[str]]:
+    """(mtime, events) of ARBS's current scan selection; (0, {}) if none."""
+    path = os.path.join(ARBS_ROOT, "scanned_selected.json")
+    doc = _json(path)
+    if not doc:
+        return 0.0, set()
+    ev = {event_of(l["ticker"]) for r in doc.get("relationships", []) for b in r["baskets"] for l in b["legs"]}
+    return os.path.getmtime(path), ev
+
+
+def remove_ours(book: dict[float, float], price: float, size: float) -> dict[float, float]:
+    out = dict(book)
+    p = round(price, 4)
+    if p in out:
+        out[p] = max(out[p] - size, 0.0)
+    return {k: v for k, v in out.items() if v > 1e-9}
+
+
+class Farm:
+    def __init__(self, live: bool):
+        self.live = live
+        self.dir = os.path.join(DATA_ROOT, "live", "LIPFARM", "live" if live else "shadow")
+        os.makedirs(self.dir, exist_ok=True)
+        self.state_path = os.path.join(self.dir, "state.json")
+        self.state = self._load_state()
+        self.programs: dict[str, dict] = {}
+        self.meta: dict[str, dict] = {}
+        self.clients: dict[int, object] = {}
+        self.books: dict[str, dict[str, dict[float, float]]] = {}
+        self.picks: dict[str, Pick] = {}
+        self.rates: dict[str, float] = {}       # ticker -> our current $/s for the resting order
+        self.held_events: set[str] = set()
+        self.waiting: list[str] = []
+        self.last_programs = 0.0
+        self.last_accrue = time.time()
+
+    # ---- persistence ----
+    def _load_state(self) -> dict:
+        if os.path.exists(self.state_path):
+            with open(self.state_path) as f:
+                return json.load(f)
+        return {"t0": time.time(), "orders": {}, "fills": [], "trade_ids": [], "accrued": {}}
+
+    def _save(self):
+        tmp = self.state_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.state, f)
+        os.replace(tmp, self.state_path)
+
+    # ---- exchange ----
+    def client(self, shard: int):
+        if shard not in self.clients:
+            from kalshi_infra.kalshi.orders import KalshiOrderClient
+            c = KalshiOrderClient.from_account(shard)
+            c.price_dp = 4
+            self.clients[shard] = c
+        return self.clients[shard]
+
+    def _fetch_meta(self, tickers):
+        tickers = [t for t in tickers]
+        for i in range(0, len(tickers), 100):
+            data = kalshi_get("/trade-api/v2/markets", params={"tickers": ",".join(tickers[i:i + 100]),
+                                                               "limit": 1000})
+            for m in data.get("markets", []):
+                self.meta[m["ticker"]] = m
+
+    def shard(self, ticker: str) -> int:
+        if ticker not in self.meta:
+            self._fetch_meta([ticker])
+        return int(self.meta[ticker].get("exchange_index") or 0)
+
+    def refresh_programs(self, cfg: Cfg):
+        out, cursor = {}, None
+        now = pd.Timestamp.now(tz="UTC")
+        while True:
+            params = {"status": "active", "limit": 1000}
+            if cursor:
+                params["cursor"] = cursor
+            data = kalshi_get("/trade-api/v2/incentive_programs", params=params, auth=True)
+            batch = data.get("incentive_programs", [])
+            for p in batch:
+                if p.get("incentive_type") == "liquidity" and pd.Timestamp(p["end_date"]) > now:
+                    out[p["market_ticker"]] = p
+            cursor = data.get("next_cursor") or data.get("cursor")
+            if not cursor or not batch:
+                break
+        self.programs = out
+        self.last_programs = time.time()
+
+    def candidates(self, cfg: Cfg) -> list[str]:
+        """Top `scan_markets` by pool $/s, plus every market we rest or hold in."""
+        def pool(p):
+            P = lip.params_from_program(p)
+            return P.period_reward_usd / P.snapshots_per_period
+        top = sorted(self.programs, key=lambda t: -pool(self.programs[t]))[:cfg.scan_markets]
+        return list(dict.fromkeys(top + list(self.state["orders"])))
+
+    def scan(self, cfg: Cfg):
+        tickers = self.candidates(cfg)
+
+        def one(t):
+            try:
+                return t, kalshi_get(f"/trade-api/v2/markets/{t}/orderbook").get("orderbook_fp", {})
+            except Exception:
+                return t, None
+        with cf.ThreadPoolExecutor(BOOK_WORKERS) as ex:
+            got = list(ex.map(one, tickers))
+        picks, rates, books = {}, {}, {}
+        self.held_events = arbs_held_events()
+        for t, ob in got:
+            if ob is None or t not in self.programs:
+                continue
+            yes, no = parse_book(ob)
+            others = {"yes": yes, "no": no}
+            mine = self.state["orders"].get(t)
+            # The REST book includes our live order; a shadow one isn't there.
+            if mine and self.live:
+                others[mine["side"]] = remove_ours(others[mine["side"]], mine["price"], mine["remaining"])
+            books[t] = others
+            P = lip.params_from_program(self.programs[t])
+            if mine:
+                rates[t] = rate_at(others, mine["side"], mine["price"], mine["remaining"], P)
+            pk = None if event_of(t) in self.held_events else best_pick(t, others, P, cfg.lots, cfg.max_price)
+            if pk:
+                picks[t] = pk
+        self.books, self.picks, self.rates = books, picks, rates
+
+    def sync_live_orders(self):
+        """Drop journaled orders Kalshi no longer has resting (filled, or the market closed)."""
+        if not self.live or not self.state["orders"]:
+            return
+        c = self.client(0)
+        resting = {oid for oid, _, _ in c._resting("")}
+        for t, o in list(self.state["orders"].items()):
+            if o["oid"] not in resting:
+                del self.state["orders"][t]
+
+    def cancel_strays(self):
+        """Cancel our resting orders left by an earlier run (client id prefix)."""
+        c = self.client(0)
+        for oid, ticker, cid in c._resting(""):
+            if cid and cid.startswith(CID_PREFIX):
+                try:
+                    self.client(self.shard(ticker)).cancel(oid, ticker)
+                except Exception as e:
+                    print(f"stray cancel {ticker}: {e}")
+        self.state["orders"] = {}
+
+    def cancel(self, ticker: str):
+        o = self.state["orders"].pop(ticker, None)
+        if o and self.live:
+            try:
+                self.client(self.shard(ticker)).cancel(o["oid"], ticker)
+            except Exception as e:
+                print(f"cancel {ticker}: {e}")
+
+    def place(self, pk: Pick, lots: float):
+        if self.live:
+            order = Order(order_id=0, ticker=pk.ticker, side=pk.side, order_type="limit",
+                          price=pk.price, size=lots, decision_time=pd.Timestamp.now(tz="UTC"),
+                          intent="quote")
+            order.client_order_id = CID_PREFIX + uuid.uuid4().hex[:24]
+            try:
+                ack = self.client(self.shard(pk.ticker)).place_resting(order)
+            except Exception as e:
+                print(f"place {pk.ticker} {pk.side}@{pk.price}: {e}")
+                return
+            oid = ack.exchange_order_id
+        else:
+            oid = "shadow-" + uuid.uuid4().hex[:12]
+        self.state["orders"][pk.ticker] = {"oid": oid, "side": pk.side, "price": pk.price,
+                                           "size": lots, "remaining": lots, "placed": time.time()}
+        self.rates[pk.ticker] = pk.rate
+
+    def write_claims(self, want: dict[str, Pick]):
+        """Claim what we want, rest on, or hold (until it settles); keep each
+        ticker's first-claim time, which the placement gate waits on."""
+        held = {f["ticker"] for f in self.state["fills"]
+                if not (self.meta.get(f["ticker"], {}).get("result") or "")}
+        now = time.time()
+        old = self.state.setdefault("claims", {})
+        claims = {t: old.get(t, now) for t in set(want) | set(self.state["orders"]) | held}
+        self.state["claims"] = claims
+        tmp = CLAIMS_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"written_at": now, "tickers": sorted(claims)}, f)
+        os.replace(tmp, CLAIMS_PATH)
+
+    def reconcile(self, cfg: Cfg):
+        want = sorted(self.picks.values(), key=lambda p: -p.rate)[:cfg.num_markets]
+        want = {p.ticker: p for p in want}
+        if self.live:
+            self.write_claims(want)
+            sel_t, sel_ev = arbs_selected()
+            now = time.time()
+
+            def ready(t: str) -> bool:
+                c = self.state["claims"].get(t)
+                return (c is not None and sel_t > c + CLAIM_SETTLE_S and now > sel_t + RELOAD_S
+                        and event_of(t) not in sel_ev)
+        else:
+            # Shadow writes no claims (ARBS keeps trading as is) and shows
+            # what live would quote once ARBS has given way.
+            def ready(t: str) -> bool:
+                return True
+        self.waiting = [t for t in want if not ready(t)]
+        for t, o in list(self.state["orders"].items()):
+            pk = want.get(t)
+            stale = (pk is None or pk.side != o["side"] or abs(pk.price - o["price"]) > 1e-9
+                     or o["remaining"] < 0.5 * cfg.lots or not ready(t))
+            if stale:
+                self.cancel(t)
+        for t, pk in want.items():
+            if t not in self.state["orders"] and ready(t):
+                self.place(pk, cfg.lots)
+
+    def poll_fills(self):
+        if not self.live or not self.clients:
+            return
+        ours = {o["oid"]: t for t, o in self.state["orders"].items()}
+        known = set(self.state.get("all_oids", []))
+        known |= set(ours)
+        self.state["all_oids"] = sorted(known)
+        seen = set(self.state["trade_ids"])
+        c = next(iter(self.clients.values()))
+        for f in c.fills("", min_ts=int(self.state["t0"]) - 60):
+            if f["order_id"] not in known or f["trade_id"] in seen:
+                continue
+            seen.add(f["trade_id"])
+            self.state["fills"].append(f)
+            t = ours.get(f["order_id"])
+            if t:
+                self.state["orders"][t]["remaining"] = max(self.state["orders"][t]["remaining"] - f["size"], 0.0)
+        self.state["trade_ids"] = sorted(seen)
+
+    def accrue(self):
+        now = time.time()
+        dt = now - self.last_accrue
+        self.last_accrue = now
+        for t in self.state["orders"]:
+            self.state["accrued"][t] = self.state["accrued"].get(t, 0.0) + self.rates.get(t, 0.0) * dt
+
+    # ---- report ----
+    def positions(self) -> list[dict]:
+        pos: dict[tuple, dict] = {}
+        for f in self.state["fills"]:
+            p = pos.setdefault((f["ticker"], f["side"]), {"ticker": f["ticker"], "side": f["side"],
+                                                          "lots": 0.0, "cost": 0.0, "fees": 0.0})
+            p["lots"] += f["size"]
+            p["cost"] += f["size"] * f["price"]
+            p["fees"] += f["fee"] or 0.0
+        if pos:
+            self._fetch_meta(sorted({t for t, _ in pos}))
+        for (t, side), p in pos.items():
+            m = self.meta.get(t, {})
+            res = m.get("result")
+            if res in ("yes", "no"):
+                mark = 1.0 if res == side else 0.0
+            else:
+                # Liquidation value: best bid on our side.
+                mark = float(m.get(f"{side}_bid_dollars") or 0.0)
+            p["mark"] = mark
+            p["value"] = p["lots"] * mark
+            p["pnl"] = p["value"] - p["cost"] - p["fees"]
+        return list(pos.values())
+
+    def report(self, cfg: Cfg):
+        rows = []
+        for t, o in sorted(self.state["orders"].items(), key=lambda kv: -self.rates.get(kv[0], 0.0)):
+            pk = self.picks.get(t)
+            rows.append({"ticker": t, "side": o["side"], "price": o["price"], "resting": o["remaining"],
+                         "our_usd_day": self.rates.get(t, 0.0) * 86400,
+                         "pool_usd_day": (pk.pool_rate if pk else 0.0) * 86400,
+                         "exp_lip_usd": self.state["accrued"].get(t, 0.0)})
+        pos = self.positions()
+        tot_lip = sum(self.state["accrued"].values())
+        fill_pnl = sum(p["pnl"] for p in pos)
+        at_risk = sum(o["price"] * o["remaining"] for o in self.state["orders"].values())
+        hrs = (time.time() - self.state["t0"]) / 3600
+        summary = {"mode": "LIVE" if self.live else "shadow", "hours": hrs, "quoting": len(rows),
+                   "our_usd_day_now": sum(r["our_usd_day"] for r in rows), "exp_lip_usd": tot_lip,
+                   "fills": len(self.state["fills"]), "fill_lots": sum(p["lots"] for p in pos),
+                   "fill_pnl_usd": fill_pnl, "net_usd": tot_lip + fill_pnl, "resting_cost_usd": at_risk,
+                   "waiting_on_arbs": len(self.waiting), "arbs_events_skipped": len(self.held_events),
+                   "updated_at": time.time()}
+        with open(os.path.join(self.dir, "status.json"), "w") as f:
+            json.dump({"summary": summary, "quotes": rows, "positions": pos, "waiting": self.waiting}, f, indent=1)
+        pd.DataFrame(rows).to_csv(os.path.join(self.dir, "status.csv"), index=False)
+
+        print(f"\n=== LIPFARM {summary['mode']} {pd.Timestamp.now(tz='UTC'):%Y-%m-%d %H:%M:%S}Z "
+              f"| {hrs:.2f}h | quoting {len(rows)} | now ${summary['our_usd_day_now']:.0f}/day "
+              f"| exp LIP ${tot_lip:.2f} | fills {summary['fills']} pnl ${fill_pnl:+.2f} "
+              f"| net ${summary['net_usd']:+.2f} | resting ${at_risk:.0f}")
+        print(f"{'ticker':44} {'side':4} {'px':>6} {'rest':>6} {'$/day':>7} {'pool/d':>7} {'expLIP':>8}")
+        for r in rows:
+            print(f"{r['ticker']:44} {r['side']:4} {r['price']:6.3f} {r['resting']:6.0f} "
+                  f"{r['our_usd_day']:7.1f} {r['pool_usd_day']:7.1f} {r['exp_lip_usd']:8.2f}")
+        if pos:
+            print(f"{'fills: ticker':44} {'side':4} {'lots':>6} {'cost':>7} {'mark':>6} {'pnl':>8}")
+            for p in pos:
+                print(f"{p['ticker']:44} {p['side']:4} {p['lots']:6.0f} {p['cost']:7.2f} "
+                      f"{p['mark']:6.3f} {p['pnl']:+8.2f}")
+
+    # ---- loop ----
+    def run(self):
+        if self.live:
+            self.cancel_strays()
+        try:
+            while True:
+                cfg = Cfg.load()
+                t0 = time.time()
+                try:
+                    if time.time() - self.last_programs > cfg.programs_refresh_s:
+                        self.refresh_programs(cfg)
+                    self.poll_fills()
+                    self.sync_live_orders()
+                    self.accrue()
+                    self.scan(cfg)
+                    self.reconcile(cfg)
+                    self.report(cfg)
+                    self._save()
+                except Exception:
+                    traceback.print_exc()
+                time.sleep(max(cfg.refresh_s - (time.time() - t0), 1.0))
+        except KeyboardInterrupt:
+            print("stopping: cancelling quotes")
+        finally:
+            self.accrue()
+            for t in list(self.state["orders"]):
+                self.cancel(t)
+            self._save()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--live", action="store_true", help="place real orders")
+    a = ap.parse_args()
+    Farm(live=a.live).run()
+
+
+if __name__ == "__main__":
+    main()

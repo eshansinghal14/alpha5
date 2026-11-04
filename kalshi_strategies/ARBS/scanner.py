@@ -260,10 +260,12 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
 
 
 def select(doc: dict, *, now: pd.Timestamp, days: float, max_markets: int, known_tickers: set[str] = frozenset(),
-           held: set[str] = frozenset(), exclude: set[str] = frozenset()) -> dict:
+           held: set[str] = frozenset(), exclude: set[str] = frozenset(),
+           yield_events: set[str] = frozenset()) -> dict:
     """The part of a scan to trade: relationships settling within `days`, the
     most traded first, until max_markets markets beyond `known_tickers`.
-    Relationships holding a basket in `held` are always kept."""
+    Relationships holding a basket in `held` are always kept; otherwise one
+    with a leg in `yield_events` (another strategy's) is skipped."""
     horizon = now + pd.Timedelta(days=days)
     out, used = [], set()
     for r in sorted(doc["relationships"], key=lambda r: -(r.get("volume_24h") or 0.0)):
@@ -275,10 +277,24 @@ def select(doc: dict, *, now: pd.Timestamp, days: float, max_markets: int, known
         s = r.get("expected_settlement_utc")
         if (s and pd.Timestamp(s) > horizon) or r.get("cluster") in exclude:
             continue
+        if yield_events and any(t.rsplit("-", 1)[0] in yield_events for t in ts):
+            continue
         if len(used | ts) <= max_markets:
             out.append(r)
             used |= ts
     return {**doc, "relationships": out}
+
+
+def lipfarm_claimed(root: str) -> set[str]:
+    """Events LIPFARM (live) claims, from its claimed.json beside our root.
+    Its scan of us waits for a selection written after its claim, so this has
+    to be read at select time, not at scan start."""
+    path = os.path.join(os.path.dirname(root), "LIPFARM", "live", "claimed.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return {t.rsplit("-", 1)[0] for t in json.load(fh).get("tickers") or []}
+    except (OSError, ValueError):
+        return set()
 
 
 def other_series() -> set[str]:
@@ -337,7 +353,7 @@ def scan_and_select(root: str) -> dict:
     doc = run(cfg, hand, os.path.join(root, "scanned_spec.json"), held)
     sel = select(doc, now=pd.Timestamp.now(tz="UTC"), days=cfg.trading.days_till_expiry,
                  max_markets=cfg.scan.max_markets, known_tickers={t for b in load_spec(SPEC_PATH) for t in b.tickers},
-                 held=held, exclude=set(cfg.watch.exclude))
+                 held=held, exclude=set(cfg.watch.exclude), yield_events=lipfarm_claimed(root))
     atomic_write_json(os.path.join(root, SELECTED), sel, indent=None)
     return {"listed_markets": doc["n_markets"], "selected_relationships": len(sel["relationships"])}
 
