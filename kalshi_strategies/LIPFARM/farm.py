@@ -4,9 +4,10 @@ cycle from today's book:
 
   wide     the yes/no spread is at least `wide_spread`: one bid of `lots` at
            each side's touch, owning both halves of a thin book.
-  decided  the expensive side's best bid is in [decided_min, decided_max]:
-           one bid of `lots` there only (fills gain the last cents; the risk
-           is a reversal). At 0.99 a side earns no LIP, so decided_max <= 0.98.
+  decided  the expensive side's best bid is at least decided_min: one bid of
+           `lots` there only (fills gain the last cents; the risk is a
+           reversal). A bid at the market's top price (0.99, or 0.999 on 0.1c
+           ticks) earns no LIP; the scorer rules those out.
 
 Every side must reach Kalshi's Target size, ours included where we quote and
 from others alone where we don't, or the snapshot pays nobody. Markets are
@@ -105,9 +106,7 @@ class Cfg:
     wide_spread: float = param("Wide: quote both sides at the touch when ask - bid is at least this.",
                                min=0.01, max=0.98, step=0.01)
     decided_min: float = param("Decided: quote the expensive side when its best bid is at least this.",
-                               min=0.5, max=0.98, step=0.01)
-    decided_max: float = param("Decided: ... and at most this (0.99 earns no LIP).", min=0.5, max=0.98,
-                               step=0.01)
+                               min=0.5, max=0.999, step=0.01)
     min_ahead: float = param("Quote a side only where others already rest at least this many contracts at our "
                              "price (they are filled before us). 0 = may be alone.", min=0.0, step=100.0)
     max_position: float = param("Stop quoting a side once we hold this many contracts of it.", min=0.0,
@@ -189,7 +188,7 @@ def plan_market(ticker: str, others: dict[str, dict[float, float]], params: lip.
         return None
     by, bn = max(others["yes"]), max(others["no"])
     hi_side, hi = ("yes", by) if by >= bn else ("no", bn)
-    if cfg.decided_min - 1e-9 <= hi <= cfg.decided_max + 1e-9:
+    if hi >= cfg.decided_min - 1e-9:
         mode, legs = "decided", [(hi_side, hi)]
     elif 1.0 - by - bn >= cfg.wide_spread - 1e-9:
         mode, legs = "wide", [("yes", by), ("no", bn)]

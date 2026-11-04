@@ -1,3 +1,4 @@
+import dataclasses
 """
 LIP scorer tests.
 
@@ -250,3 +251,13 @@ def test_ticks_count_the_markets_own_grid():
     tapered = ((0.0, 0.1, 0.001), (0.1, 0.9, 0.01), (0.9, 1.0, 0.001))
     assert ticks_between(0.012, 0.010, tapered) == 2
     assert ticks_between(0.12, 0.095, tapered) == 7
+
+
+def test_top_price_is_the_markets_own():
+    from kalshi_infra.trading.lip import LipLevel, LipParams, _score_side
+    lv = [LipLevel(price=0.99, size=2000.0, mine=0.0)]
+    cent = LipParams(target_size=1000.0, discount_factor=0.5, period_reward_usd=1.0, snapshots_per_period=1)
+    assert not _score_side(lv, cent).qualifies
+    tapered = dataclasses.replace(cent, price_ranges=((0.0, 0.1, 0.001), (0.1, 0.9, 0.01), (0.9, 1.0, 0.001)))
+    assert _score_side(lv, tapered).qualifies
+    assert not _score_side([LipLevel(price=0.999, size=2000.0, mine=0.0)], tapered).qualifies

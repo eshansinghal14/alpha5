@@ -111,8 +111,9 @@ def _score_side(levels: list[LipLevel], params: LipParams) -> LipSideScore:
     describe.
     """
     # The filing gives a side no qualifying bids if its best bid is at the
-    # highest possible price.
-    if not levels or levels[0].price >= MAX_PRICE - 1e-9:
+    # highest possible price: 0.99, or 0.999 where the market ticks 0.1c up there.
+    top = max((end - step for _, end, step in params.price_ranges), default=MAX_PRICE)
+    if not levels or levels[0].price >= top - 1e-9:
         return LipSideScore(reference_price=None, our_raw_score=0.0,
                             all_raw_score=0.0, our_share=0.0, qualifies=False,
                             levels_in_window=[])

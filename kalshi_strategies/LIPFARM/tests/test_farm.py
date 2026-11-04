@@ -8,7 +8,7 @@ from kalshi_strategies.LIPFARM import farm
 from kalshi_strategies.LIPFARM.farm import parse_book, plan_market, remove_ours
 
 P = lip.LipParams(target_size=1000, discount_factor=0.5, period_reward_usd=86.4, snapshots_per_period=86400)
-CFG = farm.Cfg(max_capital=5000, num_markets=5, lots=1000, wide_spread=0.20, decided_min=0.97, decided_max=0.98,
+CFG = farm.Cfg(max_capital=5000, num_markets=5, lots=1000, wide_spread=0.20, decided_min=0.97,
                min_ahead=0.0, max_position=1e9, scan_markets=1, refresh_s=30,
                programs_refresh_s=600)
 
@@ -26,7 +26,9 @@ def test_decided_needs_the_other_side_to_qualify_on_others_alone():
 
 
 def test_no_plan_at_99_or_in_between():
-    assert plan_market("T", {"yes": {0.99: 200.0}, "no": {0.005: 5000.0}}, P, CFG) is None
+    assert plan_market("T", {"yes": {0.99: 200.0}, "no": {0.005: 5000.0}}, P, CFG) is None   # top price
+    tapered = dataclasses.replace(P, price_ranges=((0.0, 0.1, 0.001), (0.1, 0.9, 0.01), (0.9, 1.0, 0.001)))
+    assert plan_market("T", {"yes": {0.99: 200.0}, "no": {0.005: 5000.0}}, tapered, CFG).legs == (("yes", 0.99),)
     assert plan_market("T", {"yes": {0.60: 5000.0}, "no": {0.30: 5000.0}}, P, CFG) is None   # 10c spread
 
 
