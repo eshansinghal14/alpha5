@@ -153,6 +153,10 @@ ORDER_GROUP_WINDOW_S = 15.0
 # A group with nothing resting in it this long is deleted.
 ORDER_GROUP_IDLE_S = 600.0
 PULL_BATCH = 20
+# After an exit IOC misses, the next try waits EXIT_RETRY_S, doubling per
+# consecutive miss up to EXIT_RETRY_MAX_S: retried on every book update, one
+# SENATETX combo exit sent 27 IOCs in 0.7 s (11-04 01:06 UTC).
+EXIT_RETRY_S, EXIT_RETRY_MAX_S = 0.05, 1.0
 
 
 class _Rate:
@@ -325,6 +329,10 @@ class ArbsRunner:
         # paths and over time anyway.
         self.exit_hist: dict[str, collections.deque] = {}
         self.exit_planned: dict[str, float] = {}  # exit cost the fill or take was priced at
+        # basket_id -> [exit fills' cash since the plan, bundles held then]:
+        # puts a partly done exit's cost back on the plan's basis.
+        self.exit_base: dict[str, list[float]] = {}
+        self.exit_misses: dict[str, tuple[int, float]] = {}  # basket_id -> (consecutive missed exits, last)
         self.order_errors = 0
         self.unbooked: set[str] = set()                  # settled but unbookable, alerted once
         self.halt: str | None = None                     # until restart
@@ -989,10 +997,40 @@ class ArbsRunner:
     def seed_exit(self, basket_id: str, planned: float):
         """Start a basket's chase history at the exit cost it was priced
         against: a fill usually lands in the same burst that moves the other
-        legs, so a history begun at the fill would miss that move."""
+        legs, so a history begun at the fill would miss that move. A further
+        fill while broken adds its planned cost to the plan and the history."""
         if basket_id not in self.exit_hist:
             self.exit_hist[basket_id] = collections.deque([(time.time(), planned)])
             self.exit_planned[basket_id] = planned
+            pos = self.ledger.baskets.get(basket_id)
+            b = self.baskets[basket_id]
+            self.exit_base[basket_id] = [0.0, pos.bundles(b.tickers) if pos else 0.0]
+        elif basket_id in self.exit_planned:
+            self.exit_planned[basket_id] += planned
+            self.exit_hist[basket_id] = collections.deque((t, v + planned) for t, v in self.exit_hist[basket_id])
+
+    def exit_paid(self, basket_id: str, b: Basket, side: str, ticker: str, size: float, cost: float):
+        """Count an exit fill's cash toward the plan basis: a bought other side
+        nets to $1 a pair at once."""
+        base = self.exit_base.get(basket_id)
+        if base is not None:
+            unwind = any(l.ticker == ticker and l.side != side for l in b.legs)
+            base[0] += cost - (size if unwind else 0.0)
+
+    def exit_cost(self, b: Basket, pos, loss: float) -> float:
+        """What finishing from here costs, on the basis exit_planned was priced
+        on: exits.loss is net of today's broken_spent, which a partial
+        completion raises (and a completed bundle lowers), so a retry read
+        dollars better or worse than plan that it wasn't."""
+        cost = loss - pos.broken_spent(b.tickers)
+        base = self.exit_base.get(b.basket_id)
+        if base is None:
+            return cost
+        return cost + base[0] - b.payout * (pos.bundles(b.tickers) - base[1])
+
+    def end_exit(self, basket_id: str):
+        for d in (self.exit_hist, self.exit_planned, self.exit_base, self.exit_misses):
+            d.pop(basket_id, None)
 
     def _quote_fill(self, q: Quote, size: float, cost: float, trade_id, source: str, exch_t: float | None = None):
         q.filled += size
@@ -1007,7 +1045,9 @@ class ArbsRunner:
             # Priced so the other legs cost payout - edge - this leg's cost a bundle.
             m = self.meta.get(q.ticker)
             per = q.edge + pricing.maker_cost(q.price, (m.maker_rate if m else None) or 0.0)
-            self.seed_exit(q.basket_id, -per * q.filled)
+            self.seed_exit(q.basket_id, -per * size)
+        elif q.kind in ("complete", "unwind"):
+            self.exit_paid(q.basket_id, self.baskets[q.basket_id], q.side, q.ticker, size, cost)
         self.urgent.add(q.basket_id)
         self.n["quote_fills"] += 1
         self._book(q.basket_id, q.ticker, q.side, size, cost, "deep" if q.deep else "quote", source=source,
@@ -1259,8 +1299,7 @@ class ArbsRunner:
         if pos is not None and pos.unhedged(b.tickers):
             self.resolve(b, pos, qs, now)
             return
-        self.exit_hist.pop(b.basket_id, None)
-        self.exit_planned.pop(b.basket_id, None)
+        self.end_exit(b.basket_id)
         if any(q.kind != "arb" for q in live_qs):
             self.spawn(self.cancel_quotes([q for q in live_qs if q.kind != "arb"], "whole"), b.basket_id)
             return
@@ -1602,7 +1641,7 @@ class ArbsRunner:
                                          f"{self.completion_note[bid]['excess']} (broken {age:.0f}s)")
             return
         path, loss = pick
-        cost = loss - pos.broken_spent(b.tickers)
+        cost = self.exit_cost(b, pos, loss)
         hist = self.exit_hist.setdefault(bid, collections.deque())
         hist.append((now, cost))
         while hist and hist[0][0] < now - c.chase_window_s:
@@ -1625,7 +1664,11 @@ class ArbsRunner:
             # A missed IOC leaves our book showing the level it missed until
             # Kalshi's update lands; retrying before that fires at it again.
             sig = (tuple(self.book_seq.get(t, 0) for t in b.tickers), tuple(pos.held(b.tickers)))
-            if self.last_exit.get(bid) != sig:
+            miss = self.exit_misses.get(bid)
+            wait = 0.0 if miss is None else min(EXIT_RETRY_MAX_S, EXIT_RETRY_S * 2 ** (miss[0] - 1)) - (now - miss[1])
+            if wait > 0:
+                self.later(bid, wait)
+            elif self.last_exit.get(bid) != sig:
                 self.last_exit[bid] = sig
                 self.spawn(self.exit_now(b, path, ex, legs, others, qs, cost, why), bid)
 
@@ -1674,17 +1717,24 @@ class ArbsRunner:
             res = res[:len(orders)]
         finally:
             self.release(held)
-        for (_, t, sd, _, _, _), (fill, exc) in zip(orders, res):
+        missed = False
+        for (_, t, sd, n, _, _), (fill, exc) in zip(orders, res):
             if exc is not None:
                 self._ioc_exc(b, t, exc, path)
-            if fill is not None and fill.size > 0:
-                self._book(bid, t, sd, fill.size, fill.price * fill.size + fill.fee, path,
-                           order_id=fill.exchange_order_id)
+            got = fill.size if fill is not None else 0.0
+            missed = missed or got < n - _EPS
+            if got > 0:
+                paid = fill.price * fill.size + fill.fee
+                self.exit_paid(bid, b, sd, t, fill.size, paid)
+                self._book(bid, t, sd, fill.size, paid, path, order_id=fill.exchange_order_id)
+        if missed:
+            self.exit_misses[bid] = (self.exit_misses.get(bid, (0, 0.0))[0] + 1, time.time())
+        else:
+            self.exit_misses.pop(bid, None)
         pos = self.ledger.baskets.get(bid)
         if pos is None or not pos.unhedged(b.tickers):
             self.completion_note.pop(bid, None)
-            self.exit_hist.pop(bid, None)
-            self.exit_planned.pop(bid, None)
+            self.end_exit(bid)
             self.last_exit.pop(bid, None)
             self.journal({"kind": "completed", "basket_id": bid, "path": path})
 

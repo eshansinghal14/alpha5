@@ -510,6 +510,7 @@ def test_missed_exit_retries_only_after_the_book_changes(arbs):
         return None, None
     r._ioc = miss
     _eval(r, b)
+    r.exit_misses.pop(b.basket_id)                   # past the backoff
     _eval(r, b)                                      # same book: no second IOC at the level that missed
     assert len(sent) == 1
     r._on_quote(type("V", (), {"ticker": "X-A", "ask": 0.7, "ask_depth": 1, "bid": 0.3, "bid_depth": 1})())
@@ -656,6 +657,63 @@ def test_chase_ignores_what_older_bundles_cost(arbs):
     _eval(r, b)
     note = r.summary()["holdings"][0]["completion"]
     assert note["action"] == "rest" and note["why"] is None
+
+
+def _filled_a(r, b):
+    # A quote on A fills 10 at 0.40, priced against B's 0.50 ask.
+    q = R.Quote(basket_id=b.basket_id, leg=0, ticker="X-A", side="yes", price=0.40, size=10, cid="c",
+                edge=1 - 0.40 - R.pricing.taker_cost(0.50, 0.07), max_price=0.40, pending=False)
+    r.quotes[q.key] = q
+    r._quote_fill(q, 10, 4.0, None, "shadow")
+
+
+def test_partial_completion_retry_is_scored_against_the_plan(arbs):
+    r, b = arbs
+    rows = []
+    r.journal = rows.append
+    book(r, "X-A", [(0.30, 10)], [(0.55, 10)])
+    book(r, "X-B", [(0.45, 10)], [(0.50, 10)])
+    _filled_a(r, b)
+    real, sent = r._ioc, []
+
+    async def ioc(ticker, side, limit, size, reason, view):
+        fill, exc = await real(ticker, side, limit, size, reason, view)
+        sent.append(size)
+        if len(sent) == 1:                           # the first IOC gets 4 of its 10
+            fill = dataclasses.replace(fill, size=4.0, fee=fill.fee * 0.4)
+        return fill, exc
+    r._ioc = ioc
+    _eval(r, b)
+    r.exit_misses.pop(b.basket_id)                   # past the backoff
+    _eval(r, b)
+    exits = [x for x in rows if x["kind"] == "complete"]
+    assert [x["orders"]["X-B"][1] for x in exits] == [10.0, 6.0]
+    # Same price as planned both times; net of today's broken cost alone, the
+    # retry missed the 4 completed bundles' cost and payout.
+    assert all(abs(x["vs_plan"]) < 0.01 for x in exits)
+    assert not r.shadow_ledger.baskets[b.basket_id].unhedged(b.tickers)
+
+
+def test_missed_exit_backs_off_before_retrying(arbs):
+    r, b = arbs
+    b = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
+    r.set_baskets([b])
+    book(r, "X-A", [(0.30, 10)], [(0.55, 10)])
+    book(r, "X-B", [(0.45, 10)], [(0.50, 10)])
+    _filled_a(r, b)
+    sent = []
+
+    async def ioc(ticker, side, limit, size, reason, view):
+        sent.append(ticker)
+        return None, None                            # the level was gone
+    r._ioc = ioc
+    _eval(r, b)
+    r.book_seq["X-B"] = 1                            # a new book update
+    _eval(r, b)
+    assert len(sent) == 1 and r.exit_misses[b.basket_id][0] == 1
+    r.exit_misses[b.basket_id] = (1, time.time() - R.EXIT_RETRY_S - 0.01)
+    _eval(r, b)
+    assert len(sent) == 2 and r.exit_misses[b.basket_id][0] == 2
 
 
 def test_audit_ignores_a_determined_market_kalshi_hasnt_paid_out(arbs):
