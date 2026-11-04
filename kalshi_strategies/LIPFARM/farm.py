@@ -71,6 +71,10 @@ MOVE_RESERVE = 0.8
 # once per MOVE_MIN_S, at most MAX_MOVES per pass: <= 5 * 12 / 5 s = 12
 # tokens/s, 4% of the bucket, and only while MOVE_RESERVE of it is spare.
 GUARD_S = 5.0
+# A market the guard pulled isn't re-quoted for this long: its offer was
+# flickering in and out of min_spread, and the 30 s cycle re-placed it into
+# the next flicker (STL, JOHN 11-04 19:19).
+GUARD_COOLDOWN_S = 300.0
 MOVE_MIN_S = 10.0
 MOVE_BEHIND_FRAC = 0.2
 MAX_MOVES = 5
@@ -434,6 +438,7 @@ class Farm:
             if pk is None or pk.side != o["side"]:
                 print(f"guard: pull {t} {o['side']}@{o['price']} (fails the filters now)")
                 self.cancel(t, reason="lipfarm:guard")
+                self.state.setdefault("cooldown", {})[t] = time.time() + GUARD_COOLDOWN_S
                 continue
             self.books[t] = others
             self.rates[t] = rate_at(others, o["side"], o["price"], o["remaining"], P)
@@ -499,7 +504,8 @@ class Farm:
 
         def left(t):
             return max(pd.Timestamp(self.programs[t]["end_date"]).timestamp() - now, 0.0)
-        cands = [p for p in self.picks.values() if p.ticker in self.programs
+        cool = self.state.setdefault("cooldown", {})
+        cands = [p for p in self.picks.values() if p.ticker in self.programs and cool.get(p.ticker, 0.0) <= now
                  and self.period_accrued(p.ticker) + p.rate * left(p.ticker) >= LIP_MIN_PAYOUT_USD]
         held = set(self.state["orders"])
         locked = sorted((p for p in cands if p.ticker in held and self.period_accrued(p.ticker) < LIP_MIN_PAYOUT_USD),

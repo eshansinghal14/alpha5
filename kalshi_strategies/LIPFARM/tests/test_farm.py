@@ -193,6 +193,8 @@ def test_guard_pulls_a_quote_the_filters_now_reject(tmp_path, monkeypatch):
     cfg = dataclasses.replace(cfg, min_spread=0.04, min_ahead=5000)   # only 3000 others ahead
     _guard(farm, f, cfg, monkeypatch, b, [(0.01, 4000)])
     assert b.cancelled == ["oid0"] and "Z-1-A" not in f.state["orders"]
+    f.picks = want
+    assert f.choose(cfg) == {}                        # cooling down: not re-placed by the next cycle
 
 
 def test_changed_lots_replaces_every_quote(tmp_path, monkeypatch):
