@@ -57,7 +57,9 @@ def test_arm_quotes_for_real_and_disarm_pulls(tmp_path, monkeypatch):
     monkeypatch.setattr(f, "shard", lambda t: 0)
     f.set_live(True, "test")
     assert f.live and cancelled == ["old"]            # only our stray, never another strategy's
-    cfg = farm.Cfg(num_markets=1, lots=1000, max_price=0.05, scan_markets=1, refresh_s=30, programs_refresh_s=600)
+    cfg = farm.Cfg(num_markets=1, lots=1000, max_price=0.05, switch_margin=0.5, scan_markets=1, refresh_s=30,
+                   programs_refresh_s=600)
+    f.programs = {"Z-1-A": {"id": "p", "end_date": "2099-01-01T00:00:00Z"}}
     f.picks = {"Z-1-A": farm.Pick("Z-1-A", "no", 0.01, 0.001, 0.002)}
     monkeypatch.setattr(farm, "CLAIM_SETTLE_S", 0.0)
     monkeypatch.setattr(farm.time, "sleep", lambda s: None)
@@ -69,3 +71,25 @@ def test_arm_quotes_for_real_and_disarm_pulls(tmp_path, monkeypatch):
     assert sent[0].client_order_id.startswith(farm.CID_PREFIX)
     f.set_live(False, "test")
     assert not f.live and cancelled == ["old", "oid1"]
+
+
+def test_sticky_until_one_dollar_then_switch_margin(tmp_path, monkeypatch):
+    from kalshi_strategies.LIPFARM import farm
+
+    monkeypatch.setattr(farm, "ROOT", str(tmp_path))
+    f = farm.Farm()
+    cfg = farm.Cfg(num_markets=1, lots=1000, max_price=0.05, switch_margin=0.5, scan_markets=1, refresh_s=30,
+                   programs_refresh_s=600)
+    far = "2099-01-01T00:00:00Z"
+    f.programs = {"OLD-1-A": {"id": "po", "end_date": far}, "NEW-1-A": {"id": "pn", "end_date": far},
+                  "SOON-1-A": {"id": "ps", "end_date": "2000-01-01T00:00:00Z"}}
+    f.state["orders"] = {"OLD-1-A": {"side": "no", "price": 0.01, "remaining": 1000}}
+    f.picks = {"OLD-1-A": farm.Pick("OLD-1-A", "no", 0.01, 1e-4, 0.002),
+               "NEW-1-A": farm.Pick("NEW-1-A", "no", 0.01, 9e-4, 0.002),
+               "SOON-1-A": farm.Pick("SOON-1-A", "no", 0.01, 1.0, 0.002)}
+    assert list(f.choose(cfg)) == ["OLD-1-A"]          # under $1 this period: kept; SOON can't reach $1
+    f.state["period_accrued"] = {"po": 1.5}
+    f.picks["NEW-1-A"] = farm.Pick("NEW-1-A", "no", 0.01, 1.4e-4, 0.002)
+    assert list(f.choose(cfg)) == ["OLD-1-A"]          # past $1, newcomer only 40% better
+    f.picks["NEW-1-A"] = farm.Pick("NEW-1-A", "no", 0.01, 1.6e-4, 0.002)
+    assert list(f.choose(cfg)) == ["NEW-1-A"]

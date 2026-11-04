@@ -56,6 +56,8 @@ CLAIMS_PATH = os.path.join(ROOT, "live", "claimed.json")
 # ARBS polls claims every runtime.control_poll_s (1 s) and then cancels its
 # quotes on the claimed tickers; this covers both with room.
 CLAIM_SETTLE_S = 3.0
+# Kalshi pays nothing for a market-period whose LIP is under $1 (help article).
+LIP_MIN_PAYOUT_USD = 1.0
 
 
 @section
@@ -66,6 +68,9 @@ class Cfg:
                         min=1.0, step=100.0)
     max_price: float = param("Cheap side only: quote a side only if its best bid is at most this.",
                              min=0.001, max=0.5, step=0.01)
+    switch_margin: float = param("Stickiness: once a quoted market has passed Kalshi's $1 minimum payout "
+                                 "this period, a new one replaces it only if it pays this much more "
+                                 "(0.5 = 50% more $/s). Below $1 it is never replaced.", min=0.0, step=0.1)
     scan_markets: int = param("Books read each cycle: the largest LIP pools.", min=1, step=50)
     refresh_s: float = param("Seconds between cycles.", min=5.0, editable=False)
     programs_refresh_s: float = param("Seconds between re-reads of the LIP program list.", min=60.0,
@@ -367,9 +372,29 @@ class Farm:
         os.replace(tmp, CLAIMS_PATH)
         return any(t not in old for t in claims)
 
+    def period_accrued(self, t: str) -> float:
+        return self.state.setdefault("period_accrued", {}).get(self.programs[t]["id"], 0.0)
+
+    def choose(self, cfg: Cfg) -> dict[str, Pick]:
+        """The markets to quote. Only ones that can still reach the $1 payout
+        before their period ends; a quoted one under $1 this period is kept
+        (dropping it forfeits what it accrued); past $1 it keeps its place
+        unless a newcomer pays `switch_margin` more."""
+        now = time.time()
+
+        def left(t):
+            return max(pd.Timestamp(self.programs[t]["end_date"]).timestamp() - now, 0.0)
+        cands = [p for p in self.picks.values() if p.ticker in self.programs
+                 and self.period_accrued(p.ticker) + p.rate * left(p.ticker) >= LIP_MIN_PAYOUT_USD]
+        held = set(self.state["orders"])
+        locked = sorted((p for p in cands if p.ticker in held and self.period_accrued(p.ticker) < LIP_MIN_PAYOUT_USD),
+                        key=lambda p: -p.rate)
+        rest = sorted((p for p in cands if p not in locked),
+                      key=lambda p: -p.rate * (1.0 + cfg.switch_margin if p.ticker in held else 1.0))
+        return {p.ticker: p for p in (locked + rest)[:cfg.num_markets]}
+
     def reconcile(self, cfg: Cfg):
-        want = sorted(self.picks.values(), key=lambda p: -p.rate)[:cfg.num_markets]
-        want = {p.ticker: p for p in want}
+        want = self.choose(cfg)
         if self.live:
             if self.write_claims(want):
                 time.sleep(CLAIM_SETTLE_S)
@@ -387,7 +412,7 @@ class Farm:
         for t, o in list(self.state["orders"].items()):
             pk = want.get(t)
             stale = (pk is None or pk.side != o["side"] or abs(pk.price - o["price"]) > 1e-9
-                     or o["remaining"] < 0.5 * cfg.lots or not ready(t))
+                     or o["remaining"] < 0.5 * cfg.lots or o["remaining"] > cfg.lots + 1e-9 or not ready(t))
             if stale:
                 self.cancel(t)
         for t, pk in want.items():
@@ -417,8 +442,13 @@ class Farm:
         now = time.time()
         dt = now - self.last_accrue
         self.last_accrue = now
+        per = self.state.setdefault("period_accrued", {})
         for t in self.state["orders"]:
-            self.state["accrued"][t] = self.state["accrued"].get(t, 0.0) + self.rates.get(t, 0.0) * dt
+            gain = self.rates.get(t, 0.0) * dt
+            self.state["accrued"][t] = self.state["accrued"].get(t, 0.0) + gain
+            if t in self.programs:
+                pid = self.programs[t]["id"]
+                per[pid] = per.get(pid, 0.0) + gain
 
     # ---- report ----
     def positions(self) -> list[dict]:
@@ -451,7 +481,8 @@ class Farm:
             rows.append({"ticker": t, "side": o["side"], "price": o["price"], "resting": o["remaining"],
                          "our_usd_day": self.rates.get(t, 0.0) * 86400,
                          "pool_usd_day": (pk.pool_rate if pk else 0.0) * 86400,
-                         "exp_lip_usd": self.state["accrued"].get(t, 0.0)})
+                         "exp_lip_usd": self.state["accrued"].get(t, 0.0),
+                         "period_lip_usd": self.period_accrued(t) if t in self.programs else 0.0})
         pos = self.positions()
         tot_lip = sum(self.state["accrued"].values())
         fill_pnl = sum(p["pnl"] for p in pos)

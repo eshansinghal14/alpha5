@@ -82,12 +82,14 @@ def render(page: str, stale_fn):
             st.caption("None resting.")
         else:
             st.dataframe(q.rename(columns={"our_usd_day": "our $/day", "pool_usd_day": "pool $/day",
-                                           "exp_lip_usd": "expected LIP $"}),
+                                           "exp_lip_usd": "expected LIP $", "period_lip_usd": "this period $"}),
                          hide_index=True, use_container_width=True,
                          column_config={"price": st.column_config.NumberColumn(format="%.3f"),
                                         "our $/day": st.column_config.NumberColumn(format="%.1f"),
                                         "pool $/day": st.column_config.NumberColumn(format="%.1f"),
-                                        "expected LIP $": st.column_config.NumberColumn(format="%.2f")})
+                                        "expected LIP $": st.column_config.NumberColumn(format="%.2f"),
+                                        "this period $": st.column_config.NumberColumn(
+                                            format="%.2f", help="Kalshi pays a market-period only from $1.")})
         st.subheader("Fills")
         p = pd.DataFrame(doc["positions"])
         if p.empty:
