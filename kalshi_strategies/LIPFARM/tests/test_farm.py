@@ -1,3 +1,5 @@
+import json
+
 from kalshi_infra.trading import lip
 from kalshi_strategies.LIPFARM.farm import best_pick, parse_book, remove_ours
 
@@ -57,14 +59,12 @@ def test_arm_quotes_for_real_and_disarm_pulls(tmp_path, monkeypatch):
     assert f.live and cancelled == ["old"]            # only our stray, never another strategy's
     cfg = farm.Cfg(num_markets=1, lots=1000, max_price=0.05, scan_markets=1, refresh_s=30, programs_refresh_s=600)
     f.picks = {"Z-1-A": farm.Pick("Z-1-A", "no", 0.01, 0.001, 0.002)}
-    # A claim not yet seen by an ARBS selection: nothing is sent.
-    monkeypatch.setattr(farm, "arbs_selected", lambda: (0.0, set()))
+    monkeypatch.setattr(farm, "CLAIM_SETTLE_S", 0.0)
+    monkeypatch.setattr(farm.time, "sleep", lambda s: None)
     f.reconcile(cfg)
-    assert not sent and f.waiting == ["Z-1-A"]
-    # A selection written well after the claim, without the event: quote it.
-    monkeypatch.setattr(farm, "arbs_selected", lambda: (f.state["claims"]["Z-1-A"] + 10, set()))
-    monkeypatch.setattr(farm, "RELOAD_S", -1e9)
-    f.reconcile(cfg)
+    # A new claim is written (with positions) before the order goes out.
+    with open(farm.CLAIMS_PATH) as fh:
+        assert json.load(fh) == {"written_at": f.state["claims"]["Z-1-A"], "tickers": ["Z-1-A"], "positions": {}}
     assert [(o.ticker, o.side, o.price, o.size) for o in sent] == [("Z-1-A", "no", 0.01, 1000)]
     assert sent[0].client_order_id.startswith(farm.CID_PREFIX)
     f.set_live(False, "test")

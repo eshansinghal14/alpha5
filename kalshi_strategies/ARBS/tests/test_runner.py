@@ -1576,3 +1576,46 @@ def test_series_groups_read_sports_tags(monkeypatch):
              {"series": [], "cursor": None}]
     monkeypatch.setattr(R, "kalshi_get", lambda path, params=None: pages.pop(0))
     assert R.series_groups() == {"KXEPL": "S:Soccer", "KXHOUSE": "Elections"}
+
+
+def test_lipfarm_claim_excludes_basket_and_audit_nets_its_position(arbs):
+    r, b = arbs
+    path = R.os.path.join(R.LIVE_ROOT, "LIPFARM", "live")
+    R.os.makedirs(path)
+    with open(R.os.path.join(path, "claimed.json"), "w") as fh:
+        json.dump({"tickers": ["X-A"], "positions": {"X-A": -100.0}}, fh)
+    r.dirty = set()
+    r.poll_lip_claims()
+    assert r.excluded(b) and b.basket_id in r.dirty
+
+    class Client:
+        def positions_all(self):
+            return {"X-A": -100.0}          # LIPFARM's NO fill, not ours
+
+    async def call(fn, *a):
+        return fn(*a)
+    r.gw.any_client, r.gw.call = Client, call
+    assert asyncio.run(r.audit()) and r.audit_diff is None
+    R.os.remove(R.os.path.join(path, "claimed.json"))
+    r.poll_lip_claims()
+    assert not r.excluded(b) and not r.lip_positions
+
+
+def test_sweep_leaves_lipfarm_orders(arbs, monkeypatch):
+    r, b = arbs
+    cancelled = []
+
+    class Client:
+        def _resting(self, prefix):
+            return [("o1", "X-A", "lipf-abc"), ("o2", "X-A", "ours")]
+
+    async def call(fn, *a):
+        return fn(*a)
+
+    async def cancel(ticker, oid, reason):
+        cancelled.append(oid)
+        return None, None, None
+    r.gw.any_client, r.gw.call, r.gw.cancel = Client, call, cancel
+    monkeypatch.setattr(R, "SWEEP_PACING_S", 0.0)
+    asyncio.run(r.sweep("test"))
+    assert cancelled == ["o2"]

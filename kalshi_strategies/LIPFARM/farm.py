@@ -14,10 +14,12 @@ survives restarts; data/live/LIPFARM/status.json holds the latest table. "Expect
 (lip.py) integrated over time, not what Kalshi pays: payouts under $1 per
 market-period are dropped, and others' size between our scans is unseen.
 
-ARBS: we never quote an event ARBS holds, has quoted, or hand-specs (its
-sweep and position audit cover those tickers). Live, everything else we want
-goes in claimed.json, ARBS's scan drops those events, and we quote one only
-once a selection written after the claim has loaded without it.
+ARBS: live, every ticker we want, rest on or hold goes in claimed.json (with
+our positions). ARBS reads it every second: it neither takes nor quotes a
+claimed ticker and pulls its quotes there, its sweep skips our orders, and its
+position audit takes our positions off Kalshi's. We quote CLAIM_SETTLE_S after
+claiming. Events where ARBS holds a basket are never claimed: it may have to
+take there to complete one.
 """
 from __future__ import annotations
 
@@ -51,11 +53,9 @@ ROOT = os.path.join(LIVE_ROOT, NAME)
 ARBS_ROOT = os.path.join(LIVE_ROOT, "ARBS")
 # Read by ARBS's scanner (ARBS.scanner.lipfarm_claimed): it selects no event here.
 CLAIMS_PATH = os.path.join(ROOT, "live", "claimed.json")
-# After a claim, an ARBS selection must be written at least CLAIM_SETTLE_S
-# later (so its scan read the claim), and then RELOAD_S must pass for the ARBS
-# runner to load it and pull its quotes, before we quote there.
-CLAIM_SETTLE_S = 5.0
-RELOAD_S = 30.0
+# ARBS polls claims every runtime.control_poll_s (1 s) and then cancels its
+# quotes on the claimed tickers; this covers both with room.
+CLAIM_SETTLE_S = 3.0
 
 
 @section
@@ -145,33 +145,12 @@ def _json(path: str):
 
 
 def arbs_held_events() -> set[str]:
-    """Events ARBS keeps trading whatever its scan selects: held or shadow-held
-    baskets, any basket it ever quoted (set_baskets keeps those), the hand
-    spec. Its sweep cancels resting orders on these and its audit halts on a
-    position it didn't book, so we never quote them."""
+    """Events where ARBS holds a real basket: it may take there to complete or
+    exit one, so we never claim them."""
     tickers: set[str] = set()
-    for name in ("ledger.json", "ledger_shadow.json"):
-        for b in ((_json(os.path.join(ARBS_ROOT, name)) or {}).get("baskets") or {}).values():
-            tickers |= set(b.get("legs") or {})
-    for rec in (_json(os.path.join(ARBS_ROOT, "ledger_quote_ids.json")) or {}).values():
-        tickers.add(rec.get("ticker") or "")
-    try:
-        from kalshi_strategies.ARBS.config import SPEC_PATH
-        from kalshi_strategies.ARBS.spec import load_spec
-        tickers |= {t for b in load_spec(SPEC_PATH) for t in b.tickers}
-    except Exception:
-        pass
-    return {event_of(t) for t in tickers if t}
-
-
-def arbs_selected() -> tuple[float, set[str]]:
-    """(mtime, events) of ARBS's current scan selection; (0, {}) if none."""
-    path = os.path.join(ARBS_ROOT, "scanned_selected.json")
-    doc = _json(path)
-    if not doc:
-        return 0.0, set()
-    ev = {event_of(l["ticker"]) for r in doc.get("relationships", []) for b in r["baskets"] for l in b["legs"]}
-    return os.path.getmtime(path), ev
+    for b in ((_json(os.path.join(ARBS_ROOT, "ledger.json")) or {}).get("baskets") or {}).values():
+        tickers |= {t for t, leg in (b.get("legs") or {}).items() if float(leg.get("qty") or 0) > 0}
+    return {event_of(t) for t in tickers}
 
 
 def remove_ours(book: dict[float, float], price: float, size: float) -> dict[float, float]:
@@ -364,32 +343,41 @@ class Farm:
                                            "size": lots, "remaining": lots, "placed": time.time()}
         self.rates[pk.ticker] = pk.rate
 
-    def write_claims(self, want: dict[str, Pick]):
-        """Claim what we want, rest on, or hold (until it settles); keep each
-        ticker's first-claim time, which the placement gate waits on."""
-        held = {f["ticker"] for f in self.state["fills"]
-                if not (self.meta.get(f["ticker"], {}).get("result") or "")}
+    def signed_positions(self) -> dict[str, float]:
+        """Signed YES contracts (negative = long NO) from our fills, unsettled markets only."""
+        out: dict[str, float] = {}
+        for f in self.state["fills"]:
+            if self.meta.get(f["ticker"], {}).get("result"):
+                continue
+            out[f["ticker"]] = out.get(f["ticker"], 0.0) + (f["size"] if f["side"] == "yes" else -f["size"])
+        return {t: v for t, v in out.items() if abs(v) > 1e-9}
+
+    def write_claims(self, want: dict[str, Pick]) -> bool:
+        """Claim what we want, rest on, or hold; keep each ticker's first-claim
+        time, which the placement gate waits on. True if anything new was claimed."""
+        pos = self.signed_positions()
         now = time.time()
         old = self.state.setdefault("claims", {})
-        claims = {t: old.get(t, now) for t in set(want) | set(self.state["orders"]) | held}
+        claims = {t: old.get(t, now) for t in set(want) | set(self.state["orders"]) | set(pos)}
         self.state["claims"] = claims
+        os.makedirs(os.path.dirname(CLAIMS_PATH), exist_ok=True)
         tmp = CLAIMS_PATH + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({"written_at": now, "tickers": sorted(claims)}, f)
+            json.dump({"written_at": now, "tickers": sorted(claims), "positions": pos}, f)
         os.replace(tmp, CLAIMS_PATH)
+        return any(t not in old for t in claims)
 
     def reconcile(self, cfg: Cfg):
         want = sorted(self.picks.values(), key=lambda p: -p.rate)[:cfg.num_markets]
         want = {p.ticker: p for p in want}
         if self.live:
-            self.write_claims(want)
-            sel_t, sel_ev = arbs_selected()
+            if self.write_claims(want):
+                time.sleep(CLAIM_SETTLE_S)
             now = time.time()
 
             def ready(t: str) -> bool:
                 c = self.state["claims"].get(t)
-                return (c is not None and sel_t > c + CLAIM_SETTLE_S and now > sel_t + RELOAD_S
-                        and event_of(t) not in sel_ev)
+                return c is not None and now - c >= CLAIM_SETTLE_S
         else:
             # Shadow writes no claims (ARBS keeps trading as is) and shows
             # what live would quote once ARBS has given way.
@@ -530,6 +518,8 @@ class Farm:
             self.accrue()
             for t in list(self.state["orders"]):
                 self.cancel(t)
+            if self.live:
+                self.write_claims({})   # held positions stay claimed from ARBS
             self._save()
 
 

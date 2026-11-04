@@ -53,6 +53,9 @@ from kalshi_strategies.ARBS.liquidity import Liquidity
 from kalshi_strategies.ARBS.prints import AFTER_S, Prints, top as prints_top
 from kalshi_strategies.ARBS.spec import Basket, basket_from_dict, basket_to_dict, load_spec, merge, parse_spec
 
+# Client-id prefix of LIPFARM's orders (LIPFARM.farm.CID_PREFIX): never ours to sweep.
+LIPFARM_CID_PREFIX = "lipf-"
+
 _EPS = 1e-9
 OTHER = {"yes": "no", "no": "yes"}
 TRADEABLE = ("active", "open")
@@ -293,6 +296,11 @@ class ArbsRunner:
         self.hand = load_spec(SPEC_PATH)
         self.scan_path = os.path.join(self.root, scanner.SELECTED)
         self.scan_status: dict = {}
+        # LIPFARM's claims (live): tickers we neither take nor quote, and its
+        # signed-yes positions, which the audit takes off Kalshi's.
+        self.lip_claims: set[str] = set()
+        self.lip_positions: dict[str, float] = {}
+        self._lip_mtime: float | None = None
         self.set_baskets(merge(self.hand, self.scanned()))
         for led in (self.real_ledger, self.shadow_ledger):
             for bid, pos in led.baskets.items():
@@ -694,7 +702,34 @@ class ArbsRunner:
         ex = self.cfg.watch.exclude
         if ex and (b.basket_id in ex or b.relationship_id in ex or b.cluster in ex):
             return True
+        if self.lip_claims and any(t in self.lip_claims for t in b.tickers):
+            return True
         return b.settles is not None and b.settles > self.horizon()
+
+    def poll_lip_claims(self):
+        """Reload LIPFARM's claimed.json when it changes; baskets on tickers
+        that changed are re-evaluated, which pulls our quotes on a new claim.
+        A held basket still completes (evaluate resolves it before excluded)."""
+        path = os.path.join(LIVE_ROOT, "LIPFARM", "live", "claimed.json")
+        try:
+            m = os.path.getmtime(path)
+        except OSError:
+            m = None
+        if m == self._lip_mtime:
+            return
+        if m is None:
+            tickers, pos = set(), {}
+        else:
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    doc = json.load(fh)
+            except (OSError, ValueError):
+                return          # mid-write: retry next poll
+            tickers = set(doc.get("tickers") or [])
+            pos = {t: float(v) for t, v in (doc.get("positions") or {}).items()}
+        for t in tickers ^ self.lip_claims:
+            self.dirty |= set(self.by_ticker.get(t, ()))
+        self.lip_claims, self.lip_positions, self._lip_mtime = tickers, pos, m
 
     def horizon(self) -> pd.Timestamp:
         """Latest settlement traded, refreshed once a second: evaluate asks
@@ -2298,7 +2333,9 @@ class ArbsRunner:
             return
         ours = set(self.tickers)
         resting = await self.gw.call(c._resting, "")
-        for oid, ticker, _ in resting:
+        for oid, ticker, cid in resting:
+            if (cid or "").startswith(LIPFARM_CID_PREFIX):
+                continue
             if ticker not in ours and oid not in self.real_ledger.quote_ids:
                 continue
             # Paced, with retries: ~700 cancels at once drew 429s on 180 of
@@ -2486,6 +2523,9 @@ class ArbsRunner:
         which basket a contract belongs to)."""
         c = self.gw.any_client()
         real = await self.gw.call(c.positions_all)
+        self.poll_lip_claims()
+        for t, v in self.lip_positions.items():
+            real[t] = real.get(t, 0.0) - v
         mine = self.real_ledger.net_by_ticker()
         diff = {t: {"kalshi": real.get(t, 0.0), "ledger": round(mine.get(t, 0.0), 4)}
                 for t in self.tickers if abs(real.get(t, 0.0) - mine.get(t, 0.0)) > 1e-6}
@@ -2611,6 +2651,7 @@ class ArbsRunner:
                 _log(f"STOP: {reason}")
                 stop.set()
                 return
+            self.poll_lip_claims()
             want = trading.poll()
             if want is not None:
                 self.arm_want, retry_at = want, 0.0
