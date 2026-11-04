@@ -136,6 +136,9 @@ def _live(tmp_path, monkeypatch, bucket, placed_ago=120.0, lots=1000):
     f.live = True
     f.meta = {"Z-1-A": {"volume_24h_fp": "100000"}, "Z-1-B": {"volume_24h_fp": "100000"}}
     f.taker_rates = {"Z-1": 0.07}
+    # Never a real socket in tests.
+    f.ws = SimpleNamespace(up=False, ensure=lambda tickers: None, bids=lambda t: None,
+                           take=lambda: (set(), []), wake=SimpleNamespace(set=lambda: None))
     monkeypatch.setattr(f, "client", lambda shard: bucket)
     monkeypatch.setattr(f, "shard", lambda t: 0)
     f.programs = {"Z-1-A": {"id": "p", "end_date": "2099-01-01T00:00:00Z", "target_size_fp": "1000",
