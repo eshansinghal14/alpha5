@@ -105,8 +105,9 @@ CID_PREFIX = "lipf-"
 BOOK_WORKERS = 8
 # All our REST reads share the account's read limit with ARBS (300/s). 24
 # unpaced book threads plus a parallel records refresh drew 429s on ARBS's
-# balance reads and position audits (11-04 ~21:30); 20/s takes ~45 s a cycle.
-READS_PER_S = 20.0
+# balance reads and position audits (11-04 ~21:30), and the records refresh
+# still drew 429s at 20/s; 10/s takes ~90 s a cycle.
+READS_PER_S = 10.0
 NAME = "LIPFARM"
 ROOT = os.path.join(LIVE_ROOT, NAME)
 ARBS_ROOT = os.path.join(LIVE_ROOT, "ARBS")
@@ -476,7 +477,7 @@ def fetch_meta(tickers) -> dict[str, dict]:
     def one(ch):
         return read("/trade-api/v2/markets", params={"tickers": ",".join(ch), "limit": 1000}).get("markets", [])
     out = {}
-    with cf.ThreadPoolExecutor(2) as ex:
+    with cf.ThreadPoolExecutor(1) as ex:
         for ms in ex.map(one, chunks):
             for m in ms:
                 out[m["ticker"]] = m
@@ -638,7 +639,8 @@ class Farm:
         self.est: dict[str, float] = {}       # ticker -> our LIP $/s per dollar at its last read
         self.rot = 0
         self.pool = cf.ThreadPoolExecutor(BOOK_WORKERS, thread_name_prefix="lipfarm-read")
-        self.pending: dict[str, tuple[float, float]] = {}      # leg key -> (price, lots) awaiting its claim
+        self.pending: dict[str, tuple] = {}   # leg key -> (price, lots, grouped) awaiting its claim
+        self.pending_sentinels: dict[str, dict] = {}            # ticker -> its pending legs' sentinels
         self.dumping: set[str] = set()        # markets an informed fill hit: sell out now
         self.cfg_adverse = 0.8                # cfg.adverse_fill_frac, refreshed each loop
         self.cfg_slip, self.cfg_chase = 2, 2  # cfg.dump_slip_ticks, cfg.chase_ticks
@@ -1331,16 +1333,21 @@ class Farm:
                      or o["remaining"] < 0.5 * w[1] or not ready(unkey(k)[0]))
             if stale:
                 self.cancel(k)
-        self.pending = {}
-        # The main bid before its sentinel: a sentinel alone would only trip the group.
+        self.pending, self.pending_sentinels = {}, {}
         for k, w in sorted(legs.items(), key=lambda kv: is_sentinel(kv[0])):
             t, side = unkey(k)
-            if k in self.state["orders"]:
+            if k in self.state["orders"] or is_sentinel(k):
                 continue
             if ready(t):
-                self.place_leg(k, w)
+                self.place_leg(k, w, legs)
             else:
                 self.pending[k] = w
+                sk = f"{t}|{side}|s"
+                if sk in legs:
+                    self.pending_sentinels.setdefault(t, {})[sk] = legs[sk]
+        for k, w in legs.items():              # a sentinel whose main bid already rests
+            if is_sentinel(k) and k not in self.state["orders"] and key(*unkey(k)) in self.state["orders"]:
+                self.place_leg(k, w)
         for t, pl in want.items():
             if t in self.order_tickers():
                 self.rates.setdefault(t, pl.rate)
@@ -1402,9 +1409,27 @@ class Farm:
                 else:
                     print(f"adverse: {tick[o]} filled {q:.0f} of {sizes[o]:.0f}")
 
-    def place_leg(self, k: str, w) -> bool:
+    def place_leg(self, k: str, w, legs: dict | None = None) -> bool:
+        """Place one order; a sentinel-layout main bid goes out only with its
+        sentinel right after it (tokens for both, and the group, reserved first):
+        the bid without its sentinel has no protection (11-04 22:34, sentinels
+        refused for budget after every main bid)."""
         px, q, grouped = w
         t, side = unkey(k)
+        sk = f"{t}|{side}|s"
+        if grouped and not is_sentinel(k) and legs and sk in legs:
+            need = 2 * ORDER_TOKENS + (ORDER_TOKENS if key(t, side) not in self.state.get("groups", {}) or
+                                       self.state["groups"][key(t, side)].get("tripped") else 0.0)
+            if self.live and not self.bucket.has(need):
+                return False
+            if not self.place(t, side, px, q, grouped=True):
+                return False
+            sp, sq, _ = legs[sk]
+            if not self.place(t, side, sp, sq, sentinel=True, grouped=True):
+                print(f"sentinel {t} {side}: not placed; pulling its bid")
+                self.cancel(key(t, side), reason="lipfarm:sentinel")
+                return False
+            return True
         return self.place(t, side, px, q, sentinel=is_sentinel(k), grouped=grouped)
 
     def place_pending(self):
@@ -1418,7 +1443,7 @@ class Farm:
             if c is not None and now - c >= CLAIM_SETTLE_S:
                 del self.pending[k]
                 if k not in self.state["orders"]:
-                    self.place_leg(k, w)
+                    self.place_leg(k, w, {**self.pending, k: w, **self.pending_sentinels.get(t, {})})
 
     def poll_fills(self) -> set[str]:
         """REST backstop for the socket's fills; returns tickers with new ones."""

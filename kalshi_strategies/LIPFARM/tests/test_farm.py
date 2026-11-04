@@ -572,3 +572,19 @@ def test_layout_has_hysteresis():
     assert plan_market("T", thin, P, near, {}, 1000, current={"yes": "touch"}).layout["yes"] == "touch"
     assert plan_market("T", thin, P, near, {}, 1000, current={"yes": "sentinel"}).layout["yes"] == "sentinel"
     assert base.layout["yes"] == "sentinel"
+
+
+def test_sentinel_main_bid_never_goes_out_alone(tmp_path, monkeypatch):
+    b = _Bucket()
+    f = _live(tmp_path, monkeypatch, b)
+    f.state["orders"] = {}
+    pl = farm.Plan("Z-1-A", "wide", (("yes", 0.40),), 1e-3, 390.0, 0.002, 1000, {"yes": "sentinel"}, {"yes": 0.39})
+    f.plans = {"Z-1-A": pl}
+    f.state["claims"] = {"Z-1-A": 0.0}
+    f.bucket = farm.TokenBucket(rate=0.0, capacity=120.0)
+    f.bucket.tokens = 25.0                                       # one order's worth after the group: neither goes
+    f.reconcile(CFG)
+    assert not b.sent and not f.state["orders"]
+    f.bucket.tokens = 40.0
+    f.reconcile(CFG)
+    assert [(o.price, o.size) for o in b.sent] == [(0.39, 1000), (0.40, farm.SENTINEL_LOTS)]
