@@ -8,7 +8,7 @@ from kalshi_strategies.LIPFARM import farm
 from kalshi_strategies.LIPFARM.farm import parse_book, plan_market, remove_ours
 
 P = lip.LipParams(target_size=1000, discount_factor=0.5, period_reward_usd=86.4, snapshots_per_period=86400)
-CFG = farm.Cfg(max_capital=5000, num_markets=5, lots=1000, adverse_fill_frac=0.8, exit_depth_frac=10.0, exit_depth_slip=0.03, wide_spread=0.20, decided_min=0.97,
+CFG = farm.Cfg(max_capital=5000, num_markets=5, lots=1000, adverse_fill_frac=0.8, exit_depth_frac=10.0, exit_depth_slip=0.03, wide_spread=0.20, min_leg_price=0.0, decided_min=0.97,
                min_ahead=0.0, max_position=1e9, write_tokens_per_s=5.0, scan_markets=1, scan_rotate=0, refresh_s=30,
                programs_refresh_s=600)
 
@@ -160,7 +160,7 @@ def test_guard_moves_back_only_with_size_behind_and_spare_budget(tmp_path, monke
                                       (200.0, 0.0, 120.0, False), (300.0, 0.0, 1.0, False)):
         b = _Bucket(tokens, ahead)
         f = _live(tmp_path, monkeypatch, b, placed_ago=ago)
-        _guard(f, monkeypatch, b, [(0.97, 4000)], [(0.02, 5000)])
+        _guard(f, monkeypatch, b, [(0.97, 4000), (0.95, 2000)], [(0.02, 5000)])
         assert (b.cancelled == ["oid0"] and len(b.sent) == 1) is moved
         assert "Z-1-A|yes" in f.state["orders"]
 
@@ -263,7 +263,7 @@ def test_new_fill_is_exited_within_the_second(tmp_path, monkeypatch):
                              "order_id": "oid0"}]
         return {"Z-1-A"}
     monkeypatch.setattr(f, "poll_fills", poll)
-    monkeypatch.setattr(farm, "fetch_book", lambda t: {"yes_dollars": [["0.9700", "4000"]],
+    monkeypatch.setattr(farm, "fetch_book", lambda t: {"yes_dollars": [["0.9700", "4000"], ["0.9500", "2000"]],
                                                        "no_dollars": [["0.0200", "5000"]]})
     f.exit_now(CFG)
     assert [(o.side, o.price, o.size) for o in b.sent] == [("no", 0.02, 250.0)]
@@ -301,7 +301,7 @@ def test_socket_fill_is_exited_from_the_socket_book(tmp_path, monkeypatch):
     f = _live(tmp_path, monkeypatch, b)
     f.state["hedged_oids"] = ["oid0"]
     monkeypatch.setattr(farm, "fetch_book", lambda t: (_ for _ in ()).throw(AssertionError("no REST read")))
-    f.ws = _Ws({"Z-1-A": ({0.97: 4000.0}, {0.02: 5000.0})},
+    f.ws = _Ws({"Z-1-A": ({0.97: 4000.0, 0.95: 2000.0}, {0.02: 5000.0})},
                [{"ticker": "Z-1-A", "side": "yes", "price": 0.97, "size": 250.0, "fee": 0.0,
                  "order_id": "oid0", "trade_id": "t1", "time": None}])
     f.react(CFG)
@@ -366,15 +366,14 @@ def test_a_fill_pulls_bids_that_could_take_us_past_max_capital(tmp_path, monkeyp
     assert "Z-1-A|no|h" in f.state["orders"]                     # the exit stays
 
 
-def test_bid_size_capped_by_exit_depth(tmp_path, monkeypatch):
-    b = _Bucket()
-    f = _live(tmp_path, monkeypatch, b)
+def test_exit_depth_counts_only_bids_below_ours(tmp_path, monkeypatch):
     cfg = dataclasses.replace(CFG, exit_depth_frac=1.0, exit_depth_slip=0.03)
-    P1 = f.params("Z-1-A")
-    # yes: 2000 within 3c of 0.97; no: 300 at the 0.02 touch, 4700 deeper than 3c is ignored.
-    o = {"yes": {0.97: 2000.0}, "no": {0.02: 300.0}}
-    assert farm.exit_lots(o, cfg) == 300
-    assert farm.exit_lots({"yes": {0.97: 2000.0, 0.95: 500.0}, "no": {0.02: 5000.0}}, cfg) == 1000
+    # no touch 0.05 with 1500 there and only 1c bids below: no exit depth on no.
+    o = {"yes": {0.80: 1500.0, 0.78: 400.0}, "no": {0.05: 1500.0, 0.01: 9000.0}}
+    assert farm.exit_lots(o, cfg) == {"yes": 400, "no": 0}
+    P1 = lip.LipParams(target_size=1000, discount_factor=0.5, period_reward_usd=86.4, snapshots_per_period=86400)
+    pl = plan_market("T", o, P1, dataclasses.replace(cfg, wide_spread=0.15), {}, farm.exit_lots(o, cfg))
+    assert pl.mode == "wide" and pl.legs == (("yes", 0.80),) and pl.lots == 400      # the 5c no leg isn't quoted
 
 
 def test_sync_keeps_a_resting_order_the_list_missed_and_cancels_orphans(tmp_path, monkeypatch):
@@ -492,3 +491,10 @@ def test_fractional_dust_is_sold_exactly_and_never_churns(tmp_path, monkeypatch)
     for _ in range(5):
         f2.hedge(CFG)
     assert len([o for o in b2.sent if o.ticker == "Z-1-A" and o.side == "no"]) == 1
+
+
+def test_wide_skips_legs_under_min_leg_price():
+    others = {"yes": {0.70: 50.0, 0.68: 2000.0}, "no": {0.06: 20.0, 0.05: 5000.0}}
+    cfg = dataclasses.replace(CFG, min_leg_price=0.10, exit_depth_frac=10.0)
+    pl = plan_market("T", others, P, cfg, {}, farm.exit_lots(others, cfg))
+    assert pl.mode == "wide" and pl.legs == (("yes", 0.70),)    # the 6c no leg isn't quoted

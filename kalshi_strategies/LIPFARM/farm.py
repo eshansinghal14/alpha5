@@ -159,6 +159,9 @@ class Cfg:
                                    step=0.01)
     wide_spread: float = param("Wide: quote both sides at the touch when ask - bid is at least this.",
                                min=0.01, max=0.98, step=0.01)
+    min_leg_price: float = param("Wide: don't quote a side bid under this. A full fill on a 5-6c leg was an "
+                                 "informed dump every time, sold back at 1c (ORAN, NMAN, IDS 11-04).",
+                                 min=0.0, max=0.5, step=0.01)
     decided_min: float = param("Decided: quote the expensive side when its best bid is at least this.",
                                min=0.5, max=0.999, step=0.01)
     min_ahead: float = param("Quote a side only where others already rest at least this many contracts at our "
@@ -244,14 +247,15 @@ def market_rate(others, legs, params) -> float:
 
 
 def plan_market(ticker: str, others: dict[str, dict[float, float]], params: lip.LipParams, cfg: Cfg,
-                held: dict[str, float] | None = None, lots: float | None = None) -> Plan | None:
+                held: dict[str, float] | None = None, lots=None) -> Plan | None:
     """How to quote this market now, or None. Joins others' best bids (never
     improves them). `held`: contracts we already hold per side; `lots`: bid
-    size (default cfg.lots)."""
+    size, one number or per side (exit_lots); a side sized under 1 isn't
+    quoted. Every quoted side gets the smallest of the quoted sides' sizes."""
     held = held or {}
-    lots = cfg.lots if lots is None else lots
-    if lots < 1.0:
-        return None
+    if lots is None:
+        lots = cfg.lots
+    side_lots = lots if isinstance(lots, dict) else {"yes": lots, "no": lots}
     if not others["yes"] or not others["no"]:
         return None
     by, bn = max(others["yes"]), max(others["no"])
@@ -259,13 +263,15 @@ def plan_market(ticker: str, others: dict[str, dict[float, float]], params: lip.
     if hi >= cfg.decided_min - 1e-9:
         mode, legs = "decided", [(hi_side, hi)]
     elif 1.0 - by - bn >= cfg.wide_spread - 1e-9:
-        mode, legs = "wide", [("yes", by), ("no", bn)]
+        mode, legs = "wide", [(s, p) for s, p in (("yes", by), ("no", bn)) if p >= cfg.min_leg_price - 1e-9]
     else:
         return None
     legs = [(s, p) for s, p in legs
-            if others[s].get(p, 0.0) >= cfg.min_ahead - 1e-9 and held.get(s, 0.0) < cfg.max_position - 1e-9]
+            if others[s].get(p, 0.0) >= cfg.min_ahead - 1e-9 and held.get(s, 0.0) < cfg.max_position - 1e-9
+            and side_lots.get(s, 0.0) >= 1.0]
     if not legs:
         return None
+    lots = min(side_lots[s] for s, _ in legs)
     sized = [(s, p, lots) for s, p in legs]
     # A side we quote must reach Target with our lots, one we don't from others
     # alone: otherwise the snapshot is excluded and pays nobody.
@@ -276,12 +282,20 @@ def plan_market(ticker: str, others: dict[str, dict[float, float]], params: lip.
                 lots * sum(p for _, p in legs), params.period_reward_usd / params.snapshots_per_period, lots)
 
 
-def exit_lots(others: dict[str, dict[float, float]], cfg: Cfg) -> float:
-    """Bid size: cfg.lots, capped by the thinner side's exit depth (others'
-    bids within exit_depth_slip of that side's touch)."""
-    depths = [sum(q for p, q in book.items() if p >= max(book) - cfg.exit_depth_slip - 1e-9)
-              for book in (others["yes"], others["no"]) if book]
-    return min([cfg.lots] + [math.floor(cfg.exit_depth_frac * d) for d in depths]) if depths else 0.0
+def exit_lots(others: dict[str, dict[float, float]], cfg: Cfg) -> dict[str, float]:
+    """Bid size per side: cfg.lots, capped by that side's exit depth, others'
+    bids strictly BELOW the touch we'd join, within exit_depth_slip. Bids at
+    our own price don't count: a seller who fills us full size has cleared
+    that level too (NMAN 11-04: 1000 of 1000 at 5c, the next bid 1c)."""
+    out = {}
+    for s, book in others.items():
+        if not book:
+            out[s] = 0.0
+            continue
+        top = max(book)
+        d = sum(q for p, q in book.items() if top - cfg.exit_depth_slip - 1e-9 <= p < top - 1e-9)
+        out[s] = min(cfg.lots, math.floor(cfg.exit_depth_frac * d))
+    return out
 
 
 def event_of(ticker: str) -> str:
