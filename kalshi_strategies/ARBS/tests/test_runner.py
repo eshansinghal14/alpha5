@@ -631,8 +631,11 @@ def test_quote_past_its_limit_is_cancelled_when_the_move_is_refused(arbs):
     async def cancel(ticker, oid, reason):
         return None, None, True
     r.gw.amend, r.gw.cancel = amend, cancel
+    r.book_wall.update({"X-A": 100.0, "X-B": 101.5})
     asyncio.run(r.move_quote(q, R.pricing.QuotePlan(leg=0, price=0.35, max_price=0.36, edge=0.0, others_cost=0.0)))
     assert q.key not in r.quotes and r.n["moves_refused"] == 1
+    # Both writes logged against the newest book update on the basket's markets.
+    assert [(o["kind"], o["book"]) for o in r.order_times] == [("amend", 101.5), ("cancel", 101.5)]
     r.live = False
 
 
@@ -1281,16 +1284,29 @@ def test_fill_logs_top_of_book_history_without_our_own_size(arbs):
     t0 = time.time()
     r.top_hist.on_book("X-B", t0 - 30.0, 0.40, 99, 0.6, 99)       # ages out
     r.top_hist.on_book("X-B", t0 - 3.0, 0.45, 40, 0.5, 30)
-    r.top_hist.on_book("X-B", t0 - 3.01, 0.45, 35, 0.5, 30)       # within 50 ms: replaces the last sample
+    r.top_hist.on_book("X-B", t0 - 2.995, 0.45, 35, 0.5, 30)      # depth only, within 10 ms: replaces it
     r.top_hist.on_book("X-B", t0 - 1.0, 0.45, 5, 0.5, 30)         # the others pulled
     q = R.Quote(basket_id=b.basket_id, leg=0, ticker="X-A", side="yes", price=0.40, size=5, cid="c", edge=0.05,
                 max_price=0.40, pending=False, exchange_id="oid")
     r.quotes[q.key] = q
-    r._quote_fill(q, 2, 0.8, None, "ws")
+    r._quote_fill(q, 2, 0.8, None, "ws", exch_t=t0 - 0.004)
     row = r.top_hist.take()[0]
-    assert row["kind"] == "fill" and row["size"] == 2 and row["ticker"] == "X-A"
+    assert row["kind"] == "fill" and row["size"] == 2 and row["ticker"] == "X-A" and row["exch_t"] == t0 - 0.004
     assert [s[2] for s in row["context"]["X-B"]] == [99, 35, 5]     # the book before the window, then changes
     assert row["context"]["X-B"][0][0] >= 30.0
     bk = types.SimpleNamespace(ticker="X-A", bid=0.4, bid_depth=12, ask=0.45, ask_depth=8)
     r._note_top(bk)
     assert r.top_hist.h["X-A"][-1][2] == 12 - 3                   # our 3 left resting at 0.40 taken out
+
+
+def test_top_history_keeps_price_moves_in_a_busy_book(tmp_path):
+    from kalshi_strategies.ARBS.depth import TopHistory
+    h = TopHistory(str(tmp_path))
+    t0 = 1000.0
+    for i in range(10):                                           # an update every 4 ms, depth only
+        h.on_book("X", t0 + 0.004 * i, 0.45, 100 - i, 0.5, 30)
+    h.on_book("X", t0 + 0.041, 0.45, 50, 0.52, 30)                # the ask moves: its own sample
+    rows = h.context(["X"], t0 + 0.071)["X"]
+    # Depth coalesced from each sample's opening (0, 12, 24, 36 ms), not chained into one.
+    assert [r[2] for r in rows] == [98, 95, 92, 91, 50]
+    assert rows[-1][3] == 0.52 and abs(rows[-1][0] - 0.030) < 1e-9

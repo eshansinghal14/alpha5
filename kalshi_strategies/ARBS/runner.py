@@ -309,6 +309,7 @@ class ArbsRunner:
         self._group_ev: dict[str, str] = {}
         self._group_retry: dict[str, float] = {}
         self.book_time: dict[str, float] = {}     # ticker -> monotonic time of its last book update
+        self.book_wall: dict[str, float] = {}     # the same on the wall clock, for the order log
         self.paused_until: dict[str, float] = {}  # ticker -> monotonic time Kalshi's pause is next retried
         self.exchange_paused = False              # Kalshi's exchange-wide trading_active is off
         self.priority_trading: list[str] = []     # write_priority_series in session now
@@ -836,6 +837,7 @@ class ArbsRunner:
                 self.top_moves.setdefault(book.ticker, _Rate()).add(1.0, time.time())
         self.book_seq[book.ticker] = self.book_seq.get(book.ticker, 0) + 1
         self.book_time[book.ticker] = time.monotonic()
+        self.book_wall[book.ticker] = time.time()
         self.liq.on_book(book.ticker, time.monotonic(), book.ask, book.ask_depth, book.bid, book.bid_depth)
         if self.cfg.runtime.record_prints:
             try:
@@ -989,11 +991,11 @@ class ArbsRunner:
             self.exit_hist[basket_id] = collections.deque([(time.time(), planned)])
             self.exit_planned[basket_id] = planned
 
-    def _quote_fill(self, q: Quote, size: float, cost: float, trade_id, source: str):
+    def _quote_fill(self, q: Quote, size: float, cost: float, trade_id, source: str, exch_t: float | None = None):
         q.filled += size
         if self.cfg.runtime.record_prints:
             try:
-                self.top_hist.add(self._context_row("fill", q, size=size, source=source))
+                self.top_hist.add(self._context_row("fill", q, size=size, source=source, exch_t=exch_t))
             except Exception:
                 self.n["print_errors"] = self.n.get("print_errors", 0) + 1
         if q.group:
@@ -1038,7 +1040,8 @@ class ArbsRunner:
         leg = b.tickers.index(info["ticker"]) if b is not None and info["ticker"] in b.tickers else -1
         q = self.quotes.get((info["basket_id"], leg, "deep") if info.get("deep") else (info["basket_id"], leg))
         if q is not None and q.exchange_id == oid:
-            self._quote_fill(q, size, cost, tid, source)
+            ts = f.get("time")
+            self._quote_fill(q, size, cost, tid, source, exch_t=pd.Timestamp(ts).timestamp() if ts else None)
         else:
             self.n["quote_fills"] += 1
             self._book(info["basket_id"], info["ticker"], info["side"], size, cost,
@@ -1883,6 +1886,11 @@ class ArbsRunner:
         self._register(q, hit[0])
         await self.cancel_quote(q, "lost_create")
 
+    def _last_book(self, b: Basket) -> float | None:
+        """Wall time of the newest book update on the basket's markets: the
+        order log's sent - book is how long we took to react to it."""
+        return max((self.book_wall[t] for t in b.tickers if t in self.book_wall), default=None)
+
     async def move_quote(self, q: Quote, plan: pricing.QuotePlan, size: float | None = None):
         """Reprice, and resize to `size` contracts left if given."""
         b = self.baskets[q.basket_id]
@@ -1890,7 +1898,10 @@ class ArbsRunner:
         old = q.price
         left = q.remaining if size is None else size
         if self.live:
+            t0, book = time.time(), self._last_book(b)
             resp, exc, sent = await self.gw.amend(q.ticker, q.side, q.exchange_id, plan.price, left, q.filled)
+            self.order_times.append({"kind": "amend", "reason": q.kind, "ticker": q.ticker, "sent": t0,
+                                     "answered": time.time(), "book": book, "order_id": q.exchange_id})
             if not sent:
                 self.n["moves_refused"] += 1
                 if q.price > plan.max_price + _EPS:
@@ -1925,7 +1936,11 @@ class ArbsRunner:
         self.n["quote_cancels"] += 1
         self.charge(q.basket_id, CANCEL_TOKENS)
         if self.live and q.exchange_id:
+            b = self.baskets.get(q.basket_id)
+            t0, book = time.time(), self._last_book(b) if b else None
             _, exc, _ = await self.gw.cancel(q.ticker, q.exchange_id, reason)
+            self.order_times.append({"kind": "cancel", "reason": reason, "ticker": q.ticker, "sent": t0,
+                                     "answered": time.time(), "book": book, "order_id": q.exchange_id})
             if exc is not None and http_status(exc) != 404:    # 404: already gone
                 self._order_err(q.basket_id, f"cancel {q.ticker}", exc, q.ticker)
                 return            # stays tracked; the next pass retries
