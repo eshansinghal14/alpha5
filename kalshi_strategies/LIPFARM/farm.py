@@ -23,7 +23,10 @@ market's other side, or the other legs of any ARBS basket holding our leg
 (ARBS's scanned and hand specs), whenever the bundle costs at most its payout
 after taker fees. Whatever is left gets an exit bid one tick above the other
 side's touch (Kalshi nets a yes+no pair to $1), at any price -- getting out
-comes before the pair's profit. Exits sit ahead of our own LIP bids, follow
+comes before the pair's profit. A fill taking `adverse_fill_frac` or more of a
+bid is taken as informed: we sell into the book at once (sweeping others'
+bids on the side we hold), pull that market's bids and cool it down. Exits
+sit ahead of our own LIP bids, follow
 the touch, are never pulled or moved to the back, and the market's LIP bids
 keep running beside them up to max_position.
 
@@ -86,7 +89,9 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "config.json")
 CID_PREFIX = "lipf-"
-BOOK_WORKERS = 8
+# A cycle reads ~900 books (scan_markets + scan_rotate): ~45 s on 8 threads,
+# ~15 s on 24, off the main thread so exits never wait on it.
+BOOK_WORKERS = 24
 NAME = "LIPFARM"
 ROOT = os.path.join(LIVE_ROOT, NAME)
 ARBS_ROOT = os.path.join(LIVE_ROOT, "ARBS")
@@ -136,6 +141,10 @@ class Cfg:
     num_markets: int = param("Most markets quoted.", min=0, step=1)
     lots: float = param("Contracts per bid (one bid per quoted side), before exit_vol_frac.", min=1.0,
                         step=100.0)
+    adverse_fill_frac: float = param("A fill of at least this fraction of one of our bids is informed: sell "
+                                     "into the book at once, at any price, instead of waiting on an exit bid "
+                                     "(ORAN 11-04: 1000 of 1000 at 6c, then 1c within 10 min).", min=0.05,
+                                     max=1.0, step=0.05)
     exit_vol_frac: float = param("A bid is at most this fraction of its market's 24 h volume, so a full fill is "
                                  "a size the market trades and can be exited.", min=0.01, max=10.0, step=0.1)
     wide_spread: float = param("Wide: quote both sides at the touch when ask - bid is at least this.",
@@ -152,7 +161,10 @@ class Cfg:
                                       "(its ranking at 125+ tokens/s covers every basket worth >$8/h, vs "
                                       "~$150/day realized). Spare goes to back-of-queue moves; exits and "
                                       "cancels always go.", min=1.0, max=50.0, step=1.0)
-    scan_markets: int = param("Books read each cycle: the largest LIP pools.", min=1, step=50)
+    scan_markets: int = param("Books read each cycle: the markets our last read of them says pay us most per "
+                              "dollar.", min=1, step=50)
+    scan_rotate: int = param("Plus this many more each cycle, rotating through every other LIP market (any "
+                             "category), so each is re-read every programs/scan_rotate cycles.", min=0, step=100)
     refresh_s: float = param("Seconds between cycles.", min=5.0, editable=False)
     programs_refresh_s: float = param("Seconds between re-reads of the LIP program list.", min=60.0,
                                       editable=False)
@@ -303,6 +315,51 @@ def basket_index(tickers: set[str], skip_events: set[str]) -> dict[tuple[str, st
     return out
 
 
+def load_programs() -> dict[str, dict]:
+    """Active liquidity programs not yet ended, by market ticker."""
+    out, cursor = {}, None
+    now = pd.Timestamp.now(tz="UTC")
+    while True:
+        params = {"status": "active", "limit": 1000}
+        if cursor:
+            params["cursor"] = cursor
+        data = kalshi_get("/trade-api/v2/incentive_programs", params=params, auth=True)
+        batch = data.get("incentive_programs", [])
+        for p in batch:
+            if p.get("incentive_type") == "liquidity" and pd.Timestamp(p["end_date"]) > now:
+                out[p["market_ticker"]] = p
+        cursor = data.get("next_cursor") or data.get("cursor")
+        if not cursor or not batch:
+            return out
+
+
+def fetch_meta(tickers) -> dict[str, dict]:
+    """Market records for `tickers`, 100 per read, in parallel."""
+    tickers = sorted(tickers)
+    chunks = [tickers[i:i + 100] for i in range(0, len(tickers), 100)]
+
+    def one(ch):
+        return kalshi_get("/trade-api/v2/markets", params={"tickers": ",".join(ch), "limit": 1000}).get("markets", [])
+    out = {}
+    with cf.ThreadPoolExecutor(8) as ex:
+        for ms in ex.map(one, chunks):
+            for m in ms:
+                out[m["ticker"]] = m
+    return out
+
+
+def refresh_job(held: set[str]) -> tuple[dict, dict, dict]:
+    """(programs, their markets' records, basket index): the slow refresh, for a worker thread."""
+    programs = load_programs()
+    meta = fetch_meta(set(programs) | held)
+    try:
+        baskets = basket_index(set(programs) | held, arbs_held_events())
+    except Exception:
+        traceback.print_exc()
+        baskets = None
+    return programs, meta, baskets
+
+
 def queue_ahead(c, tickers: list[str]) -> dict[str, float]:
     """Our order id -> contracts ahead of it at its price, for `tickers`, in
     one read (the endpoint takes market_tickers)."""
@@ -442,6 +499,12 @@ class Farm:
         self.ws = WsBooks()
         self.baskets: dict[tuple[str, str], list] = {}
         self.taker_rates: dict[str, float] = {}
+        self.est: dict[str, float] = {}       # ticker -> our LIP $/s per dollar at its last read
+        self.rot = 0
+        self.pool = cf.ThreadPoolExecutor(BOOK_WORKERS, thread_name_prefix="lipfarm-read")
+        self.pending: dict[str, tuple[float, float]] = {}      # leg key -> (price, lots) awaiting its claim
+        self.dumping: set[str] = set()        # markets an informed fill hit: sell out now
+        self.cfg_adverse = 0.8                # cfg.adverse_fill_frac, refreshed each loop
 
     # ---- mode ----
     def _open_mode(self, live: bool):
@@ -515,36 +578,36 @@ class Farm:
         return int(self.meta[ticker].get("exchange_index") or 0)
 
     def refresh_programs(self, cfg: Cfg):
-        out, cursor = {}, None
-        now = pd.Timestamp.now(tz="UTC")
-        while True:
-            params = {"status": "active", "limit": 1000}
-            if cursor:
-                params["cursor"] = cursor
-            data = kalshi_get("/trade-api/v2/incentive_programs", params=params, auth=True)
-            batch = data.get("incentive_programs", [])
-            for p in batch:
-                if p.get("incentive_type") == "liquidity" and pd.Timestamp(p["end_date"]) > now:
-                    out[p["market_ticker"]] = p
-            cursor = data.get("next_cursor") or data.get("cursor")
-            if not cursor or not batch:
-                break
-        self.programs = out
-        self._fetch_meta(self.candidates(cfg))
-        try:
-            self.baskets = basket_index(set(self.candidates(cfg)) | set(self.signed_positions()),
-                                        arbs_held_events())
-        except Exception:
-            traceback.print_exc()
+        """Blocking refresh (dry runs); the live loop runs refresh_job on a worker."""
+        self.apply_refresh(refresh_job(set(self.signed_positions())))
+
+    def apply_refresh(self, result):
+        programs, meta, baskets = result
+        self.programs = programs
+        self.meta.update(meta)
+        if baskets is not None:
+            self.baskets = baskets
         self.last_programs = time.time()
 
     def candidates(self, cfg: Cfg) -> list[str]:
-        """Top `scan_markets` by pool $/s, plus every market we rest in."""
-        def pool(p):
-            P = lip.params_from_program(p)
+        """The `scan_markets` best by our last estimate of LIP per dollar
+        there (pool size until a market has been read: a big pool on a full
+        book pays us nothing), a rotating `scan_rotate` of every other LIP
+        market, and every market we rest in or hold."""
+        def pool(t):
+            P = lip.params_from_program(self.programs[t])
             return P.period_reward_usd / P.snapshots_per_period
-        top = sorted(self.programs, key=lambda t: -pool(self.programs[t]))[:cfg.scan_markets]
-        return list(dict.fromkeys(top + sorted(self.order_tickers())))
+        everything = sorted(self.programs)
+        ranked = sorted(everything, key=lambda t: (-self.est.get(t, -1.0), -pool(t)))
+        top = ranked[:cfg.scan_markets]
+        rest = [t for t in everything if t not in set(top)]
+        rot = []
+        if rest and cfg.scan_rotate:
+            i = self.rot % len(rest)
+            rot = (rest[i:] + rest[:i])[:cfg.scan_rotate]
+            self.rot = i + len(rot)
+        held = sorted(self.order_tickers() | set(self.signed_positions()))
+        return list(dict.fromkeys(top + rot + [t for t in held if t in self.programs]))
 
     def others_of(self, t: str, ob) -> dict[str, dict[float, float]]:
         """Others' books from a REST orderbook or (yes, no) bids: both include
@@ -561,9 +624,11 @@ class Farm:
         return market_rate(others, legs, P) if legs else 0.0
 
     def scan(self, cfg: Cfg):
+        """Blocking scan (dry runs); the live loop reads books on workers and calls scan_finish."""
         tickers = self.candidates(cfg)
-        with cf.ThreadPoolExecutor(BOOK_WORKERS) as ex:
-            got = list(zip(tickers, ex.map(fetch_book, tickers)))
+        self.scan_finish(cfg, list(zip(tickers, self.pool.map(fetch_book, tickers))))
+
+    def scan_finish(self, cfg: Cfg, got: list[tuple[str, dict | None]]):
         plans, rates, books = {}, {}, {}
         self.held_events = arbs_held_events()
         pos = self.signed_positions()
@@ -581,6 +646,10 @@ class Farm:
             pl = self.plan(t, others, P, cfg, pos)
             if pl:
                 plans[t] = pl
+        # What each read market would pay us per dollar, for the next cycle's ranking.
+        for t in books:
+            pl = plans.get(t)
+            self.est[t] = pl.rate / max(pl.capital, 1e-9) if pl else 0.0
         self.books, self.plans, self.rates = books, plans, rates
 
     def sync_live_orders(self):
@@ -662,6 +731,8 @@ class Farm:
             oid = ack.exchange_order_id
             # Fills of these orders get hedged; fills from before two-sided quoting don't.
             self.state.setdefault("hedged_oids", []).append(oid)
+            if not hedge:
+                self.state.setdefault("lip_oid_size", {})[oid] = lots
         else:
             oid = "shadow-" + uuid.uuid4().hex[:12]
         self.state["orders"][key(t, side, hedge)] = {"oid": oid, "side": side, "price": price, "size": lots,
@@ -781,12 +852,41 @@ class Farm:
               f"({'pair' if len(best[2]) == 1 and best[2][0][0] == t else 'basket'})")
         return locked
 
+    def dump(self, t: str):
+        """Informed fill: pull this market's LIP bids, cool it down, and sell
+        what we hold into others' bids, as deep as it takes."""
+        self.dumping.discard(t)
+        for side, o in self.legs_of(t, hedges=False):
+            self.cancel(key(t, side), reason="lipfarm:adverse")
+        self.state.setdefault("cooldown", {})[t] = time.time() + GUARD_COOLDOWN_S
+        v = self.free_positions().get(t, 0.0)
+        if abs(v) < 1.0:
+            return
+        held, other = ("yes", "no") if v > 0 else ("no", "yes")
+        # Selling `held` = buying `other` against others' `held` bids, best first.
+        need, cum, worst = abs(v), 0.0, None
+        for p in sorted(self.books[t][held], reverse=True):
+            cum += self.books[t][held][p]
+            worst = p
+            if cum >= need:
+                break
+        if worst is None:
+            print(f"adverse: {t} no bids to sell {held} into; resting an exit")
+            return
+        q = math.floor(min(need, cum))
+        if q >= 1:
+            self.take(t, other, round(1.0 - worst, 4), q)
+            print(f"adverse: {t} sold {held} x{q} down to {worst}")
+
     def hedge(self, cfg: Cfg, takes: bool = False):
         """Exits for what our fills left us holding. `takes`: first try locking
         it by taking (try_lock). Then rest a bid of the rest one tick above
         the other side's touch, under its offer. Live only."""
         if not self.live:
             return
+        for t in sorted(self.dumping):
+            if t in self.books and t in self.meta:
+                self.dump(t)
         pos = self.free_positions()
         if takes:
             for t, v in list(pos.items()):
@@ -994,8 +1094,7 @@ class Farm:
     def reconcile(self, cfg: Cfg):
         want = self.choose(cfg)
         if self.live:
-            if self.write_claims(want):
-                time.sleep(CLAIM_SETTLE_S)
+            self.write_claims(want)
             now = time.time()
 
             def ready(t: str) -> bool:
@@ -1016,10 +1115,15 @@ class Farm:
                      or o["remaining"] < 0.5 * w[1] or not ready(unkey(k)[0]))
             if stale:
                 self.cancel(k)
+        self.pending = {}
         for k, (px, q) in legs.items():
             t, side = unkey(k)
-            if k not in self.state["orders"] and ready(t):
+            if k in self.state["orders"]:
+                continue
+            if ready(t):
                 self.place(t, side, px, q)
+            else:
+                self.pending[k] = (px, q)
         for t, pl in want.items():
             if t in self.order_tickers():
                 self.rates.setdefault(t, pl.rate)
@@ -1049,7 +1153,39 @@ class Farm:
         self.state["trade_ids"] = sorted(seen)
         if new:
             print(f"fill: {sorted(new)}")
+            self.flag_adverse()
         return new
+
+    def flag_adverse(self):
+        """Mark markets where fills took adverse_fill_frac of one of our LIP bids."""
+        frac = self.cfg_adverse
+        sizes = self.state.get("lip_oid_size", {})
+        done = set(self.state.setdefault("adverse_oids", []))
+        got: dict[str, float] = {}
+        tick: dict[str, str] = {}
+        for f in self.state["fills"]:
+            o = f.get("order_id")
+            if o in sizes and o not in done:
+                got[o] = got.get(o, 0.0) + f["size"]
+                tick[o] = f["ticker"]
+        for o, q in got.items():
+            if q >= frac * sizes[o] - 1e-9:
+                self.state["adverse_oids"].append(o)
+                self.dumping.add(tick[o])
+                print(f"adverse: {tick[o]} filled {q:.0f} of {sizes[o]:.0f}")
+
+    def place_pending(self):
+        """Place legs whose new claim has had CLAIM_SETTLE_S for ARBS to stand aside."""
+        if not self.pending or not self.live:
+            return
+        now = time.time()
+        for k, (px, q) in list(self.pending.items()):
+            t, side = unkey(k)
+            c = self.state.get("claims", {}).get(t)
+            if c is not None and now - c >= CLAIM_SETTLE_S:
+                del self.pending[k]
+                if k not in self.state["orders"]:
+                    self.place(t, side, px, q)
 
     def poll_fills(self) -> set[str]:
         """REST backstop for the socket's fills; returns tickers with new ones."""
@@ -1147,7 +1283,8 @@ class Farm:
         print(f"\n=== LIPFARM {summary['mode']} {pd.Timestamp.now(tz='UTC'):%Y-%m-%d %H:%M:%S}Z "
               f"| {hrs:.2f}h | quoting {len(rows)} | now ${summary['our_usd_day_now']:.0f}/day "
               f"| exp LIP ${tot_lip:.2f} | fills {summary['fills']} pnl ${fill_pnl:+.2f} "
-              f"| net ${summary['net_usd']:+.2f} | resting ${at_risk:.0f} of ${cfg.max_capital:.0f}")
+              f"| net ${summary['net_usd']:+.2f} | resting ${at_risk:.0f} | exposure "
+              f"${summary['exposure_usd']:.0f} of ${cfg.max_capital:.0f}")
         print(f"{'ticker':40} {'mode':7} {'bids':26} {'cap$':>6} {'$/day':>7} {'pool/d':>7} {'expLIP':>7}")
         for r in rows:
             print(f"{r['ticker']:40} {r['mode']:7} {r['bids']:26} {r['capital_usd']:6.0f} "
@@ -1160,14 +1297,17 @@ class Farm:
 
     # ---- loop ----
     def run(self, arm: str | None):
+        """The main thread only decides and writes; book reads and the program
+        refresh run on workers, so exits and pulls never wait on them."""
         modes, stop = TradingModeWatcher(NAME), StopWatcher()
         if arm:
             self.set_live(True, arm)
+        refresh, scan, last_cycle, last_guard = None, None, 0.0, time.time()
         try:
             while True:
                 cfg = Cfg.load()
                 self.bucket.rate = cfg.write_tokens_per_s
-                t0 = time.time()
+                self.cfg_adverse = cfg.adverse_fill_frac
                 try:
                     reason = stop.poll()
                     if reason:
@@ -1176,32 +1316,44 @@ class Farm:
                     want = modes.poll()
                     if want is not None:
                         self.set_live(want, f"dashboard {modes.origin()}")
-                    if time.time() - self.last_programs > cfg.programs_refresh_s:
-                        self.refresh_programs(cfg)
-                    self.poll_fills()
-                    self.sync_live_orders()
-                    self.accrue()
-                    self.scan(cfg)
-                    self.reconcile(cfg)
-                    self.report(cfg)
-                    self._save()
+                    now = time.time()
+                    if refresh is None and now - self.last_programs > cfg.programs_refresh_s:
+                        refresh = self.pool.submit(refresh_job, set(self.signed_positions()))
+                    if refresh is not None and refresh.done():
+                        job, refresh = refresh, None
+                        try:
+                            self.apply_refresh(job.result())
+                        except Exception:
+                            traceback.print_exc()
+                            self.last_programs = now - cfg.programs_refresh_s + 60.0    # retry in a minute
+                    if self.programs and scan is None and now - last_cycle >= cfg.refresh_s:
+                        self.poll_fills()
+                        self.sync_live_orders()
+                        self.accrue()
+                        tickers = self.candidates(cfg)
+                        scan, last_cycle = (tickers, [self.pool.submit(fetch_book, t) for t in tickers]), now
+                    if scan is not None and all(fu.done() for fu in scan[1]):
+                        (tickers, futs), scan = scan, None
+                        self.scan_finish(cfg, [(t, fu.result()) for t, fu in zip(tickers, futs)])
+                        self.reconcile(cfg)
+                        self.report(cfg)
+                        self._save()
+                    self.place_pending()
                 except Exception:
                     traceback.print_exc()
-                last_guard = time.time()
-                while time.time() - t0 < cfg.refresh_s - 1e-3:
-                    self.ws.wake.wait(timeout=max(min(FILL_POLL_S, cfg.refresh_s - (time.time() - t0)), 0.05))
-                    self.ws.wake.clear()
-                    try:
-                        if time.time() - last_guard >= GUARD_S and time.time() - t0 < cfg.refresh_s - 1.0:
-                            last_guard = time.time()
-                            self.react(cfg)
-                            self.guard(cfg)
-                        elif self.ws.up:
-                            self.react(cfg)
-                        else:
-                            self.exit_now(cfg)
-                    except Exception:
-                        traceback.print_exc()
+                self.ws.wake.wait(timeout=FILL_POLL_S)
+                self.ws.wake.clear()
+                try:
+                    if time.time() - last_guard >= GUARD_S:
+                        last_guard = time.time()
+                        self.react(cfg)
+                        self.guard(cfg)
+                    elif self.ws.up:
+                        self.react(cfg)
+                    else:
+                        self.exit_now(cfg)
+                except Exception:
+                    traceback.print_exc()
         except KeyboardInterrupt:
             print("stopping: cancelling quotes")
         finally:

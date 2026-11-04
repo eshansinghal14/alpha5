@@ -3,6 +3,7 @@
     "max_capital": 5000,
     "num_markets": 20,
     "lots": 1000,
+    "adverse_fill_frac": 0.8,
     "exit_vol_frac": 1.0,
     "wide_spread": 0.2,
     "decided_min": 0.97,
@@ -10,6 +11,7 @@
     "max_position": 1000,
     "write_tokens_per_s": 15,
     "scan_markets": 400,
+    "scan_rotate": 500,
     "refresh_s": 30,
     "programs_refresh_s": 600
   }

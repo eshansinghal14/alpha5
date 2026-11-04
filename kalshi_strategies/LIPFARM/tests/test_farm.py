@@ -8,8 +8,8 @@ from kalshi_strategies.LIPFARM import farm
 from kalshi_strategies.LIPFARM.farm import parse_book, plan_market, remove_ours
 
 P = lip.LipParams(target_size=1000, discount_factor=0.5, period_reward_usd=86.4, snapshots_per_period=86400)
-CFG = farm.Cfg(max_capital=5000, num_markets=5, lots=1000, exit_vol_frac=1.0, wide_spread=0.20, decided_min=0.97,
-               min_ahead=0.0, max_position=1e9, write_tokens_per_s=5.0, scan_markets=1, refresh_s=30,
+CFG = farm.Cfg(max_capital=5000, num_markets=5, lots=1000, adverse_fill_frac=0.8, exit_vol_frac=1.0, wide_spread=0.20, decided_min=0.97,
+               min_ahead=0.0, max_position=1e9, write_tokens_per_s=5.0, scan_markets=1, scan_rotate=0, refresh_s=30,
                programs_refresh_s=600)
 
 
@@ -189,9 +189,10 @@ def test_arm_wide_plan_places_both_sides_and_disarm_pulls(tmp_path, monkeypatch)
     assert f.live and b.cancelled == ["old"]                     # only our stray, never another strategy's
     f.programs = {"W-1-A": {"id": "pw", "end_date": "2099-01-01T00:00:00Z"}}
     f.plans = {"W-1-A": farm.Plan("W-1-A", "wide", (("yes", 0.11), ("no", 0.37)), 1e-3, 480.0, 0.002, 1000)}
-    monkeypatch.setattr(farm, "CLAIM_SETTLE_S", 0.0)
-    monkeypatch.setattr(farm.time, "sleep", lambda s: None)
     f.reconcile(CFG)
+    assert not b.sent and set(f.pending) == {"W-1-A|yes", "W-1-A|no"}     # waits for ARBS, without blocking
+    f.state["claims"]["W-1-A"] -= farm.CLAIM_SETTLE_S
+    f.place_pending()
     assert sorted((o.side, o.price, o.size) for o in b.sent) == [("no", 0.37, 1000), ("yes", 0.11, 1000)]
     assert all(o.client_order_id.startswith(farm.CID_PREFIX) for o in b.sent)
     with open(farm.CLAIMS_PATH) as fh:
@@ -383,3 +384,50 @@ def test_sync_keeps_a_resting_order_the_list_missed_and_cancels_orphans(tmp_path
     statuses["oid0"] = "canceled"
     f.sync_live_orders()
     assert "Z-1-A|yes" not in f.state["orders"]
+
+
+def test_candidates_rank_by_what_we_earned_and_rotate_through_the_rest(tmp_path, monkeypatch):
+    monkeypatch.setattr(farm, "ROOT", str(tmp_path))
+    f = farm.Farm()
+    prog = {"id": "p", "end_date": "2099-01-01T00:00:00Z", "target_size_fp": "1000", "discount_factor_bps": 5000,
+            "start_date": "2026-11-04T00:00:00Z"}
+    # BIG has the largest pool but paid us nothing when read; RT is small and pays.
+    f.programs = {"BIG-1-A": dict(prog, period_reward=9000000), "RT-1-A": dict(prog, period_reward=100000),
+                  "C-1-A": dict(prog, period_reward=50000), "D-1-A": dict(prog, period_reward=40000),
+                  "E-1-A": dict(prog, period_reward=30000)}
+    f.est = {"BIG-1-A": 0.0, "RT-1-A": 2e-6}
+    cfg = dataclasses.replace(CFG, scan_markets=1, scan_rotate=2)
+    first = f.candidates(cfg)
+    assert first[0] == "RT-1-A" and len(first) == 3
+    second = f.candidates(cfg)
+    assert second[0] == "RT-1-A" and set(first[1:]).isdisjoint(second[1:])     # the slice moves on
+
+
+def test_full_fill_is_informed_and_sold_into_the_book_at_once(tmp_path, monkeypatch):
+    b = _Bucket()
+    f = _live(tmp_path, monkeypatch, b, placed_ago=1.0)          # LIP yes bid 0.97 x1000 = oid0
+    f.state["lip_oid_size"] = {"oid0": 1000}
+    f.state["hedged_oids"] = ["oid0"]
+    f.books = {"Z-1-A": {"yes": {0.95: 300.0, 0.90: 2000.0}, "no": {0.02: 5000.0}}}
+    f.book_fills([{"ticker": "Z-1-A", "side": "yes", "price": 0.97, "size": 1000.0, "fee": 0.0,
+                   "order_id": "oid0", "trade_id": "t1"}])
+    assert f.dumping == {"Z-1-A"}
+    f.hedge(CFG)
+    ioc = [o for o in b.sent if o.intent == "take"]
+    # Sell 1000 yes: 300 at 0.95, the rest at 0.90 -> buy no up to 0.10.
+    assert [(o.side, o.price, o.size) for o in ioc] == [("no", 0.1, 1000)]
+    assert "oid0" in b.cancelled and f.state["cooldown"]["Z-1-A"] > time.time()
+    assert not f.dumping and f.free_positions() == {}
+
+
+def test_partial_fill_keeps_the_passive_exit(tmp_path, monkeypatch):
+    b = _Bucket()
+    f = _live(tmp_path, monkeypatch, b, placed_ago=1.0)
+    f.state["lip_oid_size"] = {"oid0": 1000}
+    f.state["hedged_oids"] = ["oid0"]
+    f.books = {"Z-1-A": {"yes": {0.95: 300.0}, "no": {0.02: 5000.0}}}
+    f.book_fills([{"ticker": "Z-1-A", "side": "yes", "price": 0.97, "size": 300.0, "fee": 0.0,
+                   "order_id": "oid0", "trade_id": "t1"}])
+    assert not f.dumping
+    f.hedge(CFG)
+    assert not [o for o in b.sent if o.intent == "take"] and "Z-1-A|no|h" in f.state["orders"]
