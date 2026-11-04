@@ -120,6 +120,7 @@ MOVE_RESERVE = 0.8
 # once per MOVE_MIN_S, at most MAX_MOVES per pass, within our own bucket and
 # only while MOVE_RESERVE of the shard's is spare.
 GUARD_S = 5.0
+STATUS_S = 5.0
 # A market the guard pulled isn't re-quoted for this long: books flickering
 # across a threshold had the 30 s cycle re-place into the next flicker
 # (STL, JOHN 11-04 19:19).
@@ -566,6 +567,7 @@ class Farm:
         self.dumping: set[str] = set()        # markets an informed fill hit: sell out now
         self.cfg_adverse = 0.8                # cfg.adverse_fill_frac, refreshed each loop
         self.n_refused, self.last_refused_log = 0, 0.0
+        self.marks_at = 0.0
 
     # ---- mode ----
     def _open_mode(self, live: bool):
@@ -1301,7 +1303,9 @@ class Farm:
             p["lots"] += f["size"]
             p["cost"] += f["size"] * f["price"]
             p["fees"] += f["fee"] or 0.0
-        if pos:
+        # Marks need fresh bids, but the status is written every STATUS_S: refetch at most once a minute.
+        if pos and time.time() - self.marks_at > 60:
+            self.marks_at = time.time()
             self._fetch_meta(sorted({t for t, _ in pos}))
         for (t, side), p in pos.items():
             m = self.meta.get(t, {})
@@ -1319,7 +1323,8 @@ class Farm:
             p["pnl"] = p["value"] - p["cost"] - p["fees"]
         return list(pos.values())
 
-    def report(self, cfg: Cfg):
+    def report(self, cfg: Cfg, log: bool = True):
+        """Write status.json for the dashboard; `log`: also print the table (once a cycle)."""
         rows = []
         for t in sorted(self.order_tickers(), key=lambda t: -self.rates.get(t, 0.0)):
             legs = sorted(self.legs_of(t), key=lambda so: so[0])
@@ -1356,6 +1361,8 @@ class Farm:
         with open(tmp, "w") as f:
             json.dump({"summary": summary, "quotes": rows, "positions": pos, "waiting": self.waiting}, f, indent=1)
         os.replace(tmp, os.path.join(ROOT, "status.json"))
+        if not log:
+            return
 
         print(f"\n=== LIPFARM {summary['mode']} {pd.Timestamp.now(tz='UTC'):%Y-%m-%d %H:%M:%S}Z "
               f"| {hrs:.2f}h | quoting {len(rows)} | now ${summary['our_usd_day_now']:.0f}/day "
@@ -1379,7 +1386,7 @@ class Farm:
         modes, stop = TradingModeWatcher(NAME), StopWatcher()
         if arm:
             self.set_live(True, arm)
-        refresh, scan, last_cycle, last_guard = None, None, 0.0, time.time()
+        refresh, scan, last_cycle, last_guard, last_status = None, None, 0.0, time.time(), 0.0
         try:
             while True:
                 cfg = Cfg.load()
@@ -1416,6 +1423,11 @@ class Farm:
                         self.report(cfg)
                         self._save()
                     self.place_pending()
+                    # The dashboard polls every 5 s; a scan cycle takes ~1 min at READS_PER_S.
+                    if self.programs and time.time() - last_status >= STATUS_S:
+                        last_status = time.time()
+                        self.accrue()
+                        self.report(cfg, log=False)
                 except Exception:
                     traceback.print_exc()
                 self.ws.wake.wait(timeout=FILL_POLL_S)
