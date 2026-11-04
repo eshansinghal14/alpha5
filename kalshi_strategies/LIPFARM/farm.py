@@ -1,7 +1,21 @@
 """
-LIP farmer. Rests one post-only bid of `lots` on the CHEAP side's touch
-(best bid <= `max_price`) of the `num_markets` LIP markets whose reward to
-us, at today's book, is highest in $/s. Never quotes the expensive side.
+LIP farmer. Quotes LIP markets in one of two shapes, chosen per market each
+cycle from today's book:
+
+  wide     the yes/no spread is at least `wide_spread`: one bid of `lots` at
+           each side's touch, owning both halves of a thin book.
+  decided  the expensive side's best bid is in [decided_min, decided_max]:
+           one bid of `lots` there only (fills gain the last cents; the risk
+           is a reversal). At 0.99 a side earns no LIP, so decided_max <= 0.98.
+
+Every side must reach Kalshi's Target size, ours included where we quote and
+from others alone where we don't, or the snapshot pays nobody. Markets are
+ranked by LIP per dollar of resting capital, up to `max_capital`.
+
+A fill is hedged within GUARD_S: a bid of the filled size rests on the other
+side at its touch, priced so the pair costs at least HEDGE_EDGE under $1
+(Kalshi nets a yes+no pair to $1). Hedges count toward max_capital and are
+never pulled by the guard.
 
     python -m kalshi_strategies.LIPFARM.farm                # shadow until armed from the dashboard
     python -m kalshi_strategies.LIPFARM.farm --live         # armed from the start: REAL MONEY
@@ -10,9 +24,10 @@ us, at today's book, is highest in $/s. Never quotes the expensive side.
 Arm/disarm is the dashboard's button (trading_mode.json, as for every
 series); STOP.json disarms and exits. Params in config.json (dashboard
 sidebar, re-read every cycle). Journal in data/live/LIPFARM/<mode>/state.json
-survives restarts; data/live/LIPFARM/status.json holds the latest table. "Expected LIP" is our modelled share
-(lip.py) integrated over time, not what Kalshi pays: payouts under $1 per
-market-period are dropped, and others' size between our scans is unseen.
+survives restarts; data/live/LIPFARM/status.json holds the latest table.
+"Expected LIP" is our modelled share (lip.py) integrated over time, not what
+Kalshi pays: payouts under $1 per market-period are dropped, and others' size
+between our reads is unseen.
 
 ARBS: live, every ticker we want, rest on or hold goes in claimed.json (with
 our positions). ARBS reads it every second: it neither takes nor quotes a
@@ -64,40 +79,39 @@ LIP_MIN_PAYOUT_USD = 1.0
 # MOVE_RESERVE: we spend what ARBS isn't using. Cancels always go.
 PLACE_RESERVE = 0.5
 MOVE_RESERVE = 0.8
-# Between cycles, every GUARD_S each quote's book is re-read: a quote the
-# filters would no longer place is pulled, and one with MOVE_BEHIND_FRAC *
+# Between cycles, every GUARD_S each quoted market's book is re-read: a quote
+# its market's plan no longer has is pulled, and one with MOVE_BEHIND_FRAC *
 # lots joined behind it is re-placed at the back (cancel + create, 12 tokens;
-# LIP has no time priority, so the back only sheds fills). Per market at most
+# LIP has no time priority, so the back only sheds fills). Per quote at most
 # once per MOVE_MIN_S, at most MAX_MOVES per pass: <= 5 * 12 / 5 s = 12
 # tokens/s, 4% of the bucket, and only while MOVE_RESERVE of it is spare.
 GUARD_S = 5.0
-# A market the guard pulled isn't re-quoted for this long: its offer was
-# flickering in and out of min_spread, and the 30 s cycle re-placed it into
-# the next flicker (STL, JOHN 11-04 19:19).
+# A market the guard pulled isn't re-quoted for this long: books flickering
+# across a threshold had the 30 s cycle re-place into the next flicker
+# (STL, JOHN 11-04 19:19).
 GUARD_COOLDOWN_S = 300.0
 MOVE_MIN_S = 10.0
 MOVE_BEHIND_FRAC = 0.2
 MAX_MOVES = 5
+HEDGE_EDGE = 0.01
 
 
 @section
 class Cfg:
-    num_markets: int = param("Markets quoted: the ones paying us most LIP per second at today's book.",
-                             min=0, step=1)
-    lots: float = param("Contracts per quote, one quote per market at the cheap side's best bid.",
-                        min=1.0, step=100.0)
-    max_price: float = param("Cheap side only: quote a side only if its best bid is at most this.",
-                             min=0.001, max=0.5, step=0.01)
-    min_spread: float = param("Quote a side only if its offer is at least this far above our bid: a 1c offer "
-                              "over a 1c bid gets sold into (11-04, 108 picks: fills cost 1.2-1.8x the LIP "
-                              "under 4c of spread, 0.6x from 4c).", min=0.0, max=0.5, step=0.01)
-    min_ahead: float = param("Quote only where others already rest at least this many contracts at our "
+    max_capital: float = param("Most dollars resting in our bids across all markets (each bid costs lots x "
+                               "price). Markets are taken best LIP per dollar first.", min=0.0, step=500.0)
+    num_markets: int = param("Most markets quoted.", min=0, step=1)
+    lots: float = param("Contracts per bid (one bid per quoted side).", min=1.0, step=100.0)
+    wide_spread: float = param("Wide: quote both sides at the touch when ask - bid is at least this.",
+                               min=0.01, max=0.98, step=0.01)
+    decided_min: float = param("Decided: quote the expensive side when its best bid is at least this.",
+                               min=0.5, max=0.98, step=0.01)
+    decided_max: float = param("Decided: ... and at most this (0.99 earns no LIP).", min=0.5, max=0.98,
+                               step=0.01)
+    min_ahead: float = param("Quote a side only where others already rest at least this many contracts at our "
                              "price (they are filled before us). 0 = may be alone.", min=0.0, step=100.0)
-    max_position: float = param("Stop quoting a market once we hold this many contracts in it (refills on a "
-                                "dumped market only add losers).", min=0.0, step=100.0)
-    switch_margin: float = param("Stickiness: once a quoted market has passed Kalshi's $1 minimum payout "
-                                 "this period, a new one replaces it only if it pays this much more "
-                                 "(0.5 = 50% more $/s). Below $1 it is never replaced.", min=0.0, step=0.1)
+    max_position: float = param("Stop quoting a side once we hold this many contracts of it.", min=0.0,
+                                step=100.0)
     scan_markets: int = param("Books read each cycle: the largest LIP pools.", min=1, step=50)
     refresh_s: float = param("Seconds between cycles.", min=5.0, editable=False)
     programs_refresh_s: float = param("Seconds between re-reads of the LIP program list.", min=60.0,
@@ -114,12 +128,26 @@ class LipFarmConfig:
 
 
 @dataclasses.dataclass
-class Pick:
+class Plan:
     ticker: str
-    side: str
-    price: float
-    rate: float        # our $/s with `lots` resting at price
-    pool_rate: float   # whole program's $/s
+    mode: str                          # "wide" | "decided"
+    legs: tuple                        # ((side, price), ...)
+    rate: float                        # our $/s with `lots` on every leg
+    capital: float                     # dollars those bids tie up
+    pool_rate: float                   # whole program's $/s
+
+
+def key(ticker: str, side: str, hedge: bool = False) -> str:
+    return f"{ticker}|{side}|h" if hedge else f"{ticker}|{side}"
+
+
+def unkey(k: str) -> tuple[str, str]:
+    parts = k.split("|")
+    return parts[0], parts[1]
+
+
+def is_hedge(k: str) -> bool:
+    return k.endswith("|h")
 
 
 def parse_book(ob: dict) -> tuple[dict[float, float], dict[float, float]]:
@@ -139,31 +167,46 @@ def levels(book: dict[float, float], price: float | None = None, size: float = 0
                   key=lambda lv: -lv.price)
 
 
-def rate_at(others: dict[str, dict[float, float]], side: str, price: float, size: float,
-            params: lip.LipParams) -> float:
-    """Our $/s with `size` at `price` on `side`, given others' books."""
-    y = levels(others["yes"], price, size) if side == "yes" else levels(others["yes"])
-    n = levels(others["no"], price, size) if side == "no" else levels(others["no"])
-    return lip.reward_rate(y, n, params)
+def book_score(others: dict[str, dict[float, float]], legs, params: lip.LipParams) -> lip.LipBookScore:
+    """Score with our `legs` ((side, price, size), ...) added to others' books."""
+    mine = {s: (p, q) for s, p, q in legs}
+    y = levels(others["yes"], *mine["yes"]) if "yes" in mine else levels(others["yes"])
+    n = levels(others["no"], *mine["no"]) if "no" in mine else levels(others["no"])
+    return lip.score_book(y, n, params)
 
 
-def best_pick(ticker: str, others: dict[str, dict[float, float]], params: lip.LipParams,
-              lots: float, max_price: float, min_spread: float = 0.0, min_ahead: float = 0.0) -> Pick | None:
-    """Best cheap-side touch for `lots`, or None. Joins others' best bid (never
-    improves it); on an empty side, bids 0.01. The side's offer must be at
-    least `min_spread` above that bid, and others must rest `min_ahead` there."""
-    best = None
-    for side, opp in (("yes", "no"), ("no", "yes")):
-        book = others[side]
-        price = max(book) if book else 0.01
-        ask = 1.0 - max(others[opp]) if others[opp] else 1.0
-        if (price > max_price + 1e-9 or ask - price < max(min_spread, 1e-9) - 1e-9
-                or book.get(price, 0.0) < min_ahead - 1e-9):
-            continue
-        r = rate_at(others, side, price, lots, params)
-        if r > 0 and (best is None or r > best.rate):
-            best = Pick(ticker, side, price, r, params.period_reward_usd / params.snapshots_per_period)
-    return best
+def market_rate(others, legs, params) -> float:
+    """Our $/s with `legs` ((side, price, size), ...) resting."""
+    return book_score(others, legs, params).expected_reward_this_snapshot_usd
+
+
+def plan_market(ticker: str, others: dict[str, dict[float, float]], params: lip.LipParams, cfg: Cfg,
+                held: dict[str, float] | None = None) -> Plan | None:
+    """How to quote this market now, or None. Joins others' best bids (never
+    improves them). `held`: contracts we already hold per side."""
+    held = held or {}
+    if not others["yes"] or not others["no"]:
+        return None
+    by, bn = max(others["yes"]), max(others["no"])
+    hi_side, hi = ("yes", by) if by >= bn else ("no", bn)
+    if cfg.decided_min - 1e-9 <= hi <= cfg.decided_max + 1e-9:
+        mode, legs = "decided", [(hi_side, hi)]
+    elif 1.0 - by - bn >= cfg.wide_spread - 1e-9:
+        mode, legs = "wide", [("yes", by), ("no", bn)]
+    else:
+        return None
+    legs = [(s, p) for s, p in legs
+            if others[s].get(p, 0.0) >= cfg.min_ahead - 1e-9 and held.get(s, 0.0) < cfg.max_position - 1e-9]
+    if not legs:
+        return None
+    sized = [(s, p, cfg.lots) for s, p in legs]
+    # A side we quote must reach Target with our lots, one we don't from others
+    # alone: otherwise the snapshot is excluded and pays nobody.
+    sc = book_score(others, sized, params)
+    if not sc.qualifies or sc.expected_reward_this_snapshot_usd <= 0:
+        return None
+    return Plan(ticker, mode, tuple(legs), sc.expected_reward_this_snapshot_usd,
+                cfg.lots * sum(p for _, p in legs), params.period_reward_usd / params.snapshots_per_period)
 
 
 def event_of(ticker: str) -> str:
@@ -222,7 +265,7 @@ class Farm:
         self.meta: dict[str, dict] = {}
         self.clients: dict[int, object] = {}
         self.books: dict[str, dict[str, dict[float, float]]] = {}
-        self.picks: dict[str, Pick] = {}
+        self.plans: dict[str, Plan] = {}
         self.held_events: set[str] = set()
         self.waiting: list[str] = []
         self.last_programs = 0.0
@@ -234,7 +277,7 @@ class Farm:
         os.makedirs(self.dir, exist_ok=True)
         self.state_path = os.path.join(self.dir, "state.json")
         self.state = self._load_state()
-        self.rates: dict[str, float] = {}       # ticker -> our current $/s for the resting order
+        self.rates: dict[str, float] = {}       # ticker -> our current $/s with our resting bids
         self.last_accrue = time.time()
 
     def set_live(self, want: bool, why: str):
@@ -244,8 +287,8 @@ class Farm:
             return
         print(f"{'ARM' if want else 'DISARM'}: {why}")
         self.accrue()
-        for t in list(self.state["orders"]):
-            self.cancel(t)
+        for k in list(self.state["orders"]):
+            self.cancel(k)
         if self.live:
             self.write_claims({})       # held positions stay claimed from ARBS
         self._save()
@@ -257,7 +300,10 @@ class Farm:
     def _load_state(self) -> dict:
         if os.path.exists(self.state_path):
             with open(self.state_path) as f:
-                return json.load(f)
+                st = json.load(f)
+            # Journals from before two-sided quoting keyed orders by ticker alone.
+            st["orders"] = {(k if "|" in k else key(k, o["side"])): o for k, o in st["orders"].items()}
+            return st
         return {"t0": time.time(), "orders": {}, "fills": [], "trade_ids": [], "accrued": {}}
 
     def _save(self):
@@ -265,6 +311,13 @@ class Farm:
         with open(tmp, "w") as f:
             json.dump(self.state, f)
         os.replace(tmp, self.state_path)
+
+    def order_tickers(self) -> set[str]:
+        return {unkey(k)[0] for k in self.state["orders"]}
+
+    def legs_of(self, t: str, hedges: bool = True) -> list[tuple[str, dict]]:
+        return [(unkey(k)[1], o) for k, o in self.state["orders"].items()
+                if unkey(k)[0] == t and (hedges or not is_hedge(k))]
 
     # ---- exchange ----
     def client(self, shard: int):
@@ -308,46 +361,48 @@ class Farm:
         self.last_programs = time.time()
 
     def candidates(self, cfg: Cfg) -> list[str]:
-        """Top `scan_markets` by pool $/s, plus every market we rest or hold in."""
+        """Top `scan_markets` by pool $/s, plus every market we rest in."""
         def pool(p):
             P = lip.params_from_program(p)
             return P.period_reward_usd / P.snapshots_per_period
         top = sorted(self.programs, key=lambda t: -pool(self.programs[t]))[:cfg.scan_markets]
-        return list(dict.fromkeys(top + list(self.state["orders"])))
+        return list(dict.fromkeys(top + sorted(self.order_tickers())))
+
+    def others_of(self, t: str, ob: dict) -> dict[str, dict[float, float]]:
+        """Others' books: the REST book includes our live bids (a shadow one isn't there)."""
+        yes, no = parse_book(ob)
+        others = {"yes": yes, "no": no}
+        if self.live:
+            for side, o in self.legs_of(t):
+                others[side] = remove_ours(others[side], o["price"], o["remaining"])
+        return others
+
+    def our_rate(self, t: str, others, P) -> float:
+        legs = [(s, o["price"], o["remaining"]) for s, o in self.legs_of(t)]
+        return market_rate(others, legs, P) if legs else 0.0
 
     def scan(self, cfg: Cfg):
         tickers = self.candidates(cfg)
-
-        def one(t):
-            try:
-                return t, kalshi_get(f"/trade-api/v2/markets/{t}/orderbook").get("orderbook_fp", {})
-            except Exception:
-                return t, None
         with cf.ThreadPoolExecutor(BOOK_WORKERS) as ex:
-            got = list(ex.map(one, tickers))
-        picks, rates, books = {}, {}, {}
+            got = list(zip(tickers, ex.map(fetch_book, tickers)))
+        plans, rates, books = {}, {}, {}
         self.held_events = arbs_held_events()
         pos = self.signed_positions()
         for t, ob in got:
             if ob is None or t not in self.programs:
                 continue
-            yes, no = parse_book(ob)
-            others = {"yes": yes, "no": no}
-            mine = self.state["orders"].get(t)
-            # The REST book includes our live order; a shadow one isn't there.
-            if mine and self.live:
-                others[mine["side"]] = remove_ours(others[mine["side"]], mine["price"], mine["remaining"])
+            others = self.others_of(t, ob)
             books[t] = others
             m = self.meta.get(t, {})
             if m and m.get("status") != "active":
                 continue
             P = self.params(t)
-            if mine:
-                rates[t] = rate_at(others, mine["side"], mine["price"], mine["remaining"], P)
-            pk = self.pick(t, others, P, cfg, pos)
-            if pk:
-                picks[t] = pk
-        self.books, self.picks, self.rates = books, picks, rates
+            if t in self.order_tickers():
+                rates[t] = self.our_rate(t, others, P)
+            pl = self.plan(t, others, P, cfg, pos)
+            if pl:
+                plans[t] = pl
+        self.books, self.plans, self.rates = books, plans, rates
 
     def sync_live_orders(self):
         """Drop journaled orders Kalshi no longer has resting (filled, or the market closed)."""
@@ -355,9 +410,9 @@ class Farm:
             return
         c = self.client(0)
         resting = {oid for oid, _, _ in c._resting("")}
-        for t, o in list(self.state["orders"].items()):
+        for k, o in list(self.state["orders"].items()):
             if o["oid"] not in resting:
-                del self.state["orders"][t]
+                del self.state["orders"][k]
 
     def cancel_strays(self):
         """Cancel our resting orders left by an earlier run (client id prefix)."""
@@ -370,120 +425,169 @@ class Farm:
                     print(f"stray cancel {ticker}: {e}")
         self.state["orders"] = {}
 
-    def cancel(self, ticker: str, reason: str = "lipfarm:cancel"):
-        o = self.state["orders"].pop(ticker, None)
+    def cancel(self, k: str, reason: str = "lipfarm:cancel"):
+        o = self.state["orders"].pop(k, None)
+        t = unkey(k)[0]
         if o and self.live:
-            c = self.client(self.shard(ticker))
+            c = self.client(self.shard(t))
             c.allow_now("cancel", force=True, reason=reason)
             try:
-                c.cancel(o["oid"], ticker)
+                c.cancel(o["oid"], t)
             except Exception as e:
-                print(f"cancel {ticker}: {e}")
+                print(f"cancel {k}: {e}")
 
-    def place(self, pk: Pick, lots: float, reserve: float = PLACE_RESERVE, reason: str = "lipfarm:quote") -> bool:
+    def place(self, t: str, side: str, price: float, lots: float, reserve: float = PLACE_RESERVE,
+              reason: str = "lipfarm:quote", hedge: bool = False) -> bool:
         if self.live:
-            c = self.client(self.shard(pk.ticker))
+            c = self.client(self.shard(t))
             if not (c.can_afford("order", reserve=reserve * c.tokens_per_s) and c.allow_now("order", reason=reason)):
                 return False
-            order = Order(order_id=0, ticker=pk.ticker, side=pk.side, order_type="limit",
-                          price=pk.price, size=lots, decision_time=pd.Timestamp.now(tz="UTC"),
-                          intent="quote")
+            order = Order(order_id=0, ticker=t, side=side, order_type="limit", price=price, size=lots,
+                          decision_time=pd.Timestamp.now(tz="UTC"), intent="quote")
             order.client_order_id = CID_PREFIX + uuid.uuid4().hex[:24]
             try:
                 ack = c.place_resting(order)
             except Exception as e:
-                print(f"place {pk.ticker} {pk.side}@{pk.price}: {e}")
+                print(f"place {t} {side}@{price}: {e}")
                 return False
             oid = ack.exchange_order_id
+            # Fills of these orders get hedged; fills from before two-sided quoting don't.
+            self.state.setdefault("hedged_oids", []).append(oid)
         else:
             oid = "shadow-" + uuid.uuid4().hex[:12]
-        self.state["orders"][pk.ticker] = {"oid": oid, "side": pk.side, "price": pk.price,
-                                           "size": lots, "remaining": lots, "placed": time.time()}
-        self.rates[pk.ticker] = pk.rate
+        self.state["orders"][key(t, side, hedge)] = {"oid": oid, "side": side, "price": price, "size": lots,
+                                                     "remaining": lots, "placed": time.time()}
         return True
+
+    def held_costs(self) -> dict[tuple[str, str], float]:
+        """(ticker, side) -> average price paid for that side, from our fills."""
+        acc: dict[tuple[str, str], list] = {}
+        for f in self.state["fills"]:
+            a = acc.setdefault((f["ticker"], f["side"]), [0.0, 0.0])
+            a[0] += f["size"] * f["price"]
+            a[1] += f["size"]
+        return {k: c / q for k, (c, q) in acc.items() if q > 0}
+
+    def hedge(self, cfg: Cfg):
+        """Rest a bid of our net position's size on the other side at its touch,
+        priced so the pair costs at most 1 - HEDGE_EDGE. Live only."""
+        if not self.live:
+            return
+        pos, cost, want = self.signed_positions(hedged_only=True), self.held_costs(), {}
+        for t, v in pos.items():
+            others = self.books.get(t)
+            if not others or t not in self.meta:
+                continue
+            held, side = ("yes", "no") if v > 0 else ("no", "yes")
+            touch = max(others[side]) if others[side] else 0.01
+            ask = 1.0 - max(others[held]) if others[held] else 1.0
+            px = min(touch, round(1.0 - cost.get((t, held), 1.0) - HEDGE_EDGE, 2), round(ask - 0.01, 4))
+            if px >= 0.01:
+                want[key(t, side, True)] = (px, abs(v))
+        for k, o in list(self.state["orders"].items()):
+            if not is_hedge(k):
+                continue
+            w = want.get(k)
+            if (w is None or abs(w[0] - o["price"]) > 1e-9 or o["remaining"] > w[1] + 1e-9
+                    or o["remaining"] < 0.5 * w[1]):
+                self.cancel(k, reason="lipfarm:hedge")
+        for k, (px, q) in want.items():
+            if k not in self.state["orders"]:
+                t, side = unkey(k)
+                if self.place(t, side, px, q, reserve=0.0, reason="lipfarm:hedge", hedge=True):
+                    print(f"hedge: {t} {side}@{px} x{q:.0f}")
+
+    def hedge_capital(self) -> float:
+        return sum(o["price"] * o["remaining"] for k, o in self.state["orders"].items() if is_hedge(k))
 
     def params(self, t: str) -> lip.LipParams:
         m = self.meta.get(t, {})
         return dataclasses.replace(lip.params_from_program(self.programs[t]), price_ranges=tuple(
             (float(r["start"]), float(r["end"]), float(r["step"])) for r in m.get("price_ranges") or []))
 
-    def pick(self, t: str, others: dict, P: lip.LipParams, cfg: Cfg, pos: dict[str, float]) -> Pick | None:
-        """best_pick under every filter, or None (ARBS-held event, position cap)."""
+    def plan(self, t: str, others: dict, P: lip.LipParams, cfg: Cfg, pos: dict[str, float]) -> Plan | None:
+        """plan_market, or None on an event ARBS holds."""
         if event_of(t) in self.held_events:
             return None
-        pk = best_pick(t, others, P, cfg.lots, cfg.max_price, cfg.min_spread, cfg.min_ahead)
-        if pk and (pos.get(t, 0.0) if pk.side == "yes" else -pos.get(t, 0.0)) >= cfg.max_position - 1e-9:
-            return None
-        return pk
+        v = pos.get(t, 0.0)
+        return plan_market(t, others, P, cfg, {"yes": max(v, 0.0), "no": max(-v, 0.0)})
 
     def guard(self, cfg: Cfg):
-        """Live, between cycles: re-read each quote's book; pull a quote the
-        filters would no longer place, and move one with size behind it to the
-        back. A price change is left to the next cycle."""
-        orders = dict(self.state["orders"])
-        if not self.live or not orders:
+        """Live, between cycles: re-read each quoted market's book; pull a bid
+        its plan no longer has, and move one with size behind it to the back.
+        A price change is left to the next cycle."""
+        if not self.live:
+            return
+        self.poll_fills()
+        tickers = sorted(self.order_tickers() | set(self.signed_positions()))
+        if not tickers:
             return
         with cf.ThreadPoolExecutor(BOOK_WORKERS) as ex:
-            got = dict(zip(orders, ex.map(fetch_book, orders)))
+            got = dict(zip(tickers, ex.map(fetch_book, tickers)))
         pos, keep = self.signed_positions(), {}
-        for t, o in orders.items():
+        for t in tickers:
             ob = got.get(t)
             if ob is None or t not in self.programs:
                 continue
-            yes, no = parse_book(ob)
-            others = {"yes": yes, "no": no}
-            others[o["side"]] = remove_ours(others[o["side"]], o["price"], o["remaining"])
-            P = self.params(t)
-            pk = self.pick(t, others, P, cfg, pos)
-            if pk is None or pk.side != o["side"]:
-                print(f"guard: pull {t} {o['side']}@{o['price']} (fails the filters now)")
-                self.cancel(t, reason="lipfarm:guard")
-                self.state.setdefault("cooldown", {})[t] = time.time() + GUARD_COOLDOWN_S
-                continue
+            others = self.others_of(t, ob)
             self.books[t] = others
-            self.rates[t] = rate_at(others, o["side"], o["price"], o["remaining"], P)
-            if abs(pk.price - o["price"]) < 1e-9:
-                keep[t] = (pk, others)
+            if t not in self.order_tickers():
+                continue
+            P = self.params(t)
+            pl = self.plan(t, others, P, cfg, pos)
+            want = dict(pl.legs) if pl else {}
+            for side, o in self.legs_of(t, hedges=False):
+                if side not in want:
+                    print(f"guard: pull {t} {side}@{o['price']} (not in its plan now)")
+                    self.cancel(key(t, side), reason="lipfarm:guard")
+                    self.state.setdefault("cooldown", {})[t] = time.time() + GUARD_COOLDOWN_S
+                elif abs(want[side] - o["price"]) < 1e-9:
+                    keep[key(t, side)] = others
+            self.rates[t] = self.our_rate(t, others, P)
+        self.hedge(cfg)
         now = time.time()
-        due = {t: v for t, v in keep.items() if now - orders[t]["placed"] >= MOVE_MIN_S}
+        orders = dict(self.state["orders"])
+        due = {k: v for k, v in keep.items() if k in orders and now - orders[k]["placed"] >= MOVE_MIN_S}
         if not due:
             return
         c = self.client(0)
         try:
-            ahead = queue_ahead(c, list(due))
+            ahead = queue_ahead(c, sorted({unkey(k)[0] for k in due}))
         except Exception as e:
             print(f"queue positions: {e}")
             return
         moves = 0
-        for t, (pk, others) in sorted(due.items(), key=lambda kv: orders[kv[0]]["placed"]):
-            o = orders[t]
+        for k, others in sorted(due.items(), key=lambda kv: orders[kv[0]]["placed"]):
+            o, (t, side) = orders[k], unkey(k)
             a = ahead.get(o["oid"])
-            if a is None or others[o["side"]].get(round(o["price"], 4), 0.0) - a < MOVE_BEHIND_FRAC * cfg.lots:
+            if a is None or others[side].get(round(o["price"], 4), 0.0) - a < MOVE_BEHIND_FRAC * cfg.lots:
                 continue
             c = self.client(self.shard(t))
             if moves >= MAX_MOVES or not c.can_afford("order", reserve=MOVE_RESERVE * c.tokens_per_s
                                                       + c.COST["cancel"]):
                 return
-            self.cancel(t, reason="lipfarm:move")
-            if self.place(pk, cfg.lots, reserve=0.0, reason="lipfarm:move"):
+            self.cancel(k, reason="lipfarm:move")
+            if self.place(t, side, o["price"], cfg.lots, reserve=0.0, reason="lipfarm:move"):
                 moves += 1
 
-    def signed_positions(self) -> dict[str, float]:
-        """Signed YES contracts (negative = long NO) from our fills, unsettled markets only."""
+    def signed_positions(self, hedged_only: bool = False) -> dict[str, float]:
+        """Signed YES contracts (negative = long NO) from our fills, unsettled
+        markets only; `hedged_only`: fills of orders whose fills we hedge."""
         out: dict[str, float] = {}
+        ok = set(self.state.get("hedged_oids", [])) if hedged_only else None
         for f in self.state["fills"]:
-            if self.meta.get(f["ticker"], {}).get("result"):
+            if self.meta.get(f["ticker"], {}).get("result") or (ok is not None and f.get("order_id") not in ok):
                 continue
             out[f["ticker"]] = out.get(f["ticker"], 0.0) + (f["size"] if f["side"] == "yes" else -f["size"])
         return {t: v for t, v in out.items() if abs(v) > 1e-9}
 
-    def write_claims(self, want: dict[str, Pick]) -> bool:
+    def write_claims(self, want: dict[str, Plan]) -> bool:
         """Claim what we want, rest on, or hold; keep each ticker's first-claim
         time, which the placement gate waits on. True if anything new was claimed."""
         pos = self.signed_positions()
         now = time.time()
         old = self.state.setdefault("claims", {})
-        claims = {t: old.get(t, now) for t in set(want) | set(self.state["orders"]) | set(pos)}
+        claims = {t: old.get(t, now) for t in set(want) | self.order_tickers() | set(pos)}
         self.state["claims"] = claims
         os.makedirs(os.path.dirname(CLAIMS_PATH), exist_ok=True)
         tmp = CLAIMS_PATH + ".tmp"
@@ -495,24 +599,36 @@ class Farm:
     def period_accrued(self, t: str) -> float:
         return self.state.setdefault("period_accrued", {}).get(self.programs[t]["id"], 0.0)
 
-    def choose(self, cfg: Cfg) -> dict[str, Pick]:
-        """The markets to quote. Only ones that can still reach the $1 payout
-        before their period ends; a quoted one under $1 this period is kept
-        (dropping it forfeits what it accrued); past $1 it keeps its place
-        unless a newcomer pays `switch_margin` more."""
+    def choose(self, cfg: Cfg) -> dict[str, Plan]:
+        """The markets to quote, within max_capital and num_markets. Only ones
+        that can still reach the $1 payout before their period ends. Quoted
+        markets past $1 this period come first (every further dollar there is
+        paid), then quoted ones under $1 (dropping one forfeits its accrual),
+        then new ones; best LIP per dollar first within each."""
         now = time.time()
 
         def left(t):
             return max(pd.Timestamp(self.programs[t]["end_date"]).timestamp() - now, 0.0)
+
+        def per_dollar(p):
+            return p.rate / max(p.capital, 1e-9)
         cool = self.state.setdefault("cooldown", {})
-        cands = [p for p in self.picks.values() if p.ticker in self.programs and cool.get(p.ticker, 0.0) <= now
+        cands = [p for p in self.plans.values() if p.ticker in self.programs and cool.get(p.ticker, 0.0) <= now
                  and self.period_accrued(p.ticker) + p.rate * left(p.ticker) >= LIP_MIN_PAYOUT_USD]
-        held = set(self.state["orders"])
-        locked = sorted((p for p in cands if p.ticker in held and self.period_accrued(p.ticker) < LIP_MIN_PAYOUT_USD),
-                        key=lambda p: -p.rate)
-        rest = sorted((p for p in cands if p not in locked),
-                      key=lambda p: -p.rate * (1.0 + cfg.switch_margin if p.ticker in held else 1.0))
-        return {p.ticker: p for p in (locked + rest)[:cfg.num_markets]}
+        held = self.order_tickers()
+
+        def rank(p):
+            if p.ticker not in held:
+                return 2
+            return 0 if self.period_accrued(p.ticker) >= LIP_MIN_PAYOUT_USD else 1
+        out, spent = {}, self.hedge_capital()
+        for p in sorted(cands, key=lambda p: (rank(p), -per_dollar(p))):
+            if len(out) >= cfg.num_markets:
+                break
+            if spent + p.capital <= cfg.max_capital + 1e-9:
+                out[p.ticker] = p
+                spent += p.capital
+        return out
 
     def reconcile(self, cfg: Cfg):
         want = self.choose(cfg)
@@ -530,33 +646,44 @@ class Farm:
             def ready(t: str) -> bool:
                 return True
         self.waiting = [t for t in want if not ready(t)]
-        for t, o in list(self.state["orders"].items()):
-            pk = want.get(t)
-            stale = (pk is None or pk.side != o["side"] or abs(pk.price - o["price"]) > 1e-9
-                     or abs(o["size"] - cfg.lots) > 1e-9 or o["remaining"] < 0.5 * cfg.lots or not ready(t))
+        legs = {key(t, s): p for t, pl in want.items() for s, p in pl.legs}
+        for k, o in list(self.state["orders"].items()):
+            if is_hedge(k):
+                continue
+            px = legs.get(k)
+            stale = (px is None or abs(px - o["price"]) > 1e-9 or abs(o["size"] - cfg.lots) > 1e-9
+                     or o["remaining"] < 0.5 * cfg.lots or not ready(unkey(k)[0]))
             if stale:
-                self.cancel(t)
-        for t, pk in want.items():
-            if t not in self.state["orders"] and ready(t):
-                self.place(pk, cfg.lots)
+                self.cancel(k)
+        for k, px in legs.items():
+            t, side = unkey(k)
+            if k not in self.state["orders"] and ready(t):
+                self.place(t, side, px, cfg.lots)
+        for t, pl in want.items():
+            if t in self.order_tickers():
+                self.rates.setdefault(t, pl.rate)
+        self.hedge(cfg)
 
     def poll_fills(self):
         if not self.live or not self.clients:
             return
-        ours = {o["oid"]: t for t, o in self.state["orders"].items()}
+        ours = {o["oid"]: k for k, o in self.state["orders"].items()}
         known = set(self.state.get("all_oids", []))
         known |= set(ours)
         self.state["all_oids"] = sorted(known)
         seen = set(self.state["trade_ids"])
         c = next(iter(self.clients.values()))
-        for f in c.fills("", min_ts=int(self.state["t0"]) - 60):
+        # Overlapping windows, deduped on trade_id: polled every GUARD_S.
+        since = self.state.get("fills_since", self.state["t0"]) - 120
+        self.state["fills_since"] = time.time()
+        for f in c.fills("", min_ts=int(since)):
             if f["order_id"] not in known or f["trade_id"] in seen:
                 continue
             seen.add(f["trade_id"])
             self.state["fills"].append(f)
-            t = ours.get(f["order_id"])
-            if t:
-                self.state["orders"][t]["remaining"] = max(self.state["orders"][t]["remaining"] - f["size"], 0.0)
+            k = ours.get(f["order_id"])
+            if k:
+                self.state["orders"][k]["remaining"] = max(self.state["orders"][k]["remaining"] - f["size"], 0.0)
         self.state["trade_ids"] = sorted(seen)
 
     def accrue(self):
@@ -564,7 +691,7 @@ class Farm:
         dt = now - self.last_accrue
         self.last_accrue = now
         per = self.state.setdefault("period_accrued", {})
-        for t in self.state["orders"]:
+        for t in self.order_tickers():
             gain = self.rates.get(t, 0.0) * dt
             self.state["accrued"][t] = self.state["accrued"].get(t, 0.0) + gain
             if t in self.programs:
@@ -585,35 +712,47 @@ class Farm:
         for (t, side), p in pos.items():
             m = self.meta.get(t, {})
             res = m.get("result")
+            # A yes+no pair is $1 (Kalshi nets it); only the unpaired rest is marked.
+            pair = min(p["lots"], pos.get((t, "no" if side == "yes" else "yes"), {}).get("lots", 0.0))
             if res in ("yes", "no"):
                 mark = 1.0 if res == side else 0.0
             else:
                 # Liquidation value: best bid on our side.
                 mark = float(m.get(f"{side}_bid_dollars") or 0.0)
             p["mark"] = mark
-            p["value"] = p["lots"] * mark
+            p["paired"] = pair
+            p["value"] = pair * 0.5 + (p["lots"] - pair) * mark
             p["pnl"] = p["value"] - p["cost"] - p["fees"]
         return list(pos.values())
 
     def report(self, cfg: Cfg):
         rows = []
-        for t, o in sorted(self.state["orders"].items(), key=lambda kv: -self.rates.get(kv[0], 0.0)):
-            pk = self.picks.get(t)
-            rows.append({"ticker": t, "side": o["side"], "price": o["price"], "resting": o["remaining"],
+        for t in sorted(self.order_tickers(), key=lambda t: -self.rates.get(t, 0.0)):
+            legs = sorted(self.legs_of(t), key=lambda so: so[0])
+            hedged = {unkey(k)[1] for k in self.state["orders"] if is_hedge(k) and unkey(k)[0] == t}
+            pl = self.plans.get(t)
+            rows.append({"ticker": t, "mode": pl.mode if pl else ("hedge" if hedged else ""),
+                         "bids": " + ".join(f"{s}@{o['price']:.3f}x{o['remaining']:.0f}" for s, o in legs),
+                         "resting": sum(o["remaining"] for _, o in legs),
+                         "capital_usd": sum(o["price"] * o["remaining"] for _, o in legs),
                          "our_usd_day": self.rates.get(t, 0.0) * 86400,
-                         "pool_usd_day": (pk.pool_rate if pk else 0.0) * 86400,
+                         "pool_usd_day": (pl.pool_rate if pl else 0.0) * 86400,
                          "exp_lip_usd": self.state["accrued"].get(t, 0.0),
                          "period_lip_usd": self.period_accrued(t) if t in self.programs else 0.0})
         pos = self.positions()
         tot_lip = sum(self.state["accrued"].values())
+        per = self.state.get("period_accrued", {}).values()
+        locked = sum(v for v in per if v >= LIP_MIN_PAYOUT_USD)
         fill_pnl = sum(p["pnl"] for p in pos)
-        at_risk = sum(o["price"] * o["remaining"] for o in self.state["orders"].values())
+        at_risk = sum(r["capital_usd"] for r in rows)
         hrs = (time.time() - self.state["t0"]) / 3600
         summary = {"mode": "LIVE" if self.live else "shadow", "live_trading": self.live,
                    "arm_requested": self.arm_requested, "hours": hrs, "quoting": len(rows),
                    "our_usd_day_now": sum(r["our_usd_day"] for r in rows), "exp_lip_usd": tot_lip,
+                   "lip_locked_usd": locked, "lip_pending_usd": tot_lip - locked,
                    "fills": len(self.state["fills"]), "fill_lots": sum(p["lots"] for p in pos),
                    "fill_pnl_usd": fill_pnl, "net_usd": tot_lip + fill_pnl, "resting_cost_usd": at_risk,
+                   "max_capital_usd": cfg.max_capital,
                    "waiting_on_arbs": len(self.waiting), "arbs_events_skipped": len(self.held_events),
                    "updated_at": time.time()}
         tmp = os.path.join(ROOT, "status.json.tmp")
@@ -624,15 +763,15 @@ class Farm:
         print(f"\n=== LIPFARM {summary['mode']} {pd.Timestamp.now(tz='UTC'):%Y-%m-%d %H:%M:%S}Z "
               f"| {hrs:.2f}h | quoting {len(rows)} | now ${summary['our_usd_day_now']:.0f}/day "
               f"| exp LIP ${tot_lip:.2f} | fills {summary['fills']} pnl ${fill_pnl:+.2f} "
-              f"| net ${summary['net_usd']:+.2f} | resting ${at_risk:.0f}")
-        print(f"{'ticker':44} {'side':4} {'px':>6} {'rest':>6} {'$/day':>7} {'pool/d':>7} {'expLIP':>8}")
+              f"| net ${summary['net_usd']:+.2f} | resting ${at_risk:.0f} of ${cfg.max_capital:.0f}")
+        print(f"{'ticker':40} {'mode':7} {'bids':26} {'cap$':>6} {'$/day':>7} {'pool/d':>7} {'expLIP':>7}")
         for r in rows:
-            print(f"{r['ticker']:44} {r['side']:4} {r['price']:6.3f} {r['resting']:6.0f} "
-                  f"{r['our_usd_day']:7.1f} {r['pool_usd_day']:7.1f} {r['exp_lip_usd']:8.2f}")
+            print(f"{r['ticker']:40} {r['mode']:7} {r['bids']:26} {r['capital_usd']:6.0f} "
+                  f"{r['our_usd_day']:7.1f} {r['pool_usd_day']:7.1f} {r['exp_lip_usd']:7.2f}")
         if pos:
-            print(f"{'fills: ticker':44} {'side':4} {'lots':>6} {'cost':>7} {'mark':>6} {'pnl':>8}")
+            print(f"{'fills: ticker':40} {'side':4} {'lots':>6} {'cost':>7} {'mark':>6} {'pnl':>8}")
             for p in pos:
-                print(f"{p['ticker']:44} {p['side']:4} {p['lots']:6.0f} {p['cost']:7.2f} "
+                print(f"{p['ticker']:40} {p['side']:4} {p['lots']:6.0f} {p['cost']:7.2f} "
                       f"{p['mark']:6.3f} {p['pnl']:+8.2f}")
 
     # ---- loop ----
@@ -674,8 +813,8 @@ class Farm:
             print("stopping: cancelling quotes")
         finally:
             self.accrue()
-            for t in list(self.state["orders"]):
-                self.cancel(t)
+            for k in list(self.state["orders"]):
+                self.cancel(k)
             if self.live:
                 self.write_claims({})   # held positions stay claimed from ARBS
             self._save()

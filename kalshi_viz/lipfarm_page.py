@@ -44,10 +44,11 @@ def render(page: str, stale_fn):
         st.header("Config")
         config_form.render(_FORM)
     st.title("LIP farm")
-    st.caption("One post-only bid of `lots` at the cheap side's touch (best bid <= `max_price`) on the "
-               "`num_markets` LIP markets paying us most. Expected LIP is our modelled share over time, "
-               "not Kalshi's payout (which drops anything under $1 per market-period). Skips every event "
-               "ARBS holds or has quoted; when live, claims make ARBS's scan drop the rest.")
+    st.caption("Wide markets (spread >= `wide_spread`): a bid of `lots` at both touches. Decided markets "
+               "(expensive bid in [`decided_min`, `decided_max`]): a bid on the expensive side only. Every "
+               "side must reach Target, so the snapshot pays. Best LIP per dollar first, up to `max_capital`. "
+               "Expected LIP is our modelled share over time, not Kalshi's payout (nothing under $1 per "
+               "market-period). Skips events ARBS holds; when live, ARBS stays off our claimed markets.")
 
     @st.fragment(run_every="5s")
     def body():
@@ -67,11 +68,16 @@ def render(page: str, stale_fn):
         c = st.columns(6)
         c[0].metric("Quoting", s["quoting"])
         c[1].metric("LIP rate now", f"${s['our_usd_day_now']:,.0f}/day")
-        c[2].metric("Expected LIP", f"${s['exp_lip_usd']:,.2f}")
+        c[2].metric("Expected LIP", f"${s['exp_lip_usd']:,.2f}",
+                    f"${s.get('lip_locked_usd', 0):,.2f} locked (past $1)", delta_color="off",
+                    help="Locked: program periods already past Kalshi's $1 minimum, paid in full. The rest "
+                         "is still under $1 for its period and is forfeited if the market drops before $1.")
         c[3].metric("Fill P&L", f"${s['fill_pnl_usd']:+,.2f}", f"{s['fills']} fills, {s['fill_lots']:,.0f} lots",
                     delta_color="off")
         c[4].metric("Net", f"${s['net_usd']:+,.2f}")
-        c[5].metric("Resting cost", f"${s['resting_cost_usd']:,.0f}")
+        c[5].metric("Capital resting", f"${s['resting_cost_usd']:,.0f}",
+                    f"of ${s.get('max_capital_usd', 0):,.0f}" if s.get("max_capital_usd") else None,
+                    delta_color="off")
         st.caption(f"{s['mode']} · this mode's journal covers {s['hours']:.2f} h · "
                    f"{s.get('waiting_on_arbs', 0)} picks waiting for ARBS to drop them · "
                    f"{s.get('arbs_events_skipped', 0)} ARBS events skipped")
@@ -82,9 +88,10 @@ def render(page: str, stale_fn):
             st.caption("None resting.")
         else:
             st.dataframe(q.rename(columns={"our_usd_day": "our $/day", "pool_usd_day": "pool $/day",
+                                           "capital_usd": "capital $",
                                            "exp_lip_usd": "expected LIP $", "period_lip_usd": "this period $"}),
                          hide_index=True, use_container_width=True,
-                         column_config={"price": st.column_config.NumberColumn(format="%.3f"),
+                         column_config={"capital $": st.column_config.NumberColumn(format="%.0f"),
                                         "our $/day": st.column_config.NumberColumn(format="%.1f"),
                                         "pool $/day": st.column_config.NumberColumn(format="%.1f"),
                                         "expected LIP $": st.column_config.NumberColumn(format="%.2f"),
