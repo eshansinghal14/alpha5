@@ -64,11 +64,15 @@ LIP_MIN_PAYOUT_USD = 1.0
 # MOVE_RESERVE: we spend what ARBS isn't using. Cancels always go.
 PLACE_RESERVE = 0.5
 MOVE_RESERVE = 0.8
-# Back-of-queue moves (cancel + re-place, 12 tokens; LIP has no time priority,
-# so the back only sheds fills): only when at least `lots` joined behind us,
-# per market at most once per MOVE_MIN_S, at most MAX_MOVES per cycle --
-# <= 5 * 12 / 30 s = 2 tokens/s, under 1% of the bucket.
-MOVE_MIN_S = 60.0
+# Between cycles, every GUARD_S each quote's book is re-read: a quote the
+# filters would no longer place is pulled, and one with MOVE_BEHIND_FRAC *
+# lots joined behind it is re-placed at the back (cancel + create, 12 tokens;
+# LIP has no time priority, so the back only sheds fills). Per market at most
+# once per MOVE_MIN_S, at most MAX_MOVES per pass: <= 5 * 12 / 5 s = 12
+# tokens/s, 4% of the bucket, and only while MOVE_RESERVE of it is spare.
+GUARD_S = 5.0
+MOVE_MIN_S = 10.0
+MOVE_BEHIND_FRAC = 0.2
 MAX_MOVES = 5
 
 
@@ -83,6 +87,8 @@ class Cfg:
     min_spread: float = param("Quote a side only if its offer is at least this far above our bid: a 1c offer "
                               "over a 1c bid gets sold into (11-04, 108 picks: fills cost 1.2-1.8x the LIP "
                               "under 4c of spread, 0.6x from 4c).", min=0.0, max=0.5, step=0.01)
+    min_ahead: float = param("Quote only where others already rest at least this many contracts at our "
+                             "price (they are filled before us). 0 = may be alone.", min=0.0, step=100.0)
     max_position: float = param("Stop quoting a market once we hold this many contracts in it (refills on a "
                                 "dumped market only add losers).", min=0.0, step=100.0)
     switch_margin: float = param("Stickiness: once a quoted market has passed Kalshi's $1 minimum payout "
@@ -138,16 +144,17 @@ def rate_at(others: dict[str, dict[float, float]], side: str, price: float, size
 
 
 def best_pick(ticker: str, others: dict[str, dict[float, float]], params: lip.LipParams,
-              lots: float, max_price: float, min_spread: float = 0.0) -> Pick | None:
+              lots: float, max_price: float, min_spread: float = 0.0, min_ahead: float = 0.0) -> Pick | None:
     """Best cheap-side touch for `lots`, or None. Joins others' best bid (never
     improves it); on an empty side, bids 0.01. The side's offer must be at
-    least `min_spread` above that bid."""
+    least `min_spread` above that bid, and others must rest `min_ahead` there."""
     best = None
     for side, opp in (("yes", "no"), ("no", "yes")):
         book = others[side]
         price = max(book) if book else 0.01
         ask = 1.0 - max(others[opp]) if others[opp] else 1.0
-        if price > max_price + 1e-9 or ask - price < max(min_spread, 1e-9) - 1e-9:
+        if (price > max_price + 1e-9 or ask - price < max(min_spread, 1e-9) - 1e-9
+                or book.get(price, 0.0) < min_ahead - 1e-9):
             continue
         r = rate_at(others, side, price, lots, params)
         if r > 0 and (best is None or r > best.rate):
@@ -174,6 +181,25 @@ def arbs_held_events() -> set[str]:
     for b in ((_json(os.path.join(ARBS_ROOT, "ledger.json")) or {}).get("baskets") or {}).values():
         tickers |= {t for t, leg in (b.get("legs") or {}).items() if float(leg.get("qty") or 0) > 0}
     return {event_of(t) for t in tickers}
+
+
+def queue_ahead(c, tickers: list[str]) -> dict[str, float]:
+    """Our order id -> contracts ahead of it at its price, for `tickers`, in
+    one read (the endpoint takes market_tickers)."""
+    path = "/trade-api/v2/portfolio/orders/queue_positions"
+    from kalshi_infra.kalshi.orders import BASE_URL
+    resp = c._session.get(BASE_URL + path, headers=c._headers("GET", path),
+                          params={"market_tickers": ",".join(tickers)}, timeout=c.timeout_s)
+    resp.raise_for_status()
+    return {q["order_id"]: float(q.get("queue_position_fp") or 0.0)
+            for q in resp.json().get("queue_positions") or [] if q.get("order_id")}
+
+
+def fetch_book(t: str) -> dict | None:
+    try:
+        return kalshi_get(f"/trade-api/v2/markets/{t}/orderbook").get("orderbook_fp", {})
+    except Exception:
+        return None
 
 
 def remove_ours(book: dict[float, float], price: float, size: float) -> dict[float, float]:
@@ -311,14 +337,10 @@ class Farm:
             m = self.meta.get(t, {})
             if m and m.get("status") != "active":
                 continue
-            P = dataclasses.replace(lip.params_from_program(self.programs[t]), price_ranges=tuple(
-                (float(r["start"]), float(r["end"]), float(r["step"])) for r in m.get("price_ranges") or []))
+            P = self.params(t)
             if mine:
                 rates[t] = rate_at(others, mine["side"], mine["price"], mine["remaining"], P)
-            pk = None if event_of(t) in self.held_events else best_pick(t, others, P, cfg.lots, cfg.max_price,
-                                                                          cfg.min_spread)
-            if pk and (pos.get(t, 0.0) if pk.side == "yes" else -pos.get(t, 0.0)) >= cfg.max_position - 1e-9:
-                pk = None
+            pk = self.pick(t, others, P, cfg, pos)
             if pk:
                 picks[t] = pk
         self.books, self.picks, self.rates = books, picks, rates
@@ -376,29 +398,67 @@ class Farm:
         self.rates[pk.ticker] = pk.rate
         return True
 
-    def move_back(self, cfg: Cfg, want: dict[str, Pick]):
-        """Re-place quotes that at least `lots` have joined behind, so the
-        size now behind us is filled before we are."""
-        now, moves = time.time(), 0
-        for t, o in sorted(self.state["orders"].items(), key=lambda kv: kv[1]["placed"]):
-            if moves >= MAX_MOVES:
-                break
-            pk = want.get(t)
-            if pk is None or now - o["placed"] < MOVE_MIN_S:
+    def params(self, t: str) -> lip.LipParams:
+        m = self.meta.get(t, {})
+        return dataclasses.replace(lip.params_from_program(self.programs[t]), price_ranges=tuple(
+            (float(r["start"]), float(r["end"]), float(r["step"])) for r in m.get("price_ranges") or []))
+
+    def pick(self, t: str, others: dict, P: lip.LipParams, cfg: Cfg, pos: dict[str, float]) -> Pick | None:
+        """best_pick under every filter, or None (ARBS-held event, position cap)."""
+        if event_of(t) in self.held_events:
+            return None
+        pk = best_pick(t, others, P, cfg.lots, cfg.max_price, cfg.min_spread, cfg.min_ahead)
+        if pk and (pos.get(t, 0.0) if pk.side == "yes" else -pos.get(t, 0.0)) >= cfg.max_position - 1e-9:
+            return None
+        return pk
+
+    def guard(self, cfg: Cfg):
+        """Live, between cycles: re-read each quote's book; pull a quote the
+        filters would no longer place, and move one with size behind it to the
+        back. A price change is left to the next cycle."""
+        orders = dict(self.state["orders"])
+        if not self.live or not orders:
+            return
+        with cf.ThreadPoolExecutor(BOOK_WORKERS) as ex:
+            got = dict(zip(orders, ex.map(fetch_book, orders)))
+        pos, keep = self.signed_positions(), {}
+        for t, o in orders.items():
+            ob = got.get(t)
+            if ob is None or t not in self.programs:
+                continue
+            yes, no = parse_book(ob)
+            others = {"yes": yes, "no": no}
+            others[o["side"]] = remove_ours(others[o["side"]], o["price"], o["remaining"])
+            P = self.params(t)
+            pk = self.pick(t, others, P, cfg, pos)
+            if pk is None or pk.side != o["side"]:
+                print(f"guard: pull {t} {o['side']}@{o['price']} (fails the filters now)")
+                self.cancel(t, reason="lipfarm:guard")
+                continue
+            self.books[t] = others
+            self.rates[t] = rate_at(others, o["side"], o["price"], o["remaining"], P)
+            if abs(pk.price - o["price"]) < 1e-9:
+                keep[t] = (pk, others)
+        now = time.time()
+        due = {t: v for t, v in keep.items() if now - orders[t]["placed"] >= MOVE_MIN_S}
+        if not due:
+            return
+        c = self.client(0)
+        try:
+            ahead = queue_ahead(c, list(due))
+        except Exception as e:
+            print(f"queue positions: {e}")
+            return
+        moves = 0
+        for t, (pk, others) in sorted(due.items(), key=lambda kv: orders[kv[0]]["placed"]):
+            o = orders[t]
+            a = ahead.get(o["oid"])
+            if a is None or others[o["side"]].get(round(o["price"], 4), 0.0) - a < MOVE_BEHIND_FRAC * cfg.lots:
                 continue
             c = self.client(self.shard(t))
-            if not c.can_afford("order", reserve=MOVE_RESERVE * c.tokens_per_s + c.COST["cancel"]):
+            if moves >= MAX_MOVES or not c.can_afford("order", reserve=MOVE_RESERVE * c.tokens_per_s
+                                                      + c.COST["cancel"]):
                 return
-            try:
-                ahead = c.queue_positions(self.meta.get(t, {}).get("event_ticker") or event_of(t)).get(o["oid"])
-            except Exception as e:
-                print(f"queue {t}: {e}")
-                continue
-            if ahead is None:
-                continue
-            behind = self.books.get(t, {}).get(o["side"], {}).get(round(o["price"], 4), 0.0) - ahead
-            if behind < cfg.lots:
-                continue
             self.cancel(t, reason="lipfarm:move")
             if self.place(pk, cfg.lots, reserve=0.0, reason="lipfarm:move"):
                 moves += 1
@@ -473,8 +533,6 @@ class Farm:
         for t, pk in want.items():
             if t not in self.state["orders"] and ready(t):
                 self.place(pk, cfg.lots)
-        if self.live:
-            self.move_back(cfg, want)
 
     def poll_fills(self):
         if not self.live or not self.clients:
@@ -599,7 +657,13 @@ class Farm:
                     self._save()
                 except Exception:
                     traceback.print_exc()
-                time.sleep(max(cfg.refresh_s - (time.time() - t0), 1.0))
+                while time.time() - t0 < cfg.refresh_s - 1e-3:
+                    time.sleep(max(min(GUARD_S, cfg.refresh_s - (time.time() - t0)), 0.1))
+                    if time.time() - t0 < cfg.refresh_s - 1.0:
+                        try:
+                            self.guard(cfg)
+                        except Exception:
+                            traceback.print_exc()
         except KeyboardInterrupt:
             print("stopping: cancelling quotes")
         finally:

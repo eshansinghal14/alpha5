@@ -1,3 +1,4 @@
+import dataclasses
 import json
 
 from kalshi_infra.trading import lip
@@ -69,7 +70,7 @@ def test_arm_quotes_for_real_and_disarm_pulls(tmp_path, monkeypatch):
     monkeypatch.setattr(f, "shard", lambda t: 0)
     f.set_live(True, "test")
     assert f.live and cancelled == ["old"]            # only our stray, never another strategy's
-    cfg = farm.Cfg(num_markets=1, lots=1000, max_price=0.05, min_spread=0.0, max_position=1e9, switch_margin=0.5, scan_markets=1, refresh_s=30,
+    cfg = farm.Cfg(num_markets=1, lots=1000, max_price=0.05, min_spread=0.0, min_ahead=0.0, max_position=1e9, switch_margin=0.5, scan_markets=1, refresh_s=30,
                    programs_refresh_s=600)
     f.programs = {"Z-1-A": {"id": "p", "end_date": "2099-01-01T00:00:00Z"}}
     f.picks = {"Z-1-A": farm.Pick("Z-1-A", "no", 0.01, 0.001, 0.002)}
@@ -90,7 +91,7 @@ def test_sticky_until_one_dollar_then_switch_margin(tmp_path, monkeypatch):
 
     monkeypatch.setattr(farm, "ROOT", str(tmp_path))
     f = farm.Farm()
-    cfg = farm.Cfg(num_markets=1, lots=1000, max_price=0.05, min_spread=0.0, max_position=1e9, switch_margin=0.5, scan_markets=1, refresh_s=30,
+    cfg = farm.Cfg(num_markets=1, lots=1000, max_price=0.05, min_spread=0.0, min_ahead=0.0, max_position=1e9, switch_margin=0.5, scan_markets=1, refresh_s=30,
                    programs_refresh_s=600)
     far = "2099-01-01T00:00:00Z"
     f.programs = {"OLD-1-A": {"id": "po", "end_date": far}, "NEW-1-A": {"id": "pn", "end_date": far},
@@ -146,28 +147,52 @@ def _live_farm(tmp_path, monkeypatch, bucket, lots=1000, placed_ago=120.0):
     f.state["orders"] = {"Z-1-A": {"oid": "oid0", "side": "no", "price": 0.01, "size": lots, "remaining": lots,
                                    "placed": __import__("time").time() - placed_ago}}
     f.books = {"Z-1-A": {"yes": {0.98: 5000.0}, "no": {0.01: 3000.0}}}
-    cfg = farm.Cfg(num_markets=1, lots=1000, max_price=0.05, min_spread=0.0, max_position=1e9, switch_margin=0.5, scan_markets=1, refresh_s=30,
+    cfg = farm.Cfg(num_markets=1, lots=1000, max_price=0.05, min_spread=0.0, min_ahead=0.0, max_position=1e9, switch_margin=0.5, scan_markets=1, refresh_s=30,
                    programs_refresh_s=600)
     return farm, f, cfg, {"Z-1-A": farm.Pick("Z-1-A", "no", 0.01, 0.001, 0.002)}
 
 
-def test_move_back_only_with_size_behind_and_spare_budget(tmp_path, monkeypatch):
-    b = _Bucket(tokens=300.0, ahead=1500.0)           # 3000 others at 0.01, 1500 ahead -> 1500 behind
+def _guard(farm, f, cfg, monkeypatch, bucket, no_book):
+    f.programs = {"Z-1-A": {"id": "p", "end_date": "2099-01-01T00:00:00Z", "target_size_fp": "1000",
+                            "discount_factor_bps": 5000, "period_reward": 1800000,
+                            "start_date": "2026-11-04T00:00:00Z"}}
+    ob = {"yes_dollars": [["0.9000", "5000"]], "no_dollars": [[f"{p:.4f}", str(q)] for p, q in no_book]}
+    monkeypatch.setattr(farm, "fetch_book", lambda t: ob)
+    monkeypatch.setattr(farm, "queue_ahead", lambda c, ts: {"oid0": bucket.ahead})
+    f.guard(cfg)
+
+
+def test_guard_moves_back_only_with_size_behind_and_spare_budget(tmp_path, monkeypatch):
+    # Book at 0.01 shows 4000 incl. our 1000 -> 3000 others.
+    b = _Bucket(tokens=300.0, ahead=1500.0)           # 1500 behind >= 20% of lots
     farm, f, cfg, want = _live_farm(tmp_path, monkeypatch, b)
-    f.move_back(cfg, want)
+    _guard(farm, f, cfg, monkeypatch, b, [(0.01, 4000)])
     assert b.cancelled == ["oid0"] and len(b.sent) == 1 and f.state["orders"]["Z-1-A"]["oid"] == "oid1"
-    b = _Bucket(tokens=300.0, ahead=2500.0)           # only 500 behind: not worth a move
+    b = _Bucket(tokens=300.0, ahead=2900.0)           # 100 behind: not worth a move
     farm, f, cfg, want = _live_farm(tmp_path, monkeypatch, b)
-    f.move_back(cfg, want)
+    _guard(farm, f, cfg, monkeypatch, b, [(0.01, 4000)])
     assert not b.cancelled
     b = _Bucket(tokens=200.0, ahead=0.0)              # ARBS is using the bucket: wait
     farm, f, cfg, want = _live_farm(tmp_path, monkeypatch, b)
-    f.move_back(cfg, want)
+    _guard(farm, f, cfg, monkeypatch, b, [(0.01, 4000)])
     assert not b.cancelled
-    b = _Bucket(tokens=300.0, ahead=0.0)              # moved under a minute ago
-    farm, f, cfg, want = _live_farm(tmp_path, monkeypatch, b, placed_ago=10.0)
-    f.move_back(cfg, want)
+    b = _Bucket(tokens=300.0, ahead=0.0)              # moved under MOVE_MIN_S ago
+    farm, f, cfg, want = _live_farm(tmp_path, monkeypatch, b, placed_ago=1.0)
+    _guard(farm, f, cfg, monkeypatch, b, [(0.01, 4000)])
     assert not b.cancelled
+
+
+def test_guard_pulls_a_quote_the_filters_now_reject(tmp_path, monkeypatch):
+    b = _Bucket(tokens=300.0, ahead=0.0)
+    farm, f, cfg, want = _live_farm(tmp_path, monkeypatch, b, placed_ago=1.0)
+    cfg = dataclasses.replace(cfg, min_spread=0.04)
+    # yes bid 0.90 -> no offer 0.10: fine at 0.01.
+    _guard(farm, f, cfg, monkeypatch, b, [(0.01, 4000)])
+    assert not b.cancelled
+    farm, f, cfg, want = _live_farm(tmp_path, monkeypatch, b, placed_ago=1.0)
+    cfg = dataclasses.replace(cfg, min_spread=0.04, min_ahead=5000)   # only 3000 others ahead
+    _guard(farm, f, cfg, monkeypatch, b, [(0.01, 4000)])
+    assert b.cancelled == ["oid0"] and "Z-1-A" not in f.state["orders"]
 
 
 def test_changed_lots_replaces_every_quote(tmp_path, monkeypatch):
@@ -186,3 +211,10 @@ def test_min_spread_needs_the_offer_far_enough_above_our_bid():
     others = {"yes": {0.97: 5000.0}, "no": {0.01: 200.0}}
     assert best_pick("T", others, P, 1000, 0.05, min_spread=0.02).price == 0.01
     assert best_pick("T", others, P, 1000, 0.05, min_spread=0.03) is None
+
+
+def test_min_ahead_needs_others_at_our_price():
+    others = {"yes": {0.90: 5000.0}, "no": {0.01: 200.0}}
+    assert best_pick("T", others, P, 1000, 0.05, min_ahead=200).price == 0.01
+    assert best_pick("T", others, P, 1000, 0.05, min_ahead=201) is None
+    assert best_pick("T", {"yes": {0.90: 5000.0}, "no": {}}, P, 1000, 0.05, min_ahead=1) is None
