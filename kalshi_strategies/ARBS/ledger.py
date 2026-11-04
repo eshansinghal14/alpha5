@@ -18,6 +18,7 @@ import os
 from kalshi_infra.config import atomic_write_json
 
 _EPS = 1e-9
+MAX_LOTS = 8
 
 
 @dataclasses.dataclass
@@ -25,10 +26,44 @@ class LegPos:
     side: str = "yes"
     qty: float = 0.0
     cost: float = 0.0        # dollars paid incl. fees
+    # [qty, cost] per fill, oldest first. A ledger saved before lots has none:
+    # its contracts count at the average.
+    lots: list[list[float]] = dataclasses.field(default_factory=list)
 
     @property
     def avg(self) -> float:
         return self.cost / self.qty if self.qty > _EPS else 0.0
+
+    def newest_cost(self, qty: float) -> float:
+        """Cost of the `qty` most recently bought contracts. A leg's contracts
+        beyond complete bundles are almost always its latest fill (the quote
+        fill that broke it), so they cost what that fill paid, not the leg's
+        average: at the average, an unwind moved cost between the netted
+        contracts and the bundles still held."""
+        qty = min(qty, self.qty)
+        left, cost = qty, 0.0
+        for n, c in reversed(self.lots):
+            if left <= _EPS:
+                break
+            take = min(n, left)
+            cost += c * take / n
+            left -= take
+        if left > _EPS:
+            rest_qty = self.qty - sum(n for n, _ in self.lots)
+            rest_cost = self.cost - sum(c for _, c in self.lots)
+            cost += rest_cost / rest_qty * left if rest_qty > _EPS else self.avg * left
+        return cost
+
+    def drop_newest(self, qty: float):
+        left = qty
+        while left > _EPS and self.lots:
+            n, c = self.lots[-1]
+            if n <= left + _EPS:
+                self.lots.pop()
+                left -= n
+            else:
+                self.lots[-1] = [n - left, c * (n - left) / n]
+                left = 0.0
 
 
 @dataclasses.dataclass
@@ -53,9 +88,9 @@ class BasketPos:
         return {t: q - b for t, q in zip(tickers, self.held(tickers)) if q - b > _EPS}
 
     def broken_spent(self, tickers: list[str]) -> float:
-        """Cost (at each leg's average) of the contracts beyond complete bundles."""
+        """Cost of the contracts beyond complete bundles, each leg's newest."""
         b = self.bundles(tickers)
-        return sum(self.legs[t].avg * (self.legs[t].qty - b) for t in tickers
+        return sum(self.legs[t].newest_cost(self.legs[t].qty - b) for t in tickers
                    if t in self.legs and self.legs[t].qty - b > _EPS)
 
 
@@ -157,6 +192,10 @@ class Ledger:
         lp = b.legs.setdefault(ticker, LegPos(side=side))
         lp.qty += qty
         lp.cost += cost
+        lp.lots.append([qty, cost])
+        if len(lp.lots) > MAX_LOTS:       # only the newest few are ever beyond the bundles
+            n, c = (sum(x) for x in zip(*lp.lots[:-MAX_LOTS + 1]))
+            lp.lots[:-MAX_LOTS + 1] = [[n, c]]
         if b.unhedged(tickers):
             b.broken_since = b.broken_since or now
         else:
@@ -165,11 +204,13 @@ class Ledger:
 
     def unwind(self, basket_id: str, tickers: list[str], ticker: str, qty: float, now: float) -> float:
         """Net `qty` contracts out of a leg (we bought the other side; Kalshi
-        pays $1 a pair). The leg shrinks at its average cost, which is returned."""
+        pays $1 a pair). The leg shrinks by its newest contracts, whose cost
+        is returned."""
         b = self.baskets[basket_id]
         lp = b.legs[ticker]
         qty = min(qty, lp.qty)
-        basis = lp.avg * qty
+        basis = lp.newest_cost(qty)
+        lp.drop_newest(qty)
         lp.qty -= qty
         lp.cost -= basis
         if lp.qty <= _EPS:

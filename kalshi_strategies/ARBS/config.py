@@ -59,6 +59,15 @@ class TradingParams:
     deep_quote_size: int = param("Bundles in the second quote a live (or same-day) basket rests one tick over "
                                  "the next bid behind each arb quote, where a sweep through the arb quote "
                                  "lands. 0 = off.", min=0, max=1000, step=1)
+    # Scored on fill_context 11-02..04: sports, others' depth -50% in 2 s with a
+    # 2 s hold skipped $60 of losing fills for $30 of winners, 1.7% of quote
+    # time; live elections about even (most losses there gave no warning).
+    pull_drop: float = param("Pull a live basket's quotes on a market side when other makers' size at its best "
+                             "bid falls by this fraction of its peak at that price within pull_window_s "
+                             "(0.5 = halved). 0 = off.", min=0.0, max=1.0, step=0.05)
+    pull_window_s: float = param("Seconds the pull's peak depth is taken over.", min=0.05, max=30.0, step=0.05)
+    pull_hold_s: float = param("Seconds a pulled side stays unquoted after the last pull signal.", min=0.0,
+                               max=60.0, step=0.5)
     deep_min_gap_ticks: int = param("Least gap, in cents (not a tapered market's 0.1c ticks), between the arb "
                                     "quote and the deep quote's price; a smaller "
                                     "gap gains too little over the arb quote to be worth the order.",

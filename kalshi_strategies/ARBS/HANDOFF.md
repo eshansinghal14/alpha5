@@ -1,21 +1,74 @@
-# ARBS — CURRENT STATE 2026-10-30 ~16:00 UTC (read this first)
+# ARBS — CURRENT STATE 2026-11-04 ~17:00 UTC (read this first)
 
 Cross-market basket arbitrage on Kalshi: buy a set of legs (a "basket") whose
 payout is guaranteed whatever happens, for less than that payout. Live with
 real money on the `ec2-live` box since 2026-10-28. Commits referenced below
-are on `ec2-live` (box at `6396726`).
+are on `ec2-live`. The 2026-10-30 state further down is kept for history;
+the election-night section below supersedes it where they differ.
 
-## Where it stands
+## Where it stands (11-04 ~17:00 UTC)
 
-- **PnL**: settled +$11.96, locked +$183.18 (held bundles at settlement),
-  total ≈ **+$195**. Bundle-log total over live trading +$201 on ~590 fill
-  bursts. Overnight 10-29 20:27 → 10-30 11:12 ET alone: +$115.86.
-- **Capital**: $5.2k held cost across 32 baskets; `max_dollars` 9000. Shard 0
-  only (cash lives on shard 0; other shards reject with insufficient_shard_balance).
-- **Concentration**: ~$1.9k in TX Senate identities (TXSEND/TXSENR ladders vs
-  KPAX/JTAL buckets, TX Senate combo baskets). Hedged, but all depend on
-  Kalshi settling those markets consistently (Nov 3 election). See "Open risks".
-- Armed (`--resume-arm` re-arms after a restart). No halts, ledger matches Kalshi.
+- **PnL** (summary.json): settled +$627.62, locked +$504.22, upside +$32.50.
+- **Capital**: $13.7k held cost across 154 baskets. Sized against shard 0's
+  Kalshi cash (`max_dollars_auto`): cash $14.86k, room $13.86k after the $1k
+  reserve. `max_dollars` 20000 is only the fallback.
+- Armed (`--resume-arm` re-arms after a restart, ~40 s). No halts.
+
+## Election night 11-03/04: what was done and learned
+
+- **Sizing raised** for the election: quote_size 400, live_quote_size 100,
+  live_take_size 10, deep_quote_size 50, live_edge_add 0.005, quote_edge_add 0.
+  Live election quotes, 4 h before size 100 (06:13 UTC): +$127.60 on 182
+  episodes, 6.7% return, 12% losing. After: +$26.09 on 51, 2.9%, 25% losing;
+  the 51–100-lot fills +$13.10 (2.1%, 38% losing), one AZ05 fill −$10.15.
+  Much of the drop is late-night close counts (sweeps both legs at once), not
+  size: 1–25-lot fills fell from 9.9% to 4.9% too. Replay had predicted ~14%.
+- **Sports excluded** (`watch.exclude`, 154 series/clusters) for the night:
+  live sports quotes lost −$3.58 in the 4 h before. Re-enable / replace with
+  something automatic (see Proposed improvements #10).
+- **Capital "used" overstated**: max_dollars − held cost counted YES/NO pairs and
+  event-netted positions Kalshi had already credited ($11.8k "used" vs $3.2k
+  Kalshi exposure). Now `max_dollars_auto` (`1239067`): room = shard cash
+  (Kalshi balance, read every `runtime.balance_poll_s` 5 s) + the basket's own
+  resting quotes − `cash_reserve` $1000; falls back to max_dollars in shadow
+  or after 6 missed reads. Dashboard "Capital used" tile shows shard cash.
+  Open: if other strategies (S&P) trade shard 0, raise cash_reserve.
+- **Maine Senate "−$112" on Kalshi** is Kalshi's per-market view; the
+  baskets on it made +$39.79.
+- **Pull signal research** (`~/an/tmp/pulls.py`, `lead.py`, `sig.py`,
+  `sig2.py`): fill_context recorder reworked to ms resolution (`18b41e5`:
+  price changes always open a sample, depth-only changes coalesce 10 ms;
+  fills carry Kalshi's exch_t; order log has amend/cancel rows with the
+  newest book time, so sent − book = our reaction, ~3.6 ms, RTT ~10 ms).
+  Live elections: 20 of 28 losing fills (−$47 of −$68) had no move before the
+  match itself (simultaneous cross-leg sweeps); nothing beats the base rate
+  there. Sports (older, coarser data): others' depth at our price −50% within
+  2 s, hold 2 s, would skip $60 of losses for $30 of wins, pulled 1.7% of
+  the time. Implemented as the pull rule (below) to track live.
+- **Race / order path**: legacy pre-10-30 order path (`142388b`) was no
+  better against other makers (1 s markout −2.96¢ vs −1.91¢); back on the
+  current path (`30d3042`).
+- **Exit bugs fixed** (`86f37a9`): a broken basket's exit cost was net of
+  today's broken_spent, which a partial completion raises, so retries read
+  dollars off plan (vs_plan −7.92 at plan; a fake −$241 "worse than planned"
+  total) and "at plan" re-fired. Now on the plan's basis. Missed exit IOCs
+  back off 50 ms doubling to 1 s (one SENATETX combo sent 27 IOCs in 0.7 s,
+  167 misses all night, $0.37 slippage).
+- **Unwind basis**: ledger legs keep lots; an unwind and
+  broken_spent take the newest contracts (the fill that broke the basket),
+  not the leg's average, so bundles still held keep their own cost.
+- **Pull rule**: `trading.pull_drop` 0.5, `pull_window_s` 2,
+  `pull_hold_s` 2 (on the dashboard form). On a live basket's quoted market
+  side, others' size at the best bid falling under half its peak at that
+  price within the window cancels the arb + deep quotes on that side for the
+  hold. Journal rows `kind: "pull"` (ticker, side, price, depth, quoted
+  baskets); cancels have reason `pull`; summary counter `pulls`. Track over
+  the next days: fills avoided vs fill_context control rows; score per
+  category (sports only once they're re-enabled).
+- **Ops gotchas** learned: put box scratch scripts in `~/an/tmp` (a
+  `/tmp/re.py` shadowed the stdlib); stream journals line by line (loading
+  every day OOM-killed a script); orders gz may read EOF mid-append, retry;
+  balance/positions calls share the Kalshi rate limit (429 seen).
 
 ## Box, deploy, monitoring
 
@@ -35,8 +88,8 @@ are on `ec2-live` (box at `6396726`).
   by hand before starting (happened with `max_quoted_baskets`).
 - **Scanner-only changes need just `git pull`**: the scan runs as a fresh child
   process every `scan.interval_s` (`python -m kalshi_strategies.ARBS.scanner`).
-- Tests: `python -m pytest -q kalshi_strategies/ARBS` (99). `test_slow_drift_keeps_resting`
-  is flaky (timing); rerun before believing it. **Gotcha**: `pytest | tail -1 && git commit`
+- Tests: `python -m pytest -q kalshi_strategies/ARBS` (136). `test_slow_drift_keeps_resting`
+  is flaky (Windows' ~15 ms clock with chase_window_s 0); rerun before believing it. **Gotcha**: `pytest | tail -1 && git commit`
   commits even when tests fail — check the output.
 - Analysis on the box: run scripts with `PYTHONPATH=/opt/alpha5 .venv/bin/python`.
   - `data/live/arbs_watch.py` — health, PnL vs last run / night start, new
@@ -93,15 +146,19 @@ are on `ec2-live` (box at `6396726`).
 - **Startup sweep** cancels every resting order we placed (by quote id, any
   ticker), ~100/s with retries on 429.
 
-## Config on the box (dashboard edits included)
+## Config on the box (dashboard edits included, 11-04 ~17:00 UTC)
 
-trading: min_edge 0.03, quote_edge_add 0.01, min_exit_edge 0.01, exit_ref_days 14,
-days_till_expiry 90, quote_size 50, quote_live_events true, take_live_events true,
-live_edge_add 0.015, live_quote_size 10, live_take_size 1, max_bundles_per_basket 1000, max_dollars 9000,
+Always read the box's config.json, not the repo's.
+trading: min_edge 0.03, quote_edge_add 0, min_exit_edge 0.01, exit_ref_days 7,
+days_till_expiry 120, quote_size 400, quote_live_events true, take_live_events true,
+live_edge_add 0.005, live_quote_size 100, live_take_size 10, live_order_groups true,
+deep_quote_size 50, deep_min_gap_ticks 5, max_bundles_per_basket 1500, max_dollars 20000,
+max_dollars_auto true, cash_reserve 1000, pull_drop 0.5, pull_window_s 2, pull_hold_s 2,
 requote_min_ticks 1, requote_hold_up 0.01, requote_cooldown_s 2, take_cooldown_s 5.
 completion: chase_ticks 3, chase_window_s 0.1, max_broken_baskets 3.
-watch: queue_window_s 10800, rank_interval_s 10. scan: max_markets 1000, interval 120 s.
-runtime: max_write_tokens_per_s 150, _solo 250, write_reserve_tokens 20, feed_down_pull_s 5.
+watch: exclude = 154 sports series/clusters (election night).
+runtime: max_write_tokens_per_s 150, _solo 250, write_reserve_tokens 20, balance_poll_s 5,
+feed_down_pull_s 5, record_prints true.
 
 ## Dashboard (ARBS page)
 
@@ -180,6 +237,10 @@ the budget); settled baskets. Times are America/New_York.
 | 7 | Generalize early exit to baskets without an exact flip | Deferred | Only ~$3 locked in such baskets; would need valuing their extra upside. |
 | 8 | Scan everything (`scan.max_markets` removal) | Open (user ask) | Needs multi-connection websocket and series-level fee caching first. |
 | 9 | Separate LIP market-making strategy | Idea | RT scores / Trump / Truth Social pools ~$100/day each; inventory risk. |
+| 10 | Automated per-market size/edge (replace the sports exclude list) | Next (user ask, 11-05) | Size 100 lost return in close counts (AZ05 −$10.15, MN01 −$1.98); sports lost live. Score markets on recent fills/sweeps and set size + edge per market instead of hand lists. |
+| 11 | Pull rule (others' depth at our bid −50%) | **Live, tracking** | See election-night section. Judge on journal `pull` rows vs fill_context after a few days; sports is where it should pay. |
+| 12 | Exclude volatile close-count House races (AZ05) | Offered, not done | One AZ05 basket kept getting swept during counting. |
+| 13 | Other arb markets after the election | Open (user ask) | Asked whether the strategy is "cooked" post-election; non-election baskets (awards, econ, weather, sports with fixes) carry it. |
 
 ## Open risks / watch items
 

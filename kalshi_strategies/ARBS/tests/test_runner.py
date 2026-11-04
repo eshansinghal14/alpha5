@@ -643,20 +643,80 @@ def test_quote_past_its_limit_is_cancelled_when_the_move_is_refused(arbs):
 def test_chase_ignores_what_older_bundles_cost(arbs):
     r, b = arbs
     # 5 whole bundles bought dear, then a quote on A fills 1 more at 0.40,
-    # priced against B's 0.50 ask: the book hasn't moved, so it rests.
+    # priced against B's 0.50 ask, now 0.62: a slow drift, so it rests.
     r.shadow_ledger.record(b.basket_id, b.tickers, "X-A", "yes", 5, 5 * 0.70, time.time())
     r.shadow_ledger.record(b.basket_id, b.tickers, "X-B", "yes", 5, 5 * 0.29, time.time())
     book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
-    book(r, "X-B", [(0.45, 10)], [(0.50, 10)])
+    book(r, "X-B", [(0.45, 10)], [(0.38, 10)])
     q = R.Quote(basket_id=b.basket_id, leg=0, ticker="X-A", side="yes", price=0.40, size=1, cid="c",
                 edge=1 - 0.40 - R.pricing.taker_cost(0.50, 0.07), max_price=0.40, pending=False)
     r.quotes[q.key] = q
     r._quote_fill(q, 1, 0.40, None, "shadow")
     r.cfg.completion = dataclasses.replace(r.cfg.completion, chase_ticks=50)
-    r.exit_planned[b.basket_id] -= 0.01             # planned a cent better than today's book
     _eval(r, b)
     note = r.summary()["holdings"][0]["completion"]
     assert note["action"] == "rest" and note["why"] is None
+    # Costed at its own 0.40, not the leg's 0.65 average.
+    assert note["complete_loss"] == pytest.approx(0.40 + R.pricing.taker_cost(0.62, 0.07) - 1, abs=1e-4)
+
+
+def _top(r, t, bid, bid_depth, ask=None, ask_depth=0.0):
+    r._on_quote(type("V", (), {"ticker": t, "bid": bid, "bid_depth": bid_depth, "ask": ask,
+                               "ask_depth": ask_depth})())
+
+
+def test_live_quote_pulled_when_other_makers_pull(arbs):
+    r, b = arbs
+    b = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
+    r.set_baskets([b])
+    r.hot = [b.basket_id]
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_live_events=True, live_quote_size=5, live_edge_add=0.0,
+                                        pull_drop=0.5, pull_window_s=2.0, pull_hold_s=2.0)
+    rows = []
+    r.journal = rows.append
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    _eval(r, b)
+    q = r.quotes[(b.basket_id, 0)]
+    _top(r, "X-A", q.price, q.size + 20)
+    _top(r, "X-A", q.price, q.size + 15)             # others 20 -> 15: not a pull
+    assert ("X-A", "yes") not in r.pulled
+    _top(r, "X-A", q.price, q.size + 8)              # 20 -> 8 at the same price
+    assert ("X-A", "yes") in r.pulled
+    _eval(r, b)
+    assert (b.basket_id, 0) not in r.quotes and (b.basket_id, 1) in r.quotes
+    assert [x for x in rows if x["kind"] == "pull"][0]["quoted"] == [b.basket_id]
+    r.pulled[("X-A", "yes")] = time.monotonic() - 0.01   # the hold ran out
+    _eval(r, b)
+    assert (b.basket_id, 0) in r.quotes
+
+
+def test_pull_ignores_a_price_change_and_non_live_baskets(arbs):
+    r, b = arbs
+    r.hot = [b.basket_id]
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, pull_drop=0.5, pull_window_s=2.0, pull_hold_s=2.0)
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    _eval(r, b)
+    q = r.quotes[(b.basket_id, 0)]
+    _top(r, "X-A", q.price, q.size + 20)
+    _top(r, "X-A", q.price, q.size + 1)
+    assert not r.pulled                              # not live
+    w = R.PullWatch()
+    assert not w.fires(("T", "yes"), 0.0, 0.30, 20.0, 2.0, 0.5)
+    assert not w.fires(("T", "yes"), 0.1, 0.29, 2.0, 2.0, 0.5)    # the bid moved: not a pull
+    assert w.fires(("T", "yes"), 0.2, 0.30, 2.0, 2.0, 0.5)
+    assert not w.fires(("T", "yes"), 3.0, 0.30, 1.0, 2.0, 0.5)    # the peak is out of the window
+
+
+def test_unwind_nets_out_the_newest_contracts(arbs):
+    r, b = arbs
+    L = r.shadow_ledger
+    L.record(b.basket_id, b.tickers, "X-A", "yes", 5, 5 * 0.70, time.time())
+    L.record(b.basket_id, b.tickers, "X-B", "yes", 5, 5 * 0.29, time.time())
+    L.record(b.basket_id, b.tickers, "X-A", "yes", 1, 0.40, time.time())
+    assert L.unwind(b.basket_id, b.tickers, "X-A", 1, time.time()) == pytest.approx(0.40)
+    assert L.baskets[b.basket_id].legs["X-A"].cost == pytest.approx(3.50)   # the bundles keep what they cost
 
 
 def _filled_a(r, b):

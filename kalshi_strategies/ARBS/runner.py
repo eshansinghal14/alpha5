@@ -48,7 +48,7 @@ from kalshi_strategies.ARBS.config import SPEC_PATH
 from kalshi_strategies.ARBS.execution import Gateway
 from kalshi_strategies.ARBS.feed import MultiFeed
 from kalshi_strategies.ARBS.ledger import Ledger
-from kalshi_strategies.ARBS.depth import TopHistory
+from kalshi_strategies.ARBS.depth import PullWatch, TopHistory
 from kalshi_strategies.ARBS.liquidity import Liquidity
 from kalshi_strategies.ARBS.prints import AFTER_S, Prints, top as prints_top
 from kalshi_strategies.ARBS.spec import Basket, basket_from_dict, basket_to_dict, load_spec, merge, parse_spec
@@ -321,6 +321,9 @@ class ArbsRunner:
         self.exchange_paused = False              # Kalshi's exchange-wide trading_active is off
         self.priority_trading: list[str] = []     # write_priority_series in session now
         self.last_exit: dict[str, tuple] = {}
+        self.pull_watch = PullWatch()
+        self.pulled: dict[tuple[str, str], float] = {}   # (ticker, side) -> monotonic time its pull ends
+        self.pull_wake: dict[str, float] = {}            # basket_id -> pull end its re-evaluation is set for
         self.completion_note: dict[str, dict] = {}
         # basket_id -> recent (time, exit cost) of a broken basket: the chase
         # reference. Exit cost is what finishing costs from here, net of the
@@ -342,7 +345,7 @@ class ArbsRunner:
         self.tasks: set[asyncio.Task] = set()
         self.n = {"takes": 0, "take_bundles": 0.0, "quotes_placed": 0, "quote_moves": 0, "quote_cancels": 0,
                   "quote_fills": 0, "completions": 0, "unwinds": 0, "exit_unpriced": 0, "post_only_rejects": 0,
-                  "moves_refused": 0}
+                  "moves_refused": 0, "pulls": 0}
         self.started = _utc()
         self.liq = Liquidity(self.root)
         self.prints = Prints(self.root)
@@ -855,8 +858,33 @@ class ArbsRunner:
                 self._note_top(book)
             except Exception:
                 self.n["print_errors"] = self.n.get("print_errors", 0) + 1
+        if self.cfg.trading.pull_drop > 0:
+            self._watch_pulls(book)
         for bid in self.by_ticker.get(book.ticker, ()):
             self.mark(bid)
+
+    def _watch_pulls(self, book):
+        """Mark a market side pulled (see depth.PullWatch) while a live
+        basket's arb quote rests on it; manage_quotes cancels and holds."""
+        t, c, now = book.ticker, self.cfg.trading, time.monotonic()
+        no_bid = None if book.ask is None else 1.0 - book.ask
+        for side, price, depth in (("yes", book.bid, book.bid_depth), ("no", no_bid, book.ask_depth)):
+            key = (t, side)
+            quoted = [q.basket_id for q in self.quotes.on(t, side) if q.kind == "arb"
+                      and (b := self.baskets.get(q.basket_id)) is not None and self.live_now(b, _utc())]
+            if not quoted and key not in self.pulled:
+                self.pull_watch.forget(key)
+                continue
+            price = None if price is None else round(price, 4)
+            others = 0.0 if price is None else (depth or 0.0) - self._own(t, side).get(price, 0.0)
+            if self.pull_watch.fires(key, now, price, others, c.pull_window_s, c.pull_drop):
+                if self.pulled.get(key, 0.0) <= now:
+                    self.n["pulls"] += 1
+                    self.journal({"kind": "pull", "ticker": t, "side": side, "price": price,
+                                  "depth": round(others, 2), "quoted": quoted})
+                self.pulled[key] = now + c.pull_hold_s
+            elif key in self.pulled and self.pulled[key] <= now:
+                del self.pulled[key]
 
     def _on_trade(self, ticker, trade):
         self.liq.on_trade(ticker, trade.size)
@@ -1357,11 +1385,22 @@ class ArbsRunner:
         reserve = self.cfg.runtime.write_reserve_tokens
         acts = []
         mains: dict[int, pricing.QuotePlan] = {}
+        mono = time.monotonic()
+        pulled = {j for j, l in enumerate(b.legs) if live and self.pulled.get((l.ticker, l.side), 0.0) > mono}
+        if pulled:
+            end = max(self.pulled[(b.legs[j].ticker, b.legs[j].side)] for j in pulled)
+            if self.pull_wake.get(b.basket_id) != end:
+                self.pull_wake[b.basket_id] = end
+                self.later(b.basket_id, end - mono + 0.01)
         for j, leg in enumerate(b.legs):
             q = self.quotes.get((b.basket_id, j))
             if q is not None and q.pending:
                 mains[j] = pricing.QuotePlan(leg=j, price=q.price, max_price=q.max_price, edge=q.edge,
                                              others_cost=0.0)
+                continue
+            if j in pulled:
+                if q is not None:
+                    acts.append(self.cancel_quote(q, "pull"))
                 continue
             plan, size = None, 0.0
             # As big as the other legs' books can complete at the edge needed,
@@ -1412,7 +1451,7 @@ class ArbsRunner:
                 acts.append(self.move_quote(q, plan, size if grow else None))
             else:
                 q.edge, q.max_price = plan.edge, plan.max_price
-        acts += self.manage_deep(b, vs, mains, quote_need, now, live and want)
+        acts += self.manage_deep(b, vs, mains, quote_need, now, live and want, pulled)
         if acts:
             async def run(acts=acts):
                 await asyncio.gather(*acts)
@@ -1448,7 +1487,8 @@ class ArbsRunner:
         golf longshot's deep quote 89 times in 4 min (10-31 00:03)."""
         return main - deep >= self.cfg.trading.deep_min_gap_ticks * 0.01 - _EPS
 
-    def manage_deep(self, b: Basket, vs, mains: dict, need: float, now: float, on: bool) -> list:
+    def manage_deep(self, b: Basket, vs, mains: dict, need: float, now: float, on: bool,
+                    pulled: frozenset | set = frozenset()) -> list:
         """Deep quotes behind the arb quotes in `mains`, while `on` (a live
         basket being quoted). Live sweeps ran past our arb quote 90% of the
         time and 37% by 30c+ (trades 10-28..30); on slow markets 1% did, so
@@ -1458,6 +1498,10 @@ class ArbsRunner:
         for j, leg in enumerate(b.legs):
             dq = self.quotes.get((b.basket_id, j, "deep"))
             if dq is not None and dq.pending:
+                continue
+            if j in pulled:
+                if dq is not None:
+                    acts.append(self.cancel_quote(dq, "pull"))
                 continue
             plan, size = self.deep_plan(b, vs, j, mains[j], need) if on and j in mains else (None, 0)
             if plan is None:

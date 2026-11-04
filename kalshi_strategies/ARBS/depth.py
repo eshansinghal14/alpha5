@@ -21,6 +21,30 @@ HIST_S = 10.0
 COALESCE_S = 0.01
 
 
+class PullWatch:
+    """Others' depth at a market side's best bid over the last `window` s.
+    fires() when it falls below (1 - drop) of its peak at the same price:
+    other makers pulling ahead of a sweep. A price change isn't a pull; the
+    peak is only taken over samples at today's price."""
+
+    def __init__(self):
+        self.h: dict[tuple[str, str], collections.deque] = {}
+
+    def fires(self, key: tuple[str, str], now: float, price, depth: float, window: float, drop: float) -> bool:
+        d = self.h.get(key)
+        if d is None:
+            d = self.h[key] = collections.deque()
+        while d and now - d[0][0] > window:
+            d.popleft()
+        peak = max((x[2] for x in d if x[1] == price), default=0.0)
+        if not d or (d[-1][1], d[-1][2]) != (price, depth):
+            d.append((now, price, depth))
+        return price is not None and peak > 0 and depth < (1 - drop) * peak
+
+    def forget(self, key: tuple[str, str]):
+        self.h.pop(key, None)
+
+
 class TopHistory:
     def __init__(self, root: str):
         self.dir = os.path.join(root, "fill_context")
