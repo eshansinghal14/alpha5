@@ -20,6 +20,25 @@ STALE_S = 120.0
 _FORM = types.SimpleNamespace(ticker=NAME, config_cls=LipFarmConfig, config_path=CONFIG_PATH, config_key=None)
 
 
+def _compact_bids(bids: str) -> str:
+    """'yes@0.981x1000 + yes@0.982x1.1' -> 'Y 98.1¢×1000 ⚑' (the 1.1 is the sentinel)."""
+    sides: dict[str, list] = {}
+    for part in (bids or "").split(" + "):
+        try:
+            side, rest = part.split("@")
+            px, size = rest.split("x")
+            sides.setdefault(side, []).append((float(px), float(size)))
+        except ValueError:
+            continue
+    out = []
+    for side, orders in sides.items():
+        main = [o for o in orders if abs(o[1] - 1.1) > 1e-9]
+        sent = len(main) < len(orders)
+        for px, size in main or orders:
+            out.append(f"{side[0].upper()} {px * 100:g}¢×{size:g}" + (" ⚑" if sent and main else ""))
+    return " · ".join(out)
+
+
 def _status() -> dict | None:
     try:
         with open(os.path.join(ROOT, "status.json"), encoding="utf-8") as fh:
@@ -91,16 +110,21 @@ def render(page: str, stale_fn):
         if q.empty:
             st.caption("None resting.")
         else:
-            st.dataframe(q.rename(columns={"our_usd_day": "our $/day", "pool_usd_day": "pool $/day",
-                                           "capital_usd": "capital $",
-                                           "exp_lip_usd": "expected LIP $", "period_lip_usd": "this period $"}),
-                         hide_index=True, use_container_width=True,
-                         column_config={"capital $": st.column_config.NumberColumn(format="%.0f"),
-                                        "our $/day": st.column_config.NumberColumn(format="%.1f"),
-                                        "pool $/day": st.column_config.NumberColumn(format="%.1f"),
-                                        "expected LIP $": st.column_config.NumberColumn(format="%.2f"),
-                                        "this period $": st.column_config.NumberColumn(
-                                            format="%.2f", help="Kalshi pays a market-period only from $1.")})
+            view = pd.DataFrame({
+                "market": q["ticker"],
+                "m": q["mode"].map({"wide": "W", "decided": "D", "hedge": "X"}).fillna(""),
+                "quote": q["bids"].map(_compact_bids),
+                "$/day": q["our_usd_day"], "pool/d": q["pool_usd_day"],
+                "period $": q.get("period_lip_usd", 0.0), "LIP $": q["exp_lip_usd"], "cap $": q["capital_usd"]})
+            num = st.column_config.NumberColumn
+            st.dataframe(view, hide_index=True, use_container_width=True, column_config={
+                "market": st.column_config.TextColumn(width="medium"),
+                "m": st.column_config.TextColumn(width="small", help="W wide, D decided, X exit only"),
+                "quote": st.column_config.TextColumn(width="medium", help="⚑ = 1.1-lot sentinel one tick above, "
+                                                                          "in the bid's order group"),
+                "$/day": num(format="%.0f", width="small"), "pool/d": num(format="%.0f", width="small"),
+                "period $": num(format="%.2f", width="small", help="Kalshi pays a market-period only from $1."),
+                "LIP $": num(format="%.2f", width="small"), "cap $": num(format="%.0f", width="small")})
         st.subheader("Fills")
         p = pd.DataFrame(doc["positions"])
         if p.empty:
