@@ -90,9 +90,13 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "config.json")
 CID_PREFIX = "lipf-"
-# A cycle reads ~900 books (scan_markets + scan_rotate): ~45 s on 8 threads,
-# ~15 s on 24, off the main thread so exits never wait on it.
-BOOK_WORKERS = 24
+# A cycle reads ~900 books (scan_markets + scan_rotate) off the main thread,
+# so exits never wait on it; READS_PER_S paces them.
+BOOK_WORKERS = 8
+# All our REST reads share the account's read limit with ARBS (300/s). 24
+# unpaced book threads plus a parallel records refresh drew 429s on ARBS's
+# balance reads and position audits (11-04 ~21:30); 20/s takes ~45 s a cycle.
+READS_PER_S = 20.0
 NAME = "LIPFARM"
 ROOT = os.path.join(LIVE_ROOT, NAME)
 ARBS_ROOT = os.path.join(LIVE_ROOT, "ARBS")
@@ -347,6 +351,29 @@ def basket_index(tickers: set[str], skip_events: set[str]) -> dict[tuple[str, st
     return out
 
 
+class ReadPacer:
+    """Thread-safe pacing of our REST reads to READS_PER_S."""
+
+    def __init__(self, rate: float):
+        self.gap, self.lock, self.next = 1.0 / rate, threading.Lock(), 0.0
+
+    def wait(self):
+        with self.lock:
+            now = time.monotonic()
+            t = max(self.next, now)
+            self.next = t + self.gap
+        if t > now:
+            time.sleep(t - now)
+
+
+PACER = ReadPacer(READS_PER_S)
+
+
+def read(path: str, params: dict | None = None, auth: bool = False) -> dict:
+    PACER.wait()
+    return kalshi_get(path, params=params, auth=auth)
+
+
 def load_programs() -> dict[str, dict]:
     """Active liquidity programs not yet ended, by market ticker."""
     out, cursor = {}, None
@@ -355,7 +382,7 @@ def load_programs() -> dict[str, dict]:
         params = {"status": "active", "limit": 1000}
         if cursor:
             params["cursor"] = cursor
-        data = kalshi_get("/trade-api/v2/incentive_programs", params=params, auth=True)
+        data = read("/trade-api/v2/incentive_programs", params=params, auth=True)
         batch = data.get("incentive_programs", [])
         for p in batch:
             if p.get("incentive_type") == "liquidity" and pd.Timestamp(p["end_date"]) > now:
@@ -371,9 +398,9 @@ def fetch_meta(tickers) -> dict[str, dict]:
     chunks = [tickers[i:i + 100] for i in range(0, len(tickers), 100)]
 
     def one(ch):
-        return kalshi_get("/trade-api/v2/markets", params={"tickers": ",".join(ch), "limit": 1000}).get("markets", [])
+        return read("/trade-api/v2/markets", params={"tickers": ",".join(ch), "limit": 1000}).get("markets", [])
     out = {}
-    with cf.ThreadPoolExecutor(8) as ex:
+    with cf.ThreadPoolExecutor(2) as ex:
         for ms in ex.map(one, chunks):
             for m in ms:
                 out[m["ticker"]] = m
@@ -406,7 +433,7 @@ def queue_ahead(c, tickers: list[str]) -> dict[str, float]:
 
 def fetch_book(t: str) -> dict | None:
     try:
-        return kalshi_get(f"/trade-api/v2/markets/{t}/orderbook").get("orderbook_fp", {})
+        return read(f"/trade-api/v2/markets/{t}/orderbook").get("orderbook_fp", {})
     except Exception:
         return None
 
@@ -601,8 +628,7 @@ class Farm:
     def _fetch_meta(self, tickers):
         tickers = [t for t in tickers]
         for i in range(0, len(tickers), 100):
-            data = kalshi_get("/trade-api/v2/markets", params={"tickers": ",".join(tickers[i:i + 100]),
-                                                               "limit": 1000})
+            data = read("/trade-api/v2/markets", params={"tickers": ",".join(tickers[i:i + 100]), "limit": 1000})
             for m in data.get("markets", []):
                 self.meta[m["ticker"]] = m
 
