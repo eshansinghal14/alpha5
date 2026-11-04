@@ -7,6 +7,7 @@
     "decided_min": 0.97,
     "min_ahead": 0,
     "max_position": 1000,
+    "write_tokens_per_s": 5,
     "scan_markets": 400,
     "refresh_s": 30,
     "programs_refresh_s": 600

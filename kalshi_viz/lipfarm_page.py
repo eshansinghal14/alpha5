@@ -78,7 +78,9 @@ def render(page: str, stale_fn):
         c[5].metric("Capital resting", f"${s['resting_cost_usd']:,.0f}",
                     f"of ${s.get('max_capital_usd', 0):,.0f}" if s.get("max_capital_usd") else None,
                     delta_color="off")
-        st.caption(f"{s['mode']} · this mode's journal covers {s['hours']:.2f} h · "
+        ws = ("websocket up" if s.get("ws_up") else "websocket down (REST fallback)") if s.get("live_trading") else "REST"
+        st.caption(f"writes {s.get('write_tps_10m', 0):.2f} of {s.get('write_tps_cap', 0):.0f} tokens/s (10 min) · "
+                   f"{ws} · {s['mode']} · this mode's journal covers {s['hours']:.2f} h · "
                    f"{s.get('waiting_on_arbs', 0)} picks waiting for ARBS to drop them · "
                    f"{s.get('arbs_events_skipped', 0)} ARBS events skipped")
 

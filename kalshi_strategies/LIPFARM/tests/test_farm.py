@@ -9,7 +9,7 @@ from kalshi_strategies.LIPFARM.farm import parse_book, plan_market, remove_ours
 
 P = lip.LipParams(target_size=1000, discount_factor=0.5, period_reward_usd=86.4, snapshots_per_period=86400)
 CFG = farm.Cfg(max_capital=5000, num_markets=5, lots=1000, wide_spread=0.20, decided_min=0.97,
-               min_ahead=0.0, max_position=1e9, scan_markets=1, refresh_s=30,
+               min_ahead=0.0, max_position=1e9, write_tokens_per_s=5.0, scan_markets=1, refresh_s=30,
                programs_refresh_s=600)
 
 
@@ -256,3 +256,56 @@ def test_new_fill_is_exited_within_the_second(tmp_path, monkeypatch):
     f.exit_now(CFG)
     assert [(o.side, o.price, o.size) for o in b.sent] == [("no", 0.02, 250.0)]
     assert "Z-1-A|yes" in f.state["orders"]          # the LIP bid keeps running beside the exit
+
+
+def test_our_bucket_limits_lip_bids_but_never_exits(tmp_path, monkeypatch):
+    b = _Bucket()
+    f = _live(tmp_path, monkeypatch, b)
+    f.bucket = farm.TokenBucket(rate=0.0, capacity=25.0)        # room for two orders, no refill
+    assert f.place("A-1-X", "yes", 0.1, 1000) and f.place("B-1-X", "yes", 0.1, 1000)
+    assert not f.place("C-1-X", "yes", 0.1, 1000)                # our budget is spent: ARBS's is untouched
+    assert f.place("D-1-X", "no", 0.9, 300, hedge=True)          # an exit goes anyway
+    assert [o.ticker for o in b.sent] == ["A-1-X", "B-1-X", "D-1-X"] and f.bucket.tokens < 0
+
+
+class _Ws:
+    def __init__(self, books, fills=()):
+        self._books, self._fills, self.up = books, list(fills), True
+        self.wake = SimpleNamespace(set=lambda: None, wait=lambda timeout=None: None, clear=lambda: None)
+
+    def bids(self, t):
+        return self._books.get(t)
+
+    def take(self):
+        d, f, self._fills = set(self._books), self._fills, []
+        return d, f
+
+    def ensure(self, tickers):
+        pass
+
+
+def test_socket_fill_is_exited_from_the_socket_book(tmp_path, monkeypatch):
+    b = _Bucket()
+    f = _live(tmp_path, monkeypatch, b)
+    f.meta = {"Z-1-A": {}}
+    f.state["hedged_oids"] = ["oid0"]
+    monkeypatch.setattr(farm, "fetch_book", lambda t: (_ for _ in ()).throw(AssertionError("no REST read")))
+    f.ws = _Ws({"Z-1-A": ({0.97: 4000.0}, {0.02: 5000.0})},
+               [{"ticker": "Z-1-A", "side": "yes", "price": 0.97, "size": 250.0, "fee": 0.0,
+                 "order_id": "oid0", "trade_id": "t1", "time": None}])
+    f.react(CFG)
+    assert [(o.side, o.price, o.size) for o in b.sent] == [("no", 0.02, 250.0)]
+    assert f.state["orders"]["Z-1-A|yes"]["remaining"] == 750.0
+    f.ws._fills = [{"ticker": "Z-1-A", "side": "yes", "price": 0.97, "size": 250.0, "fee": 0.0,
+                    "order_id": "oid0", "trade_id": "t1", "time": None}]
+    f.react(CFG)                                                 # same trade again: not booked twice
+    assert len(f.state["fills"]) == 1 and len(b.sent) == 1
+
+
+def test_socket_book_change_pulls_a_bid_its_plan_dropped(tmp_path, monkeypatch):
+    b = _Bucket()
+    f = _live(tmp_path, monkeypatch, b, placed_ago=1.0)
+    f.meta = {"Z-1-A": {}}
+    f.ws = _Ws({"Z-1-A": ({0.97: 4000.0}, {0.02: 500.0})})      # no side under Target now
+    f.react(CFG)
+    assert b.cancelled == ["oid0"] and not f.state["orders"]

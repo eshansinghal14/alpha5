@@ -31,6 +31,15 @@ survives restarts; data/live/LIPFARM/status.json holds the latest table.
 Kalshi pays: payouts under $1 per market-period are dropped, and others' size
 between our reads is unseen.
 
+Live, the books of every market we quote or hold and our fills come over
+the websocket (ARBS's MultiFeed): a book update re-checks that market's plan
+and a fill is exited as it arrives. REST reads (30 s scan, 5 s guard) remain
+the fallback while the socket is down.
+
+Writes: our own bucket of write_tokens_per_s (burst WRITE_BURST) on top of
+the shard bucket ARBS shares. Exits and cancels always go, charged to our
+bucket, so they only ever delay our own LIP writes.
+
 ARBS: live, every ticker we want, rest on or hold goes in claimed.json (with
 our positions). ARBS reads it every second: it neither takes nor quotes a
 claimed ticker and pulls its quotes there, its sweep skips our orders, and its
@@ -41,10 +50,13 @@ take there to complete one.
 from __future__ import annotations
 
 import argparse
+import asyncio
+import collections
 import concurrent.futures as cf
 import dataclasses
 import json
 import os
+import threading
 import time
 import traceback
 import uuid
@@ -96,7 +108,12 @@ MOVE_MIN_S = 10.0
 MOVE_BEHIND_FRAC = 0.2
 MAX_MOVES = 5
 # Fills are polled this often between guard passes; a new one is exited at once.
+# With the websocket up, fills and book updates wake the loop as they arrive
+# and this is only the idle tick.
 FILL_POLL_S = 1.0
+# Our bucket's burst: 6 orders at once (arming 18 bids takes ~25 s at 5/s).
+WRITE_BURST = 60.0
+ORDER_TOKENS, CANCEL_TOKENS = 10.0, 2.0
 
 
 @section
@@ -113,6 +130,10 @@ class Cfg:
                              "price (they are filled before us). 0 = may be alone.", min=0.0, step=100.0)
     max_position: float = param("Stop quoting a side once we hold this many contracts of it.", min=0.0,
                                 step=100.0)
+    write_tokens_per_s: float = param("Our write budget (tokens/s; an order 10, a cancel 2) out of the 300 the "
+                                      "shard shares with ARBS, which caps itself at 150-250. Measured need "
+                                      "11-04: ~1/s (0.075 touch moves/s over 13 markets); exits and cancels "
+                                      "always go.", min=1.0, max=50.0, step=1.0)
     scan_markets: int = param("Books read each cycle: the largest LIP pools.", min=1, step=50)
     refresh_s: float = param("Seconds between cycles.", min=5.0, editable=False)
     programs_refresh_s: float = param("Seconds between re-reads of the LIP program list.", min=60.0,
@@ -250,6 +271,102 @@ def fetch_book(t: str) -> dict | None:
         return None
 
 
+class TokenBucket:
+    def __init__(self, rate: float, capacity: float):
+        self.rate, self.capacity = rate, capacity
+        self.tokens, self._t = capacity, time.monotonic()
+        self.spent: collections.deque = collections.deque()      # (monotonic, cost), last 10 min
+
+    def _refill(self):
+        now = time.monotonic()
+        self.tokens = min(self.capacity, self.tokens + (now - self._t) * self.rate)
+        self._t = now
+
+    def take(self, cost: float, force: bool = False) -> bool:
+        """Spend `cost`, or refuse; force always spends (the bucket may go negative)."""
+        self._refill()
+        if not force and self.tokens < cost:
+            return False
+        self.tokens -= cost
+        now = time.monotonic()
+        self.spent.append((now, cost))
+        while self.spent and now - self.spent[0][0] > 600:
+            self.spent.popleft()
+        return True
+
+    def refund(self, cost: float):
+        self.tokens += cost
+        if self.spent:
+            self.spent.pop()
+
+    def has(self, cost: float) -> bool:
+        self._refill()
+        return self.tokens >= cost
+
+    def rate_10m(self) -> float:
+        return sum(c for _, c in self.spent) / 600.0
+
+
+class WsBooks:
+    """ARBS's MultiFeed on its own thread and event loop. Callbacks only queue
+    what changed; the farm's thread reads books and handles fills."""
+
+    def __init__(self):
+        self.feed = None
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.lock = threading.Lock()
+        self.wake = threading.Event()
+        self.dirty: set[str] = set()
+        self.fills: list[dict] = []
+        self.n_updates = 0
+
+    def _on_quote(self, view):
+        with self.lock:
+            self.dirty.add(view.ladder.ticker)
+            self.n_updates += 1
+        self.wake.set()
+
+    def _on_fill(self, f: dict):
+        with self.lock:
+            self.fills.append(f)
+        self.wake.set()
+
+    def ensure(self, tickers):
+        """Subscribe to `tickers` (starting the feed on the first ones)."""
+        tickers = sorted(tickers)
+        if not tickers:
+            return
+        if self.feed is None:
+            from kalshi_strategies.ARBS.feed import MultiFeed
+            self.feed = MultiFeed(tickers, self._on_quote, lambda t, tr: None, label="LIPFARM",
+                                  on_fill=self._on_fill)
+            self.loop = asyncio.new_event_loop()
+            threading.Thread(target=self.loop.run_until_complete, args=(self.feed.run(),), daemon=True,
+                             name="lipfarm-ws").start()
+            return
+        new = [t for t in tickers if t not in self.feed.tickers]
+        if new:
+            self.loop.call_soon_threadsafe(self.feed.add, new)
+
+    @property
+    def up(self) -> bool:
+        return self.feed is not None and self.feed.up
+
+    def bids(self, t: str) -> tuple[dict, dict] | None:
+        """(yes bids, no bids) as the socket has them, or None."""
+        b = self.feed.ladder(t) if self.up else None
+        if b is None or (not b.yes_bids and not b.no_bids):
+            return None
+        return ({round(p, 4): q for p, q in dict(b.yes_bids).items() if q > 0},
+                {round(p, 4): q for p, q in dict(b.no_bids).items() if q > 0})
+
+    def take(self) -> tuple[set[str], list[dict]]:
+        with self.lock:
+            d, f = self.dirty, self.fills
+            self.dirty, self.fills = set(), []
+        return d, f
+
+
 def remove_ours(book: dict[float, float], price: float, size: float) -> dict[float, float]:
     out = dict(book)
     p = round(price, 4)
@@ -270,6 +387,8 @@ class Farm:
         self.held_events: set[str] = set()
         self.waiting: list[str] = []
         self.last_programs = 0.0
+        self.bucket = TokenBucket(5.0, WRITE_BURST)
+        self.ws = WsBooks()
 
     # ---- mode ----
     def _open_mode(self, live: bool):
@@ -369,9 +488,10 @@ class Farm:
         top = sorted(self.programs, key=lambda t: -pool(self.programs[t]))[:cfg.scan_markets]
         return list(dict.fromkeys(top + sorted(self.order_tickers())))
 
-    def others_of(self, t: str, ob: dict) -> dict[str, dict[float, float]]:
-        """Others' books: the REST book includes our live bids (a shadow one isn't there)."""
-        yes, no = parse_book(ob)
+    def others_of(self, t: str, ob) -> dict[str, dict[float, float]]:
+        """Others' books from a REST orderbook or (yes, no) bids: both include
+        our live bids (a shadow one isn't there)."""
+        yes, no = parse_book(ob) if isinstance(ob, dict) else ob
         others = {"yes": yes, "no": no}
         if self.live:
             for side, o in self.legs_of(t):
@@ -431,6 +551,7 @@ class Farm:
         t = unkey(k)[0]
         if o and self.live:
             c = self.client(self.shard(t))
+            self.bucket.take(CANCEL_TOKENS, force=True)
             c.allow_now("cancel", force=True, reason=reason)
             try:
                 c.cancel(o["oid"], t)
@@ -441,8 +562,16 @@ class Farm:
               reason: str = "lipfarm:quote", hedge: bool = False) -> bool:
         if self.live:
             c = self.client(self.shard(t))
-            if not (c.can_afford("order", reserve=reserve * c.tokens_per_s) and c.allow_now("order", reason=reason)):
-                return False
+            if hedge:
+                # An exit always goes, at our own LIP writes' expense, not ARBS's.
+                self.bucket.take(ORDER_TOKENS, force=True)
+                c.allow_now("order", force=True, reason=reason)
+            else:
+                if not c.can_afford("order", reserve=reserve * c.tokens_per_s) or not self.bucket.take(ORDER_TOKENS):
+                    return False
+                if not c.allow_now("order", reason=reason):
+                    self.bucket.refund(ORDER_TOKENS)
+                    return False
             order = Order(order_id=0, ticker=t, side=side, order_type="limit", price=price, size=lots,
                           decision_time=pd.Timestamp.now(tz="UTC"), intent="quote")
             order.client_order_id = CID_PREFIX + uuid.uuid4().hex[:24]
@@ -504,28 +633,31 @@ class Farm:
         v = pos.get(t, 0.0)
         return plan_market(t, others, P, cfg, {"yes": max(v, 0.0), "no": max(-v, 0.0)})
 
-    def guard(self, cfg: Cfg):
-        """Live, between cycles: re-read each quoted market's book; pull a bid
-        its plan no longer has, and move one with size behind it to the back.
-        A price change is left to the next cycle."""
-        if not self.live:
-            return
-        self.poll_fills()
-        tickers = sorted(self.order_tickers() | set(self.signed_positions()))
-        if not tickers:
-            return
-        with cf.ThreadPoolExecutor(BOOK_WORKERS) as ex:
-            got = dict(zip(tickers, ex.map(fetch_book, tickers)))
+    def fresh_books(self, tickers) -> dict[str, dict]:
+        """Others' books now: from the socket where it has the market, else REST."""
+        out, missing = {}, []
+        for t in tickers:
+            b = self.ws.bids(t)
+            if b is None:
+                missing.append(t)
+            else:
+                out[t] = self.others_of(t, b)
+        if missing:
+            with cf.ThreadPoolExecutor(BOOK_WORKERS) as ex:
+                for t, ob in zip(missing, ex.map(fetch_book, missing)):
+                    if ob is not None:
+                        out[t] = self.others_of(t, parse_book(ob))
+        return out
+
+    def check(self, cfg: Cfg, tickers, moves: bool):
+        """Exits first; then pull a bid its market's plan no longer has; then
+        (`moves`) re-place bids with size behind them at the back."""
+        books = self.fresh_books(tickers)
+        self.books.update(books)
+        self.hedge(cfg)
         pos, keep = self.signed_positions(), {}
-        for t in tickers:
-            ob = got.get(t)
-            if ob is None or t not in self.programs:
-                continue
-            self.books[t] = self.others_of(t, ob)
-        self.hedge(cfg)                     # exits first
-        for t in tickers:
-            others = self.books.get(t)
-            if got.get(t) is None or t not in self.programs or t not in self.order_tickers():
+        for t, others in books.items():
+            if t not in self.programs or t not in self.order_tickers():
                 continue
             P = self.params(t)
             pl = self.plan(t, others, P, cfg, pos)
@@ -538,6 +670,32 @@ class Farm:
                 elif abs(want[side] - o["price"]) < 1e-9:
                     keep[key(t, side)] = others
             self.rates[t] = self.our_rate(t, others, P)
+        if moves:
+            self.move_back(cfg, keep)
+
+    def guard(self, cfg: Cfg):
+        """Live, every GUARD_S: fills (REST backstop), then check every market we
+        quote or hold, with back-of-queue moves."""
+        if not self.live:
+            return
+        self.poll_fills()
+        tickers = sorted(self.order_tickers() | set(self.signed_positions()))
+        if tickers:
+            self.check(cfg, tickers, moves=True)
+
+    def react(self, cfg: Cfg):
+        """Live, on a websocket wake: book our fills, then check the markets
+        whose books changed or that just filled."""
+        dirty, fills = self.ws.take()
+        if not self.live:
+            return
+        new = self.book_fills(fills)
+        mine = self.order_tickers() | set(self.signed_positions())
+        tickers = (dirty & mine) | new
+        if tickers:
+            self.check(cfg, sorted(tickers), moves=False)
+
+    def move_back(self, cfg: Cfg, keep: dict[str, dict]):
         now = time.time()
         orders = dict(self.state["orders"])
         due = {k: v for k, v in keep.items() if k in orders and now - orders[k]["placed"] >= MOVE_MIN_S}
@@ -556,8 +714,8 @@ class Farm:
             if a is None or others[side].get(round(o["price"], 4), 0.0) - a < MOVE_BEHIND_FRAC * cfg.lots:
                 continue
             c = self.client(self.shard(t))
-            if moves >= MAX_MOVES or not c.can_afford("order", reserve=MOVE_RESERVE * c.tokens_per_s
-                                                      + c.COST["cancel"]):
+            if (moves >= MAX_MOVES or not self.bucket.has(ORDER_TOKENS + CANCEL_TOKENS)
+                    or not c.can_afford("order", reserve=MOVE_RESERVE * c.tokens_per_s + c.COST["cancel"])):
                 return
             self.cancel(k, reason="lipfarm:move")
             if self.place(t, side, o["price"], cfg.lots, reserve=0.0, reason="lipfarm:move"):
@@ -656,44 +814,47 @@ class Farm:
             if t in self.order_tickers():
                 self.rates.setdefault(t, pl.rate)
         self.hedge(cfg)
+        if self.live:
+            self.ws.ensure(self.order_tickers() | set(self.signed_positions()))
 
-    def poll_fills(self) -> set[str]:
-        """Book new fills of our orders; returns the tickers that had any."""
-        if not self.live or not self.clients:
-            return set()
-        new: set[str] = set()
+    def book_fills(self, fills: list[dict]) -> set[str]:
+        """Record fills of our orders (deduped on trade_id, from the socket or
+        REST); returns the tickers that had new ones."""
         ours = {o["oid"]: k for k, o in self.state["orders"].items()}
-        known = set(self.state.get("all_oids", []))
-        known |= set(ours)
+        known = set(self.state.get("all_oids", [])) | set(ours)
         self.state["all_oids"] = sorted(known)
         seen = set(self.state["trade_ids"])
-        c = next(iter(self.clients.values()))
-        # Overlapping windows, deduped on trade_id: polled every FILL_POLL_S.
-        since = self.state.get("fills_since", self.state["t0"]) - 120
-        self.state["fills_since"] = time.time()
-        for f in c.fills("", min_ts=int(since)):
-            if f["order_id"] not in known or f["trade_id"] in seen:
+        new: set[str] = set()
+        for f in fills:
+            if f.get("order_id") not in known or f.get("trade_id") in seen:
                 continue
             seen.add(f["trade_id"])
+            f = dict(f, time=str(f["time"]) if f.get("time") is not None else None)
             self.state["fills"].append(f)
             new.add(f["ticker"])
             k = ours.get(f["order_id"])
             if k:
                 self.state["orders"][k]["remaining"] = max(self.state["orders"][k]["remaining"] - f["size"], 0.0)
         self.state["trade_ids"] = sorted(seen)
+        if new:
+            print(f"fill: {sorted(new)}")
         return new
 
+    def poll_fills(self) -> set[str]:
+        """REST backstop for the socket's fills; returns tickers with new ones."""
+        if not self.live or not self.clients:
+            return set()
+        c = next(iter(self.clients.values()))
+        # Overlapping windows, deduped on trade_id.
+        since = self.state.get("fills_since", self.state["t0"]) - 120
+        self.state["fills_since"] = time.time()
+        return self.book_fills(c.fills("", min_ts=int(since)))
+
     def exit_now(self, cfg: Cfg):
-        """Between guard passes: on a new fill, read that market's book and
-        rest its exit at once."""
+        """Socket down: poll fills over REST and exit new ones at once."""
         new = self.poll_fills() if self.live else set()
-        if not new:
-            return
-        with cf.ThreadPoolExecutor(BOOK_WORKERS) as ex:
-            for t, ob in zip(sorted(new), ex.map(fetch_book, sorted(new))):
-                if ob is not None:
-                    self.books[t] = self.others_of(t, ob)
-        self.hedge(cfg)
+        if new:
+            self.check(cfg, sorted(new), moves=False)
 
     def accrue(self):
         now = time.time()
@@ -762,6 +923,8 @@ class Farm:
                    "fills": len(self.state["fills"]), "fill_lots": sum(p["lots"] for p in pos),
                    "fill_pnl_usd": fill_pnl, "net_usd": tot_lip + fill_pnl, "resting_cost_usd": at_risk,
                    "max_capital_usd": cfg.max_capital,
+                   "write_tps_10m": self.bucket.rate_10m(), "write_tps_cap": cfg.write_tokens_per_s,
+                   "ws_up": self.ws.up, "ws_updates": self.ws.n_updates,
                    "waiting_on_arbs": len(self.waiting), "arbs_events_skipped": len(self.held_events),
                    "updated_at": time.time()}
         tmp = os.path.join(ROOT, "status.json.tmp")
@@ -791,6 +954,7 @@ class Farm:
         try:
             while True:
                 cfg = Cfg.load()
+                self.bucket.rate = cfg.write_tokens_per_s
                 t0 = time.time()
                 try:
                     reason = stop.poll()
@@ -813,11 +977,15 @@ class Farm:
                     traceback.print_exc()
                 last_guard = time.time()
                 while time.time() - t0 < cfg.refresh_s - 1e-3:
-                    time.sleep(max(min(FILL_POLL_S, cfg.refresh_s - (time.time() - t0)), 0.05))
+                    self.ws.wake.wait(timeout=max(min(FILL_POLL_S, cfg.refresh_s - (time.time() - t0)), 0.05))
+                    self.ws.wake.clear()
                     try:
                         if time.time() - last_guard >= GUARD_S and time.time() - t0 < cfg.refresh_s - 1.0:
                             last_guard = time.time()
+                            self.react(cfg)
                             self.guard(cfg)
+                        elif self.ws.up:
+                            self.react(cfg)
                         else:
                             self.exit_now(cfg)
                     except Exception:
