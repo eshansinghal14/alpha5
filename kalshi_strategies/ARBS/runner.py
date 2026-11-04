@@ -153,10 +153,6 @@ ORDER_GROUP_WINDOW_S = 15.0
 # A group with nothing resting in it this long is deleted.
 ORDER_GROUP_IDLE_S = 600.0
 PULL_BATCH = 20
-# After an exit IOC misses, the next try waits EXIT_RETRY_S, doubling per
-# consecutive miss up to EXIT_RETRY_MAX_S: retried on every book update, one
-# SENATETX combo exit sent 27 IOCs in 0.7 s (11-04 01:06 UTC).
-EXIT_RETRY_S, EXIT_RETRY_MAX_S = 0.05, 1.0
 
 
 class _Rate:
@@ -335,7 +331,7 @@ class ArbsRunner:
         # basket_id -> [exit fills' cash since the plan, bundles held then]:
         # puts a partly done exit's cost back on the plan's basis.
         self.exit_base: dict[str, list[float]] = {}
-        self.exit_misses: dict[str, tuple[int, float]] = {}  # basket_id -> (consecutive missed exits, last)
+        self.exit_misses: dict[str, int] = {}     # basket_id -> consecutive exit takes that missed
         self.order_errors = 0
         self.unbooked: set[str] = set()                  # settled but unbookable, alerted once
         self.halt: str | None = None                     # until restart
@@ -1700,19 +1696,18 @@ class ArbsRunner:
         why = ("fast move" if cost - best >= moved - _EPS else
                "at plan" if at_plan else
                "live event" if self.live_now(b, _utc()) or not b.quoting_allowed(_utc()) else None)
+        misses = self.exit_misses.get(bid, 0)
+        if why is not None and misses >= c.max_exit_misses:
+            why = None
         self.completion_note[bid]["window_best"] = round(best, 4)
-        self.completion_note[bid].update(action="take" if why else "rest", why=why)
+        self.completion_note[bid].update(action="take" if why else "rest", why=why, misses=misses)
         if why is None:
             self.rest_exit(b, path, ex, legs, others, qs, now)
         else:
             # A missed IOC leaves our book showing the level it missed until
             # Kalshi's update lands; retrying before that fires at it again.
             sig = (tuple(self.book_seq.get(t, 0) for t in b.tickers), tuple(pos.held(b.tickers)))
-            miss = self.exit_misses.get(bid)
-            wait = 0.0 if miss is None else min(EXIT_RETRY_MAX_S, EXIT_RETRY_S * 2 ** (miss[0] - 1)) - (now - miss[1])
-            if wait > 0:
-                self.later(bid, wait)
-            elif self.last_exit.get(bid) != sig:
+            if self.last_exit.get(bid) != sig:
                 self.last_exit[bid] = sig
                 self.spawn(self.exit_now(b, path, ex, legs, others, qs, cost, why), bid)
 
@@ -1772,7 +1767,9 @@ class ArbsRunner:
                 self.exit_paid(bid, b, sd, t, fill.size, paid)
                 self._book(bid, t, sd, fill.size, paid, path, order_id=fill.exchange_order_id)
         if missed:
-            self.exit_misses[bid] = (self.exit_misses.get(bid, (0, 0.0))[0] + 1, time.time())
+            self.exit_misses[bid] = self.exit_misses.get(bid, 0) + 1
+            if self.exit_misses[bid] == self.cfg.completion.max_exit_misses:
+                self.alert("warn", bid, f"{path} missed {self.exit_misses[bid]} times in a row: resting it")
         else:
             self.exit_misses.pop(bid, None)
         pos = self.ledger.baskets.get(bid)

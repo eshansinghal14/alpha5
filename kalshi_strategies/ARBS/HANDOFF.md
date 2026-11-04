@@ -51,9 +51,19 @@ the election-night section below supersedes it where they differ.
 - **Exit bugs fixed** (`86f37a9`): a broken basket's exit cost was net of
   today's broken_spent, which a partial completion raises, so retries read
   dollars off plan (vs_plan −7.92 at plan; a fake −$241 "worse than planned"
-  total) and "at plan" re-fired. Now on the plan's basis. Missed exit IOCs
-  back off 50 ms doubling to 1 s (one SENATETX combo sent 27 IOCs in 0.7 s,
-  167 misses all night, $0.37 slippage).
+  total) and "at plan" re-fired. Now on the plan's basis. A missed exit IOC is
+  retried on the next book update with no delay (a 50 ms→1 s backoff was
+  tried and removed: fast retries finished better); after
+  `completion.max_exit_misses` (5, dashboard) misses in a row the basket
+  rests post-only bids instead, with an alert.
+- **Leg-miss analysis** (`~/an/tmp/lm2..7.py`, 1,330 broken episodes
+  11-02..04): about half of live breaks miss at least once; median 2 tries,
+  0.06 s to whole. Live misses cost $185 beyond the first exit decision,
+  vs $277 already lost at that decision; on 538 of 650 missed legs our book
+  showed the size (lost the race in the same sweep). Retries paid a median
+  3.5c over the first limit. 1-2c of IOC slack on retries est. +$5-10 per
+  3 days; deeper sweeps, path switching, take order and chase_ticks showed
+  nothing. The lever is not being filled into the sweep.
 - **Unwind basis**: ledger legs keep lots; an unwind and
   broken_spent take the newest contracts (the fill that broke the basket),
   not the leg's average, so bundles still held keep their own cost.

@@ -109,6 +109,11 @@ class CompletionParams:
                              min=0, max=50, step=1)
     chase_window_s: float = param("How recent the best exit price a fast move is measured from.", min=0.0,
                                   max=60.0, step=0.1)
+    # 11-02..04: misses retried on the next book update (~28 ms) finished
+    # better than waiting; episodes of 4-6 tries ended $13 better than plan.
+    max_exit_misses: int = param("Exit takes (IOCs) in a row that may miss before a broken basket stops taking "
+                                 "and rests post-only bids instead, live or not. Reset by an exit that fills "
+                                 "in full.", min=1, max=100, step=1)
     max_broken_baskets: int = param("No new takes or quotes while this many baskets are broken.", min=1,
                                     max=1000, step=1, editable=False)
 

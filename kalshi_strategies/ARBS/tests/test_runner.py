@@ -510,7 +510,6 @@ def test_missed_exit_retries_only_after_the_book_changes(arbs):
         return None, None
     r._ioc = miss
     _eval(r, b)
-    r.exit_misses.pop(b.basket_id)                   # past the backoff
     _eval(r, b)                                      # same book: no second IOC at the level that missed
     assert len(sent) == 1
     r._on_quote(type("V", (), {"ticker": "X-A", "ask": 0.7, "ask_depth": 1, "bid": 0.3, "bid_depth": 1})())
@@ -744,7 +743,6 @@ def test_partial_completion_retry_is_scored_against_the_plan(arbs):
         return fill, exc
     r._ioc = ioc
     _eval(r, b)
-    r.exit_misses.pop(b.basket_id)                   # past the backoff
     _eval(r, b)
     exits = [x for x in rows if x["kind"] == "complete"]
     assert [x["orders"]["X-B"][1] for x in exits] == [10.0, 6.0]
@@ -754,10 +752,11 @@ def test_partial_completion_retry_is_scored_against_the_plan(arbs):
     assert not r.shadow_ledger.baskets[b.basket_id].unhedged(b.tickers)
 
 
-def test_missed_exit_backs_off_before_retrying(arbs):
+def test_exit_rests_after_max_exit_misses(arbs):
     r, b = arbs
     b = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
     r.set_baskets([b])
+    r.cfg.completion = dataclasses.replace(r.cfg.completion, max_exit_misses=3)
     book(r, "X-A", [(0.30, 10)], [(0.55, 10)])
     book(r, "X-B", [(0.45, 10)], [(0.50, 10)])
     _filled_a(r, b)
@@ -767,13 +766,13 @@ def test_missed_exit_backs_off_before_retrying(arbs):
         sent.append(ticker)
         return None, None                            # the level was gone
     r._ioc = ioc
-    _eval(r, b)
-    r.book_seq["X-B"] = 1                            # a new book update
-    _eval(r, b)
-    assert len(sent) == 1 and r.exit_misses[b.basket_id][0] == 1
-    r.exit_misses[b.basket_id] = (1, time.time() - R.EXIT_RETRY_S - 0.01)
-    _eval(r, b)
-    assert len(sent) == 2 and r.exit_misses[b.basket_id][0] == 2
+    for i in range(5):
+        r.book_seq["X-B"] = i + 1                    # a new book update each time, retried at once
+        _eval(r, b)
+    assert len(sent) == 3 and r.exit_misses[b.basket_id] == 3
+    q = r.quotes[(b.basket_id, 1)]
+    assert (q.kind, q.side) == ("complete", "yes")   # resting the exit instead
+    assert any("missed 3 times" in a["msg"] for a in r.alerts)
 
 
 def test_audit_ignores_a_determined_market_kalshi_hasnt_paid_out(arbs):
