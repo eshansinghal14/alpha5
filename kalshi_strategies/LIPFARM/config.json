@@ -3,11 +3,12 @@
     "max_capital": 5000,
     "num_markets": 20,
     "lots": 1000,
+    "exit_vol_frac": 1.0,
     "wide_spread": 0.2,
     "decided_min": 0.97,
     "min_ahead": 0,
     "max_position": 1000,
-    "write_tokens_per_s": 5,
+    "write_tokens_per_s": 15,
     "scan_markets": 400,
     "refresh_s": 30,
     "programs_refresh_s": 600

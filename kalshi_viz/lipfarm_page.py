@@ -75,9 +75,11 @@ def render(page: str, stale_fn):
         c[3].metric("Fill P&L", f"${s['fill_pnl_usd']:+,.2f}", f"{s['fills']} fills, {s['fill_lots']:,.0f} lots",
                     delta_color="off")
         c[4].metric("Net", f"${s['net_usd']:+,.2f}")
-        c[5].metric("Capital resting", f"${s['resting_cost_usd']:,.0f}",
-                    f"of ${s.get('max_capital_usd', 0):,.0f}" if s.get("max_capital_usd") else None,
-                    delta_color="off")
+        c[5].metric("Exposure", f"${s.get('exposure_usd', 0):,.0f}",
+                    f"of ${s.get('max_capital_usd', 0):,.0f} cap · ${s['resting_cost_usd']:,.0f} bids resting",
+                    delta_color="off", help="What fills have left us holding, unexited, at cost. Resting bids "
+                                            "hold no cash at Kalshi; a bid that could fill us past the cap "
+                                            "isn't placed.")
         ws = ("websocket up" if s.get("ws_up") else "websocket down (REST fallback)") if s.get("live_trading") else "REST"
         st.caption(f"writes {s.get('write_tps_10m', 0):.2f} of {s.get('write_tps_cap', 0):.0f} tokens/s (10 min) · "
                    f"{ws} · {s['mode']} · this mode's journal covers {s['hours']:.2f} h · "
