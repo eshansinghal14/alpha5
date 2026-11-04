@@ -501,3 +501,15 @@ def test_wide_skips_legs_under_min_leg_price():
     cfg = dataclasses.replace(CFG, min_leg_price=0.10, exit_depth_frac=10.0)
     pl = plan_market("T", others, P, cfg, {}, farm.exit_lots(others, cfg))
     assert pl.mode == "wide" and pl.legs == (("yes", 0.70),)    # the 6c no leg isn't quoted
+
+
+def test_moves_leave_half_our_bucket_for_new_bids(tmp_path, monkeypatch):
+    b = _Bucket(tokens=300.0, ahead=1500.0)
+    f = _live(tmp_path, monkeypatch, b)
+    f.bucket = farm.TokenBucket(rate=0.0, capacity=120.0)
+    f.bucket.tokens = 65.0                                       # under half + one move: no move
+    _guard(f, monkeypatch, b, [(0.97, 4000), (0.95, 2000)], [(0.02, 5000)])
+    assert not b.cancelled
+    f.bucket.tokens = 80.0
+    _guard(f, monkeypatch, b, [(0.97, 4000), (0.95, 2000)], [(0.02, 5000)])
+    assert b.cancelled == ["oid0"]

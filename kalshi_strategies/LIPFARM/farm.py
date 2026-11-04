@@ -1104,7 +1104,9 @@ class Farm:
             if a is None or others[side].get(round(o["price"], 4), 0.0) - a < MOVE_BEHIND_FRAC * cfg.lots:
                 continue
             c = self.client(self.shard(t))
-            if (moves >= MAX_MOVES or not self.bucket.has(ORDER_TOKENS + CANCEL_TOKENS)
+            # Moves only spend the top half of our bucket: at 10 per pass they drained it and
+            # 50 new LIP bids were refused (11-04 21:40).
+            if (moves >= MAX_MOVES or not self.bucket.has(0.5 * self.bucket.capacity + ORDER_TOKENS + CANCEL_TOKENS)
                     or not c.can_afford("order", reserve=MOVE_RESERVE * c.tokens_per_s + c.COST["cancel"])):
                 return
             self.cancel(k, reason="lipfarm:move")
