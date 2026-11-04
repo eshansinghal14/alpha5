@@ -114,6 +114,10 @@ class CompletionParams:
     max_exit_misses: int = param("Exit takes (IOCs) in a row that may miss before a broken basket stops taking "
                                  "and rests post-only bids instead, live or not. Reset by an exit that fills "
                                  "in full.", min=1, max=100, step=1)
+    cross_baskets: bool = param("Finish broken baskets from each other: excess contracts another broken basket "
+                                "holds on a leg this one needs move across, and excess on opposite sides of a "
+                                "market (which Kalshi already netted to $1) close both, whenever that lowers what "
+                                "the two cost to finish at today's books.")
     max_broken_baskets: int = param("No new takes or quotes while this many baskets are broken.", min=1,
                                     max=1000, step=1, editable=False)
 

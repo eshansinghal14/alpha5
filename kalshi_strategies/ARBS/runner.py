@@ -153,6 +153,7 @@ ORDER_GROUP_WINDOW_S = 15.0
 # A group with nothing resting in it this long is deleted.
 ORDER_GROUP_IDLE_S = 600.0
 PULL_BATCH = 20
+CROSS_MIN_GAIN = 0.01   # $ a cross between baskets must save over finishing each alone
 
 
 class _Rate:
@@ -341,7 +342,7 @@ class ArbsRunner:
         self.tasks: set[asyncio.Task] = set()
         self.n = {"takes": 0, "take_bundles": 0.0, "quotes_placed": 0, "quote_moves": 0, "quote_cancels": 0,
                   "quote_fills": 0, "completions": 0, "unwinds": 0, "exit_unpriced": 0, "post_only_rejects": 0,
-                  "moves_refused": 0, "pulls": 0}
+                  "moves_refused": 0, "pulls": 0, "crosses": 0}
         self.started = _utc()
         self.liq = Liquidity(self.root)
         self.prints = Prints(self.root)
@@ -1661,6 +1662,8 @@ class ArbsRunner:
         if any(q.pending and not (grouped_ok and q.group) for q in qs):
             self.later(bid, 0.05)
             return
+        if c.cross_baskets and self.cross(b, pos):
+            return
         legs = [self.leg_view(l.ticker, l.side) if self.is_open(l.ticker) else None for l in b.legs]
         others = [self.leg_view(l.ticker, OTHER[l.side]) if self.is_open(l.ticker) else None for l in b.legs]
         ex = pricing.exits(b.payout, pos.held(b.tickers), pos.broken_spent(b.tickers), legs, others)
@@ -1710,6 +1713,61 @@ class ArbsRunner:
             if self.last_exit.get(bid) != sig:
                 self.last_exit[bid] = sig
                 self.spawn(self.exit_now(b, path, ex, legs, others, qs, cost, why), bid)
+
+    def _finish_cost(self, b: Basket, held: list[float]) -> float:
+        """Cash the cheaper exit costs from `held` at today's books, less the
+        payout of the bundles held: comparable across states of one basket
+        whatever the contracts cost. inf when no exit is priced."""
+        legs = [self.leg_view(l.ticker, l.side) if self.is_open(l.ticker) else None for l in b.legs]
+        others = [self.leg_view(l.ticker, OTHER[l.side]) if self.is_open(l.ticker) else None for l in b.legs]
+        pick = pricing.exits(b.payout, held, 0.0, legs, others).cheaper()
+        return math.inf if pick is None else pick[1] - b.payout * min(held)
+
+    def cross(self, b: Basket, pos) -> bool:
+        """Finish part of broken basket `b` from another broken basket's
+        excess, when that lowers the two baskets' finish cost: the same side
+        of a leg `b` needs moves across, or the other side of a leg `b` has in
+        excess closes both as a $1 pair (Kalshi netted it when bought). Booked
+        as fills, so the ledger, audit and bundle log see ordinary trades:
+        the giver nets out at its contracts' cost (pnl 0). True if it booked."""
+        held = pos.held(b.tickers)
+        done = min(held)
+        excess = [h - done for h in held]
+        need = [max(excess) - e for e in excess]
+        for j, leg in enumerate(b.legs):
+            for oid in self.by_ticker.get(leg.ticker, ()):
+                o, opos = self.baskets.get(oid), self.ledger.baskets.get(oid)
+                if oid == b.basket_id or o is None or opos is None or oid in self.busy:
+                    continue
+                oex = opos.unhedged(o.tickers).get(leg.ticker, 0.0)
+                if oex <= _EPS or any(q.pending for q in self.basket_quotes(oid)):
+                    continue
+                k = o.tickers.index(leg.ticker)
+                same = o.legs[k].side == leg.side
+                qty = float(int(min(need[j] if same else excess[j], oex) + _EPS))
+                if qty < 1:
+                    continue
+                oheld = opos.held(o.tickers)
+                after, oafter = list(held), list(oheld)
+                after[j] += qty if same else -qty
+                oafter[k] -= qty
+                before = self._finish_cost(b, held) + self._finish_cost(o, oheld)
+                gain = before - (self._finish_cost(b, after) + self._finish_cost(o, oafter) - (0.0 if same else qty))
+                if not gain > CROSS_MIN_GAIN:
+                    continue
+                basis = opos.legs[leg.ticker].newest_cost(qty)
+                side = o.legs[k].side
+                self.journal({"kind": "cross", "basket_id": b.basket_id, "from": oid, "ticker": leg.ticker,
+                              "side": side, "size": qty, "cost": round(basis, 4),
+                              "gain": None if math.isinf(gain) else round(gain, 4)})
+                # The giver buys the other side at payout - cost: a $1 pair at its own cost.
+                self.exit_paid(oid, o, OTHER[side], leg.ticker, qty, qty - basis)
+                self._book(oid, leg.ticker, OTHER[side], qty, qty - basis, "cross", from_basket=b.basket_id)
+                self.exit_paid(b.basket_id, b, side, leg.ticker, qty, basis)
+                self._book(b.basket_id, leg.ticker, side, qty, basis, "cross", from_basket=oid)
+                self.n["crosses"] += 1
+                return True
+        return False
 
     def exit_tick(self, b: Basket, path: str, ex: pricing.Exits, legs, others) -> float:
         """The coarsest tick among the exit's orders at their prices: a cent,

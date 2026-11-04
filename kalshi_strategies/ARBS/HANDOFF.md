@@ -75,6 +75,15 @@ the election-night section below supersedes it where they differ.
   baskets); cancels have reason `pull`; summary counter `pulls`. Track over
   the next days: fills avoided vs fill_context control rows; score per
   category (sports only once they're re-enabled).
+- **Cross-basket exits** (`completion.cross_baskets`, on, dashboard): a
+  broken basket first tries to finish from other broken baskets' excess
+  on its markets. Same side of a leg it needs: the contracts move across
+  (journal `cross` row; the receiver books a fill at their cost, the giver
+  an unwind at payout - cost, pnl 0). Opposite sides (Kalshi already netted
+  the pair to $1): both close, the pair's pnl on the receiver. Only when
+  the two baskets' cost to finish at today's books drops by >= $0.01
+  (`CROSS_MIN_GAIN`). Nothing is traded at Kalshi; the audit's net
+  position is unchanged. Summary counter `crosses`.
 - **Ops gotchas** learned: put box scratch scripts in `~/an/tmp` (a
   `/tmp/re.py` shadowed the stdlib); stream journals line by line (loading
   every day OOM-killed a script); orders gz may read EOF mid-append, retry;

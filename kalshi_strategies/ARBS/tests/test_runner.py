@@ -708,6 +708,67 @@ def test_pull_ignores_a_price_change_and_non_live_baskets(arbs):
     assert not w.fires(("T", "yes"), 3.0, 0.30, 1.0, 2.0, 0.5)    # the peak is out of the window
 
 
+def _second_basket(r, b, legs):
+    from kalshi_backtest.book import L2Book
+    c = Basket(basket_id="t:c", relationship_id="t2", type="complete_set", cluster="t2", legs=legs, payout=1.0,
+               quote_until=None, resume_quoting=None)
+    r.set_baskets([b, c])
+    for t in c.tickers:
+        r.feed._books.setdefault(t, L2Book(t))
+        r.meta[t] = R.Meta(ticker=t, event="X", status="active", shard=0, taker_rate=0.07, maker_rate=0.0)
+    return c
+
+
+def test_broken_baskets_finish_each_other(arbs):
+    r, b = arbs
+    c = _second_basket(r, b, (Leg("X-B", "yes"), Leg("X-C", "yes")))
+    for t in ("X-A", "X-B", "X-C"):
+        book(r, t, [(0.30, 10)], [(0.35, 10)])     # every ask 0.65: finishing either alone loses
+    L, now = r.shadow_ledger, time.time()
+    L.record(b.basket_id, b.tickers, "X-A", "yes", 5, 5 * 0.40, now)      # b needs 5 B
+    L.record(c.basket_id, c.tickers, "X-B", "yes", 5, 5 * 0.45, now)      # c holds 5 B it can't use
+    net = L.net_by_ticker()
+    rows = []
+    r.journal = rows.append
+    _eval(r, b)
+    assert L.baskets[b.basket_id].bundles(b.tickers) == 5 and not L.baskets[b.basket_id].unhedged(b.tickers)
+    assert c.basket_id not in L.baskets
+    assert L.net_by_ticker() == net                # nothing traded at Kalshi
+    cross = [x for x in rows if x["kind"] == "cross"]
+    assert len(cross) == 1 and cross[0]["from"] == c.basket_id and cross[0]["size"] == 5
+    # The giver nets out at its own cost; the bundles carry it.
+    assert [x["pnl"] for x in rows if x["kind"] == "settled"] == [0.0]
+    assert L.baskets[b.basket_id].cost() == pytest.approx(5 * 0.40 + 5 * 0.45)
+
+
+def test_opposite_excess_closes_as_a_pair(arbs):
+    r, b = arbs
+    c = _second_basket(r, b, (Leg("X-A", "no"), Leg("X-C", "yes")))
+    for t in ("X-A", "X-B", "X-C"):
+        book(r, t, [(0.30, 10)], [(0.35, 10)])
+    L, now = r.shadow_ledger, time.time()
+    L.record(b.basket_id, b.tickers, "X-A", "yes", 5, 5 * 0.40, now)
+    L.record(c.basket_id, c.tickers, "X-A", "no", 5, 5 * 0.55, now)       # Kalshi netted these to $5
+    rows = []
+    r.journal = rows.append
+    _eval(r, b)
+    assert b.basket_id not in L.baskets and c.basket_id not in L.baskets
+    assert sum(x["pnl"] for x in rows if x["kind"] == "settled") == pytest.approx(5 - 5 * 0.40 - 5 * 0.55)
+
+
+def test_no_cross_when_finishing_alone_is_cheaper(arbs):
+    r, b = arbs
+    c = _second_basket(r, b, (Leg("X-B", "yes"), Leg("X-C", "yes")))
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-C", [(0.10, 10)], [(0.85, 10)])     # C's ask 0.15: c completes at a profit on its own
+    L, now = r.shadow_ledger, time.time()
+    L.record(b.basket_id, b.tickers, "X-A", "yes", 5, 5 * 0.40, now)
+    L.record(c.basket_id, c.tickers, "X-B", "yes", 5, 5 * 0.45, now)
+    r.cfg.completion = dataclasses.replace(r.cfg.completion, chase_ticks=50)
+    assert not r.cross(b, L.baskets[b.basket_id])
+
+
 def test_unwind_nets_out_the_newest_contracts(arbs):
     r, b = arbs
     L = r.shadow_ledger
