@@ -9,6 +9,16 @@ cycle from today's book:
            reversal). A bid at the market's top price (0.99, or 0.999 on 0.1c
            ticks) earns no LIP; the scorer rules those out.
 
+Each quoted side takes one of two layouts, whichever the LIP scorer prefers:
+  touch     the bid at the touch, kept at the back of its queue (moves first):
+            on a crowded touch the size ahead of us absorbs a sweep first.
+  sentinel  SENTINEL_LOTS at the touch (back of the queue: it fills only once the
+            touch is cleared) and the bid one tick under it, both in a Kalshi
+            order group of limit GROUP_LIMIT. The sentinel's fill trips the
+            group and Kalshi cancels the bid behind it. Taken when it keeps
+            sentinel_keep of the touch layout's LIP (thin touches, 11-04: ~97%;
+            crowded touches leave nothing to score one tick under).
+
 Every side must reach Kalshi's Target size, ours included where we quote and
 from others alone where we don't, or the snapshot pays nobody. Markets are
 ranked by LIP per dollar of resting bids. Kalshi holds no cash for resting
@@ -127,7 +137,10 @@ STATUS_S = 5.0
 GUARD_COOLDOWN_S = 300.0
 MOVE_MIN_S = 5.0
 MOVE_BEHIND_FRAC = 0.2
-MAX_MOVES = 10
+# Moves come before new bids (crowded touches, sentinels), but at most this
+# many a pass: 5 x 12 tokens / 5 s = 12 of our 30 tokens/s, so new bids keep
+# the rest (10 a pass drained the bucket, 11-04 21:40).
+MAX_MOVES = 5
 # Fills are polled this often between guard passes; a new one is exited at once.
 # With the websocket up, fills and book updates wake the loop as they arrive
 # and this is only the idle tick.
@@ -141,6 +154,10 @@ ORDER_TOKENS, CANCEL_TOKENS = 10.0, 2.0
 EXIT_REPRICE_S = 5.0
 # A position this small is sold into the book at once instead of resting an exit.
 DUST_LOTS = 25.0
+# Kalshi trips an order group once MORE than its limit matches within 15 s:
+# a 1.1-lot sentinel trips a limit-1 group exactly when it fills in full.
+SENTINEL_LOTS = 1.1
+GROUP_LIMIT = 1
 # Taker fee rate when a market's schedule can't be read (Kalshi's standard 0.07).
 DEFAULT_TAKER_RATE = 0.07
 
@@ -153,6 +170,15 @@ class Cfg:
     num_markets: int = param("Most markets quoted.", min=0, step=1)
     lots: float = param("Contracts per bid (one bid per quoted side), before exit_vol_frac.", min=1.0,
                         step=100.0)
+    sentinel_keep: float = param("Use the sentinel layout on a side when it keeps at least this share of the "
+                                 "touch layout's LIP. 11-04, 366 sides: thin touches (<200 ahead) keep ~97%, "
+                                 "crowded ones (>1000) nothing.", min=0.0, max=1.0, step=0.05)
+    dump_slip_ticks: int = param("After an informed fill, sell at once into bids down to this many ticks under "
+                                 "our fill; rest the rest. 11-04: median 46 lots rest within 2 ticks under the "
+                                 "touch.", min=0, max=50, step=1)
+    chase_ticks: int = param("Then sell more (again dump_slip_ticks deep) whenever the best bid is this many ticks "
+                             "under our fill. 11-04: after a sweep the price fell 2+ ticks within 1 min ~22% "
+                             "of the time on 10-90c markets, whatever its size.", min=1, max=50, step=1)
     adverse_fill_frac: float = param("A fill of at least this fraction of one of our bids is informed: sell "
                                      "into the book at once, at any price, instead of waiting on an exit bid "
                                      "(ORAN 11-04: 1000 of 1000 at 6c, then 1c within 10 min).", min=0.05,
@@ -206,6 +232,8 @@ class Plan:
     capital: float                     # dollars those bids cost if all fill
     pool_rate: float                   # whole program's $/s
     lots: float = 0.0                  # contracts per bid
+    layout: dict = dataclasses.field(default_factory=dict)   # side -> "touch" | "sentinel"
+    big: dict = dataclasses.field(default_factory=dict)      # side -> price of the main bid
 
 
 def key(ticker: str, side: str, hedge: bool = False) -> str:
@@ -219,6 +247,22 @@ def unkey(k: str) -> tuple[str, str]:
 
 def is_hedge(k: str) -> bool:
     return k.endswith("|h")
+
+
+def is_sentinel(k: str) -> bool:
+    return k.endswith("|s")
+
+
+def desired_orders(pl: Plan) -> dict[str, tuple[float, float, bool]]:
+    """Order key -> (price, size, in the side's order group) for a plan."""
+    out = {}
+    for s, p in pl.legs:
+        if pl.layout.get(s) == "sentinel":
+            out[f"{pl.ticker}|{s}|s"] = (p, SENTINEL_LOTS, True)
+            out[key(pl.ticker, s)] = (pl.big[s], pl.lots, True)
+        else:
+            out[key(pl.ticker, s)] = (p, pl.lots, False)
+    return out
 
 
 def parse_book(ob: dict) -> tuple[dict[float, float], dict[float, float]]:
@@ -238,11 +282,22 @@ def levels(book: dict[float, float], price: float | None = None, size: float = 0
                   key=lambda lv: -lv.price)
 
 
+def levels_multi(book: dict[float, float], ours) -> list[lip.LipLevel]:
+    acc = {p: [s, 0.0] for p, s in book.items()}
+    for price, size in ours:
+        if size > 0:
+            lv = acc.setdefault(round(price, 4), [0.0, 0.0])
+            lv[0] += size
+            lv[1] += size
+    return sorted((lip.LipLevel(price=p, size=v[0], mine=v[1]) for p, v in acc.items()),
+                  key=lambda lv: -lv.price)
+
+
 def book_score(others: dict[str, dict[float, float]], legs, params: lip.LipParams) -> lip.LipBookScore:
-    """Score with our `legs` ((side, price, size), ...) added to others' books."""
-    mine = {s: (p, q) for s, p, q in legs}
-    y = levels(others["yes"], *mine["yes"]) if "yes" in mine else levels(others["yes"])
-    n = levels(others["no"], *mine["no"]) if "no" in mine else levels(others["no"])
+    """Score with our `legs` ((side, price, size), ...; several per side allowed)
+    added to others' books."""
+    y = levels_multi(others["yes"], [(p, q) for s, p, q in legs if s == "yes"])
+    n = levels_multi(others["no"], [(p, q) for s, p, q in legs if s == "no"])
     return lip.score_book(y, n, params)
 
 
@@ -252,7 +307,7 @@ def market_rate(others, legs, params) -> float:
 
 
 def plan_market(ticker: str, others: dict[str, dict[float, float]], params: lip.LipParams, cfg: Cfg,
-                held: dict[str, float] | None = None, lots=None) -> Plan | None:
+                held: dict[str, float] | None = None, lots=None, tick=lambda p: 0.01) -> Plan | None:
     """How to quote this market now, or None. Joins others' best bids (never
     improves them). `held`: contracts we already hold per side; `lots`: bid
     size, one number or per side (exit_lots); a side sized under 1 isn't
@@ -283,8 +338,22 @@ def plan_market(ticker: str, others: dict[str, dict[float, float]], params: lip.
     sc = book_score(others, sized, params)
     if not sc.qualifies or sc.expected_reward_this_snapshot_usd <= 0:
         return None
-    return Plan(ticker, mode, tuple(legs), sc.expected_reward_this_snapshot_usd,
-                lots * sum(p for _, p in legs), params.period_reward_usd / params.snapshots_per_period, lots)
+    # Per side, the sentinel layout where it keeps sentinel_keep of the touch layout's LIP.
+    layout, big = {s: "touch" for s, _ in legs}, {s: p for s, p in legs}
+    base = sc.expected_reward_this_snapshot_usd
+    for s, p in legs:
+        deeper = round(p - tick(p), 4)
+        if deeper < 0.01:
+            continue
+        trial = [(x, px, lots) for x, px in legs if x != s] + [(s, p, SENTINEL_LOTS), (s, deeper, lots)]
+        r = book_score(others, trial, params)
+        if r.qualifies and r.expected_reward_this_snapshot_usd >= cfg.sentinel_keep * base - 1e-15:
+            layout[s], big[s] = "sentinel", deeper
+            sized = [(x, px, q) for x, px, q in sized if x != s] + [(s, p, SENTINEL_LOTS), (s, deeper, lots)]
+    final = book_score(others, sized, params)
+    return Plan(ticker, mode, tuple(legs), final.expected_reward_this_snapshot_usd,
+                lots * sum(big.values()), params.period_reward_usd / params.snapshots_per_period, lots,
+                layout, big)
 
 
 def exit_lots(others: dict[str, dict[float, float]], cfg: Cfg) -> dict[str, float]:
@@ -566,6 +635,7 @@ class Farm:
         self.pending: dict[str, tuple[float, float]] = {}      # leg key -> (price, lots) awaiting its claim
         self.dumping: set[str] = set()        # markets an informed fill hit: sell out now
         self.cfg_adverse = 0.8                # cfg.adverse_fill_frac, refreshed each loop
+        self.cfg_slip, self.cfg_chase = 2, 2  # cfg.dump_slip_ticks, cfg.chase_ticks
         self.n_refused, self.last_refused_log = 0, 0.0
         self.marks_at = 0.0
 
@@ -615,8 +685,12 @@ class Farm:
         return {unkey(k)[0] for k in self.state["orders"]}
 
     def legs_of(self, t: str, hedges: bool = True) -> list[tuple[str, dict]]:
+        """(side, order) for our orders on t; sentinels are always included, exits if `hedges`."""
         return [(unkey(k)[1], o) for k, o in self.state["orders"].items()
                 if unkey(k)[0] == t and (hedges or not is_hedge(k))]
+
+    def keys_of(self, t: str, hedges: bool = True) -> list[str]:
+        return [k for k in self.state["orders"] if unkey(k)[0] == t and (hedges or not is_hedge(k))]
 
     # ---- exchange ----
     def client(self, shard: int):
@@ -768,8 +842,29 @@ class Farm:
             except Exception as e:
                 print(f"cancel {k}: {e}")
 
+    def group(self, t: str, side: str) -> str | None:
+        """This side's order group, created or reset as needed; None if that fails."""
+        g = self.state.setdefault("groups", {}).get(key(t, side))
+        c = self.client(self.shard(t))
+        try:
+            if g is None:
+                if not self.bucket.take(ORDER_TOKENS):
+                    return None
+                g = {"id": c.create_order_group(GROUP_LIMIT), "tripped": False}
+                self.state["groups"][key(t, side)] = g
+            elif g.get("tripped"):
+                if not self.bucket.take(ORDER_TOKENS):
+                    return None
+                c.reset_order_group(g["id"])
+                g["tripped"] = False
+        except Exception as e:
+            print(f"group {t} {side}: {e}")
+            return None
+        return g["id"]
+
     def place(self, t: str, side: str, price: float, lots: float, reserve: float = PLACE_RESERVE,
-              reason: str = "lipfarm:quote", hedge: bool = False) -> bool:
+              reason: str = "lipfarm:quote", hedge: bool = False, sentinel: bool = False,
+              grouped: bool = False) -> bool:
         if self.live:
             c = self.client(self.shard(t))
             if hedge:
@@ -790,8 +885,11 @@ class Farm:
             order = Order(order_id=0, ticker=t, side=side, order_type="limit", price=price, size=lots,
                           decision_time=pd.Timestamp.now(tz="UTC"), intent="quote")
             order.client_order_id = CID_PREFIX + uuid.uuid4().hex[:24]
+            gid = self.group(t, side) if grouped else None
+            if grouped and gid is None:
+                return False
             try:
-                ack = c.place_resting(order)
+                ack = c.place_resting(order, order_group_id=gid)
             except Exception as e:
                 print(f"place {t} {side}@{price}: {e}")
                 return False
@@ -800,10 +898,13 @@ class Farm:
             self.state.setdefault("hedged_oids", []).append(oid)
             if not hedge:
                 self.state.setdefault("lip_oid_size", {})[oid] = lots
+            if sentinel:
+                self.state.setdefault("sentinel_oids", {})[oid] = key(t, side)
         else:
             oid = "shadow-" + uuid.uuid4().hex[:12]
-        self.state["orders"][key(t, side, hedge)] = {"oid": oid, "side": side, "price": price, "size": lots,
-                                                     "remaining": lots, "placed": time.time()}
+        k = f"{t}|{side}|s" if sentinel else key(t, side, hedge)
+        self.state["orders"][k] = {"oid": oid, "side": side, "price": price, "size": lots, "remaining": lots,
+                                   "placed": time.time()}
         return True
 
     def tick(self, t: str, price: float) -> float:
@@ -920,14 +1021,15 @@ class Farm:
               f"({'pair' if len(best[2]) == 1 and best[2][0][0] == t else 'basket'})")
         return locked
 
-    def dump(self, t: str):
-        """Sell what we hold in t into others' bids, as deep as it takes. After
-        an informed fill (not just dust) also pull its LIP bids and cool it down."""
+    def dump(self, t: str, floor: float | None = None, adverse: bool = True):
+        """Sell what we hold in t into others' bids priced at least `floor`
+        (None: as deep as it takes); the rest gets a resting exit. `adverse`
+        (a fill beyond dust): also pull its LIP bids and cool it down."""
         self.dumping.discard(t)
         v = self.free_positions().get(t, 0.0)
-        if abs(v) > DUST_LOTS:
-            for side, o in self.legs_of(t, hedges=False):
-                self.cancel(key(t, side), reason="lipfarm:adverse")
+        if adverse and abs(v) > DUST_LOTS:
+            for k in self.keys_of(t, hedges=False):
+                self.cancel(k, reason="lipfarm:adverse")
             self.state.setdefault("cooldown", {})[t] = time.time() + GUARD_COOLDOWN_S
         if abs(v) < 0.01:
             return
@@ -935,12 +1037,14 @@ class Farm:
         # Selling `held` = buying `other` against others' `held` bids, best first.
         need, cum, worst = abs(v), 0.0, None
         for p in sorted(self.books[t][held], reverse=True):
+            if floor is not None and p < floor - 1e-9:
+                break
             cum += self.books[t][held][p]
             worst = p
             if cum >= need:
                 break
         if worst is None:
-            print(f"adverse: {t} no bids to sell {held} into; resting an exit")
+            print(f"exit: {t} no bids to sell {held} into above {floor}; resting an exit")
             return
         # Hundredths, as Kalshi fills: flooring to whole contracts left 0.69 behind
         # that was then dumped and re-exited every pass (AL14 11-04 21:10).
@@ -950,7 +1054,8 @@ class Farm:
         for k in [k for k in self.state["orders"] if is_hedge(k) and unkey(k)[0] == t]:
             self.cancel(k, reason="lipfarm:dump")
         self.take(t, other, round(1.0 - worst, 4), q)
-        print(f"adverse: {t} sold {held} x{q} down to {worst}")
+        self.state.setdefault("chased", {})[t] = time.time()
+        print(f"exit: {t} sold {held} x{q} down to {worst}")
 
     def hedge(self, cfg: Cfg, takes: bool = False):
         """Exits for what our fills left us holding. `takes`: first try locking
@@ -958,18 +1063,31 @@ class Farm:
         the other side's touch, under its offer. Live only."""
         if not self.live:
             return
-        for t, v in self.free_positions().items():
-            if abs(v) <= DUST_LOTS and t in self.books and t in self.meta:
-                self.dumping.add(t)
-        for t in sorted(self.dumping):
-            if t in self.books and t in self.meta:
-                self.dump(t)
         pos = self.free_positions()
         if takes:
             for t, v in list(pos.items()):
                 if t in self.books and t in self.meta:
                     self.try_lock(t, "yes" if v > 0 else "no", abs(v))
             pos = self.free_positions()
+        # Locking first; then dust, informed fills and chases sell into the book.
+        now = time.time()
+        for t, v in self.free_positions().items():
+            if t not in self.books or t not in self.meta:
+                continue
+            held = "yes" if v > 0 else "no"
+            fill_px = self.avg_cost(t, held)
+            tk = self.tick(t, fill_px)
+            if abs(v) <= DUST_LOTS:
+                self.dump(t, adverse=False)                                   # dust: any price
+            elif t in self.dumping:
+                self.dump(t, floor=fill_px - self.cfg_slip * tk)              # informed: 2 ticks now
+            else:
+                best = max(self.books[t][held]) if self.books[t][held] else 0.0
+                if (best <= fill_px - self.cfg_chase * tk + 1e-9
+                        and now - self.state.get("chased", {}).get(t, 0.0) >= EXIT_REPRICE_S):
+                    self.dump(t, floor=best - self.cfg_slip * tk, adverse=False)   # still moving: chase
+        self.dumping &= set(self.free_positions())
+        pos = self.free_positions()
         want = {}
         for t, v in pos.items():
             others = self.books.get(t)
@@ -1015,7 +1133,8 @@ class Farm:
         if event_of(t) in self.held_events:
             return None
         v = pos.get(t, 0.0)
-        return plan_market(t, others, P, cfg, {"yes": max(v, 0.0), "no": max(-v, 0.0)}, exit_lots(others, cfg))
+        return plan_market(t, others, P, cfg, {"yes": max(v, 0.0), "no": max(-v, 0.0)}, exit_lots(others, cfg),
+                           tick=lambda px: self.tick(t, px))
 
     def fresh_books(self, tickers) -> dict[str, dict]:
         """Others' books now: from the socket where it has the market, else REST."""
@@ -1051,14 +1170,16 @@ class Farm:
                 continue
             P = self.params(t)
             pl = self.plan(t, others, P, cfg, pos)
-            want = dict(pl.legs) if pl else {}
-            for side, o in self.legs_of(t, hedges=False):
-                if side not in want:
-                    print(f"guard: pull {t} {side}@{o['price']} (not in its plan now)")
-                    self.cancel(key(t, side), reason="lipfarm:guard")
+            want = desired_orders(pl) if pl else {}
+            for k in self.keys_of(t, hedges=False):
+                o = self.state["orders"][k]
+                if k not in want:
+                    print(f"guard: pull {k} @{o['price']} (not in its plan now)")
+                    self.cancel(k, reason="lipfarm:guard")
                     self.state.setdefault("cooldown", {})[t] = time.time() + GUARD_COOLDOWN_S
-                elif abs(want[side] - o["price"]) < 1e-9:
-                    keep[key(t, side)] = others
+                elif abs(want[k][0] - o["price"]) < 1e-9 and (is_sentinel(k) or not want[k][2]):
+                    # Touch bids and sentinels belong at the back of their queue.
+                    keep[k] = others
             self.rates[t] = self.our_rate(t, others, P)
         if moves:
             self.move_back(cfg, keep)
@@ -1101,16 +1222,18 @@ class Farm:
         for k, others in sorted(due.items(), key=lambda kv: orders[kv[0]]["placed"]):
             o, (t, side) = orders[k], unkey(k)
             a = ahead.get(o["oid"])
-            if a is None or others[side].get(round(o["price"], 4), 0.0) - a < MOVE_BEHIND_FRAC * cfg.lots:
+            behind = others[side].get(round(o["price"], 4), 0.0) - (a or 0.0)
+            # A sentinel must be last in line to mean "the touch was cleared"; a
+            # crowded-touch bid wants as much ahead of it as there is.
+            if a is None or behind < (1.0 if is_sentinel(k) else MOVE_BEHIND_FRAC * cfg.lots):
                 continue
             c = self.client(self.shard(t))
-            # Moves only spend the top half of our bucket: at 10 per pass they drained it and
-            # 50 new LIP bids were refused (11-04 21:40).
-            if (moves >= MAX_MOVES or not self.bucket.has(0.5 * self.bucket.capacity + ORDER_TOKENS + CANCEL_TOKENS)
+            if (moves >= MAX_MOVES or not self.bucket.has(ORDER_TOKENS + CANCEL_TOKENS)
                     or not c.can_afford("order", reserve=MOVE_RESERVE * c.tokens_per_s + c.COST["cancel"])):
                 return
             self.cancel(k, reason="lipfarm:move")
-            if self.place(t, side, o["price"], cfg.lots, reserve=0.0, reason="lipfarm:move"):
+            if self.place(t, side, o["price"], o["size"], reserve=0.0, reason="lipfarm:move",
+                          sentinel=is_sentinel(k), grouped=is_sentinel(k)):
                 moves += 1
 
     def signed_positions(self, hedged_only: bool = False) -> dict[str, float]:
@@ -1187,7 +1310,7 @@ class Farm:
             def ready(t: str) -> bool:
                 return True
         self.waiting = [t for t in want if not ready(t)]
-        legs = {key(t, s): (p, pl.lots) for t, pl in want.items() for s, p in pl.legs}
+        legs = {k: v for pl in want.values() for k, v in desired_orders(pl).items()}
         for k, o in list(self.state["orders"].items()):
             if is_hedge(k):
                 continue
@@ -1197,14 +1320,15 @@ class Farm:
             if stale:
                 self.cancel(k)
         self.pending = {}
-        for k, (px, q) in legs.items():
+        # The main bid before its sentinel: a sentinel alone would only trip the group.
+        for k, w in sorted(legs.items(), key=lambda kv: is_sentinel(kv[0])):
             t, side = unkey(k)
             if k in self.state["orders"]:
                 continue
             if ready(t):
-                self.place(t, side, px, q)
+                self.place_leg(k, w)
             else:
-                self.pending[k] = (px, q)
+                self.pending[k] = w
         for t, pl in want.items():
             if t in self.order_tickers():
                 self.rates.setdefault(t, pl.rate)
@@ -1249,24 +1373,40 @@ class Farm:
             if o in sizes and o not in done:
                 got[o] = got.get(o, 0.0) + f["size"]
                 tick[o] = f["ticker"]
+        sent = self.state.get("sentinel_oids", {})
         for o, q in got.items():
-            if q >= frac * sizes[o] - 1e-9:
+            if o in sent or q >= frac * sizes[o] - 1e-9:
                 self.state["adverse_oids"].append(o)
                 self.dumping.add(tick[o])
-                print(f"adverse: {tick[o]} filled {q:.0f} of {sizes[o]:.0f}")
+                if o in sent:
+                    g = self.state.get("groups", {}).get(sent[o])
+                    if g:
+                        g["tripped"] = True          # Kalshi cancelled the bid behind it
+                    # The touch was just cleared: off this market both sides, for the cooldown.
+                    for k in self.keys_of(tick[o], hedges=False):
+                        self.cancel(k, reason="lipfarm:sentinel")
+                    self.state.setdefault("cooldown", {})[tick[o]] = time.time() + GUARD_COOLDOWN_S
+                    print(f"sentinel: {sent[o]} cleared; its market is pulled for {GUARD_COOLDOWN_S:.0f} s")
+                else:
+                    print(f"adverse: {tick[o]} filled {q:.0f} of {sizes[o]:.0f}")
+
+    def place_leg(self, k: str, w) -> bool:
+        px, q, grouped = w
+        t, side = unkey(k)
+        return self.place(t, side, px, q, sentinel=is_sentinel(k), grouped=grouped)
 
     def place_pending(self):
         """Place legs whose new claim has had CLAIM_SETTLE_S for ARBS to stand aside."""
         if not self.pending or not self.live:
             return
         now = time.time()
-        for k, (px, q) in list(self.pending.items()):
+        for k, w in sorted(self.pending.items(), key=lambda kv: is_sentinel(kv[0])):
             t, side = unkey(k)
             c = self.state.get("claims", {}).get(t)
             if c is not None and now - c >= CLAIM_SETTLE_S:
                 del self.pending[k]
                 if k not in self.state["orders"]:
-                    self.place(t, side, px, q)
+                    self.place_leg(k, w)
 
     def poll_fills(self) -> set[str]:
         """REST backstop for the socket's fills; returns tickers with new ones."""
@@ -1333,7 +1473,8 @@ class Farm:
             hedged = {unkey(k)[1] for k in self.state["orders"] if is_hedge(k) and unkey(k)[0] == t}
             pl = self.plans.get(t)
             rows.append({"ticker": t, "mode": pl.mode if pl else ("hedge" if hedged else ""),
-                         "bids": " + ".join(f"{s}@{o['price']:.3f}x{o['remaining']:.0f}" for s, o in legs),
+                         "bids": " + ".join(f"{s}@{o['price']:.3f}x{o['remaining']:g}" for s, o in legs),
+                         "layout": ",".join(f"{s}:{l}" for s, l in sorted((pl.layout if pl else {}).items())),
                          "resting": sum(o["remaining"] for _, o in legs),
                          "capital_usd": sum(o["price"] * o["remaining"] for _, o in legs),
                          "our_usd_day": self.rates.get(t, 0.0) * 86400,
@@ -1394,6 +1535,7 @@ class Farm:
                 cfg = Cfg.load()
                 self.bucket.rate = cfg.write_tokens_per_s
                 self.cfg_adverse = cfg.adverse_fill_frac
+                self.cfg_slip, self.cfg_chase = cfg.dump_slip_ticks, cfg.chase_ticks
                 try:
                     reason = stop.poll()
                     if reason:

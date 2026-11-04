@@ -8,7 +8,8 @@ from kalshi_strategies.LIPFARM import farm
 from kalshi_strategies.LIPFARM.farm import parse_book, plan_market, remove_ours
 
 P = lip.LipParams(target_size=1000, discount_factor=0.5, period_reward_usd=86.4, snapshots_per_period=86400)
-CFG = farm.Cfg(max_capital=5000, num_markets=5, lots=1000, adverse_fill_frac=0.8, exit_depth_frac=10.0, exit_depth_slip=0.03, wide_spread=0.20, min_leg_price=0.0, decided_min=0.97,
+CFG = farm.Cfg(max_capital=5000, num_markets=5, lots=1000, sentinel_keep=2.0, dump_slip_ticks=2, chase_ticks=2,
+               adverse_fill_frac=0.8, exit_depth_frac=10.0, exit_depth_slip=0.03, wide_spread=0.20, min_leg_price=0.0, decided_min=0.97,
                min_ahead=0.0, max_position=1e9, write_tokens_per_s=5.0, scan_markets=1, scan_rotate=0, refresh_s=30,
                programs_refresh_s=600)
 
@@ -115,9 +116,19 @@ class _Bucket:
     def _resting(self, prefix):
         return [("old", "X-1-A", "lipf-old"), ("arbs", "Y-1-A", "someone-else")]
 
-    def place_resting(self, order):
+    groups_made = 0
+
+    def place_resting(self, order, order_group_id=None):
         self.sent.append(order)
+        order.group = order_group_id
         return SimpleNamespace(exchange_order_id=f"oid{len(self.sent)}", fill=None)
+
+    def create_order_group(self, limit):
+        self.groups_made += 1
+        return f"g{self.groups_made}"
+
+    def reset_order_group(self, gid):
+        self.resets = getattr(self, "resets", []) + [gid]
 
     def cancel(self, oid, ticker):
         self.cancelled.append(oid)
@@ -219,7 +230,8 @@ def test_old_journal_keys_migrate(tmp_path, monkeypatch):
 def test_fill_is_hedged_on_the_other_side_with_the_pair_under_one_dollar(tmp_path, monkeypatch):
     b = _Bucket()
     f = _live(tmp_path, monkeypatch, b)
-    f.state["fills"] = [{"ticker": "Z-1-A", "side": "yes", "price": 0.97, "size": 600.0, "fee": 0.0,
+    # Bought at 0.91: the yes bid never falls 2 ticks under it here, so no chase.
+    f.state["fills"] = [{"ticker": "Z-1-A", "side": "yes", "price": 0.91, "size": 600.0, "fee": 0.0,
                          "order_id": "oid0"}]
     f.books = {"Z-1-A": {"yes": {0.97: 3000.0}, "no": {0.02: 5000.0}}}
     f.hedge(CFG)
@@ -238,8 +250,8 @@ def test_fill_is_hedged_on_the_other_side_with_the_pair_under_one_dollar(tmp_pat
     f.state["orders"]["Z-1-A|no|h"]["placed"] -= farm.EXIT_REPRICE_S
     f.hedge(CFG)
     assert f.state["orders"]["Z-1-A|no|h"]["price"] == 0.06
-    # What we hold counts against max_capital: 600 x 0.97 = $582.
-    assert abs(f.exposure() - 582.0) < 1e-9
+    # What we hold counts against max_capital: 600 x 0.91 = $546.
+    assert abs(f.exposure() - 546.0) < 1e-9
 
 
 def test_guard_never_pulls_a_hedge(tmp_path, monkeypatch):
@@ -421,10 +433,16 @@ def test_full_fill_is_informed_and_sold_into_the_book_at_once(tmp_path, monkeypa
     assert f.dumping == {"Z-1-A"}
     f.hedge(CFG)
     ioc = [o for o in b.sent if o.intent == "take"]
-    # Sell 1000 yes: 300 at 0.95, the rest at 0.90 -> buy no up to 0.10.
-    assert [(o.side, o.price, o.size) for o in ioc] == [("no", 0.1, 1000)]
+    # Filled at 0.97: sell at once down to 2 ticks under it (300 at 0.95); rest the other 700.
+    assert [(o.side, o.price, o.size) for o in ioc] == [("no", 0.05, 300)]
     assert "oid0" in b.cancelled and f.state["cooldown"]["Z-1-A"] > time.time()
-    assert not f.dumping and f.free_positions() == {}
+    assert abs(f.free_positions()["Z-1-A"] - 700.0) < 1e-9 and "Z-1-A|no|h" in f.state["orders"]
+    # The book keeps falling: best bid 0.94 is 3 ticks under our fill -> sell down to 0.92.
+    f.books = {"Z-1-A": {"yes": {0.94: 400.0, 0.92: 500.0, 0.85: 9000.0}, "no": {0.02: 5000.0}}}
+    f.state["chased"]["Z-1-A"] -= farm.EXIT_REPRICE_S
+    f.hedge(CFG)
+    ioc = [o for o in b.sent if o.intent == "take"]
+    assert [(o.side, o.price, o.size) for o in ioc][-1] == ("no", 0.08, 700)
 
 
 def test_partial_fill_keeps_the_passive_exit(tmp_path, monkeypatch):
@@ -432,7 +450,7 @@ def test_partial_fill_keeps_the_passive_exit(tmp_path, monkeypatch):
     f = _live(tmp_path, monkeypatch, b, placed_ago=1.0)
     f.state["lip_oid_size"] = {"oid0": 1000}
     f.state["hedged_oids"] = ["oid0"]
-    f.books = {"Z-1-A": {"yes": {0.95: 300.0}, "no": {0.02: 5000.0}}}
+    f.books = {"Z-1-A": {"yes": {0.96: 300.0}, "no": {0.02: 5000.0}}}      # 1 tick under: no chase
     f.book_fills([{"ticker": "Z-1-A", "side": "yes", "price": 0.97, "size": 300.0, "fee": 0.0,
                    "order_id": "oid0", "trade_id": "t1"}])
     assert not f.dumping
@@ -443,7 +461,7 @@ def test_partial_fill_keeps_the_passive_exit(tmp_path, monkeypatch):
 def test_exit_steps_up_only_when_outbid_and_not_too_often(tmp_path, monkeypatch):
     b = _Bucket()
     f = _live(tmp_path, monkeypatch, b)
-    _held(f, size=600.0)
+    _held(f, price=0.90, size=600.0)                             # bought at the 0.90 yes touch: no chase
     f.books = {"Z-1-A": {"yes": {0.90: 3000.0}, "no": {0.05: 5000.0}}}     # no offer 0.10
     f.hedge(CFG)
     assert f.state["orders"]["Z-1-A|no|h"]["price"] == 0.06
@@ -503,13 +521,40 @@ def test_wide_skips_legs_under_min_leg_price():
     assert pl.mode == "wide" and pl.legs == (("yes", 0.70),)    # the 6c no leg isn't quoted
 
 
-def test_moves_leave_half_our_bucket_for_new_bids(tmp_path, monkeypatch):
+def test_moves_come_first_but_are_capped_per_pass(tmp_path, monkeypatch):
     b = _Bucket(tokens=300.0, ahead=1500.0)
     f = _live(tmp_path, monkeypatch, b)
     f.bucket = farm.TokenBucket(rate=0.0, capacity=120.0)
-    f.bucket.tokens = 65.0                                       # under half + one move: no move
-    _guard(f, monkeypatch, b, [(0.97, 4000), (0.95, 2000)], [(0.02, 5000)])
-    assert not b.cancelled
-    f.bucket.tokens = 80.0
+    f.bucket.tokens = 20.0                                       # enough for one move: it goes
     _guard(f, monkeypatch, b, [(0.97, 4000), (0.95, 2000)], [(0.02, 5000)])
     assert b.cancelled == ["oid0"]
+    assert farm.MAX_MOVES * (farm.ORDER_TOKENS + farm.CANCEL_TOKENS) / farm.GUARD_S <= 12.0
+
+def test_sentinel_layout_on_a_thin_touch_touch_layout_on_a_crowded_one():
+    cfg = dataclasses.replace(CFG, sentinel_keep=0.8)
+    thin = {"yes": {0.40: 50.0, 0.39: 300.0, 0.37: 2000.0}, "no": {0.30: 3000.0, 0.28: 2000.0}}
+    pl = plan_market("T", thin, P, cfg, {}, 1000)
+    assert pl.layout["yes"] == "sentinel" and pl.big["yes"] == 0.39
+    orders = farm.desired_orders(pl)
+    assert orders["T|yes|s"] == (0.40, farm.SENTINEL_LOTS, True) and orders["T|yes"] == (0.39, 1000, True)
+    crowded = {"yes": {0.40: 3000.0, 0.39: 300.0}, "no": {0.30: 3000.0, 0.28: 2000.0}}
+    pl = plan_market("T", crowded, P, cfg, {}, 1000)
+    assert pl.layout["yes"] == "touch" and farm.desired_orders(pl)["T|yes"] == (0.40, 1000, False)
+
+
+def test_sentinel_and_bid_go_in_the_sides_group_and_a_sentinel_fill_trips_it(tmp_path, monkeypatch):
+    b = _Bucket()
+    f = _live(tmp_path, monkeypatch, b)
+    f.state["orders"] = {}
+    pl = farm.Plan("Z-1-A", "wide", (("yes", 0.40),), 1e-3, 390.0, 0.002, 1000, {"yes": "sentinel"}, {"yes": 0.39})
+    f.plans = {"Z-1-A": pl}
+    f.state["claims"] = {"Z-1-A": 0.0}
+    f.reconcile(CFG)
+    assert [(o.price, o.size, o.group) for o in b.sent] == [(0.39, 1000, "g1"), (0.40, farm.SENTINEL_LOTS, "g1")]
+    sent_oid = f.state["orders"]["Z-1-A|yes|s"]["oid"]
+    f.book_fills([{"ticker": "Z-1-A", "side": "yes", "price": 0.40, "size": 1.1, "fee": 0.0, "order_id": sent_oid,
+                   "trade_id": "t1"}])
+    assert f.state["groups"]["Z-1-A|yes"]["tripped"] and "Z-1-A" in f.dumping
+    assert not f.keys_of("Z-1-A", hedges=False) and f.state["cooldown"]["Z-1-A"] > time.time()
+    f.group("Z-1-A", "yes")                                      # re-placing later resets the group first
+    assert b.resets == ["g1"] and not f.state["groups"]["Z-1-A|yes"]["tripped"]
