@@ -135,3 +135,57 @@ class TopHistory:
         text = "".join(json.dumps(r, separators=(",", ":")) + "\n" for r in rows)
         with gzip.open(os.path.join(self.dir, f"{day}.jsonl.gz"), "at", encoding="utf-8") as fh:
             fh.write(text)
+
+
+class MoveWatch:
+    """Moves that mark an event as trading on news, from others' mids alone
+    (no fill of ours needed). on_mid() returns what fired:
+    ("legs", n) when n >= `legs` of the event's markets each moved >= `leg_move`
+    within `leg_window` s; ("jump", size) when a market's mid is >= `jump` away
+    from where it stood `jump_window` s ago.
+
+    Picked by replay of 11-01..04 prints: both fired on 83-91% of in-game
+    sports prints and 22-43% on election night, against <1% pre-game or on
+    election day. Neither fired ahead of the one non-live news sweep (a 30c
+    one-print jump), so they flag what follows a first move, not the move."""
+
+    def __init__(self, leg_move=0.02, leg_window=10.0, legs=2, jump=0.05, jump_window=300.0):
+        self.leg_move, self.leg_window, self.legs = leg_move, leg_window, legs
+        self.jump, self.jump_window = jump, jump_window
+        self.h: dict[str, collections.deque] = {}
+        self.moved: dict[str, dict[str, float]] = {}
+
+    def _at(self, d, t):
+        if not d or d[0][0] > t:
+            return None
+        for s in reversed(d):
+            if s[0] <= t:
+                return s[1]
+        return None
+
+    def on_mid(self, event: str, ticker: str, now: float, mid: float) -> list[tuple[str, float]]:
+        d = self.h.get(ticker)
+        if d is None:
+            d = self.h[ticker] = collections.deque()
+        if not d or d[-1][1] != mid:
+            d.append((now, mid))
+        # Keep one sample from before the jump window: the mid it opened on.
+        while len(d) > 1 and now - d[1][0] > self.jump_window:
+            d.popleft()
+        out = []
+        ago = self._at(d, now - self.leg_window)
+        mv = self.moved.setdefault(event, {})
+        if ago is not None and abs(mid - ago) >= self.leg_move - 1e-9:
+            mv[ticker] = now
+        for k in [k for k, t in mv.items() if now - t > self.leg_window]:
+            del mv[k]
+        if len(mv) >= self.legs:
+            out.append(("legs", float(len(mv))))
+        # After the trim only d[0] can be older than the window: no scan.
+        ago = d[0][1] if d[0][0] <= now - self.jump_window else None
+        if ago is not None and abs(mid - ago) >= self.jump - 1e-9:
+            out.append(("jump", round(abs(mid - ago), 4)))
+        return out
+
+    def forget(self, ticker: str):
+        self.h.pop(ticker, None)

@@ -48,7 +48,7 @@ from kalshi_strategies.ARBS.config import SPEC_PATH
 from kalshi_strategies.ARBS.execution import Gateway
 from kalshi_strategies.ARBS.feed import MultiFeed
 from kalshi_strategies.ARBS.ledger import Ledger
-from kalshi_strategies.ARBS.depth import PullWatch, TopHistory
+from kalshi_strategies.ARBS.depth import MoveWatch, PullWatch, TopHistory
 from kalshi_strategies.ARBS.liquidity import Liquidity
 from kalshi_strategies.ARBS.prints import AFTER_S, Prints, top as prints_top
 from kalshi_strategies.ARBS.spec import Basket, basket_from_dict, basket_to_dict, load_spec, merge, parse_spec
@@ -160,6 +160,9 @@ SHADOW_EVENT_KEEP_S = 600.0     # events in the summary: a print this recently
 SERIES_GROUPS_S = 3600.0
 # An event idle this long leaves the estimator: 12 of its 30-min half-lives.
 SHADOW_PRUNE_S = 6 * 3600.0
+# How long a regime_shadow trigger would hold an event at live settings; the
+# 11-01..04 replay scored 5 and 30 min holds about the same.
+REGIME_HOLD_S = 1800.0
 PRINTS_FLUSH_S = 10.0
 IDS_COMPACT_S = 3600.0
 # Kalshi trips a group once MORE than this many contracts match in 15 s; 0 is
@@ -342,6 +345,8 @@ class ArbsRunner:
         self.priority_trading: list[str] = []     # write_priority_series in session now
         self.last_exit: dict[str, tuple] = {}
         self.pull_watch = PullWatch()
+        self.move_watch = MoveWatch()
+        self.regime: dict[tuple[str, str], float] = {}   # (event, signal) -> wall time its shadow hold ends
         self.pulled: dict[tuple[str, str], float] = {}   # (ticker, side) -> monotonic time its pull ends
         self.pull_wake: dict[str, float] = {}            # basket_id -> pull end its re-evaluation is set for
         # (basket_id, leg) -> the other basket its quote is priced through, and
@@ -984,6 +989,30 @@ class ArbsRunner:
         mine_a = self._own(t, "no").get(round(1.0 - book.ask, 4), 0.0) if book.ask is not None else 0.0
         self.top_hist.on_book(t, time.time(), book.bid, (book.bid_depth or 0.0) - mine_b, book.ask,
                               (book.ask_depth or 0.0) - mine_a)
+        if self.cfg.runtime.regime_shadow and book.bid is not None and book.ask is not None:
+            # Only a top others stand at: our arb quotes move with the other
+            # legs, and would read as those legs moving together.
+            if (book.bid_depth or 0.0) - mine_b > _EPS and (book.ask_depth or 0.0) - mine_a > _EPS:
+                self._watch_regime(t, (book.bid + book.ask) / 2)
+
+    def _watch_regime(self, ticker: str, mid: float):
+        """Shadow: journal when depth.MoveWatch would switch the event to live
+        settings (kind regime_shadow, once per hold). No order uses it."""
+        m = self.meta.get(ticker)
+        if m is None or not m.event:
+            return
+        now = time.time()
+        for sig, x in self.move_watch.on_mid(m.event, ticker, now, round(mid, 4)):
+            key = (m.event, sig)
+            if self.regime.get(key, 0.0) <= now:
+                live = any((b := self.baskets.get(bid)) is not None and self.live_now(b, _utc())
+                           for bid in self.by_ticker.get(ticker, ()))
+                self.n["regime_fires"] = self.n.get("regime_fires", 0) + 1
+                self.journal({"kind": "regime_shadow", "event": m.event, "signal": sig, "ticker": ticker,
+                              "value": x, "mid": round(mid, 4), "live": live})
+            self.regime[key] = now + REGIME_HOLD_S
+        if len(self.regime) > 5000:
+            self.regime = {k: v for k, v in self.regime.items() if v > now}
 
     def _context_row(self, kind: str, q: Quote, **kw) -> dict:
         b = self.baskets.get(q.basket_id)
@@ -2755,6 +2784,7 @@ class ArbsRunner:
             "order_errors": self.order_errors, "counts": self.n, "write_usage": self.gw.usage(), "write_cap": self.write_cap(),
             "config_status": self.store.status(), "scan": self.scan_status,
             "live_params": self.lp_view["groups"],
+            "regime_shadow": sorted({ev for (ev, _), end in self.regime.items() if end > time.time()}),
         }
 
     async def ledger_flush_loop(self):

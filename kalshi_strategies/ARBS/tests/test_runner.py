@@ -1619,3 +1619,40 @@ def test_sweep_leaves_lipfarm_orders(arbs, monkeypatch):
     monkeypatch.setattr(R, "SWEEP_PACING_S", 0.0)
     asyncio.run(r.sweep("test"))
     assert cancelled == ["o2"]
+
+
+def test_move_watch_legs_together_and_jump():
+    from kalshi_strategies.ARBS.depth import MoveWatch
+    w = MoveWatch()
+    assert w.on_mid("E", "E-A", 0.0, 0.40) == [] and w.on_mid("E", "E-B", 0.0, 0.30) == []
+    assert w.on_mid("E", "E-A", 12.0, 0.43) == []                  # one leg moving is a trade, not news
+    assert w.on_mid("E", "E-B", 15.0, 0.27) == [("legs", 2.0)]     # a second within 10 s
+    assert w.on_mid("E", "E-B", 30.0, 0.27) == []                  # both moves aged out
+    w.on_mid("F", "F-A", 0.0, 0.50)
+    w.on_mid("F", "F-A", 299.0, 0.56)
+    assert w.on_mid("F", "F-A", 301.0, 0.56) == [("jump", 0.06)]   # 6c off where it stood 5 min ago
+    assert w.on_mid("G", "G-A", 0.0, 0.5) == [] and w.on_mid("G", "G-A", 5.0, 0.6) == []   # no history 10 s back
+
+
+def test_regime_shadow_journals_once_per_hold_and_ignores_our_own_top(arbs):
+    r, b = arbs
+    import types
+    rows = []
+    r.journal = rows.append
+    r.cfg.runtime = dataclasses.replace(r.cfg.runtime, regime_shadow=True)
+    t0 = time.time()
+    for t in ("X-A", "X-B"):
+        r.move_watch.on_mid("X", t, t0 - 20.0, 0.40)
+    r._note_top(types.SimpleNamespace(ticker="X-A", bid=0.42, bid_depth=10, ask=0.44, ask_depth=10))
+    r._note_top(types.SimpleNamespace(ticker="X-B", bid=0.42, bid_depth=10, ask=0.44, ask_depth=10))
+    r._note_top(types.SimpleNamespace(ticker="X-B", bid=0.43, bid_depth=10, ask=0.45, ask_depth=10))
+    fired = [x for x in rows if x["kind"] == "regime_shadow"]
+    assert [(x["event"], x["signal"]) for x in fired] == [("X", "legs")] and fired[0]["live"] is False
+    assert r.summary()["regime_shadow"] == ["X"]
+    # A top that is only our own size doesn't count as the market moving.
+    r.move_watch = R.MoveWatch()
+    q = R.Quote(basket_id=b.basket_id, leg=0, ticker="X-A", side="yes", price=0.30, size=5, cid="c2",
+                edge=0.05, max_price=0.30, pending=False, exchange_id="o2")
+    r.quotes[q.key] = q
+    r._note_top(types.SimpleNamespace(ticker="X-A", bid=0.30, bid_depth=5, ask=0.44, ask_depth=10))
+    assert "X-A" not in r.move_watch.h

@@ -64,6 +64,7 @@
     "liquidity_log_s": 300.0,
     "feed_down_pull_s": 5.0,
     "record_prints": true,
-    "live_params_shadow": true
+    "live_params_shadow": true,
+    "regime_shadow": true
   }
 }

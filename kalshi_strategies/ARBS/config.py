@@ -188,6 +188,9 @@ class RuntimeParams:
     live_params_shadow: bool = param("Score each recorded live print at every edge (replay.py) and keep the "
                                      "edge live_params.py would quote per sport, series and event, in the "
                                      "summary and journal only: no order uses it. Needs record_prints.")
+    regime_shadow: bool = param("Journal (kind regime_shadow) when an event's markets move the way news "
+                                "moves them (depth.MoveWatch: legs moving together, or a price jump) and "
+                                "it would be switched to live settings. No order uses it. Needs record_prints.")
 
 
 @section
