@@ -211,14 +211,18 @@ def test_fill_is_hedged_on_the_other_side_with_the_pair_under_one_dollar(tmp_pat
     f.hedge(CFG)
     assert [(o.side, o.price, o.size) for o in b.sent] == [("no", 0.02, 600.0)]
     assert "Z-1-A|no|h" in f.state["orders"]
-    # No touch is 0.05 now: capped so the pair costs 0.99.
-    f.books = {"Z-1-A": {"yes": {0.97: 3000.0}, "no": {0.05: 5000.0}}}
+    # The no touch moves to 0.05: the exit follows it, whatever the pair then costs.
+    f.books = {"Z-1-A": {"yes": {0.90: 3000.0}, "no": {0.05: 5000.0}}}     # no offer 0.10
     f.hedge(CFG)
-    assert not b.cancelled and len(b.sent) == 1 and f.state["orders"]["Z-1-A|no|h"]["price"] == 0.02
+    assert b.cancelled == ["oid1"] and f.state["orders"]["Z-1-A|no|h"]["price"] == 0.05
+    # It never crosses: on a locked book (no bid = no offer = 0.05) it rests a tick under.
+    f.books = {"Z-1-A": {"yes": {0.95: 3000.0}, "no": {0.05: 5000.0}}}
+    f.hedge(CFG)
+    assert f.state["orders"]["Z-1-A|no|h"]["price"] == 0.04
     # Hedge capital comes off max_capital.
     f.plans = {"Z-1-A": farm.Plan("Z-1-A", "decided", (("yes", 0.97),), 1e-3, 970.0, 0.002)}
-    assert f.choose(dataclasses.replace(CFG, max_capital=975)) == {}
-    assert list(f.choose(dataclasses.replace(CFG, max_capital=982))) == ["Z-1-A"]
+    assert f.choose(dataclasses.replace(CFG, max_capital=990)) == {}       # 600 x 0.04 = 24 held by the exit
+    assert list(f.choose(dataclasses.replace(CFG, max_capital=995))) == ["Z-1-A"]
 
 
 def test_guard_never_pulls_a_hedge(tmp_path, monkeypatch):
@@ -234,3 +238,21 @@ def test_guard_never_pulls_a_hedge(tmp_path, monkeypatch):
     _guard(f, monkeypatch, b, [(0.97, 4000)], [(0.02, 1100)])    # 500 others + our 600 hedge: plan gone
 
     assert b.cancelled == ["oid0"] and list(f.state["orders"]) == ["Z-1-A|no|h"]
+
+
+def test_new_fill_is_exited_within_the_second(tmp_path, monkeypatch):
+    b = _Bucket()
+    f = _live(tmp_path, monkeypatch, b)
+    f.meta = {"Z-1-A": {}}
+    f.state["hedged_oids"] = ["oid0"]
+
+    def poll():
+        f.state["fills"] = [{"ticker": "Z-1-A", "side": "yes", "price": 0.97, "size": 250.0, "fee": 0.0,
+                             "order_id": "oid0"}]
+        return {"Z-1-A"}
+    monkeypatch.setattr(f, "poll_fills", poll)
+    monkeypatch.setattr(farm, "fetch_book", lambda t: {"yes_dollars": [["0.9700", "4000"]],
+                                                       "no_dollars": [["0.0200", "5000"]]})
+    f.exit_now(CFG)
+    assert [(o.side, o.price, o.size) for o in b.sent] == [("no", 0.02, 250.0)]
+    assert "Z-1-A|yes" in f.state["orders"]          # the LIP bid keeps running beside the exit

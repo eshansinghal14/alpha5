@@ -13,10 +13,11 @@ Every side must reach Kalshi's Target size, ours included where we quote and
 from others alone where we don't, or the snapshot pays nobody. Markets are
 ranked by LIP per dollar of resting capital, up to `max_capital`.
 
-A fill is hedged within GUARD_S: a bid of the filled size rests on the other
-side at its touch, priced so the pair costs at least HEDGE_EDGE under $1
-(Kalshi nets a yes+no pair to $1). Hedges count toward max_capital and are
-never pulled by the guard.
+A fill gets an exit within about FILL_POLL_S: a bid of our net position's
+size rests at the other side's touch (Kalshi nets a yes+no pair to $1), at
+any price -- getting out comes before the pair's profit. It follows the touch,
+is never pulled by the guard, and counts toward max_capital. The market's LIP
+bids keep running beside it up to max_position.
 
     python -m kalshi_strategies.LIPFARM.farm                # shadow until armed from the dashboard
     python -m kalshi_strategies.LIPFARM.farm --live         # armed from the start: REAL MONEY
@@ -94,7 +95,8 @@ GUARD_COOLDOWN_S = 300.0
 MOVE_MIN_S = 10.0
 MOVE_BEHIND_FRAC = 0.2
 MAX_MOVES = 5
-HEDGE_EDGE = 0.01
+# Fills are polled this often between guard passes; a new one is exited at once.
+FILL_POLL_S = 1.0
 
 
 @section
@@ -458,21 +460,12 @@ class Farm:
                                                      "remaining": lots, "placed": time.time()}
         return True
 
-    def held_costs(self) -> dict[tuple[str, str], float]:
-        """(ticker, side) -> average price paid for that side, from our fills."""
-        acc: dict[tuple[str, str], list] = {}
-        for f in self.state["fills"]:
-            a = acc.setdefault((f["ticker"], f["side"]), [0.0, 0.0])
-            a[0] += f["size"] * f["price"]
-            a[1] += f["size"]
-        return {k: c / q for k, (c, q) in acc.items() if q > 0}
-
     def hedge(self, cfg: Cfg):
-        """Rest a bid of our net position's size on the other side at its touch,
-        priced so the pair costs at most 1 - HEDGE_EDGE. Live only."""
+        """Rest a bid of our net position's size at the other side's touch
+        (just under its offer, never crossing). Live only."""
         if not self.live:
             return
-        pos, cost, want = self.signed_positions(hedged_only=True), self.held_costs(), {}
+        pos, want = self.signed_positions(hedged_only=True), {}
         for t, v in pos.items():
             others = self.books.get(t)
             if not others or t not in self.meta:
@@ -480,7 +473,7 @@ class Farm:
             held, side = ("yes", "no") if v > 0 else ("no", "yes")
             touch = max(others[side]) if others[side] else 0.01
             ask = 1.0 - max(others[held]) if others[held] else 1.0
-            px = min(touch, round(1.0 - cost.get((t, held), 1.0) - HEDGE_EDGE, 2), round(ask - 0.01, 4))
+            px = min(touch, round(ask - 0.01, 4))
             if px >= 0.01:
                 want[key(t, side, True)] = (px, abs(v))
         for k, o in list(self.state["orders"].items()):
@@ -528,9 +521,11 @@ class Farm:
             ob = got.get(t)
             if ob is None or t not in self.programs:
                 continue
-            others = self.others_of(t, ob)
-            self.books[t] = others
-            if t not in self.order_tickers():
+            self.books[t] = self.others_of(t, ob)
+        self.hedge(cfg)                     # exits first
+        for t in tickers:
+            others = self.books.get(t)
+            if got.get(t) is None or t not in self.programs or t not in self.order_tickers():
                 continue
             P = self.params(t)
             pl = self.plan(t, others, P, cfg, pos)
@@ -543,7 +538,6 @@ class Farm:
                 elif abs(want[side] - o["price"]) < 1e-9:
                     keep[key(t, side)] = others
             self.rates[t] = self.our_rate(t, others, P)
-        self.hedge(cfg)
         now = time.time()
         orders = dict(self.state["orders"])
         due = {k: v for k, v in keep.items() if k in orders and now - orders[k]["placed"] >= MOVE_MIN_S}
@@ -663,16 +657,18 @@ class Farm:
                 self.rates.setdefault(t, pl.rate)
         self.hedge(cfg)
 
-    def poll_fills(self):
+    def poll_fills(self) -> set[str]:
+        """Book new fills of our orders; returns the tickers that had any."""
         if not self.live or not self.clients:
-            return
+            return set()
+        new: set[str] = set()
         ours = {o["oid"]: k for k, o in self.state["orders"].items()}
         known = set(self.state.get("all_oids", []))
         known |= set(ours)
         self.state["all_oids"] = sorted(known)
         seen = set(self.state["trade_ids"])
         c = next(iter(self.clients.values()))
-        # Overlapping windows, deduped on trade_id: polled every GUARD_S.
+        # Overlapping windows, deduped on trade_id: polled every FILL_POLL_S.
         since = self.state.get("fills_since", self.state["t0"]) - 120
         self.state["fills_since"] = time.time()
         for f in c.fills("", min_ts=int(since)):
@@ -680,10 +676,24 @@ class Farm:
                 continue
             seen.add(f["trade_id"])
             self.state["fills"].append(f)
+            new.add(f["ticker"])
             k = ours.get(f["order_id"])
             if k:
                 self.state["orders"][k]["remaining"] = max(self.state["orders"][k]["remaining"] - f["size"], 0.0)
         self.state["trade_ids"] = sorted(seen)
+        return new
+
+    def exit_now(self, cfg: Cfg):
+        """Between guard passes: on a new fill, read that market's book and
+        rest its exit at once."""
+        new = self.poll_fills() if self.live else set()
+        if not new:
+            return
+        with cf.ThreadPoolExecutor(BOOK_WORKERS) as ex:
+            for t, ob in zip(sorted(new), ex.map(fetch_book, sorted(new))):
+                if ob is not None:
+                    self.books[t] = self.others_of(t, ob)
+        self.hedge(cfg)
 
     def accrue(self):
         now = time.time()
@@ -801,13 +811,17 @@ class Farm:
                     self._save()
                 except Exception:
                     traceback.print_exc()
+                last_guard = time.time()
                 while time.time() - t0 < cfg.refresh_s - 1e-3:
-                    time.sleep(max(min(GUARD_S, cfg.refresh_s - (time.time() - t0)), 0.1))
-                    if time.time() - t0 < cfg.refresh_s - 1.0:
-                        try:
+                    time.sleep(max(min(FILL_POLL_S, cfg.refresh_s - (time.time() - t0)), 0.05))
+                    try:
+                        if time.time() - last_guard >= GUARD_S and time.time() - t0 < cfg.refresh_s - 1.0:
+                            last_guard = time.time()
                             self.guard(cfg)
-                        except Exception:
-                            traceback.print_exc()
+                        else:
+                            self.exit_now(cfg)
+                    except Exception:
+                        traceback.print_exc()
         except KeyboardInterrupt:
             print("stopping: cancelling quotes")
         finally:
