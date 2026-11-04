@@ -68,6 +68,13 @@ class TradingParams:
     max_dollars: float = param("Most dollars in the strategy: cost paid on held baskets, plus per quoted "
                                "basket its largest resting quote x (payout + 1c per chase tick), the most it "
                                "can cost filled and completed however many legs fill.", min=0.0, step=50.0)
+    max_dollars_auto: bool = param("Live, size against the traded shards' cash instead of max_dollars: room is "
+                                   "Kalshi's available balance (net of resting orders, with YES/NO pairs and "
+                                   "netted positions already credited) plus a basket's own resting quotes, "
+                                   "less cash_reserve. Falls back to max_dollars while the balance is unread "
+                                   "or stale.")
+    cash_reserve: float = param("Dollars of shard cash max_dollars_auto leaves free, for completing a fill "
+                                "while other quotes rest.", min=0.0, step=50.0)
     take_cooldown_s: float = param("Least time between takes on one basket. A take buys only the touch of "
                                    "every leg; this is how long to wait for a thin touch to refill at the same "
                                    "price before taking again.", min=0.0, step=0.5)
@@ -152,6 +159,8 @@ class RuntimeParams:
                            min=5.0, step=5.0, editable=False)
     fill_poll_s: float = param("REST backstop for quote fills the websocket missed.", min=1.0, step=1.0,
                                editable=False)
+    balance_poll_s: float = param("Seconds between shard balance reads, for trading.max_dollars_auto.",
+                                  min=1.0, step=1.0, editable=False)
     meta_refresh_s: float = param("Seconds between market status / settlement reads.", min=30.0, step=30.0,
                                   editable=False)
     max_order_errors: int = param("Consecutive order errors that stop new takes and quotes until a clean "

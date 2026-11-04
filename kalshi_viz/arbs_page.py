@@ -113,8 +113,14 @@ def _metrics(s: dict):
                      "what they'd sell for now. Upside (not in the totals): what bundles that can pay more than "
                      "their locked payout (a draw, an unlisted winner, a ladder between rungs) are expected to "
                      "add, at mid prices.")
-    c[2].metric("Capital used", f"${p.get('committed', 0):,.2f}", f"of ${p.get('max_dollars', 0):,.0f}",
-                delta_color="off", help="Cost of held baskets (resting quotes aren't counted; each is sized to fit what's left).")
+    if p.get("cash_room") is not None:
+        c[2].metric("Shard cash", f"${p['cash']:,.2f}", f"${p['cash_room']:,.0f} free to size on", delta_color="off",
+                    help="Kalshi's available balance on the traded shards (net of resting orders); quotes are "
+                         "sized against it less cash_reserve (trading.max_dollars_auto). Held basket cost: "
+                         f"${p.get('committed', 0):,.0f}.")
+    else:
+        c[2].metric("Capital used", f"${p.get('committed', 0):,.2f}", f"of ${p.get('max_dollars', 0):,.0f}",
+                    delta_color="off", help="Cost of held baskets (resting quotes aren't counted; each is sized to fit what's left).")
     c[3].metric("Baskets tradeable", f"{s.get('n_tradeable')}/{s.get('n_baskets')}",
                 f"{s.get('n_tickers')} markets", delta_color="off")
     n = s.get("counts") or {}

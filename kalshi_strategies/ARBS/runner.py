@@ -63,6 +63,7 @@ MAX_ALERTS = 300
 # by client id after this long.
 LOST_LOOKUP_S = 1.0
 ORPHAN_FILL_S = 30.0
+CASH_STALE_POLLS = 6       # balance reads missed before max_dollars_auto falls back to max_dollars
 
 
 def _log(msg: str):
@@ -310,6 +311,8 @@ class ArbsRunner:
         self._group_retry: dict[str, float] = {}
         self.book_time: dict[str, float] = {}     # ticker -> monotonic time of its last book update
         self.book_wall: dict[str, float] = {}     # the same on the wall clock, for the order log
+        self.cash: dict[int, float] = {}          # shard -> available balance, for max_dollars_auto
+        self.cash_at = 0.0
         self.paused_until: dict[str, float] = {}  # ticker -> monotonic time Kalshi's pause is next retried
         self.exchange_paused = False              # Kalshi's exchange-wide trading_active is off
         self.priority_trading: list[str] = []     # write_priority_series in session now
@@ -1176,13 +1179,39 @@ class ArbsRunner:
             (need * t.exit_ref_days / days if days is not None else 0.0)
         return min(need, max(t.min_exit_edge, scaled))
 
-    def room_dollars(self) -> float:
-        return self.cfg.trading.max_dollars - self.committed()
+    def cash_room(self, b: Basket | None) -> float | None:
+        """Shard cash a fill on `b` may spend under max_dollars_auto, or None
+        to fall back to max_dollars (shadow, or the balance unread/stale)."""
+        t = self.cfg.trading
+        if not (t.max_dollars_auto and self.live and self.cash
+                and time.time() - self.cash_at <= CASH_STALE_POLLS * self.cfg.runtime.balance_poll_s):
+            return None
+        # Kalshi's balance already holds back what our resting orders could
+        # cost; the basket's own are added back or its quotes would size
+        # against cash net of themselves and shrink every pass.
+        own = sum(q.price * q.remaining for q in self.basket_quotes(b.basket_id)) if b else 0.0
+        return sum(self.cash.values()) + own - t.cash_reserve
+
+    def room_dollars(self, b: Basket | None = None) -> float:
+        cash = self.cash_room(b)
+        return self.cfg.trading.max_dollars - self.committed() if cash is None else cash
+
+    async def balance_loop(self):
+        while True:
+            await asyncio.sleep(self.cfg.runtime.balance_poll_s)
+            if not (self.live and self.cfg.trading.max_dollars_auto):
+                continue
+            try:
+                self.cash = {s: await self.gw.call(c.balance, s) for s, c in self.gw.clients.items()}
+                self.cash_at = time.time()
+            except Exception as e:
+                _log(f"WARN: balance read failed ({e!r})")
 
     def quote_size_by_dollars(self, b: Basket) -> int:
-        """Largest quote size any leg of `b` may have under max_dollars, if
-        it alone fills: other baskets' quotes aren't counted."""
-        budget = self.room_dollars()
+        """Largest quote size any leg of `b` may have under max_dollars (or
+        the shard's cash), if it alone fills: other baskets' quotes aren't
+        counted."""
+        budget = self.room_dollars(b)
         return int(max(0.0, budget) // max(self.worst_bundle_cost(b), 0.01))
 
     # ------------------------------------------------------------------ eval
@@ -1262,7 +1291,7 @@ class ArbsRunner:
                 plan = pricing.take_plan(vs, b.payout, exit_need, min(ex, live_cap))
             if plan is None and g is not None and g >= need - _EPS:
                 per = b.payout - g
-                n = int(min(self.room_bundles(b), max(0.0, self.room_dollars()) // max(per, 0.01), live_cap))
+                n = int(min(self.room_bundles(b), max(0.0, self.room_dollars(b)) // max(per, 0.01), live_cap))
                 plan = pricing.take_plan(vs, b.payout, need, n) if n >= 1 else None
             if plan is not None:
                 if live_qs:
@@ -2234,6 +2263,7 @@ class ArbsRunner:
         if any(v <= 0 for v in bal.values()):
             self.alert("error", None, f"arm refused: zero balance on shard(s) {bal}")
             return False
+        self.cash, self.cash_at = bal, time.time()
         await self.pull_all("arm")        # shadow quotes
         self.live = True
         try:
@@ -2365,7 +2395,9 @@ class ArbsRunner:
                     "broken": round(sum(h["broken_pnl"] for h in holdings), 4),
                     "upside": round(sum(h["upside"] for h in holdings), 4),
                     "held_cost": round(sum(h["cost"] for h in holdings), 4),
-                    "committed": round(self.committed(), 4), "max_dollars": self.cfg.trading.max_dollars},
+                    "committed": round(self.committed(), 4), "max_dollars": self.cfg.trading.max_dollars,
+                    "cash": round(sum(self.cash.values()), 2) if self.cash else None,
+                    "cash_room": None if (cr := self.cash_room(None)) is None else round(cr, 2)},
             "holdings": holdings, "quotes": quotes, "hot": self.hot, "ranking": self.ranking[:60],
             "hot_churn": {f"{m}m": sum(e for t, e, _ in self.hot_churn if t >= time.time() - 60 * m)
                           for m in (1, 10, 60)},
@@ -2428,7 +2460,7 @@ class ArbsRunner:
         coros = [self.feed.run(), self.eval_loop(), self.rank_loop(), self.meta_loop(), self.fill_poll_loop(),
                  self.audit_loop(), self.guard_loop(), self.summary_loop(), self.scan_loop(),
                  self.liquidity_loop(), self.prints_loop(), self.exchange_loop(), self.write_share_loop(), self.ledger_flush_loop(),
-                 self.keepalive_loop(), self.control_loop(trading, stopper, stop)]
+                 self.keepalive_loop(), self.balance_loop(), self.control_loop(trading, stopper, stop)]
         tasks = [asyncio.create_task(c) for c in coros]
         try:
             await stop.wait()

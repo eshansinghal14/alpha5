@@ -1310,3 +1310,22 @@ def test_top_history_keeps_price_moves_in_a_busy_book(tmp_path):
     # Depth coalesced from each sample's opening (0, 12, 24, 36 ms), not chained into one.
     assert [r[2] for r in rows] == [98, 95, 92, 91, 50]
     assert rows[-1][3] == 0.52 and abs(rows[-1][0] - 0.030) < 1e-9
+
+
+def test_dollar_room_follows_shard_cash_when_live(arbs):
+    r, b = arbs
+    t = r.cfg.trading
+    t.max_dollars_auto, t.cash_reserve, t.max_dollars = True, 100.0, 50.0
+    assert r.room_dollars(b) == 50.0 - r.committed()               # shadow: max_dollars
+    r.live = True
+    assert r.room_dollars(b) == 50.0 - r.committed()               # balance not read yet
+    r.cash, r.cash_at = {0: 900.0}, time.time()
+    q = R.Quote(basket_id=b.basket_id, leg=0, ticker="X-A", side="yes", price=0.40, size=50, cid="c", edge=0.05,
+                max_price=0.40, pending=False, exchange_id="oid")
+    r.quotes[q.key] = q
+    # Kalshi's balance is net of this quote's 50 x 0.40; the basket gets it back.
+    assert abs(r.room_dollars(b) - (900.0 + 20.0 - 100.0)) < 1e-9
+    assert abs(r.room_dollars() - 800.0) < 1e-9
+    r.cash_at = time.time() - 10 * r.cfg.runtime.balance_poll_s * R.CASH_STALE_POLLS
+    assert r.room_dollars(b) == 50.0 - r.committed()               # stale: back to max_dollars
+    r.live = False
