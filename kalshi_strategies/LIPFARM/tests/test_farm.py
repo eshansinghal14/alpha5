@@ -470,3 +470,25 @@ def test_forced_spends_borrow_at_most_one_burst():
     for _ in range(50):
         bk.take(10.0, force=True)
     assert bk.tokens == -60.0
+
+
+def test_fractional_dust_is_sold_exactly_and_never_churns(tmp_path, monkeypatch):
+    b = _Bucket()
+    f = _live(tmp_path, monkeypatch, b, placed_ago=1.0)
+    _held(f, size=10.69)
+    f.books = {"Z-1-A": {"yes": {0.95: 300.0}, "no": {0.02: 5000.0}}}
+    f.hedge(CFG)
+    assert [(o.side, o.size) for o in b.sent if o.intent == "take"] == [("no", 10.69)]
+    assert f.free_positions() == {}
+    n = len(b.sent)
+    for _ in range(5):
+        f.hedge(CFG)
+    assert len(b.sent) == n and not b.cancelled                 # nothing left: no more orders
+    # Dust with nobody to sell to keeps one exit and doesn't re-place it.
+    b2 = _Bucket()
+    f2 = _live(tmp_path, monkeypatch, b2, placed_ago=1.0)
+    _held(f2, size=0.69)
+    f2.books = {"Z-1-A": {"yes": {}, "no": {0.02: 5000.0}}}
+    for _ in range(5):
+        f2.hedge(CFG)
+    assert len([o for o in b2.sent if o.ticker == "Z-1-A" and o.side == "no"]) == 1

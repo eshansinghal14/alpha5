@@ -785,7 +785,8 @@ class Farm:
         pos = self.signed_positions(hedged_only=True)
         for t, v in self.state.get("locked", {}).items():
             pos[t] = pos.get(t, 0.0) - v
-        return {t: v for t, v in pos.items() if abs(v) > 1e-9}
+        # Kalshi fills in hundredths of a contract; less than that is rounding.
+        return {t: v for t, v in pos.items() if abs(v) >= 0.01}
 
     def avg_cost(self, t: str, side: str) -> float:
         ok = set(self.state.get("hedged_oids", []))
@@ -886,9 +887,7 @@ class Farm:
             for side, o in self.legs_of(t, hedges=False):
                 self.cancel(key(t, side), reason="lipfarm:adverse")
             self.state.setdefault("cooldown", {})[t] = time.time() + GUARD_COOLDOWN_S
-        for k in [k for k in self.state["orders"] if is_hedge(k) and unkey(k)[0] == t]:
-            self.cancel(k, reason="lipfarm:dump")
-        if abs(v) < 1.0:
+        if abs(v) < 0.01:
             return
         held, other = ("yes", "no") if v > 0 else ("no", "yes")
         # Selling `held` = buying `other` against others' `held` bids, best first.
@@ -901,10 +900,15 @@ class Farm:
         if worst is None:
             print(f"adverse: {t} no bids to sell {held} into; resting an exit")
             return
-        q = math.floor(min(need, cum))
-        if q >= 1:
-            self.take(t, other, round(1.0 - worst, 4), q)
-            print(f"adverse: {t} sold {held} x{q} down to {worst}")
+        # Hundredths, as Kalshi fills: flooring to whole contracts left 0.69 behind
+        # that was then dumped and re-exited every pass (AL14 11-04 21:10).
+        q = math.floor(min(need, cum) * 100) / 100
+        if q < 0.01:
+            return
+        for k in [k for k in self.state["orders"] if is_hedge(k) and unkey(k)[0] == t]:
+            self.cancel(k, reason="lipfarm:dump")
+        self.take(t, other, round(1.0 - worst, 4), q)
+        print(f"adverse: {t} sold {held} x{q} down to {worst}")
 
     def hedge(self, cfg: Cfg, takes: bool = False):
         """Exits for what our fills left us holding. `takes`: first try locking
