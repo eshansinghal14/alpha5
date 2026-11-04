@@ -32,6 +32,8 @@ class Fair:
     underlying: float | None = None
     # False: no takes on this fair (quotes unaffected), e.g. no lead behind it.
     takes: bool = True
+    # This market's quoting.constant_edge (same near-close scaling); None = the global one.
+    constant_edge: float | None = None
 
 
 @dataclasses.dataclass(frozen=True)

@@ -483,6 +483,7 @@ class CoinRaceModel:
             # would erase the edge on tail coins (fair 0.002, band 0.015).
             out[self.ticker_of[c]] = Fair(prob=prob, lo=prob - k * tv, hi=prob + k * tv,
                                           edge_add=p.held_vol_edge if held else 0.0,
+                                          constant_edge=getattr(p, f"{c.lower()}_constant_edge", None),
                                           extras={"coin": c, "theo_vol": tv, "tau": self.result.tau,
                                                   "phase": self.result.phase, "cf_basis_bp": self.basis_bp[c],
                                                   "cf_end_n": snap.end_n[c],

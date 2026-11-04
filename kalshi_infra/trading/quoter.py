@@ -273,19 +273,20 @@ class Quoter:
     # Gates
     # ------------------------------------------------------------------
 
-    def _constant_edge(self, now: pd.Timestamp) -> float:
-        """constant_edge, scaled by sqrt(ref / time left) inside the last
-        `constant_edge_ref_s` seconds; flat when that's empty or there's no close."""
+    def _constant_edge(self, now: pd.Timestamp, base: float | None = None) -> float:
+        """`base` (default constant_edge), scaled by sqrt(ref / time left) inside
+        the last `constant_edge_ref_s` seconds; flat when that's empty or there's no close."""
         q = self.cfg.quoting
+        e = q.constant_edge if base is None else base
         ref = getattr(q, "constant_edge_ref_s", None)
         if not ref or self.close_time is None:
-            return q.constant_edge
+            return e
         left = (self.close_time - now).total_seconds()
         if left >= ref:
-            return q.constant_edge
+            return e
         # Floored at 1s: at the close the multiplier would be unbounded, and no
         # quote rests there anyway (real_trading_cutoff_s), but takes do.
-        return q.constant_edge * math.sqrt(ref / max(left, 1.0))
+        return e * math.sqrt(ref / max(left, 1.0))
 
     def takes_only(self, now: pd.Timestamp) -> bool:
         """Inside real_trading_cutoff_s with taking on: the session stays armed
@@ -471,7 +472,7 @@ class Quoter:
 
         fee_bid = self.fees.taker(market_ask) if market_ask is not None else 0.0
         fee_ask = self.fees.taker(market_bid) if market_bid is not None else 0.0
-        const = self._constant_edge(now) + fair.edge_add
+        const = self._constant_edge(now, fair.constant_edge) + fair.edge_add
         # Floored at 0 before the fee: a negative lean may bring a side to fair, never past it.
         bid_edge = max(const + ci_bid + lean_bid, 0.0) + fee_bid
         ask_edge = max(const + ci_ask + lean_ask, 0.0) + fee_ask

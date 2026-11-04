@@ -156,6 +156,16 @@ class CryptoPricingParams:
         "fills still ran -8.9c/lot at 10s (22 fills).", min=0.05, max=0.95, step=0.05)
     held_vol_hold_s: float = param("A held_vol pull lasts this long after the last tripping second.",
                                    min=0, step=5)
+    btc_constant_edge: float | None = param(
+        "This coin's quoting.constant_edge (takes and quotes, same near-close scaling); empty = the global. Race maker fills 10-30..11-04 by edge at the fill: under 7c lost (-1.35c/lot at 10s under 5c), above gained, but per coin HYPE and XRP lost below ~11c while BTC and SOL gained at every edge.", min=0, max=0.3, step=0.005)
+    eth_constant_edge: float | None = param(
+        "See btc_constant_edge.", min=0, max=0.3, step=0.005)
+    sol_constant_edge: float | None = param(
+        "See btc_constant_edge.", min=0, max=0.3, step=0.005)
+    xrp_constant_edge: float | None = param(
+        "See btc_constant_edge.", min=0, max=0.3, step=0.005)
+    hype_constant_edge: float | None = param(
+        "See btc_constant_edge.", min=0, max=0.3, step=0.005)
     held_vol_edge: float = param(
         "Extra $ edge on a coin's market (quotes and takes) while that coin prices on a held implied vol. "
         "Real edge fills 10-19..10-21 02:58 UTC on held vol: +0.84c/lot at 10s (+-0.93, 303 fills) vs "

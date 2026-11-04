@@ -1688,3 +1688,10 @@ def test_a_lead_move_moves_the_exposed_quote_by_all_of_it():
     step(q, ctx, {"A": Fair(0.50, 0.49, 0.51, take_prob=0.54)}, Book("A", 0.40, 0.60))
     assert ladder(ctx, "no")[0] == 0.45            # offer off 0.54: 0.55 yes, i.e. no bid 0.45
     assert ladder(ctx, "yes")[0] == 0.45           # bid stays off 0.50 (0.49 limit), capped 5 ticks over 0.40
+
+
+def test_per_market_constant_edge_overrides_the_global():
+    q, ctx = Quoter(cfg(constant_edge=0.01, lean_dollars=0.0, edge_fraction=0.0), Model(), FREE, close_time=None), Ctx()
+    step(q, ctx, {"A": Fair(0.60, 0.59, 0.61, constant_edge=0.06)}, Book("A", 0.40, 0.55))
+    assert takes(ctx) == []                        # 0.60 - 0.06 < 0.55; the global 1c would have taken
+    assert q.debug_log[-1]["constant_edge"] == pytest.approx(0.06)
