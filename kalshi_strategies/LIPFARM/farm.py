@@ -58,6 +58,18 @@ CLAIMS_PATH = os.path.join(ROOT, "live", "claimed.json")
 CLAIM_SETTLE_S = 3.0
 # Kalshi pays nothing for a market-period whose LIP is under $1 (help article).
 LIP_MIN_PAYOUT_USD = 1.0
+# Our writes share ARBS's shard bucket (300 tokens/s on shard 0, 2026-11-04;
+# ARBS drained it to refusals that day). A new quote goes out only with this
+# fraction of the bucket left after it, a back-of-queue move only with
+# MOVE_RESERVE: we spend what ARBS isn't using. Cancels always go.
+PLACE_RESERVE = 0.5
+MOVE_RESERVE = 0.8
+# Back-of-queue moves (cancel + re-place, 12 tokens; LIP has no time priority,
+# so the back only sheds fills): only when at least `lots` joined behind us,
+# per market at most once per MOVE_MIN_S, at most MAX_MOVES per cycle --
+# <= 5 * 12 / 30 s = 2 tokens/s, under 1% of the bucket.
+MOVE_MIN_S = 60.0
+MAX_MOVES = 5
 
 
 @section
@@ -322,31 +334,64 @@ class Farm:
                     print(f"stray cancel {ticker}: {e}")
         self.state["orders"] = {}
 
-    def cancel(self, ticker: str):
+    def cancel(self, ticker: str, reason: str = "lipfarm:cancel"):
         o = self.state["orders"].pop(ticker, None)
         if o and self.live:
+            c = self.client(self.shard(ticker))
+            c.allow_now("cancel", force=True, reason=reason)
             try:
-                self.client(self.shard(ticker)).cancel(o["oid"], ticker)
+                c.cancel(o["oid"], ticker)
             except Exception as e:
                 print(f"cancel {ticker}: {e}")
 
-    def place(self, pk: Pick, lots: float):
+    def place(self, pk: Pick, lots: float, reserve: float = PLACE_RESERVE, reason: str = "lipfarm:quote") -> bool:
         if self.live:
+            c = self.client(self.shard(pk.ticker))
+            if not (c.can_afford("order", reserve=reserve * c.tokens_per_s) and c.allow_now("order", reason=reason)):
+                return False
             order = Order(order_id=0, ticker=pk.ticker, side=pk.side, order_type="limit",
                           price=pk.price, size=lots, decision_time=pd.Timestamp.now(tz="UTC"),
                           intent="quote")
             order.client_order_id = CID_PREFIX + uuid.uuid4().hex[:24]
             try:
-                ack = self.client(self.shard(pk.ticker)).place_resting(order)
+                ack = c.place_resting(order)
             except Exception as e:
                 print(f"place {pk.ticker} {pk.side}@{pk.price}: {e}")
-                return
+                return False
             oid = ack.exchange_order_id
         else:
             oid = "shadow-" + uuid.uuid4().hex[:12]
         self.state["orders"][pk.ticker] = {"oid": oid, "side": pk.side, "price": pk.price,
                                            "size": lots, "remaining": lots, "placed": time.time()}
         self.rates[pk.ticker] = pk.rate
+        return True
+
+    def move_back(self, cfg: Cfg, want: dict[str, Pick]):
+        """Re-place quotes that at least `lots` have joined behind, so the
+        size now behind us is filled before we are."""
+        now, moves = time.time(), 0
+        for t, o in sorted(self.state["orders"].items(), key=lambda kv: kv[1]["placed"]):
+            if moves >= MAX_MOVES:
+                break
+            pk = want.get(t)
+            if pk is None or now - o["placed"] < MOVE_MIN_S:
+                continue
+            c = self.client(self.shard(t))
+            if not c.can_afford("order", reserve=MOVE_RESERVE * c.tokens_per_s + c.COST["cancel"]):
+                return
+            try:
+                ahead = c.queue_positions(self.meta.get(t, {}).get("event_ticker") or event_of(t)).get(o["oid"])
+            except Exception as e:
+                print(f"queue {t}: {e}")
+                continue
+            if ahead is None:
+                continue
+            behind = self.books.get(t, {}).get(o["side"], {}).get(round(o["price"], 4), 0.0) - ahead
+            if behind < cfg.lots:
+                continue
+            self.cancel(t, reason="lipfarm:move")
+            if self.place(pk, cfg.lots, reserve=0.0, reason="lipfarm:move"):
+                moves += 1
 
     def signed_positions(self) -> dict[str, float]:
         """Signed YES contracts (negative = long NO) from our fills, unsettled markets only."""
@@ -412,12 +457,14 @@ class Farm:
         for t, o in list(self.state["orders"].items()):
             pk = want.get(t)
             stale = (pk is None or pk.side != o["side"] or abs(pk.price - o["price"]) > 1e-9
-                     or o["remaining"] < 0.5 * cfg.lots or o["remaining"] > cfg.lots + 1e-9 or not ready(t))
+                     or abs(o["size"] - cfg.lots) > 1e-9 or o["remaining"] < 0.5 * cfg.lots or not ready(t))
             if stale:
                 self.cancel(t)
         for t, pk in want.items():
             if t not in self.state["orders"] and ready(t):
                 self.place(pk, cfg.lots)
+        if self.live:
+            self.move_back(cfg, want)
 
     def poll_fills(self):
         if not self.live or not self.clients:

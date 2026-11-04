@@ -41,6 +41,18 @@ def test_arm_quotes_for_real_and_disarm_pulls(tmp_path, monkeypatch):
     sent, cancelled = [], []
 
     class FakeClient:
+        tokens_per_s = 300.0
+        COST = {"order": 10, "amend": 10, "cancel": 2}
+
+        def can_afford(self, kind, reserve=0.0):
+            return True
+
+        def allow_now(self, kind, force=False, reason=""):
+            return True
+
+        def queue_positions(self, event):
+            return {}
+
         def _resting(self, prefix):
             return [("old", "X-1-A", "lipf-old"), ("arbs", "Y-1-A", "someone-else")]
 
@@ -93,3 +105,77 @@ def test_sticky_until_one_dollar_then_switch_margin(tmp_path, monkeypatch):
     assert list(f.choose(cfg)) == ["OLD-1-A"]          # past $1, newcomer only 40% better
     f.picks["NEW-1-A"] = farm.Pick("NEW-1-A", "no", 0.01, 1.6e-4, 0.002)
     assert list(f.choose(cfg)) == ["NEW-1-A"]
+
+
+class _Bucket:
+    tokens_per_s = 300.0
+    COST = {"order": 10, "amend": 10, "cancel": 2}
+
+    def __init__(self, tokens, ahead):
+        self.tokens, self.ahead, self.sent, self.cancelled = tokens, ahead, [], []
+
+    def can_afford(self, kind, reserve=0.0):
+        return self.tokens >= self.COST[kind] + reserve
+
+    def allow_now(self, kind, force=False, reason=""):
+        if force or self.tokens >= self.COST[kind]:
+            self.tokens -= self.COST[kind]
+            return True
+        return False
+
+    def queue_positions(self, event):
+        return {"oid0": self.ahead}
+
+    def place_resting(self, order):
+        from types import SimpleNamespace
+        self.sent.append(order)
+        return SimpleNamespace(exchange_order_id=f"oid{len(self.sent)}", fill=None)
+
+    def cancel(self, oid, ticker):
+        self.cancelled.append(oid)
+        return True
+
+
+def _live_farm(tmp_path, monkeypatch, bucket, lots=1000, placed_ago=120.0):
+    from kalshi_strategies.LIPFARM import farm
+    monkeypatch.setattr(farm, "ROOT", str(tmp_path))
+    f = farm.Farm()
+    f.live = True
+    monkeypatch.setattr(f, "client", lambda shard: bucket)
+    monkeypatch.setattr(f, "shard", lambda t: 0)
+    f.state["orders"] = {"Z-1-A": {"oid": "oid0", "side": "no", "price": 0.01, "size": lots, "remaining": lots,
+                                   "placed": __import__("time").time() - placed_ago}}
+    f.books = {"Z-1-A": {"yes": {0.98: 5000.0}, "no": {0.01: 3000.0}}}
+    cfg = farm.Cfg(num_markets=1, lots=1000, max_price=0.05, switch_margin=0.5, scan_markets=1, refresh_s=30,
+                   programs_refresh_s=600)
+    return farm, f, cfg, {"Z-1-A": farm.Pick("Z-1-A", "no", 0.01, 0.001, 0.002)}
+
+
+def test_move_back_only_with_size_behind_and_spare_budget(tmp_path, monkeypatch):
+    b = _Bucket(tokens=300.0, ahead=1500.0)           # 3000 others at 0.01, 1500 ahead -> 1500 behind
+    farm, f, cfg, want = _live_farm(tmp_path, monkeypatch, b)
+    f.move_back(cfg, want)
+    assert b.cancelled == ["oid0"] and len(b.sent) == 1 and f.state["orders"]["Z-1-A"]["oid"] == "oid1"
+    b = _Bucket(tokens=300.0, ahead=2500.0)           # only 500 behind: not worth a move
+    farm, f, cfg, want = _live_farm(tmp_path, monkeypatch, b)
+    f.move_back(cfg, want)
+    assert not b.cancelled
+    b = _Bucket(tokens=200.0, ahead=0.0)              # ARBS is using the bucket: wait
+    farm, f, cfg, want = _live_farm(tmp_path, monkeypatch, b)
+    f.move_back(cfg, want)
+    assert not b.cancelled
+    b = _Bucket(tokens=300.0, ahead=0.0)              # moved under a minute ago
+    farm, f, cfg, want = _live_farm(tmp_path, monkeypatch, b, placed_ago=10.0)
+    f.move_back(cfg, want)
+    assert not b.cancelled
+
+
+def test_changed_lots_replaces_every_quote(tmp_path, monkeypatch):
+    b = _Bucket(tokens=300.0, ahead=0.0)
+    farm, f, cfg, want = _live_farm(tmp_path, monkeypatch, b, lots=500, placed_ago=0.0)
+    f.picks = want
+    f.programs = {"Z-1-A": {"id": "p", "end_date": "2099-01-01T00:00:00Z"}}
+    f.state["claims"] = {"Z-1-A": 0.0}
+    monkeypatch.setattr(farm, "CLAIMS_PATH", str(tmp_path / "live" / "claimed.json"))
+    f.reconcile(cfg)                                  # cfg.lots = 1000, quote rests 500
+    assert b.cancelled == ["oid0"] and [o.size for o in b.sent] == [1000]
