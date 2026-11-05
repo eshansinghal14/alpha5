@@ -105,7 +105,7 @@ def render(page: str, stale_fn):
         _toggle(s, idle)
         c = st.columns(6)
         c[0].metric("Quoting", s["quoting"])
-        c[1].metric("LIP rate now", f"${s['our_usd_day_now']:,.0f}/day")
+        c[1].metric("LIP rate now", f"${s['our_usd_day_now'] / 1440:,.3f}/min")
         c[2].metric("Expected LIP", f"${s['exp_lip_usd']:,.2f}",
                     f"${s.get('lip_locked_usd', 0):,.2f} locked (past $1)", delta_color="off",
                     help="Locked: program periods already past Kalshi's $1 minimum, paid in full. The rest "
@@ -133,7 +133,7 @@ def render(page: str, stale_fn):
                 "market": q["ticker"],
                 "m": q["mode"].map({"wide": "W", "decided": "D", "narrow": "N", "hedge": "X"}).fillna(""),
                 "quote": q["bids"].map(_compact_bids),
-                "$/day": q["our_usd_day"], "pool/d": q["pool_usd_day"],
+                "$/min": q["our_usd_day"] / 1440, "pool/min": q["pool_usd_day"] / 1440,
                 "period $": q.get("period_lip_usd", 0.0), "LIP $": q["exp_lip_usd"], "cap $": q["capital_usd"]})
             num = st.column_config.NumberColumn
             st.dataframe(view, hide_index=True, use_container_width=True, column_config={
@@ -141,7 +141,7 @@ def render(page: str, stale_fn):
                 "m": st.column_config.TextColumn(width="small", help="W wide, D decided, N narrow (exit-liquidity sized), X exit only"),
                 "quote": st.column_config.TextColumn(width="medium", help="⚑ = 1.1-lot sentinel one tick above, "
                                                                           "in the bid's order group"),
-                "$/day": num(format="%.0f", width="small"), "pool/d": num(format="%.0f", width="small"),
+                "$/min": num(format="%.4f", width="small"), "pool/min": num(format="%.3f", width="small"),
                 "period $": num(format="%.2f", width="small", help="Kalshi pays a market-period only from $1."),
                 "LIP $": num(format="%.2f", width="small"), "cap $": num(format="%.0f", width="small")})
         st.subheader("Fills")
