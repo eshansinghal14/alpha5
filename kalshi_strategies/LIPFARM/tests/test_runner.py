@@ -1,13 +1,14 @@
 import asyncio
+import json
 import dataclasses
 import threading
 import time
 from types import SimpleNamespace
 
-import pytest
 
 from kalshi_backtest.core import Trade
 from kalshi_strategies.LIPFARM import farm, runner
+from kalshi_strategies.LIPFARM.farm import unkey
 from kalshi_strategies.LIPFARM.tests.test_farm import CFG
 
 import pandas as pd
@@ -313,3 +314,255 @@ def test_a_resting_sentinel_doesnt_get_its_new_main_bid_pulled(tmp_path, monkeyp
         await settle(r)
     asyncio.run(go())
     assert [x[1] for x in c.calls] == ["rest"] and "Z-1-A|yes" in r.state["orders"]
+
+
+# ---- ported from the synchronous farm's tests ----
+
+def _plan(t, mode="decided", legs=(("yes", 0.97),), rate=1e-3, capital=970.0, lots=1000, layout=None, big=None):
+    return farm.Plan(t, mode, legs, rate, capital, 0.002, lots, layout or {s: "touch" for s, _ in legs},
+                     big or {s: p for s, p in legs})
+
+
+def _order(side, price, size=1000, oid="o1", group="g1", placed=None, remaining=None):
+    return {"oid": oid, "side": side, "price": price, "size": size,
+            "remaining": size if remaining is None else remaining, "placed": placed or time.time(), "group": group}
+
+
+def _held(r, t, side, price, size, oid="f1"):
+    r.state.setdefault("hedged_oids", []).append(oid)
+    r.state["fills"].append({"ticker": t, "side": side, "price": price, "size": size, "fee": 0.0, "order_id": oid,
+                             "trade_id": "x" + oid, "time": "2026-11-05T00:00:00", "liquidity": "maker"})
+
+
+def test_choose_ranks_per_dollar_and_caps_by_exposure(tmp_path, monkeypatch):
+    books = {t: {"yes": {}, "no": {}} for t in ("A-1-X", "B-1-X", "C-1-X")}
+    r, _ = make(tmp_path, monkeypatch, books)
+    r.plans = {"A-1-X": _plan("A-1-X"), "C-1-X": _plan("C-1-X", legs=(("no", 0.98),), rate=5e-4, capital=980.0),
+               "B-1-X": _plan("B-1-X", "wide", (("yes", 0.1), ("no", 0.4)), capital=500.0)}
+    assert list(r.choose(dataclasses.replace(CFG, max_capital=1000))) == ["B-1-X", "A-1-X", "C-1-X"]
+    monkeypatch.setattr(r, "exposure", lambda: 500.0)
+    assert list(r.choose(dataclasses.replace(CFG, max_capital=1000))) == ["B-1-X"]
+
+
+def test_quoted_past_one_dollar_first_then_under_then_new(tmp_path, monkeypatch):
+    books = {t: {"yes": {}, "no": {}} for t in ("PAST-1-A", "UNDER-1-A", "NEW-1-A")}
+    r, _ = make(tmp_path, monkeypatch, books)
+    r.plans = {t: _plan(t, rate=rate) for t, rate in (("PAST-1-A", 1e-4), ("UNDER-1-A", 2e-4), ("NEW-1-A", 9e-4))}
+    r.state["orders"] = {"PAST-1-A|yes": _order("yes", 0.97), "UNDER-1-A|yes": _order("yes", 0.97, oid="o2")}
+    r.state["period_accrued"] = {"pPAST-1-A": 1.5, "pUNDER-1-A": 0.4}
+    assert list(r.choose(dataclasses.replace(CFG, num_markets=3))) == ["PAST-1-A", "UNDER-1-A", "NEW-1-A"]
+    assert list(r.choose(dataclasses.replace(CFG, num_markets=1))) == ["PAST-1-A"]
+
+
+def test_candidates_rank_by_what_we_earned_and_rotate_through_the_rest(tmp_path, monkeypatch):
+    books = {f"M-1-{i}": {"yes": {}, "no": {}} for i in range(6)}
+    r, _ = make(tmp_path, monkeypatch, books)
+    r.pool_rate = {t: float(i) for i, t in enumerate(sorted(books))}
+    r.est = {"M-1-0": 5.0}
+    cfg = dataclasses.replace(CFG, scan_markets=2, scan_rotate=2)
+    first = r.candidates(cfg)
+    assert first[:2] == ["M-1-0", "M-1-5"] and len(first) == 4
+    assert set(r.candidates(cfg)[2:]) != set(first[2:])               # the rotation moved on
+
+
+def test_old_journal_keys_migrate(tmp_path, monkeypatch):
+    (tmp_path / "shadow").mkdir()
+    (tmp_path / "shadow" / "state.json").write_text(json.dumps(
+        {"t0": 0, "orders": {"Q-1-A": {"oid": "o", "side": "no", "price": 0.1, "size": 5, "remaining": 5,
+                                       "placed": 0}}, "fills": [], "trade_ids": [], "accrued": {}}))
+    r = runner.Runner(root=str(tmp_path))
+    assert list(r.state["orders"]) == ["Q-1-A|no"]
+
+
+def test_our_bucket_limits_lip_bids_but_never_exits(tmp_path, monkeypatch):
+    books = {t: {"yes": {}, "no": {}} for t in ("A-1-X", "A-1-Y", "A-1-Z", "D-1-X")}
+    r, c = make(tmp_path, monkeypatch, books)
+    r.bucket = farm.TokenBucket(rate=0.0, capacity=35.0)               # the event's group and two orders
+
+    async def go():
+        await boot(r)
+        assert await r.place("A-1-X", "yes", 0.1, 1000) and await r.place("A-1-Y", "yes", 0.1, 1000)
+        assert not await r.place("A-1-Z", "yes", 0.1, 1000)             # spent: ARBS's budget untouched
+        assert await r.place("D-1-X", "no", 0.9, 300, hedge=True)       # an exit goes anyway
+    asyncio.run(go())
+    rests = [x[1:] for x in c.calls if x[1] == "rest"]
+    assert [x[1] for x in rests] == ["A-1-X", "A-1-Y", "D-1-X"] and r.bucket.tokens < 0
+    assert rests[0][5] == rests[1][5] is not None and rests[2][5] is None   # one group per event, exits outside
+
+
+def test_guard_pulls_a_side_its_plan_dropped_and_cools_down(tmp_path, monkeypatch):
+    books = {"Z-1-A": {"yes": {0.60: 5000.0}, "no": {0.30: 5000.0}}}     # 10c spread, no exit depth: no plan
+    r, c = make(tmp_path, monkeypatch, books)
+    r.state["orders"] = {"Z-1-A|yes": _order("yes", 0.60)}
+
+    async def go():
+        await boot(r)
+        r.guard_market("Z-1-A", r.ws_others("Z-1-A"), CFG)
+        await settle(r)
+    asyncio.run(go())
+    assert not r.state["orders"] and [x[1] for x in c.calls] == ["cancel"]
+    assert r.state["cooldown"]["Z-1-A"] > time.time() + farm.GUARD_COOLDOWN_S - 5
+
+
+def test_stale_bids_are_replaced_and_disarm_pulls_everything(tmp_path, monkeypatch):
+    books = {"Z-1-A": {"yes": {0.11: 2000.0}, "no": {0.37: 2000.0}}}
+    r, c = make(tmp_path, monkeypatch, books)
+    monkeypatch.setattr(runner, "CLAIM_SETTLE_S", 0.0)
+    r.state["orders"] = {"Z-1-A|yes": _order("yes", 0.11, size=400)}            # the plan now wants 1000
+    r.plans = {"Z-1-A": _plan("Z-1-A", "wide", (("yes", 0.11), ("no", 0.37)), capital=480.0)}
+
+    async def go():
+        await boot(r)
+        await r.reconcile(CFG)
+        await settle(r)
+        assert sorted(unkey(k)[1] for k in r.state["orders"]) == ["no", "yes"]
+        await r.cancel_all()
+    asyncio.run(go())
+    assert [x[1] for x in c.calls].count("cancel") == 3 and not r.state["orders"]
+
+
+def test_fill_rests_an_exit_one_tick_over_the_other_touch_and_steps_up_only_when_outbid(tmp_path, monkeypatch):
+    books = {"Z-1-A": {"yes": {0.40: 2000.0}, "no": {0.50: 2000.0}}}
+    r, c = make(tmp_path, monkeypatch, books)
+    _held(r, "Z-1-A", "yes", 0.40, 100.0)
+
+    async def go():
+        await boot(r)
+        r.dirty.add("Z-1-A")
+        await settle(r)
+        assert r.state["orders"]["Z-1-A|no|h"]["price"] == 0.51           # a pair at 0.91: under $1
+        books["Z-1-A"]["no"] = {0.52: 2000.0}                            # outbid
+        r.dirty.add("Z-1-A")
+        await settle(r)
+        assert r.state["orders"]["Z-1-A|no|h"]["price"] == 0.51           # not before EXIT_REPRICE_S
+        r.state["orders"]["Z-1-A|no|h"]["placed"] -= farm.EXIT_REPRICE_S
+        r.dirty.add("Z-1-A")
+        await settle(r)
+        await settle(r)
+    asyncio.run(go())
+    assert r.state["orders"]["Z-1-A|no|h"]["price"] == 0.53
+    assert not [x for x in c.calls if x[1] == "ioc"]                      # under adverse_lots: no sell into the book
+
+
+def test_dust_is_sold_into_the_book_exactly_once(tmp_path, monkeypatch):
+    books = {"Z-1-A": {"yes": {0.40: 2000.0, 0.30: 100.0}, "no": {0.50: 2000.0}}}
+    r, c = make(tmp_path, monkeypatch, books)
+    _held(r, "Z-1-A", "yes", 0.42, 10.69)
+
+    async def go():
+        await boot(r)
+        r.dirty.add("Z-1-A")
+        await settle(r)
+        for _ in range(3):
+            r.dirty.add("Z-1-A")
+            await settle(r)
+    asyncio.run(go())
+    assert [x[1:] for x in c.calls if x[1] == "ioc"] == [("ioc", "Z-1-A", "no", 0.6, 10.69)]
+    assert abs(r.free_positions().get("Z-1-A", 0.0)) < 1e-9
+
+
+def test_an_informed_fill_takes_the_pair_when_it_costs_under_a_dollar(tmp_path, monkeypatch):
+    books = {"Z-1-A": {"yes": {0.95: 300.0}, "no": {0.02: 5000.0}}}           # no asks 1 - 0.95 = 0.05
+    r, c = make(tmp_path, monkeypatch, books)
+    r.state["orders"] = {"Z-1-A|yes": _order("yes", 0.90, oid="o1", group=None)}
+    r.state.update(lip_oid_size={"o1": 1000}, hedged_oids=["o1"], all_oids=["o1"])
+
+    async def go():
+        await boot(r)
+        r._on_fill(_fill("Z-1-A", "yes", 0.90, 300.0, "o1", "t1"))       # informed: 300 >= adverse_lots
+        await settle(r)
+    asyncio.run(go())
+    # 0.90 + 0.05 + fee < $1: locked by buying the other side, not sold.
+    assert [x[1:] for x in c.calls if x[1] == "ioc"][0] == ("ioc", "Z-1-A", "no", 0.05, 300)
+
+
+def test_fill_locked_through_an_arbs_basket(tmp_path, monkeypatch):
+    books = {"Z-1-A": {"yes": {0.30: 2000.0}, "no": {0.50: 2000.0}},
+             "Z-1-B": {"yes": {0.10: 2000.0}, "no": {0.80: 2000.0}}}
+    r, c = make(tmp_path, monkeypatch, books)
+    r.books = {t: {"yes": dict(b["yes"]), "no": dict(b["no"])} for t, b in books.items()}
+    _held(r, "Z-1-A", "yes", 0.30, 100.0)
+    # Z-1-A yes + Z-1-B yes pays $1; Z-1-B yes asks 1 - 0.80 = 0.20: 0.30 + 0.20 + fees < $1.
+    r.baskets = {("Z-1-A", "yes"): [(1.0, (("Z-1-A", "yes"), ("Z-1-B", "yes")))]}
+
+    async def go():
+        await boot(r)
+        await r.basket_lock("Z-1-A", "yes")
+    asyncio.run(go())
+    assert [x[1:3] for x in c.calls if x[1] == "ioc"] == [("ioc", "Z-1-B")]
+    assert r.state["locked"] == {"Z-1-A": 100.0, "Z-1-B": 100.0} and not r.free_positions().get("Z-1-A")
+
+
+def test_a_fill_pulls_bids_that_could_take_us_past_max_capital(tmp_path, monkeypatch):
+    books = {"Z-1-A": {"yes": {0.96: 300.0}, "no": {0.02: 5000.0}},
+             "Z-1-B": {"yes": {0.40: 900.0}, "no": {0.50: 900.0}}}
+    r, c = make(tmp_path, monkeypatch, books)
+    r.cfg = dataclasses.replace(CFG, max_capital=500.0)
+    r.state["orders"] = {"Z-1-A|yes": _order("yes", 0.97, oid="o1", group=None),
+                         "Z-1-B|yes": _order("yes", 0.40, oid="o2", group=None)}
+    r.state.update(lip_oid_size={"o1": 1000, "o2": 1000}, hedged_oids=["o1", "o2"], all_oids=["o1", "o2"])
+
+    async def go():
+        await boot(r)
+        r._on_fill(_fill("Z-1-A", "yes", 0.97, 200.0, "o1", "t1"))         # $194 held: a 0.40 x1000 bid passes $500
+        await settle(r)
+    asyncio.run(go())
+    assert "Z-1-B|yes" not in r.state["orders"]
+
+
+def test_sync_keeps_a_resting_order_the_list_missed_and_cancels_orphans(tmp_path, monkeypatch):
+    books = {"Z-1-A": {"yes": {}, "no": {}}}
+    r, c = make(tmp_path, monkeypatch, books)
+    old = time.time() - 60
+    r.state["orders"] = {"Z-1-A|yes": _order("yes", 0.4, oid="still", placed=old),
+                         "Z-1-A|no": _order("no", 0.3, oid="gone", placed=old)}
+    c._resting = lambda prefix: [("orphan", "Z-1-A", "lipf-x"), ("arbs", "Z-1-A", "someone-else")]
+    c.order = lambda oid: {"status": "resting" if oid == "still" else "canceled"}
+
+    async def go():
+        await boot(r)
+        await r.sync_live_orders()
+        await settle(r)
+    asyncio.run(go())
+    assert list(r.state["orders"]) == ["Z-1-A|yes"]
+    assert [x[1:] for x in c.calls if x[1] == "cancel"] == [("cancel", "Z-1-A", "orphan")]
+
+
+def test_moves_go_to_the_back_only_with_size_behind_and_are_capped(tmp_path, monkeypatch):
+    books = {f"Z-1-{i}": {"yes": {0.40: 3000.0}, "no": {0.30: 900.0}} for i in range(8)}
+    r, c = make(tmp_path, monkeypatch, books)
+    old = time.time() - 60
+    r.state["orders"] = {f"Z-1-{i}|yes": _order("yes", 0.40, oid=f"o{i}", placed=old) for i in range(8)}
+    r.plans = {t: _plan(t, "wide", (("yes", 0.40),), capital=400.0) for t in books}
+    r.books = {t: r.ws_others(t) for t in books}
+    ahead = {f"o{i}": (3000.0 if i == 0 else 1000.0) for i in range(8)}      # Z-1-0: nothing behind it
+    monkeypatch.setattr(farm, "queue_ahead", lambda c, ts: ahead)
+
+    async def go():
+        await boot(r)
+        await r.move_back()
+        await settle(r)
+    asyncio.run(go())
+    moved = {x[2] for x in c.calls if x[1] == "rest"}
+    assert "Z-1-0" not in moved and len(moved) == farm.MAX_MOVES
+
+
+def test_fill_of_adverse_lots_is_informed_even_on_a_big_bid(tmp_path, monkeypatch):
+    books = {"Z-1-A": {"yes": {0.96: 300.0}, "no": {0.02: 5000.0}}}
+    r, _ = make(tmp_path, monkeypatch, books)
+    r.state["orders"] = {"Z-1-A|yes": _order("yes", 0.97, size=5000, oid="o1", group=None)}
+    r.state.update(lip_oid_size={"o1": 5000}, all_oids=["o1"])
+    r.book_fills([_fill("Z-1-A", "yes", 0.97, 300.0, "o1", "t1")])
+    assert r.dumping == {"Z-1-A"}                                           # 6% of the bid, still informed
+
+
+def test_flow_gate(tmp_path, monkeypatch):
+    books = {"S-1-A": {"yes": {}, "no": {}}, "Q-1-A": {"yes": {}, "no": {}}}
+    r, _ = make(tmp_path, monkeypatch, books)
+    r.categories = {"S": "Sports", "Q": "Politics"}
+    assert r.flow_ok("S-1-A", CFG) is False and not r.flow_futs
+    assert r.flow_ok("Q-1-A", CFG) is None
+    r.flow_futs["Q-1-A"].result()
+    assert r.flow_ok("Q-1-A", CFG) is True
+    r.state["flow"]["Q-1-A"].update(trades_day=CFG.max_trades_day + 1)
+    assert r.flow_ok("Q-1-A", CFG) is False

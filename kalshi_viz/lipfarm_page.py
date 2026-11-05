@@ -94,7 +94,7 @@ def render(page: str, stale_fn):
             return
         doc = _status()
         if doc is None:
-            st.info("No run yet: `python -m kalshi_strategies.LIPFARM.farm` (EC2: alpha5-lipfarm).")
+            st.info("No run yet: `python -m kalshi_strategies.LIPFARM.runner` (EC2: alpha5-lipfarm).")
             _toggle({}, idle=True)
             return
         s = doc["summary"]

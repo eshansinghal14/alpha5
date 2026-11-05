@@ -51,8 +51,8 @@ from kalshi_strategies.LIPFARM import farm
 from kalshi_strategies.LIPFARM.farm import (CANCEL_TOKENS, CID_PREFIX, CLAIM_SETTLE_S, DUST_LOTS, EXIT_REPRICE_S,
                                             GROUP_DELETES, GROUP_IDLE_S, GROUP_LIMIT, GUARD_COOLDOWN_S, GUARD_S,
                                             MAX_MOVES, MOVE_BEHIND_FRAC, MOVE_MIN_S, MOVE_RESERVE, NAME,
-                                            ORDER_TOKENS, PLACE_RESERVE, ROOT, SENTINEL_LOTS, STATUS_S,
-                                            TRIP_COOLDOWN_S, WRITE_BURST, Cfg, Farm, TokenBucket, desired_orders,
+                                            ORDER_TOKENS, PLACE_RESERVE, ROOT, STATUS_S,
+                                            TRIP_COOLDOWN_S, WRITE_BURST, Cfg, TokenBucket, desired_orders,
                                             event_of, exit_lots, is_hedge, is_sentinel, key, parse_book,
                                             plan_market, remove_ours, unkey)
 
@@ -119,8 +119,8 @@ def plan_batch(jobs: list[tuple]) -> dict[str, tuple]:
     return out
 
 
-class Runner(Farm):
-    """Farm's state, ranking and plan helpers; its own I/O, all async."""
+class Runner:
+    """The LIP farm: state, ranking and I/O on one asyncio loop (planning in farm.py)."""
 
     def __init__(self, root: str = ROOT, shadow_only: bool = False, sim: bool = True,
                  beside: str | None = None):
@@ -131,7 +131,28 @@ class Runner(Farm):
         self.ghosts: dict[str, list] = {}
         self.shadow_only = shadow_only
         self.sim = sim
-        super().__init__()
+        self.programs: dict[str, dict] = {}
+        self.meta: dict[str, dict] = {}
+        self.books: dict[str, dict[str, dict[float, float]]] = {}
+        self.plans: dict[str, farm.Plan] = {}
+        self.held_events: set[str] = set()
+        self.waiting: list[str] = []
+        self.last_programs = 0.0
+        self.bucket = TokenBucket(5.0, WRITE_BURST)
+        self.baskets: dict[tuple[str, str], list] = {}
+        self.taker_rates: dict[str, float] = {}
+        self.est: dict[str, float] = {}       # ticker -> our LIP $/s per dollar at its last read
+        self.rot = 0
+        self.dumping: set[str] = set()        # markets an informed fill hit: sell out now
+        self.pull: set[str] = set()           # markets whose LIP bids go once their sells are out
+        self.arm_requested = False
+        self.cfg_adverse = 300.0              # cfg.adverse_lots, refreshed each second
+        self.n_refused, self.last_refused_log = 0, 0.0
+        self.marks_at = 0.0
+        self.categories: dict[str, str] = {}  # series -> category
+        self.flow_pool = cf.ThreadPoolExecutor(1, thread_name_prefix="lipfarm-flow")
+        self.flow_futs: dict[str, cf.Future] = {}
+        self._open_mode(False)
         self.pool = cf.ThreadPoolExecutor(16, thread_name_prefix="lipfarm")
         self.write_pool = cf.ThreadPoolExecutor(16, thread_name_prefix="lipfarm-write")
         from kalshi_strategies.ARBS.execution import Gateway
@@ -159,6 +180,262 @@ class Runner(Farm):
         self.io_pool = cf.ThreadPoolExecutor(1, thread_name_prefix="lipfarm-io")   # file writes, in order
         self.book_seq: dict[str, int] = {}                     # ticker -> socket book updates seen
         self.dump_seq: dict[str, int] = {}                     # ticker -> book_seq its last informed sell saw
+
+    # ---- state, positions, ranking ----
+    def _load_state(self) -> dict:
+        if os.path.exists(self.state_path):
+            with open(self.state_path) as f:
+                st = json.load(f)
+            # Journals from before two-sided quoting keyed orders by ticker alone.
+            st["orders"] = {(k if "|" in k else key(k, o["side"])): o for k, o in st["orders"].items()}
+            return st
+        return {"t0": time.time(), "orders": {}, "fills": [], "trade_ids": [], "accrued": {}}
+
+    def order_tickers(self) -> set[str]:
+        return {unkey(k)[0] for k in self.state["orders"]}
+
+    def legs_of(self, t: str, hedges: bool = True) -> list[tuple[str, dict]]:
+        """(side, order) for our orders on t; sentinels are always included, exits if `hedges`."""
+        return [(unkey(k)[1], o) for k, o in self.state["orders"].items()
+                if unkey(k)[0] == t and (hedges or not is_hedge(k))]
+
+    def keys_of(self, t: str, hedges: bool = True) -> list[str]:
+        return [k for k in self.state["orders"] if unkey(k)[0] == t and (hedges or not is_hedge(k))]
+
+    def apply_refresh(self, result):
+        programs, meta, baskets, cats = result
+        self.programs = programs
+        self.meta.update(meta)
+        if baskets is not None:
+            self.baskets = baskets
+        if cats:
+            self.categories = cats
+        self.last_programs = time.time()
+
+    def our_rate(self, t: str, others, P) -> float:
+        legs = [(s, o["price"], o["remaining"]) for s, o in self.legs_of(t)]
+        return farm.market_rate(others, legs, P) if legs else 0.0
+
+    def tick(self, t: str, price: float) -> float:
+        for r in self.meta.get(t, {}).get("price_ranges") or []:
+            if float(r["start"]) - 1e-9 <= price < float(r["end"]) - 1e-9:
+                return float(r["step"])
+        return 0.01
+
+    def free_positions(self) -> dict[str, float]:
+        """Hedged-fill positions not already locked in a taken basket."""
+        pos = self.signed_positions(hedged_only=True)
+        for t, v in self.state.get("locked", {}).items():
+            pos[t] = pos.get(t, 0.0) - v
+        # Kalshi fills in hundredths of a contract; less than that is rounding.
+        return {t: v for t, v in pos.items() if abs(v) >= 0.01}
+
+    def avg_cost(self, t: str, side: str) -> float:
+        ok = set(self.state.get("hedged_oids", []))
+        fs = [f for f in self.state["fills"] if f["ticker"] == t and f["side"] == side and f.get("order_id") in ok]
+        q = sum(f["size"] for f in fs)
+        return sum(f["size"] * f["price"] for f in fs) / q if q else 1.0
+
+    def ask(self, t: str, side: str) -> tuple[float, float] | None:
+        """(offer price, its size) to buy `side` of t, from others' books."""
+        o = self.books.get(t)
+        opp = "no" if side == "yes" else "yes"
+        if not o or not o[opp]:
+            return None
+        p = max(o[opp])
+        return round(1.0 - p, 4), o[opp][p]
+
+    def exposure(self) -> float:
+        """Dollars our fills have left us holding, unexited, at cost."""
+        return sum(abs(v) * self.avg_cost(t, "yes" if v > 0 else "no") for t, v in self.free_positions().items())
+
+    def plan(self, t: str, others: dict, P: lip.LipParams, cfg: Cfg, pos: dict[str, float],
+             flow: bool = True) -> farm.Plan | None:
+        """plan_market, or None on an event ARBS holds or (`flow`) one whose flow read failed."""
+        if event_of(t) in self.held_events:
+            return None
+        v = pos.get(t, 0.0)
+        current = {}
+        for k in self.keys_of(t, hedges=False):
+            sd = unkey(k)[1]
+            current[sd] = "sentinel" if (is_sentinel(k) or current.get(sd) == "sentinel") else "touch"
+        # Unread flow doesn't pull a resting bid (scan_finish only places on a read that passed).
+        if flow and self.flow_ok(t, cfg) is False:
+            return None
+        return plan_market(t, others, P, cfg, {"yes": max(v, 0.0), "no": max(-v, 0.0)},
+                           tick=lambda px: self.tick(t, px), current=current,
+                           exit=exit_lots(others, cfg, P.target_size))
+
+    def signed_positions(self, hedged_only: bool = False) -> dict[str, float]:
+        """Signed YES contracts (negative = long NO) from our fills, unsettled
+        markets only; `hedged_only`: fills of orders whose fills we hedge."""
+        out: dict[str, float] = {}
+        ok = set(self.state.get("hedged_oids", [])) if hedged_only else None
+        for f in self.state["fills"]:
+            if self.meta.get(f["ticker"], {}).get("result") or (ok is not None and f.get("order_id") not in ok):
+                continue
+            out[f["ticker"]] = out.get(f["ticker"], 0.0) + (f["size"] if f["side"] == "yes" else -f["size"])
+        return {t: v for t, v in out.items() if abs(v) > 1e-9}
+
+    def write_claims(self, want: dict[str, farm.Plan]) -> bool:
+        """Claim what we want, rest on, or hold; keep each ticker's first-claim
+        time, which the placement gate waits on. True if anything new was claimed."""
+        pos = self.signed_positions()
+        now = time.time()
+        old = self.state.setdefault("claims", {})
+        claims = {t: old.get(t, now) for t in set(want) | self.order_tickers() | set(pos)}
+        self.state["claims"] = claims
+        os.makedirs(os.path.dirname(farm.CLAIMS_PATH), exist_ok=True)
+        tmp = farm.CLAIMS_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"written_at": now, "tickers": sorted(claims), "positions": pos}, f)
+        os.replace(tmp, farm.CLAIMS_PATH)
+        return any(t not in old for t in claims)
+
+    def period_accrued(self, t: str) -> float:
+        return self.state.setdefault("period_accrued", {}).get(self.programs[t]["id"], 0.0)
+
+    def choose(self, cfg: Cfg) -> dict[str, farm.Plan]:
+        """The markets to quote, within max_capital and num_markets. Only ones
+        that can still reach the $1 payout before their period ends. Quoted
+        markets past $1 this period come first (every further dollar there is
+        paid), then quoted ones under $1 (dropping one forfeits its accrual),
+        then new ones; best LIP per dollar first within each."""
+        now = time.time()
+
+        def left(t):
+            return max(pd.Timestamp(self.programs[t]["end_date"]).timestamp() - now, 0.0)
+
+        def per_dollar(p):
+            return p.rate / max(p.capital, 1e-9)
+        cool = self.state.setdefault("cooldown", {})
+        cands = [p for p in self.plans.values() if p.ticker in self.programs and cool.get(p.ticker, 0.0) <= now
+                 and self.period_accrued(p.ticker) + p.rate * left(p.ticker) >= farm.LIP_MIN_PAYOUT_USD]
+        held = self.order_tickers()
+
+        def rank(p):
+            if p.ticker not in held:
+                return 2
+            return 0 if self.period_accrued(p.ticker) >= farm.LIP_MIN_PAYOUT_USD else 1
+        out, exp = {}, self.exposure()
+        for p in sorted(cands, key=lambda p: (rank(p), -per_dollar(p))):
+            if len(out) >= cfg.num_markets:
+                break
+            if exp + p.lots * max(px for _, px in p.legs) <= cfg.max_capital + 1e-9:
+                out[p.ticker] = p
+        return out
+
+    def book_fills(self, fills: list[dict]) -> set[str]:
+        """Record fills of our orders (deduped on trade_id, from the socket or
+        REST); returns the tickers that had new ones."""
+        ours = {o["oid"]: k for k, o in self.state["orders"].items()}
+        known = set(self.state.get("all_oids", [])) | set(ours)
+        self.state["all_oids"] = sorted(known)
+        seen = set(self.state["trade_ids"])
+        booked = set(self.state.get("ioc_booked", []))
+        new: set[str] = set()
+        for f in fills:
+            if f.get("order_id") not in known or f.get("trade_id") in seen or f.get("order_id") in booked:
+                continue
+            seen.add(f["trade_id"])
+            f = dict(f, time=str(f["time"]) if f.get("time") is not None else None)
+            self.state["fills"].append(f)
+            new.add(f["ticker"])
+            k = ours.get(f["order_id"])
+            if k:
+                o = self.state["orders"][k]
+                o["remaining"] = max(o["remaining"] - f["size"], 0.0)
+                if o.get("group"):
+                    self.group_fill(o["group"], f["size"])
+        self.state["trade_ids"] = sorted(seen)
+        if new:
+            print(f"fill: {sorted(new)}")
+            self.flag_adverse()
+        return new
+
+    def flag_adverse(self):
+        """Mark markets where fills on one of our LIP bids reached adverse_lots."""
+        lim = self.cfg_adverse
+        sizes = self.state.get("lip_oid_size", {})
+        done = set(self.state.setdefault("adverse_oids", []))
+        got: dict[str, float] = {}
+        tick: dict[str, str] = {}
+        for f in self.state["fills"]:
+            o = f.get("order_id")
+            if o in sizes and o not in done:
+                got[o] = got.get(o, 0.0) + f["size"]
+                tick[o] = f["ticker"]
+        sent = self.state.get("sentinel_oids", {})
+        for o, q in got.items():
+            if o in sent or q >= lim - 1e-9:
+                self.state["adverse_oids"].append(o)
+                self.dumping.add(tick[o])
+                if o in sent:
+                    # Its fill tripped the event's group (group_fill): Kalshi pulled the bids.
+                    self.state.setdefault("cooldown", {})[tick[o]] = time.time() + TRIP_COOLDOWN_S
+                    print(f"sentinel: {sent[o]} cleared; its market is pulled for {TRIP_COOLDOWN_S:.0f} s")
+                else:
+                    print(f"adverse: {tick[o]} filled {q:.0f} of {sizes[o]:.0f}")
+
+    def accrue(self):
+        now = time.time()
+        dt = now - self.last_accrue
+        self.last_accrue = now
+        per = self.state.setdefault("period_accrued", {})
+        for t in self.order_tickers():
+            gain = self.rates.get(t, 0.0) * dt
+            self.state["accrued"][t] = self.state["accrued"].get(t, 0.0) + gain
+            if t in self.programs:
+                pid = self.programs[t]["id"]
+                per[pid] = per.get(pid, 0.0) + gain
+
+    def flow_ok(self, t: str, cfg: Cfg) -> bool | None:
+        """Low-flow check: True/False, None while its trades haven't been read.
+        A stale or missing reading is queued for a re-read; a stale one still answers."""
+        skip = {c.strip().lower() for c in cfg.skip_categories.split(",") if c.strip()}
+        if self.category(t).lower() in skip:
+            return False
+        flows = self.state.setdefault("flow", {})
+        fut = self.flow_futs.get(t)
+        if fut is not None and fut.done():
+            del self.flow_futs[t]
+            if fut.result() is not None:
+                flows[t] = fut.result()
+        f = flows.get(t)
+        stale = f is None or time.time() - f["at"] > farm.FLOW_TTL_S or abs(f["days"] - cfg.flow_days) > 1e-9
+        if stale and t not in self.flow_futs and len(self.flow_futs) < farm.FLOW_QUEUE:
+            ot = self.meta.get(t, {}).get("open_time")
+            self.flow_futs[t] = self.flow_pool.submit(farm.fetch_flow, t, cfg.flow_days,
+                                                      pd.Timestamp(ot).timestamp() if ot else None)
+        if f is None:
+            return None
+        return f["trades_day"] <= cfg.max_trades_day + 1e-9 and f["sweeps_day"] <= cfg.max_sweeps_day + 1e-9
+
+    def category(self, t: str) -> str:
+        ev = self.meta.get(t, {}).get("event_ticker") or event_of(t)
+        return self.categories.get(ev.split("-")[0], "")
+
+    def _group_fill_live(self, gid: str, size: float):
+        """Count a grouped fill as Kalshi does; past the limit the group has tripped."""
+        g = next((g for g in self.state.get("groups", {}).values() if g.get("id") == gid), None)
+        if g is None or g.get("tripped"):
+            return
+        now = time.time()
+        f = [x for x in g.setdefault("fills", []) if x[0] >= now - farm.GROUP_WINDOW_S] + [[now, size]]
+        g["fills"] = f
+        total = sum(x[1] for x in f)
+        if total > GROUP_LIMIT + 1e-9:
+            self.group_trip(gid, f"{total:g} contracts matched in {farm.GROUP_WINDOW_S:g} s")
+
+    def _others_base(self, t: str, ob) -> dict[str, dict[float, float]]:
+        """Others' books from a REST orderbook or (yes, no) bids: both include
+        our live bids (a shadow one isn't there)."""
+        yes, no = parse_book(ob) if isinstance(ob, dict) else ob
+        others = {"yes": yes, "no": no}
+        if self.live:
+            for side, o in self.legs_of(t):
+                others[side] = remove_ours(others[side], o["price"], o["remaining"])
+        return others
 
     # ---- paths and persistence ----
     def _open_mode(self, live: bool):
@@ -247,7 +524,7 @@ class Runner(Farm):
         await self.run_io(self.gw.setup, shards, None)
 
     def others_of(self, t: str, ob) -> dict[str, dict[float, float]]:
-        others = super().others_of(t, ob)
+        others = self._others_base(t, ob)
         for side, price, rem in self.ghosts.get(t, ()):
             others[side] = remove_ours(others[side], price, rem)
         return others
@@ -485,9 +762,9 @@ class Runner(Farm):
         t0 = time.time()
         if self.live:
             self.bucket.take(ORDER_TOKENS, force=True)
-            fill, exc, sent = await self.gw.ioc(t, side, price, q, force=True, reason="lipfarm:take")
+            fill, exc, _ = await self.gw.ioc(t, side, price, q, force=True, reason="lipfarm:take")
         else:
-            fill, exc, sent = self.sim_ioc(t, side, price, q), None, True
+            fill, exc = self.sim_ioc(t, side, price, q), None
         seen, kts = self.seen_at.get(t, (None, None))
         self.journal({"kind": "order", "op": "ioc", "why": why, "ticker": t, "side": side, "price": price,
                       "size": q, "sent": t0, "answered": time.time(), "fill_seen": seen,
@@ -567,7 +844,7 @@ class Runner(Farm):
                 g["fills"] = []
                 self.group_trip(gid, "shadow: past the limit")
             return
-        super().group_fill(gid, size)
+        self._group_fill_live(gid, size)
 
     async def tidy_groups(self):
         if not self.live:
@@ -819,7 +1096,9 @@ class Runner(Farm):
     def params(self, t: str) -> lip.LipParams:
         P = self.P.get(t)
         if P is None:
-            P = self.P[t] = super().params(t)
+            m = self.meta.get(t, {})
+            P = self.P[t] = dataclasses.replace(lip.params_from_program(self.programs[t]), price_ranges=tuple(
+                (float(r["start"]), float(r["end"]), float(r["step"])) for r in m.get("price_ranges") or []))
         return P
 
     def candidates(self, cfg: Cfg) -> list[str]:
@@ -914,8 +1193,9 @@ class Runner(Farm):
         for k, w in legs.items():
             t, side = unkey(k)
             by_side.setdefault((t, side), {})[k] = w
+        busy = set(self.busy)                     # before this pass: a market's two sides both go
         for (t, side), ws in by_side.items():
-            if t in self.busy or all(k in self.state["orders"] for k in ws):
+            if t in busy or all(k in self.state["orders"] for k in ws):
                 continue
             wait = settle(t)
             self.spawn(self.place_side(t, side, ws, wait), None if wait > 0 else t)

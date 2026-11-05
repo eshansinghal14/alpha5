@@ -1,5 +1,5 @@
 """LIP farming on the cheap side's touch (farm.py). Runs its own loop
-(`python -m kalshi_strategies.LIPFARM.farm`), not through run.py: no series,
+(`python -m kalshi_strategies.LIPFARM.runner`), not through run.py: no series,
 only a dashboard page."""
 SERIES: dict = {}
 DASHBOARD_GROUP = "LIP"
