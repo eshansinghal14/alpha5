@@ -436,6 +436,7 @@ def test_full_fill_is_informed_and_sold_into_the_book_at_once(tmp_path, monkeypa
     # Filled at 0.97: sell at once down to 2 ticks under it (300 at 0.95); rest the other 700.
     assert [(o.side, o.price, o.size) for o in ioc] == [("no", 0.05, 300)]
     assert "oid0" in b.cancelled and f.state["cooldown"]["Z-1-A"] > time.time()
+    assert f.state["cooldown"]["Z-1-A"] <= time.time() + farm.TRIP_COOLDOWN_S
     assert abs(f.free_positions()["Z-1-A"] - 700.0) < 1e-9 and "Z-1-A|no|h" in f.state["orders"]
     # The book keeps falling: best bid 0.94 is 3 ticks under our fill -> sell down to 0.92.
     f.books = {"Z-1-A": {"yes": {0.94: 400.0, 0.92: 500.0, 0.85: 9000.0}, "no": {0.02: 5000.0}}}

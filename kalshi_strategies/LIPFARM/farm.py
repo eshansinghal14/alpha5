@@ -136,6 +136,9 @@ STATUS_S = 5.0
 # across a threshold had the 30 s cycle re-place into the next flicker
 # (STL, JOHN 11-04 19:19).
 GUARD_COOLDOWN_S = 300.0
+# After a sentinel trip or adverse fill: 11-04, from 10 s after a sweep on, a further
+# 2c fall was no likelier than a 2c rise (22% vs 18% to 60 s), so a short pull is enough.
+TRIP_COOLDOWN_S = 60.0
 MOVE_MIN_S = 5.0
 MOVE_BEHIND_FRAC = 0.2
 # Moves come before new bids (crowded touches, sentinels), but at most this
@@ -1046,7 +1049,7 @@ class Farm:
         if adverse and abs(v) > DUST_LOTS:
             for k in self.keys_of(t, hedges=False):
                 self.cancel(k, reason="lipfarm:adverse")
-            self.state.setdefault("cooldown", {})[t] = time.time() + GUARD_COOLDOWN_S
+            self.state.setdefault("cooldown", {})[t] = time.time() + TRIP_COOLDOWN_S
         if abs(v) < 0.01:
             return
         held, other = ("yes", "no") if v > 0 else ("no", "yes")
@@ -1418,8 +1421,8 @@ class Farm:
                     # The touch was just cleared: off this market both sides, for the cooldown.
                     for k in self.keys_of(tick[o], hedges=False):
                         self.cancel(k, reason="lipfarm:sentinel")
-                    self.state.setdefault("cooldown", {})[tick[o]] = time.time() + GUARD_COOLDOWN_S
-                    print(f"sentinel: {sent[o]} cleared; its market is pulled for {GUARD_COOLDOWN_S:.0f} s")
+                    self.state.setdefault("cooldown", {})[tick[o]] = time.time() + TRIP_COOLDOWN_S
+                    print(f"sentinel: {sent[o]} cleared; its market is pulled for {TRIP_COOLDOWN_S:.0f} s")
                 else:
                     print(f"adverse: {tick[o]} filled {q:.0f} of {sizes[o]:.0f}")
 
