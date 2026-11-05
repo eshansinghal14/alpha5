@@ -686,3 +686,22 @@ def test_an_adverse_fill_pulls_its_whole_event_for_event_pull_s(tmp_path, monkey
     cool = r.state["cooldown"]
     assert cool["F-1-45"] > time.time() + 1700 and cool["F-1-40"] > time.time() + 1700
     assert "F-1-45|no" not in r.state["orders"] and "G-1-A|no" in r.state["orders"]    # other events untouched
+
+
+def test_stopping_keeps_exit_bids_and_the_next_run_adopts_them(tmp_path, monkeypatch):
+    books = {"Z-1-A": {"yes": {0.40: 1500.0}, "no": {0.30: 900.0}}}
+    r, c = make(tmp_path, monkeypatch, books)
+    r.state["orders"] = {"Z-1-A|yes": _order("yes", 0.40, oid="lip"), "Z-1-A|no|h": _order("no", 0.55, oid="exit"),
+                         "Z-1-A|yes|h": _order("yes", 0.45, oid="gone")}
+
+    async def go():
+        await boot(r)
+        await r.cancel_all()
+        assert [x[1:] for x in c.calls if x[1] == "cancel"] == [("cancel", "Z-1-A", "lip")]
+        assert set(r.state["orders"]) == {"Z-1-A|no|h", "Z-1-A|yes|h"}
+        # Next run: Kalshi still rests our exit and an unknown order of ours; the other exit is gone.
+        c._resting = lambda prefix: [("exit", "Z-1-A", "lipf-1"), ("stray", "Z-1-A", "lipf-2")]
+        await r.cancel_strays()
+    asyncio.run(go())
+    assert list(r.state["orders"]) == ["Z-1-A|no|h"]
+    assert [x[3] for x in c.calls if x[1] == "cancel"] == ["lip", "stray"]

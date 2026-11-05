@@ -1664,8 +1664,11 @@ class Runner:
             await self.cancel_strays()
 
     async def cancel_all(self):
-        orders = list(self.state["orders"].items())
-        self.state["orders"] = {}
+        """Pull every LIP bid. Exit bids stay on Kalshi (and in the journal): a restart or
+        a pause shouldn't cost them their queue position; the next run adopts them."""
+        orders = [(k, o) for k, o in self.state["orders"].items() if not is_hedge(k)]
+        for k, _ in orders:
+            del self.state["orders"][k]
         if self.live:
             await asyncio.gather(*(self._cancel(unkey(k)[0], o["oid"], "lipfarm:stop")
                                    for k, o in orders if o.get("oid")))
@@ -1674,10 +1677,15 @@ class Runner:
         c = self.gw.clients.get(0) or next(iter(self.gw.clients.values()), None)
         if c is None:
             return
+        exits = {o["oid"]: k for k, o in self.state["orders"].items() if is_hedge(k) and o.get("oid")}
+        listed = set()
         for oid, t, cid in await self.run_io(c._resting, ""):
-            if cid and cid.startswith(CID_PREFIX):
+            listed.add(oid)
+            if cid and cid.startswith(CID_PREFIX) and oid not in exits:
                 await self._cancel(t, oid, "lipfarm:stray")
-        self.state["orders"] = {}
+        # Exits from the last run that are still resting are adopted as they are.
+        self.state["orders"] = {k: o for k, o in self.state["orders"].items()
+                                if is_hedge(k) and o.get("oid") in listed}
 
     # ---- report (file writes off the loop) ----
     def positions(self) -> list[dict]:
