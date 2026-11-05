@@ -437,14 +437,18 @@ class LiveEngine:
         return None if self._applied_age_fn is None else self._applied_age_fn()
 
     def position_limit(self) -> float:
-        """The larger of the two caps: a LIP fill may legitimately take a
+        """The larger of the caps: max_position (plus take_max_position when
+        takes keep their own position), or the LIP size -- a LIP fill may legitimately take a
         position past max_position, up to the largest LIP size. Only while LIP
         quoting is on: otherwise a 400-lot LIP setting would silently loosen
         the guard on the edge quotes."""
         lip = getattr(getattr(self.strategy, "cfg", None), "lip", None)
         lip_max = (lip.max_lots() if lip is not None and hasattr(lip, "max_lots")
                    and getattr(lip, "enable_lip_quoting", False) else 0.0)
-        return max(self.quoting.max_position, lip_max)
+        # Takes on their own cap (take_max_position) stack on the quotes': one
+        # 1-lot take past the 0.5 quote cap halted KXBTC15M (11-05 21:15 UTC).
+        take_max = getattr(self.quoting, "take_max_position", None) or 0.0
+        return max(self.quoting.max_position + take_max, lip_max)
 
     def signal_age_limit(self) -> float:
         return self.risk.max_signal_age_s
@@ -478,20 +482,37 @@ class LiveEngine:
         limit = self.position_limit()
         if self.halted:
             return self.halted
-        if positions is None:
-            positions = {t: p.yes_qty - p.no_qty for t, p in self.portfolio.positions.items()}
-        self.over_limit = {t: q for t, q in positions.items() if abs(q) > limit + 1e-9}
-        for ticker, qty in self.over_limit.items():
-            prev = self._last_abs_position.get(ticker, 0.0)
-            if abs(qty) > prev + 1e-9 and prev > limit + 1e-9:
+        take_net = getattr(self.strategy, "_take_net", None)
+        take_max = getattr(self.quoting, "take_max_position", None)
+        if positions is None and take_max is not None and take_net is not None:
+            # Takes keep their own position: each part is checked on its own
+            # cap, so neither can grow inside the other's headroom.
+            total = {t: p.yes_qty - p.no_qty for t, p in self.portfolio.positions.items()}
+            parts, caps = {}, {}
+            for t, q in total.items():
+                tk = take_net.get(t, 0.0)
+                parts[(t, "quotes")], caps[(t, "quotes")] = q - tk, self.position_limit() - take_max
+                parts[(t, "takes")], caps[(t, "takes")] = tk, take_max
+        else:
+            if positions is None:
+                positions = {t: p.yes_qty - p.no_qty for t, p in self.portfolio.positions.items()}
+            parts = {(t, None): q for t, q in positions.items()}
+            caps = {k: limit for k in parts}
+        over = {k: q for k, q in parts.items() if abs(q) > caps[k] + 1e-9}
+        self.over_limit = {(t if part is None else f"{t} {part}"): q for (t, part), q in over.items()}
+        for (ticker, part), qty in over.items():
+            key = ticker if part is None else f"{ticker}|{part}"
+            prev = self._last_abs_position.get(key, 0.0)
+            if abs(qty) > prev + 1e-9 and prev > caps[(ticker, part)] + 1e-9:
                 self.halted = True
                 self.halt_kind = "position"
-                self.halt_reason = (f"{ticker} grew to {qty:+.4g} while already past the cap "
-                                    f"{limit:g} -- the position cap is not holding")
+                what = ticker if part is None else f"{ticker} ({part} position)"
+                self.halt_reason = (f"{what} grew to {qty:+.4g} while already past the cap "
+                                    f"{caps[(ticker, part)]:g} -- the position cap is not holding")
                 print(f"[live] HALT: {self.halt_reason}. No further orders will be sent.")
                 break
-        for ticker, qty in positions.items():
-            self._last_abs_position[ticker] = abs(qty)
+        for (ticker, part), qty in parts.items():
+            self._last_abs_position[ticker if part is None else f"{ticker}|{part}"] = abs(qty)
         return self.halted
 
     def ledger_positions(self) -> dict[str, float]:
