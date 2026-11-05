@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import concurrent.futures as cf
 import dataclasses
 import gc
@@ -71,6 +72,11 @@ MARKS_S = 60.0
 # (the socket book still showed bids the sweep had taken) is retried on the
 # market's next book update, at most this many times in a row.
 MAX_DUMP_MISSES = 5
+# Research log for a depth-drop pull (ARBS's pull_drop): per market we rest on,
+# others' size at our prices and at each touch over the last DEPTH_KEEP_S; the
+# FILL_CONTEXT_S before each LIP fill is journaled ("fill_context").
+DEPTH_KEEP_S = 30.0
+FILL_CONTEXT_S = 10.0
 FLUSH_S = 1.0
 
 
@@ -179,6 +185,7 @@ class Runner:
         self.P: dict[str, lip.LipParams] = {}                  # params by ticker, from the last cycle
         self.io_pool = cf.ThreadPoolExecutor(1, thread_name_prefix="lipfarm-io")   # file writes, in order
         self.flow_held: dict[str, dict] = {}                   # ticker -> its plan the flow filter holds back
+        self.depth_hist: dict[str, collections.deque] = {}     # ticker -> (time, depth snapshot), DEPTH_KEEP_S
         self.book_seq: dict[str, int] = {}                     # ticker -> socket book updates seen
         self.dump_seq: dict[str, int] = {}                     # ticker -> book_seq its last informed sell saw
 
@@ -567,8 +574,24 @@ class Runner:
     def _on_quote(self, view):
         t = view.ladder.ticker
         self.book_seq[t] = self.book_seq.get(t, 0) + 1
-        if t in self.order_tickers() or t in self.positions_now:
+        legs = self.legs_of(t, hedges=False)
+        if legs:
+            self.note_depth(t, view.ladder, legs)
+        if legs or t in self.order_tickers() or t in self.positions_now:
             self.dirty.add(t)
+
+    def note_depth(self, t: str, ladder, legs):
+        """Others' size at each of our LIP prices (the book shows ours too) and at both touches."""
+        now = time.time()
+        books = {"yes": {round(p, 4): q for p, q in dict(ladder.yes_bids).items() if q > 0},
+                 "no": {round(p, 4): q for p, q in dict(ladder.no_bids).items() if q > 0}}
+        snap = {f"{s}_top": [max(b), b[max(b)]] if b else None for s, b in books.items()}
+        snap["at_ours"] = {f"{side}@{o['price']:g}": round(books[side].get(round(o["price"], 4), 0.0) - o["remaining"], 2)
+                           for side, o in legs}
+        dq = self.depth_hist.setdefault(t, collections.deque())
+        dq.append((now, snap))
+        while dq and dq[0][0] < now - DEPTH_KEEP_S:
+            dq.popleft()
 
     def _on_fill(self, f: dict):
         if f.get("liquidity") == "taker" or f.get("order_id") in self.gw.ioc_ids:
@@ -585,9 +608,16 @@ class Runner:
         """Book fills, then: the markets they hit are urgent, and the capital guard runs."""
         now = time.time()
         new = self.book_fills(fills)
+        sizes = self.state.get("lip_oid_size", {})
         for f in fills:
             if f.get("ticker") in new:
                 self.seen_at[f["ticker"]] = (now, f.get("time"))
+                if f.get("order_id") in sizes:
+                    hist = [(round(now - at, 3), snap) for at, snap in self.depth_hist.get(f["ticker"], ())
+                            if at >= now - FILL_CONTEXT_S]
+                    self.journal({"kind": "fill_context", "ticker": f["ticker"], "side": f["side"],
+                                  "price": f["price"], "size": f["size"], "fill_time": str(f.get("time")),
+                                  "seen": now, "depth_before": hist})
         self.positions_now = set(self.signed_positions())
         if new:
             self.urgent_set |= new

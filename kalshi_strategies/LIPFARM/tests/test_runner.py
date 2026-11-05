@@ -605,3 +605,23 @@ def test_a_busier_market_is_quoted_only_when_its_lip_pays_for_the_risk(tmp_path,
     assert "R-1-A" in r.plans and "P-1-A" not in r.plans
     assert r.flow_held["P-1-A"]["exp_loss_day"] == pytest.approx(15.0)
     assert r.est["R-1-A"] < r.plans["R-1-A"].rate / r.plans["R-1-A"].capital     # ranked net of the loss
+
+
+def test_the_ten_seconds_of_depth_before_a_lip_fill_are_journaled(tmp_path, monkeypatch):
+    books = {"Z-1-A": {"yes": {0.40: 1300.0, 0.39: 200.0}, "no": {0.50: 900.0}}}
+    r, _ = make(tmp_path, monkeypatch, books)
+    r.state["orders"] = {"Z-1-A|yes": _order("yes", 0.40, oid="o1")}
+    r.state.update(lip_oid_size={"o1": 1000}, all_oids=["o1"])
+    view = SimpleNamespace(ladder=SimpleNamespace(ticker="Z-1-A", yes_bids=books["Z-1-A"]["yes"],
+                                                  no_bids=books["Z-1-A"]["no"]))
+
+    async def go():
+        await boot(r)
+        r._on_quote(view)
+        books["Z-1-A"]["yes"][0.40] = 1050.0                                  # others pulled 250
+        r._on_quote(view)
+        r.take_fills([_fill("Z-1-A", "yes", 0.40, 1000.0, "o1", "t1")])
+    asyncio.run(go())
+    row = next(x for x in r.rows if x["kind"] == "fill_context")
+    assert [snap["at_ours"]["yes@0.4"] for _, snap in row["depth_before"]] == [300.0, 50.0]
+    assert row["depth_before"][0][1]["no_top"] == [0.5, 900.0]
