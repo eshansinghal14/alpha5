@@ -186,6 +186,11 @@ class Cfg:
                                 step=100.0, group="pricing")
     wide_spread: float = param("Wide: quote both sides at the touch, Target size, when ask - bid is at least "
                                "this.", min=0.01, max=0.98, step=0.01, group="pricing", sub="wide markets")
+    deep_keep: float = param("Wide: bid each side at the deepest price that keeps this share of its best LIP "
+                             "(LIP scores every bid at or above the reference price in full, and on a thin book "
+                             "our own size sets it; 11-05 T130: no at 7c scored as much as at 56c). A sentinel "
+                             "rides one tick above. 0 = always at the touch.", min=0.0, max=1.0, step=0.05,
+                             group="pricing", sub="wide markets")
     min_leg_price: float = param("Wide and narrow: don't quote a side bid under this. A full fill on a 2-6c leg "
                                  "was an informed dump every time, sold back at 1c (ORAN, NMAN, IDS 11-04; "
                                  "DEEPSHARE, OPENSHARE 11-05).",
@@ -398,10 +403,24 @@ def plan_market(ticker: str, others: dict[str, dict[float, float]], params: lip.
     sc = book_score(others, sized, params)
     if not sc.qualifies or sc.expected_reward_this_snapshot_usd <= 0:
         return None
-    # Per side, the sentinel layout where it keeps sentinel_keep of the touch layout's LIP.
     layout, big = {s: "touch" for s, _ in legs}, {s: p for s, p in legs}
+    # Wide: as deep as keeps deep_keep of the side's best LIP, a sentinel one tick above.
+    deep = {}
+    if mode == "wide" and cfg.deep_keep > 0:
+        for s, p in legs:
+            d = deepest_price(s, p, others, [(x, px, lots) for x, px in legs if x != s], lots, params, cfg, tick)
+            if d is not None and d < p - 1e-9:
+                deep[s] = d
+        for s, d in deep.items():
+            sent = min(round(d + tick(d), 4), next(p for x, p in legs if x == s))
+            layout[s], big[s] = "sentinel", d
+            sized = [(x, px, q) for x, px, q in sized if x != s] + [(s, sent, SENTINEL_LOTS), (s, d, lots)]
+            legs = [(x, sent if x == s else px) for x, px in legs]
+    # Per side, the sentinel layout where it keeps sentinel_keep of the touch layout's LIP.
     base = sc.expected_reward_this_snapshot_usd
     for s, p in legs:
+        if s in deep:
+            continue
         deeper = round(p - tick(p), 4)
         if deeper < 0.01:
             continue
@@ -418,6 +437,31 @@ def plan_market(ticker: str, others: dict[str, dict[float, float]], params: lip.
     return Plan(ticker, mode, tuple(legs), final.expected_reward_this_snapshot_usd,
                 lots * sum(big.values()), params.period_reward_usd / params.snapshots_per_period, lots,
                 layout, big)
+
+
+def deepest_price(s: str, touch: float, others, rest: list, lots: float, params, cfg: Cfg, tick) -> float | None:
+    """The lowest price on side `s` where `lots` keep deep_keep of the best LIP
+    available from the touch down. The score only changes at others' levels, so
+    the candidates are the touch, each lower level (joining it) and one tick
+    above each (alone), and the lowest price."""
+    lower = sorted((q for q in others[s] if q < touch - 1e-9), reverse=True)
+    cands = {touch, 0.01}
+    for lv in lower:
+        cands.add(lv)
+        up = round(lv + tick(lv), 4)
+        if up < touch - 1e-9:
+            cands.add(up)
+    scored = []
+    for c in sorted(cands, reverse=True):
+        r = book_score(others, rest + [(s, c, lots)], params)
+        if r.qualifies:
+            scored.append((c, r.expected_reward_this_snapshot_usd))
+    if not scored:
+        return None
+    best = max(v for _, v in scored)
+    if best <= 0:
+        return None
+    return min(c for c, v in scored if v >= cfg.deep_keep * best - 1e-15)
 
 
 def exit_lots(others: dict[str, dict[float, float]], cfg: Cfg, target: float) -> dict[str, float]:

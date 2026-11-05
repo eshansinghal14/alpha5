@@ -10,7 +10,7 @@ from kalshi_strategies.LIPFARM.farm import parse_book, plan_market, remove_ours
 FETCH_FLOW = farm.fetch_flow          # the real one; an autouse fixture stubs it
 P = lip.LipParams(target_size=1000, discount_factor=0.5, period_reward_usd=86.4, snapshots_per_period=86400)
 CFG = farm.Cfg(max_capital=5000, num_markets=5, min_lots_frac=0.0, sentinel_keep=2.0, dump_slip_ticks=2, chase_ticks=2, max_chase_ticks=5,
-               adverse_lots=300, exit_depth_frac=10.0, exit_depth_slip=0.03, wide_spread=0.20, min_leg_price=0.0, decided_min=0.97,
+               adverse_lots=300, deep_keep=0.0, exit_depth_frac=10.0, exit_depth_slip=0.03, wide_spread=0.20, min_leg_price=0.0, decided_min=0.97,
                min_ahead=0.0, max_position=1e9, write_tokens_per_s=5.0, scan_markets=1, scan_rotate=0, refresh_s=30,
                programs_refresh_s=600, flow_days=4.0, max_trades_day=50.0, loss_per_trade=3.0, loss_cap=30.0,
                min_lip_to_loss=2.0,
@@ -181,3 +181,17 @@ def test_flow_of_a_young_market_is_over_its_own_age(monkeypatch):
     assert FETCH_FLOW("T", 10.0)["trades_day"] == 0.6
     assert FETCH_FLOW("T", 10.0, opened=time.time() - 3 * 86400)["trades_day"] == pytest.approx(2.0)
     assert FETCH_FLOW("T", 10.0, opened=time.time() - 3600)["trades_day"] == 6.0          # at least a day
+
+
+def test_wide_bids_as_deep_as_keeps_most_of_the_lip():
+    cfg = dataclasses.replace(CFG, deep_keep=0.8, min_leg_price=0.2)
+    # T130 11-05 without our bids: 184 lots above 9c, then thin down to 5c.
+    others = {"yes": {0.10: 89.0, 0.04: 3926.0}, "no": {0.57: 11.0, 0.56: 173.0, 0.09: 2.5, 0.06: 27.0, 0.05: 3025.0}}
+    pl = plan_market("T", others, P, cfg, {}, 1000)
+    assert pl.mode == "wide" and pl.big["no"] == 0.06 and pl.legs == (("no", 0.07),)    # main 6c, sentinel 7c
+    assert pl.layout["no"] == "sentinel" and pl.capital == pytest.approx(60.0)
+    touch = plan_market("T", others, P, dataclasses.replace(cfg, deep_keep=0.0), {}, 1000)
+    assert pl.rate >= 0.8 * touch.rate
+    # Others past Target/5 above it: deep scores nothing, so it stays up top.
+    crowded = dict(others, no={0.57: 300.0, 0.56: 173.0, 0.09: 2.5, 0.06: 27.0, 0.05: 3025.0})
+    assert plan_market("T", crowded, P, cfg, {}, 1000).big["no"] >= 0.56

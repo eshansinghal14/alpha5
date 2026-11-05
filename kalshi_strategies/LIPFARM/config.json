@@ -25,6 +25,7 @@
     "skip_categories": "Sports,Mentions",
     "loss_per_trade": 3.0,
     "loss_cap": 30.0,
-    "min_lip_to_loss": 2.0
+    "min_lip_to_loss": 2.0,
+    "deep_keep": 0.8
   }
 }
