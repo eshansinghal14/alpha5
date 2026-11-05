@@ -93,7 +93,7 @@ from kalshi_infra.config import load, param, section
 from kalshi_infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
 from kalshi_infra.runtime.persist import LIVE_ROOT
 from kalshi_infra.kalshi.fees import fee as kfee
-from kalshi_infra.kalshi.orders import is_order_group_reject
+from kalshi_infra.kalshi.orders import http_status, is_order_group_reject
 from kalshi_infra.trading import lip
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -171,6 +171,7 @@ SENTINEL_LOTS = 1.1
 GROUP_LIMIT = 1
 GROUP_WINDOW_S = 15.0
 GROUP_IDLE_S = 600.0                  # a group with nothing resting this long is deleted
+GROUP_DELETES = 5                     # most deletes per cycle
 LAYOUT_HYSTERESIS = 0.1
 # Taker fee rate when a market's schedule can't be read (Kalshi's standard 0.07).
 DEFAULT_TAKER_RATE = 0.07
@@ -1029,14 +1030,22 @@ class Farm:
         if not self.live:
             return
         resting = {o.get("group") for o in self.state["orders"].values()}
+        n = 0
         for ev, g in list(self.state.get("groups", {}).items()):
             if g.get("id") in resting or time.time() - g.get("used", 0.0) < GROUP_IDLE_S:
                 continue
-            del self.state["groups"][ev]
+            # Paced from our own budget: 300+ deletes at once drew 429s on the shard ARBS shares (11-05).
+            c = self.client(self.shard(g.get("ticker") or ev.split("|")[0]))
+            if n >= GROUP_DELETES or not self.bucket.take(CANCEL_TOKENS) or not c.allow_now("cancel", reason="lipfarm:group"):
+                return
+            n += 1
             try:
-                self.client(self.shard(g.get("ticker") or ev.split("|")[0])).delete_order_group(g["id"])
+                c.delete_order_group(g["id"])
             except Exception as e:
-                print(f"group {ev} delete: {e}")
+                if http_status(e) != 404:
+                    print(f"group {ev} delete: {e}")
+                    continue
+            del self.state["groups"][ev]
 
     def place(self, t: str, side: str, price: float, lots: float, reserve: float = PLACE_RESERVE,
               reason: str = "lipfarm:quote", hedge: bool = False, sentinel: bool = False) -> bool:
