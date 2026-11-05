@@ -1089,14 +1089,18 @@ class Farm:
             held = "yes" if v > 0 else "no"
             fill_px = self.avg_cost(t, held)
             tk = self.tick(t, fill_px)
+            if t in self.dumping:
+                self.dump(t, floor=fill_px - self.cfg_slip * tk)              # informed: 2 ticks now
+                continue
+            # Other sells wait EXIT_REPRICE_S after the last: a dust sell that kept failing
+            # (429) retried each pass, ~2,000 times in 45 min (RTOR 11-05 00:23).
+            if now - self.state.get("chased", {}).get(t, 0.0) < EXIT_REPRICE_S:
+                continue
             if abs(v) <= DUST_LOTS:
                 self.dump(t, adverse=False)                                   # dust: any price
-            elif t in self.dumping:
-                self.dump(t, floor=fill_px - self.cfg_slip * tk)              # informed: 2 ticks now
             else:
                 best = max(self.books[t][held]) if self.books[t][held] else 0.0
-                if (best <= fill_px - self.cfg_chase * tk + 1e-9
-                        and now - self.state.get("chased", {}).get(t, 0.0) >= EXIT_REPRICE_S):
+                if best <= fill_px - self.cfg_chase * tk + 1e-9:
                     self.dump(t, floor=best - self.cfg_slip * tk, adverse=False)   # still moving: chase
         self.dumping &= set(self.free_positions())
         pos = self.free_positions()

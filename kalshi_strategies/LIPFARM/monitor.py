@@ -4,7 +4,7 @@ Prints what changed since the last run to data/live/lipfarm_monitor.log and
 disarms the farm (as the dashboard button does: every farm order pulled,
 positions kept) when a rule hits, with an SNS alert:
   - fill P&L since monitoring began, marked at current bids, under LOSS_TOTAL
-  - one new fill marked under LOSS_ONE
+  - one market's new fills, netted with its earlier ones, marked under LOSS_ONE
   - exposure over MAX_EXPOSURE
   - ARBS halted, or its position audit disagrees with Kalshi
   - more than MAX_TRACEBACKS new tracebacks in the farm's error log
@@ -70,11 +70,18 @@ def main():
     new = [f for f in fills if f.get("trade_id") not in seen]
     pnl = marked_pnl([f for f in fills if f.get("trade_id") not in base], cache)
     lines, worst = [], 0.0
-    for f in new:
-        one = marked_pnl([f], cache)
+    since = [f for f in fills if f.get("trade_id") not in base]
+    for t in sorted({f["ticker"] for f in new}):
+        # A market's change, not each fill alone: an exit marked by itself looked like
+        # a $138 loss when, netted with the fill it closed, it was $14 (TJAC 11-05).
+        mine = [f for f in since if f["ticker"] == t]
+        one = marked_pnl(mine, cache) - marked_pnl([f for f in mine if f.get("trade_id") in seen], cache)
         worst = min(worst, one)
-        lines.append(f"  {str(f.get('time'))[11:19]} {f['ticker']} {f['side']} @{f['price']} x{f['size']:g} "
-                     f"{f.get('liquidity')} fee {f.get('fee') or 0:.3f} -> {one:+.2f} at today's bid")
+        lines.append(f"  {t}: {one:+.2f} at today's bids")
+        for f in new:
+            if f["ticker"] == t:
+                lines.append(f"    {str(f.get('time'))[11:19]} {f['side']} @{f['price']} x{f['size']:g} "
+                             f"{f.get('liquidity')} fee {f.get('fee') or 0:.3f}")
     err_path = os.path.join(LIVE_ROOT, "lipfarm.err.log")
     tb = open(err_path).read().count("Traceback") if os.path.exists(err_path) else 0
     a = json.load(open(max(glob.glob(os.path.join(LIVE_ROOT, "ARBS", "*", "summary.json")), key=os.path.getmtime)))
@@ -95,7 +102,7 @@ def main():
         if pnl < LOSS_TOTAL:
             why.append(f"fill P&L since monitoring began ${pnl:.2f} < ${LOSS_TOTAL:.0f}")
         if worst < LOSS_ONE:
-            why.append(f"a fill marked ${worst:.2f} (< ${LOSS_ONE:.0f})")
+            why.append(f"one market's new fills marked ${worst:.2f} (< ${LOSS_ONE:.0f})")
         if s.get("exposure_usd", 0) > MAX_EXPOSURE:
             why.append(f"exposure ${s['exposure_usd']:.0f} > ${MAX_EXPOSURE:.0f}")
         if a.get("halt_reason") or a.get("audit_diff"):
