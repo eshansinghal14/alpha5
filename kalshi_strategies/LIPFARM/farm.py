@@ -109,12 +109,14 @@ CLAIMS_PATH = os.path.join(ROOT, "live", "claimed.json")
 CLAIM_SETTLE_S = 3.0
 # Kalshi pays nothing for a market-period whose LIP is under $1 (help article).
 LIP_MIN_PAYOUT_USD = 1.0
-# Our writes share ARBS's shard bucket (300 tokens/s on shard 0, 2026-11-04;
-# ARBS drained it to refusals that day). A new quote goes out only with this
-# fraction of the bucket left after it, a back-of-queue move only with
-# MOVE_RESERVE: we spend what ARBS isn't using. Cancels always go.
-PLACE_RESERVE = 0.5
-MOVE_RESERVE = 0.8
+# Our writes share ARBS's shard bucket (300 tokens/s on shard 0); ARBS caps itself
+# at 250/s and our own bucket (write_tokens_per_s) is what bounds us. A new quote
+# goes out only with this fraction of the shard's bucket left after it, a
+# back-of-queue move with MOVE_RESERVE: just enough that a write never meets an
+# empty bucket. At 0.5 / 0.8, with ARBS holding the shard near 155 (11-05), 259
+# bids were refused in an hour and moves never ran. Cancels always go.
+PLACE_RESERVE = 0.1
+MOVE_RESERVE = 0.15
 # Between cycles, every GUARD_S each quoted market's book is re-read: a quote
 # its market's plan no longer has is pulled, and one with MOVE_BEHIND_FRAC *
 # lots joined behind it is re-placed at the back (cancel + create, 12 tokens;
@@ -135,11 +137,11 @@ TRIP_COOLDOWN_S = 60.0
 FLOW_TTL_S = 3600.0
 FLOW_QUEUE = 40
 MOVE_MIN_S = 5.0
-MOVE_BEHIND_FRAC = 0.2
-# Moves come before new bids (crowded touches, sentinels), but at most this
-# many a pass: 5 x 12 tokens / 5 s = 12 of our 30 tokens/s, so new bids keep
-# the rest (10 a pass drained the bucket, 11-04 21:40).
-MAX_MOVES = 5
+MOVE_BEHIND_FRAC = 0.05
+# At most this many moves a pass, most size behind first: 10 x 12 tokens / 5 s =
+# 24 of our 40 tokens/s, leaving the rest for new bids and re-pricing (10 a pass
+# drained a 30/s bucket with a 120 burst, 11-04 21:40; it's 40/s and 300 now).
+MAX_MOVES = 10
 # Our bucket's burst: 30 orders at once, so a cycle's bids (with group creates and
 # sentinels) go out together. At 12, 65 bids a day were refused with the shard
 # at 211-249 of 300 tokens (11-05); only ARBS and LIPFARM write on shard 0 now.

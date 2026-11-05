@@ -531,13 +531,13 @@ def test_sync_keeps_a_resting_order_the_list_missed_and_cancels_orphans(tmp_path
 
 
 def test_moves_go_to_the_back_only_with_size_behind_and_are_capped(tmp_path, monkeypatch):
-    books = {f"Z-1-{i}": {"yes": {0.40: 3000.0}, "no": {0.30: 900.0}} for i in range(8)}
+    books = {f"Z-1-{i}": {"yes": {0.40: 3000.0}, "no": {0.30: 900.0}} for i in range(14)}
     r, c = make(tmp_path, monkeypatch, books)
     old = time.time() - 60
-    r.state["orders"] = {f"Z-1-{i}|yes": _order("yes", 0.40, oid=f"o{i}", placed=old) for i in range(8)}
+    r.state["orders"] = {f"Z-1-{i}|yes": _order("yes", 0.40, oid=f"o{i}", placed=old) for i in range(14)}
     r.plans = {t: _plan(t, "wide", (("yes", 0.40),), capital=400.0) for t in books}
     r.books = {t: r.ws_others(t) for t in books}
-    ahead = {f"o{i}": (3000.0 if i == 0 else 1000.0) for i in range(8)}      # Z-1-0: nothing behind it
+    ahead = {f"o{i}": (3000.0 if i == 0 else 1000.0) for i in range(14)}      # Z-1-0: nothing behind it
     monkeypatch.setattr(farm, "queue_ahead", lambda c, ts: ahead)
 
     async def go():

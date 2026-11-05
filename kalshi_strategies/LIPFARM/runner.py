@@ -1456,16 +1456,21 @@ class Runner:
         except Exception as e:
             print(f"queue positions: {e}")
             return
-        moves = 0
-        for k, others in sorted(due.items(), key=lambda kv: self.state["orders"].get(kv[0], {}).get("placed", 0)):
+        moves, ranked = 0, []
+        for k, others in due.items():
+            o = self.state["orders"].get(k)
+            a = None if o is None else ahead.get(o["oid"])
+            if a is None:
+                continue
+            t, side = unkey(k)
+            behind = others[side].get(round(o["price"], 4), 0.0) - a
+            if behind >= (1.0 if is_sentinel(k) else MOVE_BEHIND_FRAC * o["size"]):
+                ranked.append((behind, k))
+        for behind, k in sorted(ranked, reverse=True):
             o = self.state["orders"].get(k)
             if o is None:
                 continue
             t, side = unkey(k)
-            a = ahead.get(o["oid"])
-            behind = others[side].get(round(o["price"], 4), 0.0) - (a or 0.0)
-            if a is None or behind < (1.0 if is_sentinel(k) else MOVE_BEHIND_FRAC * o["size"]):
-                continue
             cl = self.gw.client(t)
             if (moves >= MAX_MOVES or cl is None or not self.bucket.has(ORDER_TOKENS + CANCEL_TOKENS)
                     or not cl.can_afford("order", reserve=MOVE_RESERVE * cl.tokens_per_s + cl.COST["cancel"])):
