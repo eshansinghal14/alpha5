@@ -39,6 +39,10 @@ def _compact_bids(bids: str) -> str:
     return " · ".join(out)
 
 
+# The ticker is the URL's fragment (farm.kalshi_url); links open in a new tab.
+_LINK = st.column_config.LinkColumn(width="medium", display_text=r"#(.+)$")
+
+
 def _by_market(p: pd.DataFrame) -> pd.DataFrame:
     """One row per market from status.json's per-side positions, which split each
     yes+no pair's $1 half to each side (so a side alone reads as a big win or loss)."""
@@ -51,7 +55,7 @@ def _by_market(p: pd.DataFrame) -> pd.DataFrame:
                  if lots.get(s, 0.0) - paired >= 0.01]
         cost = float((g["cost"] + g["fees"]).sum())
         value = float(g["value"].sum())
-        rows.append({"market": t, "paired": paired, "open": ", ".join(open_) or "-",
+        rows.append({"market": g["url"].iloc[0] if "url" in g else t, "paired": paired, "open": ", ".join(open_) or "-",
                      "cost $": cost, "value $": value, "P&L $": value - cost})
     return pd.DataFrame(rows).sort_values("P&L $")
 
@@ -130,14 +134,14 @@ def render(page: str, stale_fn):
             st.caption("None resting.")
         else:
             view = pd.DataFrame({
-                "market": q["ticker"],
+                "market": q["url"] if "url" in q else q["ticker"],
                 "m": q["mode"].map({"wide": "W", "decided": "D", "narrow": "N", "hedge": "X"}).fillna(""),
                 "quote": q["bids"].map(_compact_bids),
                 "$/min": q["our_usd_day"] / 1440, "pool/min": q["pool_usd_day"] / 1440,
                 "period $": q.get("period_lip_usd", 0.0), "LIP $": q["exp_lip_usd"], "cap $": q["capital_usd"]})
             num = st.column_config.NumberColumn
             st.dataframe(view, hide_index=True, use_container_width=True, column_config={
-                "market": st.column_config.TextColumn(width="medium"),
+                "market": _LINK,
                 "m": st.column_config.TextColumn(width="small", help="W wide, D decided, N narrow (exit-liquidity sized), X exit only"),
                 "quote": st.column_config.TextColumn(width="medium", help="⚑ = 1.1-lot sentinel one tick above, "
                                                                           "in the bid's order group"),
@@ -150,6 +154,7 @@ def render(page: str, stale_fn):
             st.caption("No fills.")
         else:
             st.dataframe(_by_market(p), hide_index=True, use_container_width=True, column_config={
+                "market": _LINK,
                 "paired": st.column_config.NumberColumn(format="%.0f", help="yes+no pairs: worth $1 each at settlement"),
                 "open": st.column_config.TextColumn(help="Unpaired contracts left, marked at today's bid"),
                 "cost $": st.column_config.NumberColumn(format="%.2f", help="Everything paid, fees included"),

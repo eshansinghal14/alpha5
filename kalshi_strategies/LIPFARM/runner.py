@@ -176,6 +176,7 @@ class Runner:
         self.n_refused, self.last_refused_log = 0, 0.0
         self.marks_at = 0.0
         self.categories: dict[str, str] = {}  # series -> category
+        self.series_titles: dict[str, str] = {}
         self.flow_pool = cf.ThreadPoolExecutor(1, thread_name_prefix="lipfarm-flow")
         self.flow_futs: dict[str, cf.Future] = {}
         self._open_mode(False)
@@ -239,7 +240,8 @@ class Runner:
         if baskets is not None:
             self.baskets = baskets
         if cats:
-            self.categories = cats
+            self.categories = {k: v["category"] for k, v in cats.items()}
+            self.series_titles = {k: v["title"] for k, v in cats.items()}
         self.last_programs = time.time()
 
     def our_rate(self, t: str, others, P) -> float:
@@ -440,6 +442,10 @@ class Runner:
         if f is None:
             return None
         return f["trades_day"] <= cfg.max_trades_day + 1e-9
+
+    def url(self, t: str) -> str:
+        ev = self.meta.get(t, {}).get("event_ticker") or event_of(t)
+        return farm.kalshi_url(t, ev, self.series_titles.get(ev.split("-")[0], ""))
 
     def category(self, t: str) -> str:
         ev = self.meta.get(t, {}).get("event_ticker") or event_of(t)
@@ -1582,6 +1588,7 @@ class Runner:
             p["fees"] += f["fee"] or 0.0
         for (t, side), p in pos.items():
             m = self.meta.get(t, {})
+            p["url"] = self.url(t)
             res = m.get("result")
             pair = min(p["lots"], pos.get((t, "no" if side == "yes" else "yes"), {}).get("lots", 0.0))
             p["mark"] = (1.0 if res == side else 0.0) if res in ("yes", "no") else float(
@@ -1597,7 +1604,7 @@ class Runner:
             legs = sorted(self.legs_of(t), key=lambda so: so[0])
             hedged = {unkey(k)[1] for k in self.state["orders"] if is_hedge(k) and unkey(k)[0] == t}
             pl = self.plans.get(t)
-            rows.append({"ticker": t, "mode": pl.mode if pl else ("hedge" if hedged else ""),
+            rows.append({"ticker": t, "url": self.url(t), "mode": pl.mode if pl else ("hedge" if hedged else ""),
                          "bids": " + ".join(f"{s}@{o['price']:.3f}x{o['remaining']:g}" for s, o in legs),
                          "layout": ",".join(f"{s}:{l}" for s, l in sorted((pl.layout if pl else {}).items())),
                          "resting": sum(o["remaining"] for _, o in legs),

@@ -75,6 +75,7 @@ import concurrent.futures as cf
 import dataclasses
 import json
 import math
+import re
 import os
 import threading
 import time
@@ -557,10 +558,19 @@ def fetch_flow(t: str, days: float, opened: float | None = None) -> dict | None:
     return {"trades_day": len(tr) / span, "days": days, "at": time.time()}
 
 
-def load_categories() -> dict[str, str]:
-    """Series ticker -> category."""
+def load_categories() -> dict[str, dict]:
+    """Series ticker -> {category, title}."""
     d = read("/trade-api/v2/series", params={"include_product_metadata": "false"})
-    return {x["ticker"]: x.get("category") or "" for x in d.get("series") or []}
+    return {x["ticker"]: {"category": x.get("category") or "", "title": x.get("title") or ""}
+            for x in d.get("series") or []}
+
+
+def kalshi_url(ticker: str, event: str, series_title: str = "") -> str:
+    """The market's page on kalshi.com (series / title slug / event); the ticker
+    rides in the fragment so the dashboard can show it as the link text."""
+    ser = event.split("-")[0].lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", series_title.lower()).strip("-") or ser
+    return f"https://kalshi.com/markets/{ser}/{slug}/{event.lower()}#{ticker}"
 
 
 def refresh_job(held: set[str]) -> tuple[dict, dict, dict, dict | None]:
