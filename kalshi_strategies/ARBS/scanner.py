@@ -24,7 +24,7 @@ relationships in the hand spec's format, written to scanned_spec.json.
 Every such event is listed except those off scan.shards and series another
 strategy trades (the position audit would read its contracts as ours).
 `select` picks what the runner trades: within trading.days_till_expiry, the
-most traded events until scan.max_markets markets.
+most traded events per market until scan.max_markets markets.
 
     python -m kalshi_strategies.ARBS.scanner [root]   # one scan + selection, as the runner runs it
 """
@@ -263,12 +263,19 @@ def select(doc: dict, *, now: pd.Timestamp, days: float, max_markets: int, known
            held: set[str] = frozenset(), exclude: set[str] = frozenset(),
            yield_events: set[str] = frozenset()) -> dict:
     """The part of a scan to trade: relationships settling within `days`, the
-    most traded first, until max_markets markets beyond `known_tickers`.
-    Relationships holding a basket in `held` are always kept; otherwise one
-    with a leg in `yield_events` (another strategy's) is skipped."""
+    most traded per market first, until max_markets markets beyond
+    `known_tickers`. Relationships holding a basket in `held` are always kept;
+    otherwise one with a leg in `yield_events` (another strategy's) is skipped."""
+    # Per market, not in total: on 11-05 a 400-market Nasdaq ladder and the
+    # 14-market election-margin ladders outranked 3-market games trading
+    # $40-110k a day, and only 10 games within 36 h made the budget (32 per market).
+    def per_market(r):
+        n = len({l["ticker"] for b in r["baskets"] for l in b["legs"]})
+        return (r.get("volume_24h") or 0.0) / max(n, 1)
+
     horizon = now + pd.Timedelta(days=days)
     out, used = [], set()
-    for r in sorted(doc["relationships"], key=lambda r: -(r.get("volume_24h") or 0.0)):
+    for r in sorted(doc["relationships"], key=lambda r: -per_market(r)):
         ts = {l["ticker"] for b in r["baskets"] for l in b["legs"]} - known_tickers
         if any(b["basket_id"] in held for b in r["baskets"]):
             out.append(r)

@@ -98,6 +98,14 @@ def test_filters_and_market_budget():
     assert {b.relationship_id for b in parse_spec(doc)} == {"mecnet:SM-1"}
 
 
+def test_budget_goes_by_volume_per_market():
+    # LAD trades more in total (1,200 vs 600) but less per market (200 vs 300).
+    lad = event("LAD-1", "MECNET", [mkt(f"LAD-1-{c}", vol=200) for c in "ABCDEF"])
+    game = event("G-1", "MECNET", [mkt("G-1-A", vol=300), mkt("G-1-B", vol=300)])
+    doc = run([lad, game], max_markets=6)
+    assert {b.relationship_id for b in parse_spec(doc)} == {"mecnet:G-1"}
+
+
 def test_scan_lists_everything_and_select_keeps_held():
     far = event("FAR-1", "MECNET", [mkt("FAR-1-A"), mkt("FAR-1-B", expected_expiration_time="2027-06-01T00:00:00Z")])
     big = event("BIG-1", "MECNET", [mkt("BIG-1-A", vol=500), mkt("BIG-1-B", vol=500)])
