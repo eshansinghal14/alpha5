@@ -81,6 +81,12 @@ FILL_CONTEXT_S = 10.0
 # Accuracy test for levels.Levels: every QUEUE_CHECK_S, Kalshi's size ahead of
 # each of our LIP bids vs the size ahead our reconstruction of the level gives.
 QUEUE_CHECK_S = 60.0
+# A side whose resting bids earn under REPRICE_FRAC of what its plan would there
+# is re-placed at once, not at the next cycle (11-05 FOC-40: others stacked Target
+# at the sentinel's level and the bid a tick under scored nothing), at most once
+# per REPRICE_MIN_S per side so bots stepping over us don't start a write war.
+REPRICE_FRAC = 0.5
+REPRICE_MIN_S = 30.0
 # Manual holds (an operator or agent writes holds.json: {ticker: {"until": epoch, "why": str}}):
 # our LIP bids there are pulled and kept off until then; exits are untouched. Re-read this often.
 HOLDS_S = 5.0
@@ -211,6 +217,7 @@ class Runner:
         self.flow_held: dict[str, dict] = {}                   # ticker -> its plan the flow filter holds back
         self.depth_hist: dict[str, collections.deque] = {}     # ticker -> (time, depth snapshot), DEPTH_KEEP_S
         self.levels = Levels()
+        self.repriced_at: dict[tuple, float] = {}              # (ticker, side) -> last guard re-place
         self.queue_err: collections.deque = collections.deque(maxlen=500)   # |inferred - actual| ahead, last checks
         self.book_seq: dict[str, int] = {}                     # ticker -> socket book updates seen
         self.dump_seq: dict[str, int] = {}                     # ticker -> book_seq its last informed sell saw
@@ -1169,7 +1176,34 @@ class Runner:
             print(f"guard: pull {k} @{o['price']} (not in its plan now)")
             self.cancel(k, reason="lipfarm:guard")
             self.state.setdefault("cooldown", {})[t] = time.time() + GUARD_COOLDOWN_S
+        if pl:
+            self.reprice(t, pl, others, P)
         self.rates[t] = self.our_rate(t, others, P)
+
+    def reprice(self, t: str, pl: farm.Plan, others: dict, P):
+        """Re-place a side now when its resting bids earn under REPRICE_FRAC of its plan's."""
+        want, now = desired_orders(pl), time.time()
+        for s in {s for s, _ in pl.legs}:
+            mine = [(k, o) for k, o in self.state["orders"].items()
+                    if unkey(k)[0] == t and unkey(k)[1] == s and not is_hedge(k) and o.get("oid")]
+            ws = {k: w for k, w in want.items() if unkey(k)[1] == s}
+            if not mine or now - self.repriced_at.get((t, s), 0.0) < REPRICE_MIN_S:
+                continue
+            if all(k in self.state["orders"] and abs(self.state["orders"][k]["price"] - w[0]) < 1e-9
+                   and abs(self.state["orders"][k]["size"] - w[1]) < 1e-9 for k, w in ws.items()):
+                continue
+            cur = farm.market_rate(others, [(s, o["price"], o["remaining"]) for _, o in mine], P)
+            new = farm.market_rate(others, [(s, px, q) for px, q, _ in ws.values()], P)
+            if new <= 0 or cur >= REPRICE_FRAC * new:
+                continue
+            self.repriced_at[(t, s)] = now
+            print(f"reprice: {t} {s} earns {cur * 86400:.2f}/day vs {new * 86400:.2f} as planned; re-placing")
+            for k, _ in mine:
+                self.cancel(k, reason="lipfarm:reprice")
+            for k in [k for k in self.wanted if unkey(k)[0] == t and unkey(k)[1] == s]:
+                del self.wanted[k]
+            self.wanted.update(ws)
+            self.spawn(self.place_side(t, s, ws, 0.0), t)
 
     def capital_check(self):
         exp = self.exposure()

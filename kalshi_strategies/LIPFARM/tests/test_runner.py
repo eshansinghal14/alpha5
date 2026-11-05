@@ -647,3 +647,21 @@ def test_a_hold_pulls_our_lip_bids_and_keeps_the_market_off_until_it_ends(tmp_pa
     assert list(r.state["orders"]) == ["Z-1-A|no|h"]                     # the exit stays
     assert r.state["cooldown"]["Z-1-A"] == until
     assert [x[1:] for x in c.calls if x[1] == "cancel"] == [("cancel", "Z-1-A", "a")]
+
+
+
+def test_a_side_scoring_nothing_is_re_placed_at_once(tmp_path, monkeypatch):
+    # FOC-40 11-05: others stacked 1824 (past Target) at the sentinel's 63c; our bid at 62c scored 0.
+    books = {"Z-1-A": {"yes": {0.63: 1825.1, 0.62: 2700.0, 0.58: 20034.0}, "no": {0.34: 2591.0, 0.32: 36.0}}}
+    r, c = make(tmp_path, monkeypatch, books)
+    r.state["groups"] = {"Z-1": {"id": "g1", "tripped": False, "fills": [], "used": time.time()}}
+    r.state["orders"] = {"Z-1-A|yes|s": _order("yes", 0.63, size=1.1, oid="s"),
+                         "Z-1-A|yes": _order("yes", 0.62, size=1000, oid="m")}
+
+    async def go():
+        await boot(r)
+        r.guard_market("Z-1-A", r.ws_others("Z-1-A"), CFG)
+        await settle(r)
+    asyncio.run(go())
+    assert {x[3] for x in c.calls if x[1] == "cancel"} == {"s", "m"}
+    assert [x[1:5] for x in c.calls if x[1] == "rest"] == [("rest", "Z-1-A", "yes", 0.63)]
