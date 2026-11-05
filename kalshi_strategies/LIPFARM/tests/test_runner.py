@@ -665,3 +665,24 @@ def test_a_side_scoring_nothing_is_re_placed_at_once(tmp_path, monkeypatch):
     asyncio.run(go())
     assert {x[3] for x in c.calls if x[1] == "cancel"} == {"s", "m"}
     assert [x[1:5] for x in c.calls if x[1] == "rest"] == [("rest", "Z-1-A", "yes", 0.63)]
+
+
+def test_an_adverse_fill_pulls_its_whole_event_for_event_pull_s(tmp_path, monkeypatch):
+    books = {"F-1-40": {"yes": {0.60: 2000.0}, "no": {0.34: 900.0}},
+             "F-1-45": {"yes": {0.56: 2000.0}, "no": {0.43: 900.0}},
+             "G-1-A": {"yes": {0.50: 2000.0}, "no": {0.40: 900.0}}}
+    r, c = make(tmp_path, monkeypatch, books)
+    r.cfg = dataclasses.replace(CFG, event_pull_s=1800.0)
+    r.state["orders"] = {"F-1-40|no": _order("no", 0.34, oid="a", group=None),
+                         "F-1-45|no": _order("no", 0.43, oid="b", group=None),
+                         "G-1-A|no": _order("no", 0.40, oid="g", group=None)}
+    r.state.update(lip_oid_size={"a": 1000, "b": 1000, "g": 1000}, hedged_oids=["a"], all_oids=["a", "b", "g"])
+
+    async def go():
+        await boot(r)
+        r._on_fill(_fill("F-1-40", "no", 0.34, 730.0, "a", "t1"))
+        await settle(r)
+    asyncio.run(go())
+    cool = r.state["cooldown"]
+    assert cool["F-1-45"] > time.time() + 1700 and cool["F-1-40"] > time.time() + 1700
+    assert "F-1-45|no" not in r.state["orders"] and "G-1-A|no" in r.state["orders"]    # other events untouched

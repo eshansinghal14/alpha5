@@ -246,6 +246,11 @@ class Cfg:
                                  "that the rest waits on a passive exit. 11-04 sweeps of 300+ lots: a further "
                                  "fall of up to ~5c in 10 s kept falling (holding lost 2-6c), one of 6c+ came "
                                  "back (holding gained 6-26c).", min=0, max=99, step=1, group="exits")
+    event_pull_s: float = param("After an adverse fill or a sentinel trip, every market in its event is off this "
+                                "long. 14-day tape (10-22..11-05): another market in the event was swept "
+                                "adversely within 5 min of an adverse sweep 15% of the time vs 3% at random, "
+                                "30 min 32% vs 17%, 1 h 43% vs 33% (FOC-40 then FOC-45, 23 min apart, 11-05).",
+                                min=0.0, max=7200.0, step=300.0, group="exits")
     # ---- operations ----
     write_tokens_per_s: float = param("Our write budget (tokens/s; an order 10, a cancel 2) out of the 300 the "
                                       "shard shares with ARBS, which caps itself at 150-250. 11-04: our "

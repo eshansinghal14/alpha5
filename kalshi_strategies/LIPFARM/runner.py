@@ -413,12 +413,37 @@ class Runner:
             if o in sent or q >= lim - 1e-9:
                 self.state["adverse_oids"].append(o)
                 self.dumping.add(tick[o])
+                self.pull_event(tick[o])
                 if o in sent:
                     # Its fill tripped the event's group (group_fill): Kalshi pulled the bids.
-                    self.state.setdefault("cooldown", {})[tick[o]] = time.time() + TRIP_COOLDOWN_S
+                    self.cool(tick[o], TRIP_COOLDOWN_S)
                     print(f"sentinel: {sent[o]} cleared; its market is pulled for {TRIP_COOLDOWN_S:.0f} s")
                 else:
                     print(f"adverse: {tick[o]} filled {q:.0f} of {sizes[o]:.0f}")
+
+    def cool(self, t: str, span: float):
+        """Keep t off for `span` from now, never shortening a longer cooldown (an event pull)."""
+        c = self.state.setdefault("cooldown", {})
+        c[t] = max(c.get(t, 0.0), time.time() + span)
+
+    def pull_event(self, t: str):
+        """Every market in t's event off for cfg.event_pull_s; our bids there go once
+        the filled market's exit is out (evaluate handles `pull`)."""
+        span = self.cfg.event_pull_s if self.cfg is not None else 0.0
+        if span <= 0:
+            return
+        ev = self.meta.get(t, {}).get("event_ticker") or event_of(t)
+        until, cool = time.time() + span, self.state.setdefault("cooldown", {})
+        hit = sorted({x for x in self.programs if (self.meta.get(x, {}).get("event_ticker") or event_of(x)) == ev}
+                     | {t})
+        for x in hit:
+            cool[x] = max(cool.get(x, 0.0), until)
+            if x != t and self.keys_of(x, hedges=False):
+                self.pull.add(x)
+                if self.dirty is not None:
+                    self.dirty.add(x)
+        self.journal({"kind": "event_pull", "event": ev, "from": t, "markets": hit, "until": until})
+        print(f"event pull: {ev} ({len(hit)} markets) off for {span / 60:.0f} min after the fill on {t}")
 
     def accrue(self):
         now = time.time()
@@ -921,7 +946,7 @@ class Runner:
         tickers = sorted({unkey(k)[0] for k in gone})
         for t in tickers:
             self.pull.add(t)
-            self.state.setdefault("cooldown", {})[t] = time.time() + TRIP_COOLDOWN_S
+            self.cool(t, TRIP_COOLDOWN_S)
         if self.dirty is not None:
             self.dirty |= set(tickers)       # urgent (the filled market) goes first
         self.journal({"kind": "group_trip", "group": gid, "why": why, "markets": tickers})
@@ -1107,7 +1132,7 @@ class Runner:
         cancels = [k for k in self.keys_of(t) if is_hedge(k)]
         if adverse and abs(v) > DUST_LOTS:
             cancels += self.keys_of(t, hedges=False)
-            self.state.setdefault("cooldown", {})[t] = time.time() + TRIP_COOLDOWN_S
+            self.cool(t, TRIP_COOLDOWN_S)
         need, cum, worst = abs(v), 0.0, None
         for p in sorted(self.books[t][held], reverse=True):
             if floor is not None and p < floor - 1e-9:
@@ -1177,7 +1202,7 @@ class Runner:
                 continue
             print(f"guard: pull {k} @{o['price']} (not in its plan now)")
             self.cancel(k, reason="lipfarm:guard")
-            self.state.setdefault("cooldown", {})[t] = time.time() + GUARD_COOLDOWN_S
+            self.cool(t, GUARD_COOLDOWN_S)
         if pl:
             self.reprice(t, pl, others, P)
         self.rates[t] = self.our_rate(t, others, P)
