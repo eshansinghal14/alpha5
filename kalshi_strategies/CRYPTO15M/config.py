@@ -83,7 +83,8 @@ class UpDownPricingParams:
     min_rv_seconds: int = param(
         "Withhold until the coin's RV has this many 1s samples (cold start without persisted bars).",
         min=0, step=60)
-    min_trade_tau_s: float = param("Block both sides with fewer than this many seconds to close.",
+    min_trade_tau_s: float = param("Block both sides with fewer than this many seconds to close (quotes only "
+                                   "while enable_taking is on: takes run to the close).",
                                    min=0, step=5)
     tradeable_min: float = param(
         "Block when the fair or the Kalshi touch is below this. These markets tick 0.1c under 0.10 and "

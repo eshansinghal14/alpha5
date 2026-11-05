@@ -106,6 +106,9 @@ class Quoter:
         self.model = model
         self.fees = fees
         self.close_time = close_time
+        # When this event's trading time starts (the session sets it): for
+        # takes_only through real_trading_delay_s.
+        self.open_time: pd.Timestamp | None = None
         self.lip = lip
         self.record_debug = record_debug
 
@@ -321,11 +324,16 @@ class Quoter:
         return e * math.sqrt(ref / max(left, 1.0))
 
     def takes_only(self, now: pd.Timestamp) -> bool:
-        """Inside real_trading_cutoff_s with taking on: the session stays armed
-        for takes and quotes (edge and LIP) are withdrawn, real or paper."""
-        cut = self.cfg.trading_time.real_trading_cutoff_s
-        return (self.cfg.quoting.enable_taking and cut > 0 and self.close_time is not None
-                and (self.close_time - now).total_seconds() <= cut)
+        """Inside real_trading_cutoff_s or real_trading_delay_s with taking on:
+        the session stays armed for takes and quotes (edge and LIP) are
+        withdrawn, real or paper."""
+        if not self.cfg.quoting.enable_taking:
+            return False
+        tt = self.cfg.trading_time
+        cut, delay = tt.real_trading_cutoff_s, tt.real_trading_delay_s
+        in_cut = cut > 0 and self.close_time is not None and (self.close_time - now).total_seconds() <= cut
+        in_delay = delay > 0 and self.open_time is not None and (now - self.open_time).total_seconds() < delay
+        return in_cut or in_delay
 
     def _alt_signal_age(self) -> float | None:
         fn = getattr(self.model, "signal_age_alt_s", None)

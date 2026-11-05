@@ -100,7 +100,12 @@ def test_tail_and_close_blocks():
     assert m.side_block(m.ticker, "yes", f, now) is None
     m.on_book(_Book(m.ticker, 0.03, 0.05))
     assert m.side_block(m.ticker, "yes", f, now) == "book_in_tail"
+    m.cfg.quoting.enable_taking = False
     assert m.side_block(m.ticker, "yes", f, m.window.T - 5) == "near_close"
+    m.cfg.quoting.enable_taking = True                    # taking on: the last seconds only pull quotes
+    m.on_book(_Book(m.ticker, 0.48, 0.52))
+    assert m.side_block(m.ticker, "yes", f, m.window.T - 5) is None
+    assert m.quote_block(m.ticker, m.window.T - 5) == "near_close"
 
 
 def test_burst_pulls_own_coin_only():

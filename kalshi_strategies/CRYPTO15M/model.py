@@ -521,7 +521,8 @@ class UpDownModel:
 
     def side_block(self, ticker, side, fair, now_s):
         p = self.cfg.pricing
-        if self.window.T - now_s < p.min_trade_tau_s:
+        # With taking on, the last min_trade_tau_s only pulls quotes (quote_block).
+        if self.window.T - now_s < p.min_trade_tau_s and not self.cfg.quoting.enable_taking:
             return "near_close"
         # Outside [0.10, 0.90] these markets tick in 0.1c, which the shared book
         # and quoter round to whole cents; prices there are not trustworthy.
@@ -553,6 +554,8 @@ class UpDownModel:
         return mono < self._cme_pull_until[side]
 
     def quote_block(self, ticker, now_s):
+        if self.window.T - now_s < self.cfg.pricing.min_trade_tau_s:
+            return "near_close"
         until = (self.spot.burst_until_by_coin.get(self.coin, 0.0) if self.cfg.pricing.burst_own_coin_only
                  else self.spot.burst_until)
         mono = time.monotonic()

@@ -1735,3 +1735,15 @@ def test_separate_take_position_has_no_lean_and_its_own_cap():
     assert takes(ctx) == []
     r = q.debug_log[-1]
     assert r["lean_bid"] == pytest.approx(0.0)      # quotes don't lean on the take position (portfolio has none here)
+
+
+def test_inside_the_opening_delay_taking_keeps_going_and_quotes_stay_off():
+    c = cfg()
+    c.trading_time = P.TradingTimeParams(real_trading_delay_s=10.0, real_trading_cutoff_s=0.0)
+    q, ctx = Quoter(c, Model(), FREE, close_time=None), Ctx()
+    q.open_time = T0 - pd.Timedelta(seconds=3)
+    step(q, ctx, {"A": Fair(0.60, 0.59, 0.61)}, Book("A", 0.40, 0.55))
+    assert len(takes(ctx)) == 1 and ladder(ctx, "yes") == []
+    q.open_time = T0 - pd.Timedelta(seconds=30)                  # delay over: quotes back
+    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, Book("A", 0.40, 0.60), dt=1.0)
+    assert ladder(ctx, "yes")
