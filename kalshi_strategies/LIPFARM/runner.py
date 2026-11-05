@@ -122,8 +122,13 @@ def plan_batch(jobs: list[tuple]) -> dict[str, tuple]:
 class Runner(Farm):
     """Farm's state, ranking and plan helpers; its own I/O, all async."""
 
-    def __init__(self, root: str = ROOT, shadow_only: bool = False, sim: bool = True):
+    def __init__(self, root: str = ROOT, shadow_only: bool = False, sim: bool = True,
+                 beside: str | None = None):
         self.root = root
+        # Side-by-side test: the live farm's state.json, whose resting bids are
+        # taken out of every book (it would otherwise look like others' size).
+        self.beside = beside
+        self.ghosts: dict[str, list] = {}
         self.shadow_only = shadow_only
         self.sim = sim
         super().__init__()
@@ -240,6 +245,24 @@ class Runner(Farm):
             self.gw.shard_of = shards           # no clients: nothing is ever sent
             return
         await self.run_io(self.gw.setup, shards, None)
+
+    def others_of(self, t: str, ob) -> dict[str, dict[float, float]]:
+        others = super().others_of(t, ob)
+        for side, price, rem in self.ghosts.get(t, ()):
+            others[side] = remove_ours(others[side], price, rem)
+        return others
+
+    async def ghost_loop(self):
+        while self.beside:
+            try:
+                st = json.loads(await self.run_io(_read, self.beside))
+                g: dict[str, list] = {}
+                for k, o in st.get("orders", {}).items():
+                    g.setdefault(unkey(k)[0], []).append((o["side"], o["price"], o["remaining"]))
+                self.ghosts = g
+            except Exception as e:
+                print(f"beside: {e}")
+            await asyncio.sleep(5.0)
 
     def ws_others(self, t: str) -> dict | None:
         b = self.feed.ladder(t) if self.feed is not None and self.feed.up else None
@@ -916,7 +939,7 @@ class Runner(Farm):
                 if not await self.place(t, side, px, q):
                     return
                 sp, sq, _ = ws[sk]
-                if not await self.place(t, side, sp, sq, sentinel=True):
+                if sk not in self.state["orders"] and not await self.place(t, side, sp, sq, sentinel=True):
                     print(f"sentinel {t} {side}: not placed; pulling its bid")
                     self.cancel(main, reason="lipfarm:sentinel")
                 return
@@ -1236,7 +1259,7 @@ class Runner(Farm):
         self.ensure_feed(held or set(list(self.programs)[:1]))
         coros = [self.control_loop(arm, stop_ev), self.eval_loop(), self.cycle_loop(), self.guard_loop(),
                  self.refresh_loop(), self.status_loop(), self.keepalive_loop(), self.flush_loop(),
-                 self.lag_loop()]
+                 self.lag_loop(), self.ghost_loop()]
         tasks = [loop.create_task(c) for c in coros]
         try:
             await stop_ev.wait()
@@ -1273,6 +1296,11 @@ def _atomic_write(path: str, data: str):
     os.replace(tmp, path)
 
 
+def _read(path: str) -> str:
+    with open(path) as f:
+        return f.read()
+
+
 def _append_rows(path: str, rows: list[dict]):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "a", encoding="utf-8") as fh:
@@ -1288,6 +1316,8 @@ def main():
     ap.add_argument("--shadow-only", action="store_true",
                     help="never arm (ignores the dashboard): a side-by-side test beside the live farm")
     ap.add_argument("--root", default=ROOT, help="state, status and journal directory")
+    ap.add_argument("--beside", default=None,
+                    help="side-by-side test: the live farm's state.json; its resting bids are removed from books")
     ap.add_argument("--reads-per-s", type=float, default=None,
                     help="REST read pace (default farm.READS_PER_S; the account's read limit is shared with ARBS)")
     a = ap.parse_args()
@@ -1296,7 +1326,7 @@ def main():
     arm = None
     if not a.shadow_only:
         arm = "--live" if a.live else (resumable_arm(NAME) if a.resume_arm else None)
-    r = Runner(root=a.root, shadow_only=a.shadow_only)
+    r = Runner(root=a.root, shadow_only=a.shadow_only, beside=a.beside if a.shadow_only else None)
     try:
         asyncio.run(r.main(arm))
     except KeyboardInterrupt:

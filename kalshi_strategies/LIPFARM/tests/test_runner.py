@@ -296,3 +296,20 @@ def test_a_short_informed_sell_is_retried_on_the_next_book_update(tmp_path, monk
     iocs = [x[1:] for x in c.calls if x[1] == "ioc"]
     assert iocs[0] == ("ioc", "Z-1-A", "no", 0.04, 300.0) and iocs[1] == ("ioc", "Z-1-A", "no", 0.05, 200.0)
     assert abs(r.free_positions().get("Z-1-A", 0.0)) < 1e-9
+
+
+def test_a_resting_sentinel_doesnt_get_its_new_main_bid_pulled(tmp_path, monkeypatch):
+    books = {"Z-1-A": {"yes": {0.40: 50.0, 0.39: 300.0}, "no": {0.30: 900.0}}}
+    r, c = make(tmp_path, monkeypatch, books)
+    r.state["groups"] = {"Z-1": {"id": "g1", "tripped": False, "fills": [], "used": time.time()}}
+    r.state["orders"] = {"Z-1-A|yes|s": {"oid": "s1", "side": "yes", "price": 0.40, "size": 1.1, "remaining": 1.1,
+                                         "placed": time.time(), "group": "g1"}}
+    ws = {"Z-1-A|yes": (0.39, 1000, True), "Z-1-A|yes|s": (0.40, farm.SENTINEL_LOTS, True)}
+    r.wanted = dict(ws)
+
+    async def go():
+        await boot(r)
+        await r.place_side("Z-1-A", "yes", ws, 0.0)
+        await settle(r)
+    asyncio.run(go())
+    assert [x[1] for x in c.calls] == ["rest"] and "Z-1-A|yes" in r.state["orders"]
