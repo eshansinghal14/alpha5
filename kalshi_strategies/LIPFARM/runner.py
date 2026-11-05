@@ -308,7 +308,7 @@ class Runner:
             return max(pd.Timestamp(self.programs[t]["end_date"]).timestamp() - now, 0.0)
 
         def per_dollar(p):
-            return p.rate / max(p.capital, 1e-9)
+            return (p.rate - p.loss_rate) / max(p.capital, 1e-9)
         cool = self.state.setdefault("cooldown", {})
         cands = [p for p in self.plans.values() if p.ticker in self.programs and cool.get(p.ticker, 0.0) <= now
                  and self.period_accrued(p.ticker) + p.rate * left(p.ticker) >= farm.LIP_MIN_PAYOUT_USD]
@@ -1151,14 +1151,20 @@ class Runner:
         for t, (pl, P) in planned.items():
             self.P[t] = P
             ok = self.flow_ok(t, cfg) if pl else False
-            self.est[t] = pl.rate / max(pl.capital, 1e-9) if pl and ok is not False else 0.0
+            if pl and ok:
+                # LIP must pay for the market's expected adverse-sweep loss.
+                f = self.state["flow"][t]
+                pl.loss_rate = farm.expected_loss_day(f["trades_day"], pl, cfg) / 86400
+                ok = pl.rate >= cfg.min_lip_to_loss * pl.loss_rate
+            self.est[t] = (pl.rate - pl.loss_rate) / max(pl.capital, 1e-9) if pl and ok is not False else 0.0
             if pl and ok:
                 plans[t] = pl
             # What the flow filter costs: plans it holds back (False) or hasn't read yet (None).
             if pl and not ok:
                 f = self.state.get("flow", {}).get(t) or {}
                 self.flow_held[t] = {"usd_day": pl.rate * 86400, "per_k": pl.rate * 86400 / max(pl.capital / 1000, 0.05),
-                                     "trades_day": f.get("trades_day"), "mode": pl.mode, "at": time.time()}
+                                     "exp_loss_day": pl.loss_rate * 86400, "trades_day": f.get("trades_day"),
+                                     "mode": pl.mode, "at": time.time()}
             else:
                 self.flow_held.pop(t, None)
         for t in books:

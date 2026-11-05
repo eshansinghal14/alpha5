@@ -12,6 +12,7 @@ from kalshi_strategies.LIPFARM.farm import unkey
 from kalshi_strategies.LIPFARM.tests.test_farm import CFG
 
 import pandas as pd
+import pytest
 
 
 class FakeClient:
@@ -566,3 +567,41 @@ def test_flow_gate(tmp_path, monkeypatch):
     assert r.flow_ok("Q-1-A", CFG) is True
     r.state["flow"]["Q-1-A"].update(trades_day=CFG.max_trades_day + 1)
     assert r.flow_ok("Q-1-A", CFG) is False
+
+
+def test_expected_loss_grows_with_trades_up_to_the_cap():
+    two = farm.Plan("T", "wide", (("yes", 0.4), ("no", 0.5)), 1e-3, 900.0, 0.002, 1000)
+    one = farm.Plan("T", "decided", (("yes", 0.97),), 1e-3, 970.0, 0.002, 500)
+    assert farm.expected_loss_day(4.0, two, CFG) == pytest.approx(12.0)        # 3 x 4, both sides, 1000 lots
+    assert farm.expected_loss_day(40.0, two, CFG) == pytest.approx(30.0)       # capped
+    assert farm.expected_loss_day(4.0, one, CFG) == pytest.approx(3.0)         # one side, 500 lots
+
+
+def test_a_busier_market_is_quoted_only_when_its_lip_pays_for_the_risk(tmp_path, monkeypatch):
+    books = {"R-1-A": {"yes": {0.97: 2000.0}, "no": {0.02: 5000.0}}, "P-1-A": {"yes": {0.97: 2000.0}, "no": {0.02: 5000.0}}}
+    r, c = make(tmp_path, monkeypatch, books)
+    ob = {"yes_dollars": [["0.97", "2000"]], "no_dollars": [["0.02", "5000"]]}
+    monkeypatch.setattr(farm, "fetch_book", lambda t: ob)
+    monkeypatch.setattr(farm, "arbs_held_events", lambda: set())
+    rich = {"R-1-A": 10.0, "P-1-A": 10.0}
+    monkeypatch.setattr(farm, "fetch_flow", lambda t, days, opened=None: {"trades_day": rich[t], "days": days,
+                                                                          "at": time.time()})
+    # One-day periods; same book, so P's program paying a twentieth of R's is the only difference.
+    for t in books:
+        r.programs[t] = dict(r.programs[t], start_date="2026-11-05T00:00:00Z", end_date="2099-11-06T00:00:00Z")
+    day = {"start_date": "2026-11-05T00:00:00Z", "end_date": "2026-11-06T00:00:00Z"}
+    r.programs["R-1-A"].update(day, period_reward=3600000)
+    r.programs["P-1-A"].update(day, period_reward=180000)
+
+    async def go():
+        await boot(r)
+        cfg = dataclasses.replace(CFG, scan_markets=10)
+        await r.cycle(cfg)
+        for f in list(r.flow_futs.values()):
+            f.result()
+        await r.cycle(cfg)
+    asyncio.run(go())
+    # 10 trades/day: expected loss min(30, 30) / 2 x 1 leg = $15/day; R's LIP clears 2x that, P's doesn't.
+    assert "R-1-A" in r.plans and "P-1-A" not in r.plans
+    assert r.flow_held["P-1-A"]["exp_loss_day"] == pytest.approx(15.0)
+    assert r.est["R-1-A"] < r.plans["R-1-A"].rate / r.plans["R-1-A"].capital     # ranked net of the loss

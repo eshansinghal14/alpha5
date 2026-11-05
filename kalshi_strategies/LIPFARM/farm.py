@@ -194,12 +194,22 @@ class Cfg:
     flow_days: float = param("Every quoted market must be low-flow over this many trailing days (public "
                              "trades, re-read hourly).", min=0.5, max=14.0, step=0.5, group="pricing",
                              sub="low flow (all markets)")
-    max_trades_day: float = param("Most trades per day (a market younger than flow_days over its own age). "
-                                  "Out of sample, 10 days predicting the next 4 (10-22..11-05, 2,408 "
-                                  "markets): <= 2/day kept 69% of the LIP pool at $27 adverse-sweep loss per "
-                                  "$1k of pool vs $128 under 0.5 sweeps & 20 trades/day; above 2 it climbs fast "
-                                  "(5/day: $82). Over 1000 trades in flow_days reads as busy.", min=0.0, step=1.0,
+    max_trades_day: float = param("Never quote a market trading more than this per day (a market younger "
+                                  "than flow_days over its own age); under it, LIP must pay for the expected "
+                                  "loss (min_lip_to_loss). Out of sample (10 days predicting the next 4, "
+                                  "10-22..11-05, 2,408 markets): above 50/day a 1000-lot touch bid lost "
+                                  "~$68/day. Over 1000 trades in flow_days reads as busy.", min=0.0, step=1.0,
                                   group="pricing", sub="low flow (all markets)")
+    loss_per_trade: float = param("Expected adverse-sweep loss, $/day per trade/day, for 1000 lots on each side "
+                                  "(scaled by our bids' size). Same test: <=2 trades/day ~$0.5-1/day, 2-3 $3, "
+                                  "3-10 $11-20, 10-50 $23-30.", min=0.0, step=0.5, group="pricing",
+                                  sub="low flow (all markets)")
+    loss_cap: float = param("Expected loss per market-day stops growing here (the 10-50 trades/day band "
+                            "lost $23-30).", min=0.0, step=5.0, group="pricing", sub="low flow (all markets)")
+    min_lip_to_loss: float = param("Quote a market only if its LIP/day is at least this many times its expected "
+                                   "loss. Above 1 because the replay model understated our real fills' losses "
+                                   "~1.5x (11-04/05).", min=0.0, step=0.25, group="pricing",
+                                   sub="low flow (all markets)")
     skip_categories: str = param("Comma-separated series categories never quoted (11-01..05: Sports, "
                                  "Mentions ~50-60% safe).", group="pricing", sub="low flow (all markets)")
     exit_depth_frac: float = param("Neither wide nor decided: quote both touches only with exit liquidity, "
@@ -263,6 +273,15 @@ class Plan:
     lots: float = 0.0                  # contracts per bid
     layout: dict = dataclasses.field(default_factory=dict)   # side -> "touch" | "sentinel"
     big: dict = dataclasses.field(default_factory=dict)      # side -> price of the main bid
+    loss_rate: float = 0.0             # expected adverse-sweep loss, $/s (expected_loss_day / 86400)
+
+
+def expected_loss_day(trades_day: float, pl: Plan, cfg: Cfg) -> float:
+    """Expected adverse-sweep loss, $/day, of quoting `pl` on a market trading
+    `trades_day`: loss_per_trade per trade/day up to loss_cap, for 1000 lots
+    on each side, scaled by the lots we actually bid (fit, max_trades_day)."""
+    per_side = min(cfg.loss_per_trade * trades_day, cfg.loss_cap) / 2.0
+    return per_side * pl.lots * len(pl.legs) / 1000.0
 
 
 def key(ticker: str, side: str, hedge: bool = False) -> str:

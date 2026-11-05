@@ -12,7 +12,8 @@ P = lip.LipParams(target_size=1000, discount_factor=0.5, period_reward_usd=86.4,
 CFG = farm.Cfg(max_capital=5000, num_markets=5, min_lots_frac=0.0, sentinel_keep=2.0, dump_slip_ticks=2, chase_ticks=2, max_chase_ticks=5,
                adverse_lots=300, exit_depth_frac=10.0, exit_depth_slip=0.03, wide_spread=0.20, min_leg_price=0.0, decided_min=0.97,
                min_ahead=0.0, max_position=1e9, write_tokens_per_s=5.0, scan_markets=1, scan_rotate=0, refresh_s=30,
-               programs_refresh_s=600, flow_days=4.0, max_trades_day=20.0,
+               programs_refresh_s=600, flow_days=4.0, max_trades_day=50.0, loss_per_trade=3.0, loss_cap=30.0,
+               min_lip_to_loss=2.0,
                skip_categories="Sports,Mentions")
 
 
