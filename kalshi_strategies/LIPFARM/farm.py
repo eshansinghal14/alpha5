@@ -210,10 +210,13 @@ class Cfg:
                              "trades, re-read hourly).", min=0.5, max=14.0, step=0.5, group="pricing",
                              sub="low flow (all markets)")
     max_sweeps_day: float = param("Most sweeps per day: a burst of sells (1 s) that cleared a bid level. "
-                                  "11-01..05 tape, 2,600 markets: <= 0.12/day were all safe, > 0.5/day "
-                                  "~70%.", min=0.0, step=0.1, group="pricing", sub="low flow (all markets)")
-    max_trades_day: float = param("Most trades per day. 11-01..05: > 20/day ~55% safe, <= 5/day 94-99%. "
-                                  "Over 1000 trades in flow_days reads as busy.", min=0.0, step=1.0,
+                                  "Off (99) since 11-05: with 0-2 a market in the window it predicted the next "
+                                  "days' adverse sweeps worse than trades/day (AUC 0.75 vs 0.82).", min=0.0, step=0.1, group="pricing", sub="low flow (all markets)")
+    max_trades_day: float = param("Most trades per day (a market younger than flow_days over its own age). "
+                                  "Out of sample, 10 days predicting the next 4 (10-22..11-05, 2,408 "
+                                  "markets): <= 2/day kept 69% of the LIP pool at $27 adverse-sweep loss per "
+                                  "$1k of pool vs $128 under 0.5 sweeps & 20 trades/day; above 2 it climbs fast "
+                                  "(5/day: $82). Over 1000 trades in flow_days reads as busy.", min=0.0, step=1.0,
                                   group="pricing", sub="low flow (all markets)")
     skip_categories: str = param("Comma-separated series categories never quoted (11-01..05: Sports, "
                                  "Mentions ~50-60% safe).", group="pricing", sub="low flow (all markets)")
@@ -553,9 +556,12 @@ def count_sweeps(trades: list[dict]) -> int:
     return n
 
 
-def fetch_flow(t: str, days: float) -> dict | None:
-    """{trades_day, sweeps_day, days, at} over the trailing `days`, one read.
-    A full page (1000 trades) means busier than any sane limit: counted as inf."""
+def fetch_flow(t: str, days: float, opened: float | None = None) -> dict | None:
+    """{trades_day, sweeps_day, days, at} over the trailing `days`, one read;
+    a market `opened` (epoch s) more recently is rated over its own age, at
+    least a day. A full page (1000 trades) means busier than any sane limit:
+    counted as inf."""
+    span = days if opened is None else min(days, max(1.0, (time.time() - opened) / 86400))
     try:
         d = read("/trade-api/v2/markets/trades",
                  params={"ticker": t, "min_ts": int(time.time() - days * 86400), "limit": 1000})
@@ -564,7 +570,7 @@ def fetch_flow(t: str, days: float) -> dict | None:
     tr = d.get("trades") or []
     if d.get("cursor"):
         return {"trades_day": math.inf, "sweeps_day": math.inf, "days": days, "at": time.time()}
-    return {"trades_day": len(tr) / days, "sweeps_day": count_sweeps(tr) / days, "days": days, "at": time.time()}
+    return {"trades_day": len(tr) / span, "sweeps_day": count_sweeps(tr) / span, "days": days, "at": time.time()}
 
 
 def load_categories() -> dict[str, str]:
@@ -899,7 +905,9 @@ class Farm:
         f = flows.get(t)
         stale = f is None or time.time() - f["at"] > FLOW_TTL_S or abs(f["days"] - cfg.flow_days) > 1e-9
         if stale and t not in self.flow_futs and len(self.flow_futs) < FLOW_QUEUE:
-            self.flow_futs[t] = self.flow_pool.submit(fetch_flow, t, cfg.flow_days)
+            ot = self.meta.get(t, {}).get("open_time")
+            self.flow_futs[t] = self.flow_pool.submit(fetch_flow, t, cfg.flow_days,
+                                                      pd.Timestamp(ot).timestamp() if ot else None)
         if f is None:
             return None
         return f["trades_day"] <= cfg.max_trades_day + 1e-9 and f["sweeps_day"] <= cfg.max_sweeps_day + 1e-9

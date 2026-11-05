@@ -78,7 +78,7 @@ class FakeFeed:
 
 
 def make(tmp_path, monkeypatch, books, live=True):
-    monkeypatch.setattr(farm, "fetch_flow", lambda t, days: {"trades_day": 0.0, "sweeps_day": 0.0, "days": days,
+    monkeypatch.setattr(farm, "fetch_flow", lambda t, days, opened=None: {"trades_day": 0.0, "sweeps_day": 0.0, "days": days,
                                                              "at": time.time()})
     monkeypatch.setattr(farm, "CLAIMS_PATH", str(tmp_path / "live" / "claimed.json"))
     r = runner.Runner(root=str(tmp_path))

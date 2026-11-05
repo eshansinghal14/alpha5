@@ -9,6 +9,7 @@ from kalshi_infra.trading import lip
 from kalshi_strategies.LIPFARM import farm
 from kalshi_strategies.LIPFARM.farm import parse_book, plan_market, remove_ours
 
+FETCH_FLOW = farm.fetch_flow          # the real one; an autouse fixture stubs it
 P = lip.LipParams(target_size=1000, discount_factor=0.5, period_reward_usd=86.4, snapshots_per_period=86400)
 CFG = farm.Cfg(max_capital=5000, num_markets=5, min_lots_frac=0.0, sentinel_keep=2.0, dump_slip_ticks=2, chase_ticks=2, max_chase_ticks=5,
                adverse_lots=300, exit_depth_frac=10.0, exit_depth_slip=0.03, wide_spread=0.20, min_leg_price=0.0, decided_min=0.97,
@@ -20,7 +21,7 @@ CFG = farm.Cfg(max_capital=5000, num_markets=5, min_lots_frac=0.0, sentinel_keep
 @pytest.fixture(autouse=True)
 def _quiet_flow(monkeypatch):
     """No trade reads in tests: every market reads as having no flow."""
-    monkeypatch.setattr(farm, "fetch_flow", lambda t, days: {"trades_day": 0.0, "sweeps_day": 0.0, "days": days,
+    monkeypatch.setattr(farm, "fetch_flow", lambda t, days, opened=None: {"trades_day": 0.0, "sweeps_day": 0.0, "days": days,
                                                              "at": time.time()})
 
 
@@ -765,3 +766,11 @@ def test_a_fill_past_the_group_limit_trips_the_events_group(tmp_path, monkeypatc
     assert f.state["groups"]["Z-1"]["tripped"] and f.pull == {"Z-1-A", "Z-1-B"}
     assert f.state["cooldown"]["Z-1-B"] > time.time()            # the whole event is off
     assert not b.cancelled                                        # Kalshi pulled them; we confirm after exits
+
+
+def test_flow_of_a_young_market_is_over_its_own_age(monkeypatch):
+    trades = [_tr(i, "yes", 0.5) for i in range(6)]
+    monkeypatch.setattr(farm, "read", lambda path, params=None, auth=False: {"trades": trades, "cursor": None})
+    assert FETCH_FLOW("T", 10.0)["trades_day"] == 0.6
+    assert FETCH_FLOW("T", 10.0, opened=time.time() - 3 * 86400)["trades_day"] == pytest.approx(2.0)
+    assert FETCH_FLOW("T", 10.0, opened=time.time() - 3600)["trades_day"] == 6.0          # at least a day
