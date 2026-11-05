@@ -80,7 +80,7 @@ def render(page: str, stale_fn):
         st.header("Config")
         config_form.render(_FORM)
     st.title("LIP farm")
-    st.caption("Only low-flow markets (`max_sweeps_day`, `max_trades_day`, not `skip_categories`). "
+    st.caption("Only low-flow markets (`max_trades_day` over `flow_days`, not `skip_categories`). "
                "Wide markets (spread >= `wide_spread`): a bid of the market's Target (where LIP stops counting) at both touches. Decided markets "
                "(expensive bid >= `decided_min`, below the market's top price): a bid on the expensive side only. "
                "Other markets: both touches, sized by exit liquidity (`exit_depth_frac`). Every "

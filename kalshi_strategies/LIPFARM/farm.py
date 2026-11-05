@@ -1,7 +1,7 @@
 """
 LIP farmer: what to quote and the shared reads (the service that runs it is
-runner.py). Quotes only low-flow LIP markets (at most max_sweeps_day and
-max_trades_day over the trailing flow_days, not in skip_categories), in one of
+runner.py). Quotes only low-flow LIP markets (at most max_trades_day over
+the trailing flow_days, not in skip_categories), in one of
 three shapes, chosen per market each cycle from today's book:
 
   wide     the yes/no spread is at least `wide_spread`: one bid of the market's
@@ -129,7 +129,7 @@ GUARD_COOLDOWN_S = 300.0
 # After a sentinel trip or adverse fill: 11-04, from 10 s after a sweep on, a further
 # 2c fall was no likelier than a 2c rise (22% vs 18% to 60 s), so a short pull is enough.
 TRIP_COOLDOWN_S = 60.0
-# Trailing flow (max_sweeps_day, max_trades_day) is re-read this often per
+# Trailing flow (max_trades_day) is re-read this often per
 # market; at most FLOW_QUEUE reads wait at once, best markets first.
 FLOW_TTL_S = 3600.0
 FLOW_QUEUE = 40
@@ -194,9 +194,6 @@ class Cfg:
     flow_days: float = param("Every quoted market must be low-flow over this many trailing days (public "
                              "trades, re-read hourly).", min=0.5, max=14.0, step=0.5, group="pricing",
                              sub="low flow (all markets)")
-    max_sweeps_day: float = param("Most sweeps per day: a burst of sells (1 s) that cleared a bid level. "
-                                  "Off (99) since 11-05: with 0-2 a market in the window it predicted the next "
-                                  "days' adverse sweeps worse than trades/day (AUC 0.75 vs 0.82).", min=0.0, step=0.1, group="pricing", sub="low flow (all markets)")
     max_trades_day: float = param("Most trades per day (a market younger than flow_days over its own age). "
                                   "Out of sample, 10 days predicting the next 4 (10-22..11-05, 2,408 "
                                   "markets): <= 2/day kept 69% of the LIP pool at $27 adverse-sweep loss per "
@@ -524,25 +521,8 @@ def fetch_meta(tickers) -> dict[str, dict]:
     return out
 
 
-def count_sweeps(trades: list[dict]) -> int:
-    """Bursts of same-side taker trades within 1 s that printed at more than
-    one price: a level cleared. By price span, not order: one sweep's prints
-    share a timestamp and come back in any order (KXOPENSHARE 11-05 12:18)."""
-    tr = sorted(trades, key=lambda x: x["created_time"])
-    n, i = 0, 0
-    while i < len(tr):
-        t0, side = pd.Timestamp(tr[i]["created_time"]).timestamp(), tr[i]["taker_side"]
-        j = i + 1
-        while j < len(tr) and tr[j]["taker_side"] == side and pd.Timestamp(tr[j]["created_time"]).timestamp() - t0 <= 1.0:
-            j += 1
-        px = [float(x["yes_price_dollars"]) for x in tr[i:j]]
-        n += max(px) - min(px) > 1e-9
-        i = j
-    return n
-
-
 def fetch_flow(t: str, days: float, opened: float | None = None) -> dict | None:
-    """{trades_day, sweeps_day, days, at} over the trailing `days`, one read;
+    """{trades_day, days, at} over the trailing `days`, one read;
     a market `opened` (epoch s) more recently is rated over its own age, at
     least a day. A full page (1000 trades) means busier than any sane limit:
     counted as inf."""
@@ -554,8 +534,8 @@ def fetch_flow(t: str, days: float, opened: float | None = None) -> dict | None:
         return None
     tr = d.get("trades") or []
     if d.get("cursor"):
-        return {"trades_day": math.inf, "sweeps_day": math.inf, "days": days, "at": time.time()}
-    return {"trades_day": len(tr) / span, "sweeps_day": count_sweeps(tr) / span, "days": days, "at": time.time()}
+        return {"trades_day": math.inf, "days": days, "at": time.time()}
+    return {"trades_day": len(tr) / span, "days": days, "at": time.time()}
 
 
 def load_categories() -> dict[str, str]:

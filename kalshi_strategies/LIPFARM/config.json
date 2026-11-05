@@ -21,7 +21,6 @@
     "refresh_s": 30,
     "programs_refresh_s": 600,
     "flow_days": 10,
-    "max_sweeps_day": 99,
     "max_trades_day": 2,
     "skip_categories": "Sports,Mentions"
   }

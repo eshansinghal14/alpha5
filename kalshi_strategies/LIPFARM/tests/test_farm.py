@@ -12,14 +12,14 @@ P = lip.LipParams(target_size=1000, discount_factor=0.5, period_reward_usd=86.4,
 CFG = farm.Cfg(max_capital=5000, num_markets=5, min_lots_frac=0.0, sentinel_keep=2.0, dump_slip_ticks=2, chase_ticks=2, max_chase_ticks=5,
                adverse_lots=300, exit_depth_frac=10.0, exit_depth_slip=0.03, wide_spread=0.20, min_leg_price=0.0, decided_min=0.97,
                min_ahead=0.0, max_position=1e9, write_tokens_per_s=5.0, scan_markets=1, scan_rotate=0, refresh_s=30,
-               programs_refresh_s=600, flow_days=4.0, max_sweeps_day=0.5, max_trades_day=20.0,
+               programs_refresh_s=600, flow_days=4.0, max_trades_day=20.0,
                skip_categories="Sports,Mentions")
 
 
 @pytest.fixture(autouse=True)
 def _quiet_flow(monkeypatch):
     """No trade reads in tests: every market reads as having no flow."""
-    monkeypatch.setattr(farm, "fetch_flow", lambda t, days, opened=None: {"trades_day": 0.0, "sweeps_day": 0.0, "days": days,
+    monkeypatch.setattr(farm, "fetch_flow", lambda t, days, opened=None: {"trades_day": 0.0, "days": days,
                                                              "at": time.time()})
 
 
@@ -140,14 +140,6 @@ def test_bid_size_follows_the_programs_target():
 
 def _tr(ts, side, yes_px):
     return {"created_time": f"2026-11-05T12:00:{ts:06.3f}Z", "taker_side": side, "yes_price_dollars": f"{yes_px:.2f}"}
-
-
-def test_count_sweeps_counts_bursts_that_cleared_a_level():
-    trades = [_tr(0.0, "yes", 0.88), _tr(0.2, "yes", 0.89), _tr(0.4, "yes", 0.90),   # through 3 levels: 1
-              _tr(5.0, "no", 0.50), _tr(5.5, "no", 0.50),                           # one level only: 0
-              _tr(9.0, "no", 0.50), _tr(9.5, "no", 0.49),                           # 1
-              _tr(20.0, "yes", 0.50), _tr(22.0, "yes", 0.60)]                       # > 1 s apart: 0
-    assert farm.count_sweeps(trades) == 2
 
 
 def test_narrow_market_needs_exit_liquidity_and_is_sized_by_it():

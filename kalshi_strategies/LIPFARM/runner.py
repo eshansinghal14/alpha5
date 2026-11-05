@@ -409,7 +409,7 @@ class Runner:
                                                       pd.Timestamp(ot).timestamp() if ot else None)
         if f is None:
             return None
-        return f["trades_day"] <= cfg.max_trades_day + 1e-9 and f["sweeps_day"] <= cfg.max_sweeps_day + 1e-9
+        return f["trades_day"] <= cfg.max_trades_day + 1e-9
 
     def category(self, t: str) -> str:
         ev = self.meta.get(t, {}).get("event_ticker") or event_of(t)
