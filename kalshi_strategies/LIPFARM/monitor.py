@@ -1,19 +1,14 @@
 """LIPFARM watchdog, every 5 min on the box (alpha5-lipfarm-monitor.timer).
 
-Prints what changed since the last run to data/live/lipfarm_monitor.log. It
-disarms the farm (as the dashboard button does: every farm order pulled,
-positions kept) only on evidence checked twice:
-  - P&L is computed from Kalshi's own fills of our orders, not our journal,
-    and marked at mid (settled markets at their result), so a wide spread
-    or a journal bug can't fake a loss; a journal that disagrees with Kalshi
-    is reported, not acted on.
-  - a rule must hold on two runs in a row (5 min apart); only a loss past
-    LOSS_HARD disarms at once.
-Shutdown rules: fill P&L since monitoring began under LOSS_TOTAL; exposure over
-MAX_EXPOSURE; ARBS halted or its audit disagreeing with Kalshi; more than
-MAX_TRACEBACKS new tracebacks; writes over WRITE_RUNAWAY x the farm's cap
-(a retry loop, as RTOR 11-05). One market's fills marked under LOSS_ONE only
-alerts: one bad fill isn't a reason to stop.
+Prints what changed since the last run to data/live/lipfarm_monitor.log and
+sends an SNS alert when a rule starts holding. It never disarms the farm: the
+user turns trading off (11-05, after two stops on one bad market each).
+P&L is from Kalshi's own fills of our orders, marked at mid (settled markets
+at their result); net P&L adds the LIP locked since monitoring began.
+Alert rules: net P&L under LOSS_NET; exposure over MAX_EXPOSURE; ARBS halted
+or its audit disagreeing with Kalshi; more than MAX_TRACEBACKS new
+tracebacks; writes over WRITE_RUNAWAY x the farm's cap (a retry loop, as RTOR
+11-05); one market's new fills marked under LOSS_ONE; journal vs Kalshi gaps.
 State between runs: data/live/LIPFARM/monitor.json (delete it to restart the P&L baseline).
 
     python -m kalshi_strategies.LIPFARM.monitor
@@ -32,7 +27,7 @@ from kalshi_infra.runtime.persist import LIVE_ROOT
 
 ROOT = os.path.join(LIVE_ROOT, "LIPFARM")
 MON = os.path.join(ROOT, "monitor.json")
-LOSS_TOTAL, LOSS_HARD, LOSS_ONE = -75.0, -200.0, -40.0
+LOSS_NET, LOSS_ONE = -75.0, -40.0
 MAX_EXPOSURE, MAX_TRACEBACKS, WRITE_RUNAWAY = 1500.0, 20, 2.0
 TOPIC_FILE = "/etc/alpha5/report-topic-arn"
 
@@ -93,14 +88,16 @@ def kalshi_fills(since: float, oids: set) -> list[dict]:
     return out
 
 
-def decide(cur: dict, pending: dict) -> tuple[list[str], list[str], dict]:
-    """(shutdown reasons, alerts, rules pending for next run) from this run's
-    checked figures `cur` and the rules that held last run (`pending`)."""
+def decide(cur: dict, active: dict) -> tuple[list[str], dict]:
+    """(alerts, rules holding now) from this run's figures `cur` and the rules
+    that held last run (`active`); a rule alerts once when it starts holding."""
     hits, alerts = {}, []
     if cur["mode"] != "LIVE":
-        return [], [], {}
-    if cur["pnl"] < LOSS_TOTAL:
-        hits["loss"] = f"fill P&L since monitoring began ${cur['pnl']:.2f} < ${LOSS_TOTAL:.0f} (Kalshi's fills, mid marks)"
+        return [], {}
+    net = cur["pnl"] + cur["lip"]
+    if net < LOSS_NET:
+        hits["loss"] = (f"net P&L since monitoring began ${net:.2f} < ${LOSS_NET:.0f} (fills ${cur['pnl']:.2f} "
+                        f"from Kalshi at mid, LIP locked ${cur['lip']:+.2f})")
     if cur["exposure"] > MAX_EXPOSURE:
         hits["exposure"] = f"exposure ${cur['exposure']:.0f} > ${MAX_EXPOSURE:.0f}"
     if cur["arbs_bad"]:
@@ -110,13 +107,11 @@ def decide(cur: dict, pending: dict) -> tuple[list[str], list[str], dict]:
     if cur["write_cap"] and cur["write_tps"] > WRITE_RUNAWAY * cur["write_cap"]:
         hits["writes"] = f"writes {cur['write_tps']:.0f}/s > {WRITE_RUNAWAY:g}x the {cur['write_cap']:.0f}/s cap"
     if cur["worst_market"] < LOSS_ONE:
-        alerts.append(f"{cur['worst_name']} marked ${cur['worst_market']:.2f} (one market; not a shutdown)")
+        alerts.append(f"{cur['worst_name']} marked ${cur['worst_market']:.2f}")
     if cur["journal_gap"]:
         alerts.append(f"journal disagrees with Kalshi: {cur['journal_gap']}")
-    stop = [why for k, why in hits.items() if k in pending]
-    if cur["pnl"] < LOSS_HARD and "loss" not in pending:
-        stop.append(hits["loss"] + f", past ${LOSS_HARD:.0f}: at once")
-    return stop, alerts, {k: pending.get(k, time.time()) for k in hits}
+    alerts += [why for k, why in hits.items() if k not in active]
+    return alerts, {k: active.get(k, time.time()) for k in hits}
 
 
 def alert(subject: str, body: str):
@@ -134,7 +129,7 @@ def main():
     fills = st["fills"]
     mon = json.load(open(MON)) if os.path.exists(MON) else {
         "started": time.time(), "base": [f.get("trade_id") for f in fills], "seen": [f.get("trade_id") for f in fills],
-        "tb": None}
+        "tb": None, "lip0": s.get("lip_locked_usd", 0.0)}
     base, seen, cache = set(mon["base"]), set(mon["seen"]), {}
     new = [f for f in fills if f.get("trade_id") not in seen]
     since = [f for f in fills if f.get("trade_id") not in base]
@@ -176,7 +171,8 @@ def main():
     a = json.load(open(max(glob.glob(os.path.join(LIVE_ROOT, "ARBS", "*", "summary.json")), key=os.path.getmtime)))
     arbs_bad = (f"halt={a.get('halt_reason')} audit={a.get('audit_diff')}"
                 if a.get("halt_reason") or a.get("audit_diff") else "")
-    cur = {"mode": s["mode"], "pnl": pnl, "exposure": s.get("exposure_usd", 0), "arbs_bad": arbs_bad,
+    lip = s.get("lip_locked_usd", 0.0) - mon.setdefault("lip0", s.get("lip_locked_usd", 0.0))
+    cur = {"mode": s["mode"], "pnl": pnl, "lip": lip, "exposure": s.get("exposure_usd", 0), "arbs_bad": arbs_bad,
            "new_tb": tb - (mon["tb"] if mon["tb"] is not None else tb), "write_tps": s.get("write_tps_10m", 0),
            "write_cap": s.get("write_tps_cap", 0), "worst_market": worst, "worst_name": worst_name,
            "journal_gap": gap}
@@ -185,7 +181,8 @@ def main():
           f"{time.time() - s['updated_at']:.0f}s old | quoting {s['quoting']} | ${s['our_usd_day_now']:.0f}/day | "
           f"exp LIP ${s['exp_lip_usd']:.2f} (locked ${s.get('lip_locked_usd', 0):.2f}) | exposure "
           f"${cur['exposure']:.0f} | writes {cur['write_tps']:.1f}/s | ws {'up' if s.get('ws_up') else 'DOWN'}")
-    print(f"monitoring {(time.time() - mon['started']) / 3600:.1f} h | fill P&L since: ${pnl:+.2f} at mid "
+    print(f"monitoring {(time.time() - mon['started']) / 3600:.1f} h | net ${pnl + lip:+.2f} | LIP locked since "
+          f"${lip:+.2f} | fill P&L since: ${pnl:+.2f} at mid "
           f"(${pnl_bid:+.2f} at bid; journal ${pnl_journal:+.2f}; source {'Kalshi' if kf is not None else 'journal'}) "
           f"| new fills {len(new)} | new tracebacks {cur['new_tb']} | ARBS live {a.get('live_trading')} "
           f"halt {a.get('halt_reason')} audit {a.get('audit_diff')}")
@@ -195,22 +192,12 @@ def main():
     if gap and gap == mon.get("gap"):
         cur["journal_gap"] = ""                      # alerted on already
     mon["gap"] = gap
-    stop, alerts, pending = decide(cur, mon.get("pending", {}))
-    for k in pending:
-        if k not in mon.get("pending", {}):
-            print(f"WATCH: {k} rule hit; disarms if it still holds next run")
+    alerts, active = decide(cur, mon.get("pending", {}))
     for x in alerts:
         print(f"ALERT: {x}")
     if alerts:
         alert("LIPFARM monitor alert (still trading)", "\n".join(alerts + [""] + lines))
-    if stop:
-        from kalshi_infra.runtime.control import request_trading_mode
-        reason = "; ".join(stop)
-        request_trading_mode("LIPFARM", False, source=f"lipfarm monitor: {reason}")
-        print(f"SHUTDOWN: disarmed LIPFARM: {reason}")
-        alert("LIPFARM disarmed by its monitor", reason + "\n\n" + "\n".join(lines))
-        pending = {}
-    mon["pending"] = pending
+    mon["pending"] = active
     mon["seen"] = sorted(seen | {f.get("trade_id") for f in new})
     mon["tb"] = tb
     json.dump(mon, open(MON, "w"))

@@ -179,6 +179,10 @@ class Cfg:
     chase_ticks: int = param("Then sell more (again dump_slip_ticks deep) whenever the best bid is this many ticks "
                              "under our fill. 11-04: after a sweep the price fell 2+ ticks within 1 min ~22% "
                              "of the time on 10-90c markets, whatever its size.", min=1, max=50, step=1)
+    max_chase_ticks: int = param("Never sell (dump or chase) more than this many ticks under our fill; below "
+                                 "that the rest waits on a passive exit. 11-04 sweeps of 300+ lots: a further "
+                                 "fall of up to ~5c in 10 s kept falling (holding lost 2-6c), one of 6c+ came "
+                                 "back (holding gained 6-26c).", min=0, max=99, step=1)
     adverse_lots: float = param("Fills of at least this many lots on one of our bids: sell up to "
                                 "dump_slip_ticks under our fill at once, instead of waiting on an exit bid. "
                                 "A risk cap, not a signal: 11-04 sweeps of 50 to 3000+ lots, and 0.5x to 10x+ "
@@ -647,7 +651,7 @@ class Farm:
         self.pending_sentinels: dict[str, dict] = {}            # ticker -> its pending legs' sentinels
         self.dumping: set[str] = set()        # markets an informed fill hit: sell out now
         self.cfg_adverse = 300.0              # cfg.adverse_lots, refreshed each loop
-        self.cfg_slip, self.cfg_chase = 2, 2  # cfg.dump_slip_ticks, cfg.chase_ticks
+        self.cfg_slip, self.cfg_chase, self.cfg_max_chase = 2, 2, 5  # cfg.dump_slip_ticks, chase_ticks, max_chase_ticks
         self.n_refused, self.last_refused_log = 0, 0.0
         self.marks_at = 0.0
 
@@ -1089,8 +1093,10 @@ class Farm:
             held = "yes" if v > 0 else "no"
             fill_px = self.avg_cost(t, held)
             tk = self.tick(t, fill_px)
+            # A chase from the best bid sold 384 at 1c after our sweep emptied the book (MT1 11-05).
+            lowest = fill_px - self.cfg_max_chase * tk
             if t in self.dumping:
-                self.dump(t, floor=fill_px - self.cfg_slip * tk)              # informed: 2 ticks now
+                self.dump(t, floor=max(fill_px - self.cfg_slip * tk, lowest))   # informed: 2 ticks now
                 continue
             # Other sells wait EXIT_REPRICE_S after the last: a dust sell that kept failing
             # (429) retried each pass, ~2,000 times in 45 min (RTOR 11-05 00:23).
@@ -1100,8 +1106,8 @@ class Farm:
                 self.dump(t, adverse=False)                                   # dust: any price
             else:
                 best = max(self.books[t][held]) if self.books[t][held] else 0.0
-                if best <= fill_px - self.cfg_chase * tk + 1e-9:
-                    self.dump(t, floor=best - self.cfg_slip * tk, adverse=False)   # still moving: chase
+                if lowest - 1e-9 <= best <= fill_px - self.cfg_chase * tk + 1e-9:
+                    self.dump(t, floor=max(best - self.cfg_slip * tk, lowest), adverse=False)   # still moving: chase
         self.dumping &= set(self.free_positions())
         pos = self.free_positions()
         want = {}
@@ -1580,7 +1586,7 @@ class Farm:
                 cfg = Cfg.load()
                 self.bucket.rate = cfg.write_tokens_per_s
                 self.cfg_adverse = cfg.adverse_lots
-                self.cfg_slip, self.cfg_chase = cfg.dump_slip_ticks, cfg.chase_ticks
+                self.cfg_slip, self.cfg_chase, self.cfg_max_chase = cfg.dump_slip_ticks, cfg.chase_ticks, cfg.max_chase_ticks
                 try:
                     reason = stop.poll()
                     if reason:

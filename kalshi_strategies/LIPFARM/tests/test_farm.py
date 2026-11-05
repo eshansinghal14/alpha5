@@ -8,7 +8,7 @@ from kalshi_strategies.LIPFARM import farm
 from kalshi_strategies.LIPFARM.farm import parse_book, plan_market, remove_ours
 
 P = lip.LipParams(target_size=1000, discount_factor=0.5, period_reward_usd=86.4, snapshots_per_period=86400)
-CFG = farm.Cfg(max_capital=5000, num_markets=5, min_lots_frac=0.0, sentinel_keep=2.0, dump_slip_ticks=2, chase_ticks=2,
+CFG = farm.Cfg(max_capital=5000, num_markets=5, min_lots_frac=0.0, sentinel_keep=2.0, dump_slip_ticks=2, chase_ticks=2, max_chase_ticks=5,
                adverse_lots=300, exit_depth_frac=10.0, exit_depth_slip=0.03, wide_spread=0.20, min_leg_price=0.0, decided_min=0.97,
                min_ahead=0.0, max_position=1e9, write_tokens_per_s=5.0, scan_markets=1, scan_rotate=0, refresh_s=30,
                programs_refresh_s=600)
@@ -443,6 +443,12 @@ def test_full_fill_is_informed_and_sold_into_the_book_at_once(tmp_path, monkeypa
     f.hedge(CFG)
     ioc = [o for o in b.sent if o.intent == "take"]
     assert [(o.side, o.price, o.size) for o in ioc][-1] == ("no", 0.08, 700)
+    # Then the book empties: best bid 0.80 is past max_chase_ticks (5) under our fill. No sale; the exit rests.
+    f.books = {"Z-1-A": {"yes": {0.80: 50.0, 0.01: 9000.0}, "no": {0.02: 5000.0}}}
+    f.state["chased"]["Z-1-A"] -= farm.EXIT_REPRICE_S
+    n = len([o for o in b.sent if o.intent == "take"])
+    f.hedge(CFG)
+    assert len([o for o in b.sent if o.intent == "take"]) == n
 
 
 def test_fill_under_adverse_lots_keeps_the_passive_exit(tmp_path, monkeypatch):

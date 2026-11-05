@@ -2,35 +2,35 @@ from kalshi_strategies.LIPFARM import monitor
 
 
 def _cur(**kw):
-    c = {"mode": "LIVE", "pnl": 0.0, "exposure": 0.0, "arbs_bad": "", "new_tb": 0, "write_tps": 3.0,
+    c = {"mode": "LIVE", "pnl": 0.0, "lip": 0.0, "exposure": 0.0, "arbs_bad": "", "new_tb": 0, "write_tps": 3.0,
          "write_cap": 30.0, "worst_market": 0.0, "worst_name": "", "journal_gap": ""}
     c.update(kw)
     return c
 
 
-def test_one_bad_market_only_alerts():
-    stop, alerts, pending = monitor.decide(_cur(worst_market=-138.0, worst_name="TJAC"), {})
-    assert not stop and not pending and "TJAC" in alerts[0]
+def test_one_bad_market_alerts():
+    alerts, active = monitor.decide(_cur(worst_market=-138.0, worst_name="TJAC"), {})
+    assert not active and "TJAC" in alerts[0]
 
 
-def test_a_rule_disarms_only_when_it_holds_two_runs():
-    stop, _, pending = monitor.decide(_cur(pnl=-80.0), {})
-    assert not stop and "loss" in pending
-    stop, _, _ = monitor.decide(_cur(pnl=-80.0), pending)
-    assert stop and "P&L" in stop[0]
-    stop, _, pending = monitor.decide(_cur(pnl=-10.0), pending)      # recovered: cleared
-    assert not stop and not pending
-
-
-def test_hard_loss_disarms_at_once():
-    stop, _, _ = monitor.decide(_cur(pnl=-250.0), {})
-    assert len(stop) == 1 and "at once" in stop[0]
+def test_loss_is_net_of_lip_and_alerts_once():
+    alerts, active = monitor.decide(_cur(pnl=-80.0, lip=50.0), {})
+    assert not alerts and not active                                  # net -30
+    alerts, active = monitor.decide(_cur(pnl=-80.0), {})
+    assert "net P&L" in alerts[0] and "loss" in active
+    alerts, active = monitor.decide(_cur(pnl=-500.0), active)         # still holding: no repeat
+    assert not alerts and "loss" in active
 
 
 def test_write_runaway_and_shadow():
-    _, _, pending = monitor.decide(_cur(write_tps=72.8), {})
-    assert "writes" in pending
-    assert monitor.decide(_cur(mode="shadow", pnl=-500.0), {"loss": 1.0}) == ([], [], {})
+    alerts, active = monitor.decide(_cur(write_tps=72.8), {})
+    assert "writes" in active and alerts
+    assert monitor.decide(_cur(mode="shadow", pnl=-500.0), {"loss": 1.0}) == ([], {})
+
+
+def test_monitor_never_disarms():
+    import inspect
+    assert "request_trading_mode" not in inspect.getsource(monitor)
 
 
 def test_marks_and_pairs():
