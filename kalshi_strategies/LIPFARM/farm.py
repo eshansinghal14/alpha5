@@ -154,8 +154,10 @@ MAX_MOVES = 5
 # With the websocket up, fills and book updates wake the loop as they arrive
 # and this is only the idle tick.
 FILL_POLL_S = 1.0
-# Our bucket's burst: 12 orders at once.
-WRITE_BURST = 120.0
+# Our bucket's burst: 30 orders at once, so a cycle's bids (with group creates and
+# sentinels) go out together. At 12, 65 bids a day were refused with the shard
+# at 211-249 of 300 tokens (11-05); only ARBS and LIPFARM write on shard 0 now.
+WRITE_BURST = 300.0
 ORDER_TOKENS, CANCEL_TOKENS = 10.0, 2.0
 # An exit is re-priced only when outbid, at most this often: re-pricing on
 # every socket update into a penny-jumping bot spent ~250 orders exiting 13
