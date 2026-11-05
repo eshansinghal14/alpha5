@@ -93,6 +93,7 @@ from kalshi_infra.config import load, param, section
 from kalshi_infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
 from kalshi_infra.runtime.persist import LIVE_ROOT
 from kalshi_infra.kalshi.fees import fee as kfee
+from kalshi_infra.kalshi.orders import is_order_group_reject
 from kalshi_infra.trading import lip
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -162,10 +163,14 @@ ORDER_TOKENS, CANCEL_TOKENS = 10.0, 2.0
 EXIT_REPRICE_S = 5.0
 # A position this small is sold into the book at once instead of resting an exit.
 DUST_LOTS = 25.0
-# Kalshi trips an order group once MORE than its limit matches within 15 s:
-# a 1.1-lot sentinel trips a limit-1 group exactly when it fills in full.
+# As ARBS: every LIP bid of an event rests in one Kalshi order group of limit
+# GROUP_LIMIT. Kalshi trips it once MORE than that matches within
+# GROUP_WINDOW_S (0 is refused) and cancels the rest inside its matching engine,
+# so the pull needs no write of ours. A 1.1-lot sentinel trips it when it fills in full.
 SENTINEL_LOTS = 1.1
 GROUP_LIMIT = 1
+GROUP_WINDOW_S = 15.0
+GROUP_IDLE_S = 600.0                  # a group with nothing resting this long is deleted
 LAYOUT_HYSTERESIS = 0.1
 # Taker fee rate when a market's schedule can't be read (Kalshi's standard 0.07).
 DEFAULT_TAKER_RATE = 0.07
@@ -289,7 +294,7 @@ def is_sentinel(k: str) -> bool:
 
 
 def desired_orders(pl: Plan) -> dict[str, tuple[float, float, bool]]:
-    """Order key -> (price, size, in the side's order group) for a plan."""
+    """Order key -> (price, size, part of a sentinel layout) for a plan."""
     out = {}
     for s, p in pl.legs:
         if pl.layout.get(s) == "sentinel":
@@ -726,7 +731,7 @@ class Farm:
         self.est: dict[str, float] = {}       # ticker -> our LIP $/s per dollar at its last read
         self.rot = 0
         self.pool = cf.ThreadPoolExecutor(BOOK_WORKERS, thread_name_prefix="lipfarm-read")
-        self.pending: dict[str, tuple] = {}   # leg key -> (price, lots, grouped) awaiting its claim
+        self.pending: dict[str, tuple] = {}   # leg key -> (price, lots, sentinel layout) awaiting its claim
         self.pending_sentinels: dict[str, dict] = {}            # ticker -> its pending legs' sentinels
         self.dumping: set[str] = set()        # markets an informed fill hit: sell out now
         self.pull: set[str] = set()           # markets whose LIP bids go once their sells are out
@@ -971,29 +976,70 @@ class Farm:
             except Exception as e:
                 print(f"cancel {k}: {e}")
 
-    def group(self, t: str, side: str) -> str | None:
-        """This side's order group, created or reset as needed; None if that fails."""
-        g = self.state.setdefault("groups", {}).get(key(t, side))
+    def group(self, t: str) -> str | None:
+        """t's event's order group, created or reset as needed; None if that fails."""
+        ev = self.meta.get(t, {}).get("event_ticker") or event_of(t)
+        g = self.state.setdefault("groups", {}).get(ev)
         c = self.client(self.shard(t))
         try:
             if g is None:
                 if not self.bucket.take(ORDER_TOKENS):
                     return None
-                g = {"id": c.create_order_group(GROUP_LIMIT), "tripped": False}
-                self.state["groups"][key(t, side)] = g
+                g = {"id": c.create_order_group(GROUP_LIMIT), "tripped": False, "fills": [], "ticker": t}
+                self.state["groups"][ev] = g
             elif g.get("tripped"):
                 if not self.bucket.take(ORDER_TOKENS):
                     return None
                 c.reset_order_group(g["id"])
-                g["tripped"] = False
+                g["tripped"], g["fills"] = False, []
         except Exception as e:
-            print(f"group {t} {side}: {e}")
+            print(f"group {ev}: {e}")
             return None
+        g["used"] = time.time()
         return g["id"]
 
+    def group_fill(self, gid: str, size: float):
+        """Count a grouped fill as Kalshi does; past the limit the group has tripped."""
+        g = next((g for g in self.state.get("groups", {}).values() if g.get("id") == gid), None)
+        if g is None or g.get("tripped"):
+            return
+        now = time.time()
+        f = [x for x in g.setdefault("fills", []) if x[0] >= now - GROUP_WINDOW_S] + [[now, size]]
+        g["fills"] = f
+        total = sum(x[1] for x in f)
+        if total > GROUP_LIMIT + 1e-9:
+            self.group_trip(gid, f"{total:g} contracts matched in {GROUP_WINDOW_S:g} s")
+
+    def group_trip(self, gid: str, why: str):
+        """Kalshi has cancelled every bid in the group: off those markets for
+        TRIP_COOLDOWN_S. Our cancels only confirm it, after any sells (hedge)."""
+        g = next((g for g in self.state.get("groups", {}).values() if g.get("id") == gid), None)
+        if g is None or g.get("tripped"):
+            return
+        g["tripped"] = True
+        gone = sorted({unkey(k)[0] for k, o in self.state["orders"].items() if o.get("group") == gid})
+        for t in gone:
+            self.pull.add(t)
+            self.state.setdefault("cooldown", {})[t] = time.time() + TRIP_COOLDOWN_S
+        print(f"group: tripped ({why}); Kalshi pulled our bids on {', '.join(gone) or 'nothing'} "
+              f"for {TRIP_COOLDOWN_S:.0f} s")
+
+    def tidy_groups(self):
+        """Delete groups with nothing resting in them for GROUP_IDLE_S (and old per-side ones)."""
+        if not self.live:
+            return
+        resting = {o.get("group") for o in self.state["orders"].values()}
+        for ev, g in list(self.state.get("groups", {}).items()):
+            if g.get("id") in resting or time.time() - g.get("used", 0.0) < GROUP_IDLE_S:
+                continue
+            del self.state["groups"][ev]
+            try:
+                self.client(self.shard(g.get("ticker") or ev.split("|")[0])).delete_order_group(g["id"])
+            except Exception as e:
+                print(f"group {ev} delete: {e}")
+
     def place(self, t: str, side: str, price: float, lots: float, reserve: float = PLACE_RESERVE,
-              reason: str = "lipfarm:quote", hedge: bool = False, sentinel: bool = False,
-              grouped: bool = False) -> bool:
+              reason: str = "lipfarm:quote", hedge: bool = False, sentinel: bool = False) -> bool:
         if not hedge:
             self.urgent()
             # A fill handled just now may have pulled this market.
@@ -1019,13 +1065,15 @@ class Farm:
             order = Order(order_id=0, ticker=t, side=side, order_type="limit", price=price, size=lots,
                           decision_time=pd.Timestamp.now(tz="UTC"), intent="quote")
             order.client_order_id = CID_PREFIX + uuid.uuid4().hex[:24]
-            gid = self.group(t, side) if grouped else None
-            if grouped and gid is None:
+            gid = None if hedge else self.group(t)
+            if not hedge and gid is None:
                 return False
             try:
                 ack = c.place_resting(order, order_group_id=gid)
             except Exception as e:
                 print(f"place {t} {side}@{price}: {e}")
+                if gid and is_order_group_reject(e):
+                    self.group_trip(gid, "create refused")
                 return False
             oid = ack.exchange_order_id
             # Fills of these orders get hedged; fills from before two-sided quoting don't.
@@ -1039,6 +1087,8 @@ class Farm:
         k = f"{t}|{side}|s" if sentinel else key(t, side, hedge)
         self.state["orders"][k] = {"oid": oid, "side": side, "price": price, "size": lots, "remaining": lots,
                                    "placed": time.time()}
+        if self.live and not hedge:
+            self.state["orders"][k]["group"] = gid
         return True
 
     def tick(self, t: str, price: float) -> float:
@@ -1420,7 +1470,7 @@ class Farm:
                 return
             self.cancel(k, reason="lipfarm:move")
             if self.place(t, side, o["price"], o["size"], reserve=0.0, reason="lipfarm:move",
-                          sentinel=is_sentinel(k), grouped=is_sentinel(k)):
+                          sentinel=is_sentinel(k)):
                 moves += 1
 
     def signed_positions(self, hedged_only: bool = False) -> dict[str, float]:
@@ -1546,7 +1596,10 @@ class Farm:
             new.add(f["ticker"])
             k = ours.get(f["order_id"])
             if k:
-                self.state["orders"][k]["remaining"] = max(self.state["orders"][k]["remaining"] - f["size"], 0.0)
+                o = self.state["orders"][k]
+                o["remaining"] = max(o["remaining"] - f["size"], 0.0)
+                if o.get("group"):
+                    self.group_fill(o["group"], f["size"])
         self.state["trade_ids"] = sorted(seen)
         if new:
             print(f"fill: {sorted(new)}")
@@ -1571,12 +1624,7 @@ class Farm:
                 self.state["adverse_oids"].append(o)
                 self.dumping.add(tick[o])
                 if o in sent:
-                    g = self.state.get("groups", {}).get(sent[o])
-                    if g:
-                        g["tripped"] = True          # Kalshi cancelled the bid behind it
-                    # The touch was just cleared: off this market both sides, for the cooldown
-                    # (pulled in hedge, after the dump: each cancel is a write in the way).
-                    self.pull.add(tick[o])
+                    # Its fill tripped the event's group (group_fill): Kalshi pulled the bids.
                     self.state.setdefault("cooldown", {})[tick[o]] = time.time() + TRIP_COOLDOWN_S
                     print(f"sentinel: {sent[o]} cleared; its market is pulled for {TRIP_COOLDOWN_S:.0f} s")
                 else:
@@ -1587,23 +1635,23 @@ class Farm:
         sentinel right after it (tokens for both, and the group, reserved first):
         the bid without its sentinel has no protection (11-04 22:34, sentinels
         refused for budget after every main bid)."""
-        px, q, grouped = w
+        px, q, behind = w
         t, side = unkey(k)
         sk = f"{t}|{side}|s"
-        if grouped and not is_sentinel(k) and legs and sk in legs:
-            need = 2 * ORDER_TOKENS + (ORDER_TOKENS if key(t, side) not in self.state.get("groups", {}) or
-                                       self.state["groups"][key(t, side)].get("tripped") else 0.0)
+        if behind and not is_sentinel(k) and legs and sk in legs:
+            g = self.state.get("groups", {}).get(self.meta.get(t, {}).get("event_ticker") or event_of(t))
+            need = 2 * ORDER_TOKENS + (ORDER_TOKENS if g is None or g.get("tripped") else 0.0)
             if self.live and not self.bucket.has(need):
                 return False
-            if not self.place(t, side, px, q, grouped=True):
+            if not self.place(t, side, px, q):
                 return False
             sp, sq, _ = legs[sk]
-            if not self.place(t, side, sp, sq, sentinel=True, grouped=True):
+            if not self.place(t, side, sp, sq, sentinel=True):
                 print(f"sentinel {t} {side}: not placed; pulling its bid")
                 self.cancel(key(t, side), reason="lipfarm:sentinel")
                 return False
             return True
-        return self.place(t, side, px, q, sentinel=is_sentinel(k), grouped=grouped)
+        return self.place(t, side, px, q, sentinel=is_sentinel(k))
 
     def place_pending(self):
         """Place legs whose new claim has had CLAIM_SETTLE_S for ARBS to stand aside."""
@@ -1776,6 +1824,7 @@ class Farm:
                         self.scan_finish(cfg, [(t, fu.result()) for t, fu in zip(tickers, futs)])
                         self.urgent()
                         self.reconcile(cfg)
+                        self.tidy_groups()
                         self.report(cfg)
                         self._save()
                     self.place_pending()

@@ -298,11 +298,13 @@ def test_new_fill_is_exited_within_the_second(tmp_path, monkeypatch):
 def test_our_bucket_limits_lip_bids_but_never_exits(tmp_path, monkeypatch):
     b = _Bucket()
     f = _live(tmp_path, monkeypatch, b)
-    f.bucket = farm.TokenBucket(rate=0.0, capacity=25.0)        # room for two orders, no refill
-    assert f.place("A-1-X", "yes", 0.1, 1000) and f.place("B-1-X", "yes", 0.1, 1000)
-    assert not f.place("C-1-X", "yes", 0.1, 1000)                # our budget is spent: ARBS's is untouched
+    f.bucket = farm.TokenBucket(rate=0.0, capacity=35.0)        # the event's group and two orders, no refill
+    assert f.place("A-1-X", "yes", 0.1, 1000) and f.place("A-1-Y", "yes", 0.1, 1000)
+    assert not f.place("A-1-Z", "yes", 0.1, 1000)                # our budget is spent: ARBS's is untouched
     assert f.place("D-1-X", "no", 0.9, 300, hedge=True)          # an exit goes anyway
-    assert [o.ticker for o in b.sent] == ["A-1-X", "B-1-X", "D-1-X"] and f.bucket.tokens < 0
+    assert [o.ticker for o in b.sent] == ["A-1-X", "A-1-Y", "D-1-X"] and f.bucket.tokens < 0
+    assert b.groups_made == 1 and b.sent[0].group == b.sent[1].group     # one group per event, exits outside it
+    assert getattr(b.sent[2], "group", None) is None
 
 
 class _Ws:
@@ -571,12 +573,12 @@ def test_sentinel_and_bid_go_in_the_sides_group_and_a_sentinel_fill_trips_it(tmp
     sent_oid = f.state["orders"]["Z-1-A|yes|s"]["oid"]
     f.book_fills([{"ticker": "Z-1-A", "side": "yes", "price": 0.40, "size": 1.1, "fee": 0.0, "order_id": sent_oid,
                    "trade_id": "t1"}])
-    assert f.state["groups"]["Z-1-A|yes"]["tripped"] and "Z-1-A" in f.dumping
+    assert f.state["groups"]["Z-1"]["tripped"] and "Z-1-A" in f.dumping
     assert f.state["cooldown"]["Z-1-A"] > time.time()
     f.hedge(CFG)                                                 # bids go after any sell
     assert not f.keys_of("Z-1-A", hedges=False)
-    f.group("Z-1-A", "yes")                                      # re-placing later resets the group first
-    assert b.resets == ["g1"] and not f.state["groups"]["Z-1-A|yes"]["tripped"]
+    f.group("Z-1-A")                                             # re-placing later resets the group first
+    assert b.resets == ["g1"] and not f.state["groups"]["Z-1"]["tripped"]
 
 
 def test_layout_has_hysteresis():
@@ -740,3 +742,19 @@ def test_socket_fill_is_exited_before_the_next_bid_goes_out(tmp_path, monkeypatc
     # A cycle's bid on the same market: the fill is exited first, and the bid isn't placed.
     assert f.place("Z-1-A", "no", 0.02, 1000) is False
     assert took == [("Z-1-A", "no", 0.04)] and not q
+
+
+def test_a_fill_past_the_group_limit_trips_the_events_group(tmp_path, monkeypatch):
+    b = _Bucket()
+    f = _live(tmp_path, monkeypatch, b)
+    f.state["orders"] = {}
+    assert f.place("Z-1-A", "yes", 0.40, 1000) and f.place("Z-1-B", "no", 0.30, 1000)
+    oid = f.state["orders"]["Z-1-A|yes"]["oid"]
+    f.book_fills([{"ticker": "Z-1-A", "side": "yes", "price": 0.40, "size": 1.0, "fee": 0.0, "order_id": oid,
+                   "trade_id": "t1"}])
+    assert not f.state["groups"]["Z-1"]["tripped"]                # 1 contract: at the limit, not past it
+    f.book_fills([{"ticker": "Z-1-A", "side": "yes", "price": 0.40, "size": 5.0, "fee": 0.0, "order_id": oid,
+                   "trade_id": "t2"}])
+    assert f.state["groups"]["Z-1"]["tripped"] and f.pull == {"Z-1-A", "Z-1-B"}
+    assert f.state["cooldown"]["Z-1-B"] > time.time()            # the whole event is off
+    assert not b.cancelled                                        # Kalshi pulled them; we confirm after exits
