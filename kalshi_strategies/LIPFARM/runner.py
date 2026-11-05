@@ -1586,6 +1586,10 @@ class Runner:
             p["lots"] += f["size"]
             p["cost"] += f["size"] * f["price"]
             p["fees"] += f["fee"] or 0.0
+            at = _utc_iso(f.get("time"))
+            if at:
+                p["first"] = min(p.get("first") or at, at)
+                p["last"] = max(p.get("last") or at, at)
         for (t, side), p in pos.items():
             m = self.meta.get(t, {})
             p["url"] = self.url(t)
@@ -1714,6 +1718,17 @@ def _atomic_write(path: str, data: str):
     with open(tmp, "w") as f:
         f.write(data)
     os.replace(tmp, path)
+
+
+def _utc_iso(x) -> str | None:
+    """A fill's time (REST, socket or our IOC record: mixed formats) as a UTC ISO string."""
+    if x is None:
+        return None
+    try:
+        ts = pd.Timestamp(str(x).replace(" ", "T", 1))
+    except ValueError:
+        return None
+    return (ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")).isoformat()
 
 
 def _read(path: str) -> str:

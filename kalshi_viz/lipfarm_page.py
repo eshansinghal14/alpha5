@@ -55,7 +55,10 @@ def _by_market(p: pd.DataFrame) -> pd.DataFrame:
                  if lots.get(s, 0.0) - paired >= 0.01]
         cost = float((g["cost"] + g["fees"]).sum())
         value = float(g["value"].sum())
-        rows.append({"market": g["url"].iloc[0] if "url" in g else t, "paired": paired, "open": ", ".join(open_) or "-",
+        first = pd.to_datetime(g["first"], utc=True).min() if "first" in g else pd.NaT
+        rows.append({"market": g["url"].iloc[0] if "url" in g else t,
+                     "filled (ET)": "" if pd.isna(first) else first.tz_convert("US/Eastern").strftime("%m-%d %H:%M:%S"),
+                     "paired": paired, "open": ", ".join(open_) or "-",
                      "cost $": cost, "value $": value, "P&L $": value - cost})
     return pd.DataFrame(rows).sort_values("P&L $")
 
@@ -155,6 +158,7 @@ def render(page: str, stale_fn):
         else:
             st.dataframe(_by_market(p), hide_index=True, use_container_width=True, column_config={
                 "market": _LINK,
+                "filled (ET)": st.column_config.TextColumn(width="small", help="First fill in this market, US Eastern"),
                 "paired": st.column_config.NumberColumn(format="%.0f", help="yes+no pairs: worth $1 each at settlement"),
                 "open": st.column_config.TextColumn(help="Unpaired contracts left, marked at today's bid"),
                 "cost $": st.column_config.NumberColumn(format="%.2f", help="Everything paid, fees included"),
