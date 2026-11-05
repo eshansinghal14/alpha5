@@ -49,6 +49,7 @@ from kalshi_infra.kalshi.orders import http_status, is_order_group_reject
 from kalshi_infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
 from kalshi_infra.trading import lip
 from kalshi_strategies.LIPFARM import farm
+from kalshi_strategies.LIPFARM.levels import Levels
 from kalshi_strategies.LIPFARM.farm import (CANCEL_TOKENS, CID_PREFIX, CLAIM_SETTLE_S, DUST_LOTS, EXIT_REPRICE_S,
                                             GROUP_DELETES, GROUP_IDLE_S, GROUP_LIMIT, GUARD_COOLDOWN_S, GUARD_S,
                                             MAX_MOVES, MOVE_BEHIND_FRAC, MOVE_MIN_S, MOVE_RESERVE, NAME,
@@ -77,6 +78,25 @@ MAX_DUMP_MISSES = 5
 # FILL_CONTEXT_S before each LIP fill is journaled ("fill_context").
 DEPTH_KEEP_S = 30.0
 FILL_CONTEXT_S = 10.0
+# Accuracy test for levels.Levels: every QUEUE_CHECK_S, Kalshi's size ahead of
+# each of our LIP bids vs the size ahead our reconstruction of the level gives.
+QUEUE_CHECK_S = 60.0
+
+
+def lip_feed_class():
+    """ARBS's MultiFeed, also handing each raw level snapshot/delta to `on_level`."""
+    from kalshi_strategies.ARBS.feed import MultiFeed
+
+    class LipFeed(MultiFeed):
+        on_level = None
+
+        def _handle_message(self, d):
+            if self.on_level is not None and d.get("type") in ("orderbook_snapshot", "orderbook_delta"):
+                msg = d.get("msg") or {}
+                if msg.get("market_ticker") in self._books:
+                    self.on_level(d["type"], msg)
+            super()._handle_message(d)
+    return LipFeed
 FLUSH_S = 1.0
 
 
@@ -186,6 +206,8 @@ class Runner:
         self.io_pool = cf.ThreadPoolExecutor(1, thread_name_prefix="lipfarm-io")   # file writes, in order
         self.flow_held: dict[str, dict] = {}                   # ticker -> its plan the flow filter holds back
         self.depth_hist: dict[str, collections.deque] = {}     # ticker -> (time, depth snapshot), DEPTH_KEEP_S
+        self.levels = Levels()
+        self.queue_err: collections.deque = collections.deque(maxlen=500)   # |inferred - actual| ahead, last checks
         self.book_seq: dict[str, int] = {}                     # ticker -> socket book updates seen
         self.dump_seq: dict[str, int] = {}                     # ticker -> book_seq its last informed sell saw
 
@@ -562,8 +584,8 @@ class Runner:
         if not tickers:
             return
         if self.feed is None:
-            from kalshi_strategies.ARBS.feed import MultiFeed
-            self.feed = MultiFeed(tickers, self._on_quote, self._on_trade, label=NAME, on_fill=self._on_fill)
+            self.feed = lip_feed_class()(tickers, self._on_quote, self._on_trade, label=NAME, on_fill=self._on_fill)
+            self.feed.on_level = self._on_level
             self.spawn(self.feed.run())
             return
         new = [t for t in tickers if t not in self.feed.tickers]
@@ -588,6 +610,10 @@ class Runner:
         snap = {f"{s}_top": [max(b), b[max(b)]] if b else None for s, b in books.items()}
         snap["at_ours"] = {f"{side}@{o['price']:g}": round(books[side].get(round(o["price"], 4), 0.0) - o["remaining"], 2)
                            for side, o in legs}
+        # Guessed orders (levels.Levels) at our prices and the three levels under each.
+        snap["orders"] = {f"{side}@{p:g}": self.levels.view(t, side, p)["sizes"]
+                          for side, o in legs for p in sorted(books[side], reverse=True)
+                          if o["price"] - 0.03 - 1e-9 <= p <= o["price"] + 1e-9}
         dq = self.depth_hist.setdefault(t, collections.deque())
         dq.append((now, snap))
         while dq and dq[0][0] < now - DEPTH_KEEP_S:
@@ -639,11 +665,26 @@ class Runner:
         if ready:
             self.take_fills(ready)
 
+    def _on_level(self, mtype: str, msg: dict):
+        try:
+            now, t = time.time(), msg["market_ticker"]
+            if mtype == "orderbook_snapshot":
+                for side, k in (("yes", "yes_dollars_fp"), ("no", "no_dollars_fp")):
+                    self.levels.snapshot(t, side, [(float(p), float(q)) for p, q in msg.get(k) or []], now)
+            else:
+                self.levels.delta(t, msg["side"], float(msg["price_dollars"]), float(msg["delta_fp"]), now)
+        except Exception as e:
+            print(f"levels: {e!r}")
+
     def _on_trade(self, t: str, tr):
-        """Shadow: a print below our bid's price swept its level, and us with it."""
-        if self.live or not self.sim or tr.taker_side not in ("yes", "no"):
+        """Every print marks its level for levels.Levels; in shadow, a print below
+        our bid's price swept its level, and us with it."""
+        if tr.taker_side not in ("yes", "no"):
             return
         maker = "no" if tr.taker_side == "yes" else "yes"
+        self.levels.trade(t, maker, tr.price, time.time())
+        if self.live or not self.sim:
+            return
         fills = []
         for k, o in list(self.state["orders"].items()):
             if unkey(k)[0] != t or o["side"] != maker or o["remaining"] <= 1e-9:
@@ -772,6 +813,7 @@ class Runner:
             return False
         rec["oid"] = ack.exchange_order_id
         self._note_placed(rec["oid"], t, side, lots, hedge, sentinel)
+        self.levels.ours(t, side, price, lots, rec["oid"], time.time())
         if self.state["orders"].get(k) is not rec:
             # Cancelled (or a trip pulled it) while the create was in flight.
             self.spawn(self._cancel(t, rec["oid"], "lipfarm:late"))
@@ -1438,6 +1480,35 @@ class Runner:
             await asyncio.sleep(0.05)
             self.lag_max = max(self.lag_max, time.perf_counter() - t0 - 0.05)
 
+    async def levels_loop(self):
+        """Classify level decreases on time; every QUEUE_CHECK_S, test the guessed
+        orders against Kalshi's queue positions for our LIP bids (live)."""
+        last = 0.0
+        while True:
+            await asyncio.sleep(0.25)
+            self.levels.flush(time.time())
+            if not self.live or time.time() - last < QUEUE_CHECK_S or not self.gw.clients:
+                continue
+            last = time.time()
+            mine = [(k, o) for k, o in self.state["orders"].items() if not is_hedge(k) and o.get("oid")]
+            if not mine:
+                continue
+            c = self.gw.clients.get(0) or next(iter(self.gw.clients.values()))
+            try:
+                actual = await self.run_io(farm.queue_ahead, c, sorted({unkey(k)[0] for k, _ in mine}))
+            except Exception as e:
+                print(f"queue check: {e}")
+                continue
+            for k, o in mine:
+                t, side = unkey(k)
+                a = actual.get(o["oid"])
+                g = self.levels.ahead_of(t, side, o["price"], o["oid"])
+                v = self.levels.view(t, side, o["price"])
+                if a is not None and g is not None:
+                    self.queue_err.append(abs(g - a))
+                self.journal({"kind": "queue_check", "ticker": t, "side": side, "price": o["price"], "actual": a,
+                              "guessed": g, "chunks": v["sizes"], "snap": v["snap"]})
+
     async def keepalive_loop(self):
         while True:
             await asyncio.sleep(KEEPALIVE_S)
@@ -1555,6 +1626,10 @@ class Runner:
                    "runner": "async", "loop_lag_ms_max": 1000 * self.lag_max, "updated_at": time.time()}
         held = {t: h for t, h in self.flow_held.items() if time.time() - h["at"] < 3600}
         summary["flow_held"] = len(held)
+        errs = list(self.queue_err)
+        summary["queue_checks"] = len(errs)
+        summary["queue_exact_share"] = sum(e < 1.0 for e in errs) / len(errs) if errs else None
+        summary["levels_counts"] = dict(self.levels.n)
         summary["flow_held_usd_day"] = sum(h["usd_day"] for h in held.values())
         top = sorted(held.items(), key=lambda kv: -kv[1]["per_k"])[:40]
         doc = json.dumps({"summary": summary, "quotes": rows, "positions": pos, "waiting": self.waiting,
@@ -1597,7 +1672,7 @@ class Runner:
         self.ensure_feed(held or set(list(self.programs)[:1]))
         coros = [self.control_loop(arm, stop_ev), self.eval_loop(), self.cycle_loop(), self.guard_loop(),
                  self.refresh_loop(), self.status_loop(), self.keepalive_loop(), self.flush_loop(),
-                 self.lag_loop(), self.ghost_loop()]
+                 self.lag_loop(), self.ghost_loop(), self.levels_loop()]
         tasks = [loop.create_task(c) for c in coros]
         try:
             await stop_ev.wait()
