@@ -292,7 +292,7 @@ def test_new_fill_is_exited_within_the_second(tmp_path, monkeypatch):
                                                        "no_dollars": [["0.0200", "5000"]]})
     f.exit_now(CFG)
     assert [(o.side, o.price, o.size) for o in b.sent] == [("no", 0.02, 250.0)]
-    assert "Z-1-A|yes" in f.state["orders"]          # the LIP bid keeps running beside the exit
+    assert "Z-1-A|yes" not in f.state["orders"]      # a side we hold isn't bid again while it's exited
 
 
 def test_our_bucket_limits_lip_bids_but_never_exits(tmp_path, monkeypatch):
@@ -333,7 +333,7 @@ def test_socket_fill_is_exited_from_the_socket_book(tmp_path, monkeypatch):
                  "order_id": "oid0", "trade_id": "t1", "time": None}])
     f.react(CFG)
     assert [(o.side, o.price, o.size) for o in b.sent] == [("no", 0.02, 250.0)]
-    assert f.state["orders"]["Z-1-A|yes"]["remaining"] == 750.0
+    assert "Z-1-A|yes" not in f.state["orders"]      # held 250: its bid is pulled while that's exited
     f.ws._fills = [{"ticker": "Z-1-A", "side": "yes", "price": 0.97, "size": 250.0, "fee": 0.0,
                     "order_id": "oid0", "trade_id": "t1", "time": None}]
     f.react(CFG)                                                 # same trade again: not booked twice
@@ -658,11 +658,18 @@ def test_narrow_market_needs_exit_liquidity_and_is_sized_by_it():
     thin = {"yes": {0.45: 1500.0}, "no": {0.50: 500.0, 0.49: 600.0}}
     pl = plan_market("T", thin, P, CFG, {}, exit=farm.exit_lots(thin, CFG, 1000))
     assert pl.legs == (("no", 0.50),)
-    # min_leg_price is for wide markets only.
+    # min_leg_price holds for narrow legs too.
     cheap = {"yes": {0.05: 1500.0, 0.04: 600.0}, "no": {0.90: 1500.0, 0.89: 600.0}}
     pl = plan_market("T", cheap, P, dataclasses.replace(CFG, min_leg_price=0.2), {},
                      exit=farm.exit_lots(cheap, CFG, 1000))
-    assert pl.mode == "narrow" and ("yes", 0.05) in pl.legs
+    assert pl.mode == "narrow" and pl.legs == (("no", 0.90),)
+
+
+def test_a_side_we_hold_is_not_bid_again():
+    others = {"yes": {0.40: 2000.0, 0.39: 2000.0}, "no": {0.45: 2000.0, 0.44: 2000.0}}
+    ex = farm.exit_lots(others, CFG, 1000)
+    assert set(plan_market("T", others, P, CFG, {"yes": 25.0}, exit=ex).legs) == {("yes", 0.40), ("no", 0.45)}
+    assert plan_market("T", others, P, CFG, {"yes": 797.0}, exit=ex).legs == (("no", 0.45),)
 
 
 def test_wide_and_decided_quote_target_whatever_the_exit_depth():

@@ -38,8 +38,8 @@ comes before the pair's profit. Fills of `adverse_lots` or more on one bid
 are too much to wait out: we sell into the book at once (sweeping others'
 bids on the side we hold), pull that market's bids and cool it down. Exits
 sit ahead of our own LIP bids, follow
-the touch, are never pulled or moved to the back, and the market's LIP bids
-keep running beside them up to max_position.
+the touch, and are never pulled or moved to the back; a side we hold more
+than DUST_LOTS of isn't bid for LIP until that's exited.
 
     python -m kalshi_strategies.LIPFARM.farm                # shadow until armed from the dashboard
     python -m kalshi_strategies.LIPFARM.farm --live         # armed from the start: REAL MONEY
@@ -198,8 +198,9 @@ class Cfg:
                                 step=100.0, group="pricing")
     wide_spread: float = param("Wide: quote both sides at the touch, Target size, when ask - bid is at least "
                                "this.", min=0.01, max=0.98, step=0.01, group="pricing", sub="wide markets")
-    min_leg_price: float = param("Wide: don't quote a side bid under this. A full fill on a 5-6c leg was an "
-                                 "informed dump every time, sold back at 1c (ORAN, NMAN, IDS 11-04).",
+    min_leg_price: float = param("Wide and narrow: don't quote a side bid under this. A full fill on a 2-6c leg "
+                                 "was an informed dump every time, sold back at 1c (ORAN, NMAN, IDS 11-04; "
+                                 "DEEPSHARE, OPENSHARE 11-05).",
                                  min=0.0, max=0.5, step=0.01, group="pricing", sub="wide markets")
     decided_min: float = param("Decided: quote the expensive side, Target size, when its best bid is at least "
                                "this.", min=0.5, max=0.999, step=0.01, group="pricing", sub="decided markets")
@@ -370,12 +371,16 @@ def plan_market(ticker: str, others: dict[str, dict[float, float]], params: lip.
     elif 1.0 - by - bn >= cfg.wide_spread - 1e-9:
         mode, legs = "wide", [(s, p) for s, p in (("yes", by), ("no", bn)) if p >= cfg.min_leg_price - 1e-9]
     elif exit is not None:
-        mode, legs = "narrow", [("yes", by), ("no", bn)]
+        # Cheap narrow legs were swept like wide ones: DEEPSHARE 2c, OPENSHARE 4c, 1000 lots each (11-05 16:38).
+        mode, legs = "narrow", [(s, p) for s, p in (("yes", by), ("no", bn)) if p >= cfg.min_leg_price - 1e-9]
         side_lots = {s: min(side_lots.get(s, 0.0), exit.get(s, 0.0)) for s in ("yes", "no")}
     else:
         return None
+    # A side we already hold more than dust of is being exited: bidding there adds to a position a
+    # sweep just handed us (OPENSHARE 11-05: +1000 at 4c on 797 held from 11c).
     legs = [(s, p) for s, p in legs
-            if others[s].get(p, 0.0) >= cfg.min_ahead - 1e-9 and held.get(s, 0.0) < cfg.max_position - 1e-9
+            if others[s].get(p, 0.0) >= cfg.min_ahead - 1e-9 and held.get(s, 0.0) <= DUST_LOTS
+            and held.get(s, 0.0) < cfg.max_position - 1e-9
             and side_lots.get(s, 0.0) >= max(1.0, cfg.min_lots_frac * params.target_size)]
     if not legs:
         return None
