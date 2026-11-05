@@ -222,6 +222,10 @@ class Cfg:
                                    sub="low flow (all markets)")
     skip_categories: str = param("Comma-separated series categories never quoted (11-01..05: Sports, "
                                  "Mentions ~50-60% safe).", group="pricing", sub="low flow (all markets)")
+    skip_series: str = param("Comma-separated series never quoted. KXRT (Rotten Tomatoes): 25 settled movies, 54% "
+                             "of 50+ lot sweeps adverse vs 29% across LIP markets, with review-day bursts not tied "
+                             "to the close (FOC 11-05: four sweeps, ~$390, 25 days before close).",
+                             group="pricing", sub="low flow (all markets)")
     exit_depth_frac: float = param("Neither wide nor decided: quote both touches only with exit liquidity, "
                                    "each bid at most this fraction of others' bids within exit_depth_slip "
                                    "under the touch (what a fill could be sold into), and at least "

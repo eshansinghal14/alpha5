@@ -28,6 +28,7 @@
     "min_lip_to_loss": 2.0,
     "deep_keep": 0.8,
     "event_pull_s": 1800.0,
-    "recover_s": 60.0
+    "recover_s": 60.0,
+    "skip_series": "KXRT"
   }
 }

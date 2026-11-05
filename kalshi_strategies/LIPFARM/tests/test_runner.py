@@ -746,3 +746,10 @@ def test_the_exit_ignores_a_few_lots_and_steps_back_down(tmp_path, monkeypatch):
         await settle(r)
     asyncio.run(go())
     assert r.state["orders"]["Z-1-A|yes|h"]["price"] == 0.18                  # one over the 17c bid, not 31c
+
+
+def test_a_skipped_series_is_never_quoted(tmp_path, monkeypatch):
+    books = {"KXRT-FOC-55": {"yes": {}, "no": {}}, "KXOTHER-1-A": {"yes": {}, "no": {}}}
+    r, _ = make(tmp_path, monkeypatch, books)
+    assert r.flow_ok("KXRT-FOC-55", CFG) is False and not r.flow_futs
+    assert r.flow_ok("KXOTHER-1-A", CFG) is None                          # read queued as usual

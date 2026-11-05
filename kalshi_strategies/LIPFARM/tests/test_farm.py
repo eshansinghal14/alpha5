@@ -14,7 +14,7 @@ CFG = farm.Cfg(max_capital=5000, num_markets=5, min_lots_frac=0.0, sentinel_keep
                min_ahead=0.0, max_position=1000.0, write_tokens_per_s=5.0, scan_markets=1, scan_rotate=0, refresh_s=30,
                programs_refresh_s=600, flow_days=4.0, max_trades_day=50.0, loss_per_trade=3.0, loss_cap=30.0,
                min_lip_to_loss=2.0,
-               skip_categories="Sports,Mentions")
+               skip_categories="Sports,Mentions", skip_series="KXRT")
 
 
 @pytest.fixture(autouse=True)

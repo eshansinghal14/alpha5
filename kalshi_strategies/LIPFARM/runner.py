@@ -468,6 +468,9 @@ class Runner:
         skip = {c.strip().lower() for c in cfg.skip_categories.split(",") if c.strip()}
         if self.category(t).lower() in skip:
             return False
+        ev = self.meta.get(t, {}).get("event_ticker") or event_of(t)
+        if ev.split("-")[0].upper() in {x.strip().upper() for x in cfg.skip_series.split(",") if x.strip()}:
+            return False
         flows = self.state.setdefault("flow", {})
         fut = self.flow_futs.get(t)
         if fut is not None and fut.done():
