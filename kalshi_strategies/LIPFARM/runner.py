@@ -1,0 +1,1307 @@
+"""
+LIP farmer on one asyncio loop, built the way ARBS's runner is (and on its
+Gateway and MultiFeed). What to quote is unchanged (farm.plan_market and the
+farm's pricing, exit and group rules); what changed is how it runs:
+
+  * Our fills arrive on the websocket's `fill` channel and are handled on the
+    loop at once: booked, counted against the event's order group, the market
+    marked urgent. The eval loop takes urgent markets before any whose book
+    merely ticked, in 1 ms slices.
+  * An exit is decided from the websocket book in memory and sent as a
+    spawned task through the Gateway's write pool; cancels go in the same
+    gather, never ahead of it. A market with a write in flight is busy and is
+    re-evaluated when its last task ends.
+  * Everything slow runs off the loop: REST reads on the read pool (paced
+    with the farm's ReadPacer), the ~900-market scan's planning on a worker,
+    file writes on the pool. Nothing in the hot path reads REST.
+  * Every exit journals its timing: Kalshi's fill time, when we saw it, when
+    we decided, sent and were answered.
+
+Shadow mode places nothing. With the websocket's public trades it fills our
+shadow bids when a print clears their price (we sit at the back of the
+touch, so a print below our price means the level was swept) and fills
+exits against the book in memory, so the whole fill -> exit path runs.
+
+    python -m kalshi_strategies.LIPFARM.runner --resume-arm        # as farm.py
+    python -m kalshi_strategies.LIPFARM.runner --shadow-only --root /opt/alpha5/data/live/LIPFARM_ASYNC \
+        --reads-per-s 3                                              # side-by-side test
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import concurrent.futures as cf
+import dataclasses
+import gc
+import json
+import math
+import os
+import time
+import traceback
+import uuid
+from types import SimpleNamespace
+
+import pandas as pd
+
+from kalshi_infra.kalshi.fees import fee as kfee
+from kalshi_infra.kalshi.orders import http_status, is_order_group_reject
+from kalshi_infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
+from kalshi_infra.trading import lip
+from kalshi_strategies.LIPFARM import farm
+from kalshi_strategies.LIPFARM.farm import (CANCEL_TOKENS, CID_PREFIX, CLAIM_SETTLE_S, DUST_LOTS, EXIT_REPRICE_S,
+                                            GROUP_DELETES, GROUP_IDLE_S, GROUP_LIMIT, GUARD_COOLDOWN_S, GUARD_S,
+                                            MAX_MOVES, MOVE_BEHIND_FRAC, MOVE_MIN_S, MOVE_RESERVE, NAME,
+                                            ORDER_TOKENS, PLACE_RESERVE, ROOT, SENTINEL_LOTS, STATUS_S,
+                                            TRIP_COOLDOWN_S, WRITE_BURST, Cfg, Farm, TokenBucket, desired_orders,
+                                            event_of, exit_lots, is_hedge, is_sentinel, key, parse_book,
+                                            plan_market, remove_ours, unkey)
+
+# As ARBS's eval loop: a pass gives the loop back after this long.
+EVAL_SLICE_S = 0.001
+# Socket down: fills are polled this often instead of every GUARD_S.
+FILL_POLL_DOWN_S = 1.0
+KEEPALIVE_S = 20.0
+# A fill whose order id we don't know yet (its create still in flight) waits
+# this long for the ack before it's dropped; the REST poll backstops it.
+ORPHAN_S = 10.0
+# A journaled order this young may not be in Kalshi's resting list yet.
+SYNC_GRACE_S = 10.0
+MARKS_S = 60.0
+# As ARBS's completion.max_exit_misses: an informed sell that comes back short
+# (the socket book still showed bids the sweep had taken) is retried on the
+# market's next book update, at most this many times in a row.
+MAX_DUMP_MISSES = 5
+FLUSH_S = 1.0
+
+
+class _Dirty(set):
+    """Tickers to evaluate. Adding one wakes the eval loop (as ARBS's)."""
+
+    def __init__(self, wake: asyncio.Event):
+        super().__init__()
+        self.wake = wake
+
+    def add(self, x):
+        super().add(x)
+        self.wake.set()
+
+    def __ior__(self, other):
+        super().__ior__(other)
+        if other:
+            self.wake.set()
+        return self
+
+
+def tick_in(ranges, price: float) -> float:
+    for start, end, step in ranges:
+        if start - 1e-9 <= price < end - 1e-9:
+            return step
+    return 0.01
+
+
+def pool_rates(programs: dict) -> dict[str, float]:
+    """Each program's whole pool, $/s (parsing all ~9,500 took ~0.8 s: a worker's job)."""
+    out = {}
+    for t, prog in programs.items():
+        P = lip.params_from_program(prog)
+        out[t] = P.period_reward_usd / P.snapshots_per_period
+    return out
+
+
+def plan_batch(jobs: list[tuple]) -> dict[str, tuple]:
+    """plan_market over prepared inputs; pure, run on a worker thread.
+    Returns ticker -> (plan or None, its LipParams)."""
+    out = {}
+    for t, others, prog, cfg, held, ranges, current in jobs:
+        P = dataclasses.replace(lip.params_from_program(prog), price_ranges=ranges)
+        out[t] = (plan_market(t, others, P, cfg, held, tick=lambda px, r=ranges: tick_in(r, px), current=current,
+                             exit=exit_lots(others, cfg, P.target_size)), P)
+    return out
+
+
+class Runner(Farm):
+    """Farm's state, ranking and plan helpers; its own I/O, all async."""
+
+    def __init__(self, root: str = ROOT, shadow_only: bool = False, sim: bool = True):
+        self.root = root
+        self.shadow_only = shadow_only
+        self.sim = sim
+        super().__init__()
+        self.pool = cf.ThreadPoolExecutor(16, thread_name_prefix="lipfarm")
+        self.write_pool = cf.ThreadPoolExecutor(16, thread_name_prefix="lipfarm-write")
+        from kalshi_strategies.ARBS.execution import Gateway
+        self.gw = Gateway(self.pool, self.write_pool)
+        self.feed = None
+        self.wake: asyncio.Event | None = None
+        self.urgent_set: _Dirty | None = None
+        self.dirty: _Dirty | None = None
+        self.busy: set[str] = set()
+        self.busy_n: dict[str, int] = {}
+        self.urgent_after: set[str] = set()
+        self.positions_now: set[str] = set()
+        self.tasks: set[asyncio.Task] = set()
+        self.orphans: list[tuple[float, dict]] = []
+        self.seen_at: dict[str, tuple[float, object]] = {}    # ticker -> (our clock, Kalshi's fill time)
+        self.rows: list[dict] = []                             # journal rows awaiting the flush
+        self.group_wait: dict[str, asyncio.Future] = {}
+        self.marks: dict[str, dict] = {}
+        self.wanted: dict[str, tuple] = {}                     # leg key -> desired (price, lots, behind)
+        self.cfg = None
+        self.n_evals = 0
+        self.lag_max = 0.0                                     # worst loop stall since the last cycle print
+        self.pool_rate: dict[str, float] = {}
+        self.P: dict[str, lip.LipParams] = {}                  # params by ticker, from the last cycle
+        self.io_pool = cf.ThreadPoolExecutor(1, thread_name_prefix="lipfarm-io")   # file writes, in order
+        self.book_seq: dict[str, int] = {}                     # ticker -> socket book updates seen
+        self.dump_seq: dict[str, int] = {}                     # ticker -> book_seq its last informed sell saw
+
+    # ---- paths and persistence ----
+    def _open_mode(self, live: bool):
+        self.live = live
+        self.dir = os.path.join(self.root, "live" if live else "shadow")
+        os.makedirs(self.dir, exist_ok=True)
+        self.state_path = os.path.join(self.dir, "state.json")
+        self.state = self._load_state()
+        self.rates = {}
+        self.last_accrue = time.time()
+
+    async def save(self):
+        data = json.dumps(self.state)
+        await asyncio.get_running_loop().run_in_executor(self.io_pool, _atomic_write, self.state_path, data)
+
+    async def run_io(self, fn, *a):
+        return await asyncio.get_running_loop().run_in_executor(self.pool, fn, *a)
+
+    def journal(self, row: dict):
+        self.rows.append({"t": time.time(), "live": self.live, **row})
+
+    async def flush_loop(self):
+        while True:
+            await asyncio.sleep(FLUSH_S)
+            if self.rows:
+                rows, self.rows = self.rows, []
+                path = os.path.join(self.root, "journal", f"{pd.Timestamp.now(tz='UTC'):%Y-%m-%d}.jsonl")
+                await asyncio.get_running_loop().run_in_executor(self.io_pool, _append_rows, path, rows)
+
+    # ---- tasks (as ARBS's spawn: a ticker is busy until its last task ends) ----
+    def spawn(self, coro, t: str | None = None):
+        if t is not None:
+            self.busy.add(t)
+            self.busy_n[t] = self.busy_n.get(t, 0) + 1
+
+        async def wrap():
+            try:
+                await coro
+            except Exception:
+                print(f"task error ({t}):")
+                traceback.print_exc()
+            finally:
+                if t is not None:
+                    self.busy_n[t] -= 1
+                    if self.busy_n[t] <= 0:
+                        del self.busy_n[t]
+                        self.busy.discard(t)
+                    if t in self.urgent_after:
+                        self.urgent_after.discard(t)
+                        self.urgent_set.add(t)
+                    else:
+                        self.dirty.add(t)
+        task = asyncio.get_running_loop().create_task(wrap())
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+        return task
+
+    # ---- exchange plumbing (no blocking calls on the loop) ----
+    def shard(self, t: str) -> int | None:
+        m = self.meta.get(t)
+        return None if m is None else int(m.get("exchange_index") or 0)
+
+    def client(self, shard: int):
+        return self.gw.clients.get(shard)
+
+    def taker_rate(self, t: str) -> float:
+        ev = self.meta.get(t, {}).get("event_ticker") or event_of(t)
+        return self.taker_rates.get(ev, farm.DEFAULT_TAKER_RATE)
+
+    async def prefetch_fees(self, tickers):
+        from kalshi_infra.kalshi import fees
+        for t in tickers:
+            ev = self.meta.get(t, {}).get("event_ticker") or event_of(t)
+            if ev in self.taker_rates:
+                continue
+            try:
+                self.taker_rates[ev] = (await self.run_io(fees.for_event, ev.split("-")[0], ev)).taker_rate
+            except Exception:
+                self.taker_rates[ev] = farm.DEFAULT_TAKER_RATE
+
+    async def setup_clients(self):
+        shards = {t: s for t in self.meta if (s := self.shard(t)) is not None}
+        if self.shadow_only:
+            self.gw.shard_of = shards           # no clients: nothing is ever sent
+            return
+        await self.run_io(self.gw.setup, shards, None)
+
+    def ws_others(self, t: str) -> dict | None:
+        b = self.feed.ladder(t) if self.feed is not None and self.feed.up else None
+        if b is None or (not b.yes_bids and not b.no_bids):
+            return None
+        bids = ({round(p, 4): q for p, q in dict(b.yes_bids).items() if q > 0},
+                {round(p, 4): q for p, q in dict(b.no_bids).items() if q > 0})
+        return self.others_of(t, bids)
+
+    def ensure_feed(self, tickers):
+        tickers = sorted(set(tickers))
+        if not tickers:
+            return
+        if self.feed is None:
+            from kalshi_strategies.ARBS.feed import MultiFeed
+            self.feed = MultiFeed(tickers, self._on_quote, self._on_trade, label=NAME, on_fill=self._on_fill)
+            self.spawn(self.feed.run())
+            return
+        new = [t for t in tickers if t not in self.feed.tickers]
+        if new:
+            self.feed.add(new)
+
+    # ---- websocket callbacks (on the loop) ----
+    def _on_quote(self, view):
+        t = view.ladder.ticker
+        self.book_seq[t] = self.book_seq.get(t, 0) + 1
+        if t in self.order_tickers() or t in self.positions_now:
+            self.dirty.add(t)
+
+    def _on_fill(self, f: dict):
+        if f.get("liquidity") == "taker" or f.get("order_id") in self.gw.ioc_ids:
+            return                             # our IOCs are booked from their response
+        oids = {o["oid"] for o in self.state["orders"].values()}
+        known = f.get("order_id") in oids or f.get("order_id") in set(self.state.get("all_oids", []))
+        if not known:
+            if any(o.get("oid") is None for o in self.state["orders"].values()):
+                self.orphans.append((time.time(), f))   # its create may not be answered yet
+            return
+        self.take_fills([f])
+
+    def take_fills(self, fills: list[dict]):
+        """Book fills, then: the markets they hit are urgent, and the capital guard runs."""
+        now = time.time()
+        new = self.book_fills(fills)
+        for f in fills:
+            if f.get("ticker") in new:
+                self.seen_at[f["ticker"]] = (now, f.get("time"))
+        self.positions_now = set(self.signed_positions())
+        if new:
+            self.urgent_set |= new
+            self.capital_check()
+        return new
+
+    def replay_orphans(self):
+        if not self.orphans:
+            return
+        oids = {o["oid"] for o in self.state["orders"].values()}
+        now = time.time()
+        keep, ready = [], []
+        for at, f in self.orphans:
+            if f.get("order_id") in oids:
+                ready.append(f)
+            elif now - at < ORPHAN_S:
+                keep.append((at, f))
+        self.orphans = keep
+        if ready:
+            self.take_fills(ready)
+
+    def _on_trade(self, t: str, tr):
+        """Shadow: a print below our bid's price swept its level, and us with it."""
+        if self.live or not self.sim or tr.taker_side not in ("yes", "no"):
+            return
+        maker = "no" if tr.taker_side == "yes" else "yes"
+        fills = []
+        for k, o in list(self.state["orders"].items()):
+            if unkey(k)[0] != t or o["side"] != maker or o["remaining"] <= 1e-9:
+                continue
+            if tr.price < o["price"] - 1e-9:
+                fills.append({"ticker": t, "side": maker, "price": o["price"], "size": o["remaining"], "fee": 0.0,
+                              "order_id": o["oid"], "trade_id": "sim-" + uuid.uuid4().hex[:12],
+                              "time": pd.Timestamp.now(tz="UTC"), "liquidity": "maker"})
+        if fills:
+            self.take_fills(fills)
+
+    # ---- orders ----
+    def cancel(self, k: str, reason: str = "lipfarm:cancel"):
+        """Forget k now and send its cancel (spawned). A create still in flight
+        is cancelled by its own task once it's answered."""
+        o = self.state["orders"].pop(k, None)
+        if o and self.live and o.get("oid"):
+            t = unkey(k)[0]
+            self.spawn(self._cancel(t, o["oid"], reason))
+
+    async def _cancel(self, t: str, oid: str, reason: str):
+        self.bucket.take(CANCEL_TOKENS, force=True)
+        _, exc, _ = await self.gw.cancel(t, oid, reason)
+        if exc is not None and http_status(exc) != 404:
+            print(f"cancel {t} {oid}: {exc}")
+
+    async def group_id(self, t: str) -> str | None:
+        """t's event's order group, created or reset as needed (one call per
+        event at a time); None if that fails."""
+        ev = self.meta.get(t, {}).get("event_ticker") or event_of(t)
+        if not self.live:
+            return "shadow-" + ev
+        while ev in self.group_wait:
+            await asyncio.shield(self.group_wait[ev])
+        g = self.state.setdefault("groups", {}).get(ev)
+        if g is not None and not g.get("tripped"):
+            g["used"] = time.time()
+            return g["id"]
+        if not self.bucket.take(ORDER_TOKENS):
+            return None
+        fut = asyncio.get_running_loop().create_future()
+        self.group_wait[ev] = fut
+        try:
+            if g is None:
+                gid, exc = await self.gw.group_call(t, "create_order_group", GROUP_LIMIT)
+                if exc is not None:
+                    print(f"group {ev}: {exc}")
+                    return None
+                g = {"id": gid, "tripped": False, "fills": [], "ticker": t}
+                self.state["groups"][ev] = g
+            else:
+                _, exc = await self.gw.group_call(t, "reset_order_group", g["id"])
+                if exc is not None:
+                    print(f"group {ev} reset: {exc}")
+                    return None
+                g["tripped"], g["fills"] = False, []
+            g["used"] = time.time()
+            return g["id"]
+        finally:
+            self.group_wait.pop(ev, None)
+            fut.set_result(None)
+
+    def budget_ok(self, t: str, hedge: bool, reserve: float = PLACE_RESERVE) -> bool:
+        """Spend the tokens for one create, or refuse (a LIP bid only; an exit always goes)."""
+        if not self.live:
+            return True
+        c = self.gw.client(t)
+        if c is None:
+            return False
+        if hedge:
+            self.bucket.take(ORDER_TOKENS, force=True)
+            return c.allow_now("order", force=True, reason="lipfarm:hedge")
+        if not c.can_afford("order", reserve=reserve * c.tokens_per_s) or not self.bucket.take(ORDER_TOKENS):
+            self.n_refused += 1
+            if time.time() - self.last_refused_log > 60:
+                self.last_refused_log = time.time()
+                print(f"budget: {self.n_refused} bids refused so far (our bucket {self.bucket.tokens:.0f}, "
+                      f"shard {c.tokens_now():.0f})")
+            return False
+        if not c.allow_now("order", reason="lipfarm:quote"):
+            self.bucket.refund(ORDER_TOKENS)
+            return False
+        return True
+
+    async def place(self, t: str, side: str, price: float, lots: float, reserve: float = PLACE_RESERVE,
+                    reason: str = "lipfarm:quote", hedge: bool = False, sentinel: bool = False) -> bool:
+        if not hedge and self.state.get("cooldown", {}).get(t, 0.0) > time.time():
+            return False
+        k = f"{t}|{side}|s" if sentinel else key(t, side, hedge)
+        if k in self.state["orders"]:
+            return False
+        gid = None
+        if not hedge:
+            gid = await self.group_id(t)
+            if gid is None:
+                return False
+        if not self.budget_ok(t, hedge, reserve):
+            return False
+        rec = {"oid": None, "side": side, "price": price, "size": lots, "remaining": lots, "placed": time.time()}
+        if not hedge:
+            rec["group"] = gid
+        self.state["orders"][k] = rec
+        if not self.live:
+            rec["oid"] = "shadow-" + uuid.uuid4().hex[:12]
+            self._note_placed(rec["oid"], t, side, lots, hedge, sentinel)
+            return True
+        c = self.gw.client(t)
+        o = self.gw._order(t, side, price, lots, "quote", cid=CID_PREFIX + uuid.uuid4().hex[:24])
+        t0 = time.time()
+        try:
+            ack = await self.gw.write(c.place_resting, o, order_group_id=gid)
+            exc = None
+        except Exception as e:
+            ack, exc = None, e
+        self.journal({"kind": "order", "op": "rest", "ticker": t, "side": side, "price": price, "size": lots,
+                      "hedge": hedge, "sentinel": sentinel, "sent": t0, "answered": time.time(),
+                      "error": None if exc is None else repr(exc)[:200]})
+        if exc is not None:
+            if self.state["orders"].get(k) is rec:
+                del self.state["orders"][k]
+            if http_status(exc) == 429:
+                c.note_rate_limited(reason)
+            print(f"place {t} {side}@{price}: {exc}")
+            if gid and is_order_group_reject(exc):
+                self.group_trip(gid, "create refused")
+            return False
+        rec["oid"] = ack.exchange_order_id
+        self._note_placed(rec["oid"], t, side, lots, hedge, sentinel)
+        if self.state["orders"].get(k) is not rec:
+            # Cancelled (or a trip pulled it) while the create was in flight.
+            self.spawn(self._cancel(t, rec["oid"], "lipfarm:late"))
+            return False
+        self.replay_orphans()
+        return True
+
+    def _note_placed(self, oid, t, side, lots, hedge, sentinel):
+        self.state.setdefault("hedged_oids", []).append(oid)
+        known = self.state.setdefault("all_oids", [])
+        known.append(oid)
+        if not hedge:
+            self.state.setdefault("lip_oid_size", {})[oid] = lots
+        if sentinel:
+            self.state.setdefault("sentinel_oids", {})[oid] = key(t, side)
+
+    async def take(self, t: str, side: str, price: float, q: float, why: str) -> float:
+        """IOC buy of `side` at `price` (always sent); books and returns what filled."""
+        t0 = time.time()
+        if self.live:
+            self.bucket.take(ORDER_TOKENS, force=True)
+            fill, exc, sent = await self.gw.ioc(t, side, price, q, force=True, reason="lipfarm:take")
+        else:
+            fill, exc, sent = self.sim_ioc(t, side, price, q), None, True
+        seen, kts = self.seen_at.get(t, (None, None))
+        self.journal({"kind": "order", "op": "ioc", "why": why, "ticker": t, "side": side, "price": price,
+                      "size": q, "sent": t0, "answered": time.time(), "fill_seen": seen,
+                      "fill_time": None if kts is None else str(kts),
+                      "filled": 0.0 if fill is None else fill.size,
+                      "error": None if exc is None else repr(exc)[:200]})
+        got = 0.0 if exc is not None or fill is None else fill.size
+        if why == "informed":
+            misses = self.state.setdefault("dump_misses", {})
+            if got < q - 1e-9 and misses.get(t, 0) + 1 < MAX_DUMP_MISSES:
+                misses[t] = misses.get(t, 0) + 1
+                self.dumping.add(t)                  # again on the next book update
+            else:
+                misses.pop(t, None)
+        if exc is not None:
+            print(f"take {t} {side}@{price} x{q:.0f}: {exc}")
+            return 0.0
+        if fill is None or fill.size <= 0:
+            return 0.0
+        oid = fill.exchange_order_id or ("ioc-" + uuid.uuid4().hex[:12])
+        self.state.setdefault("hedged_oids", []).append(oid)
+        self.state.setdefault("ioc_booked", []).append(oid)
+        self.state["fills"].append({"ticker": t, "side": side, "price": fill.price, "size": fill.size,
+                                    "fee": fill.fee, "order_id": oid, "trade_id": "ioc:" + oid,
+                                    "time": pd.Timestamp.now(tz="UTC").isoformat(), "liquidity": "taker"})
+        self.positions_now = set(self.signed_positions())
+        print(f"take: {t} {side}@{fill.price:.4f} x{fill.size:.0f} ({why}, "
+              f"{1000 * (t0 - seen) if seen else float('nan'):.0f} ms after the fill reached us)")
+        return fill.size
+
+    def sim_ioc(self, t: str, side: str, price: float, q: float):
+        """Shadow IOC: buying `side` up to `price` is selling the other side into
+        others' bids from 1 - price up, at the book in memory."""
+        held = "no" if side == "yes" else "yes"
+        book = self.books.get(t, {}).get(held, {})
+        got, cost = 0.0, 0.0
+        for p in sorted(book, reverse=True):
+            if p < 1.0 - price - 1e-9 or got >= q - 1e-9:
+                break
+            n = min(book[p], q - got)
+            got += n
+            cost += n * (1.0 - p)
+        if got <= 0:
+            return None
+        px = cost / got
+        return SimpleNamespace(price=round(px, 4), size=got, fee=kfee(px, got, self.taker_rate(t)),
+                               exchange_order_id="simioc-" + uuid.uuid4().hex[:12])
+
+    # ---- order groups ----
+    def group_trip(self, gid: str, why: str):
+        """Kalshi has cancelled every bid in the group: off those markets for
+        TRIP_COOLDOWN_S. Our cancels only confirm it, after the market's exit
+        has been sent (evaluate)."""
+        g = next((g for g in self.state.get("groups", {}).values() if g.get("id") == gid), None)
+        if self.live and (g is None or g.get("tripped")):
+            return
+        if g is not None:
+            g["tripped"] = True
+        gone = [k for k, o in self.state["orders"].items() if o.get("group") == gid]
+        tickers = sorted({unkey(k)[0] for k in gone})
+        for t in tickers:
+            self.pull.add(t)
+            self.state.setdefault("cooldown", {})[t] = time.time() + TRIP_COOLDOWN_S
+        if self.dirty is not None:
+            self.dirty |= set(tickers)       # urgent (the filled market) goes first
+        self.journal({"kind": "group_trip", "group": gid, "why": why, "markets": tickers})
+        print(f"group: tripped ({why}); our bids pulled on {', '.join(tickers) or 'nothing'} "
+              f"for {TRIP_COOLDOWN_S:.0f} s")
+
+    def group_fill(self, gid: str, size: float):
+        if not self.live:
+            # Shadow groups exist only in name: count them here.
+            g = self.state.setdefault("shadow_groups", {}).setdefault(gid, {"fills": []})
+            now = time.time()
+            g["fills"] = [x for x in g["fills"] if x[0] >= now - farm.GROUP_WINDOW_S] + [[now, size]]
+            if sum(x[1] for x in g["fills"]) > GROUP_LIMIT + 1e-9:
+                g["fills"] = []
+                self.group_trip(gid, "shadow: past the limit")
+            return
+        super().group_fill(gid, size)
+
+    async def tidy_groups(self):
+        if not self.live:
+            return
+        resting = {o.get("group") for o in self.state["orders"].values()}
+        n = 0
+        for ev, g in list(self.state.get("groups", {}).items()):
+            if g.get("id") in resting or time.time() - g.get("used", 0.0) < GROUP_IDLE_S:
+                continue
+            t = g.get("ticker") or ev.split("|")[0]
+            c = self.gw.client(t)
+            if c is None or n >= GROUP_DELETES or not self.bucket.take(CANCEL_TOKENS) \
+                    or not c.allow_now("cancel", reason="lipfarm:group"):
+                return
+            n += 1
+            _, exc = await self.gw.group_call(t, "delete_order_group", g["id"])
+            if exc is not None and http_status(exc) != 404:
+                print(f"group {ev} delete: {exc}")
+                continue
+            self.state["groups"].pop(ev, None)
+
+    # ---- the hot path ----
+    async def eval_loop(self):
+        while True:
+            await self.wake.wait()
+            self.wake.clear()
+            self.replay_orphans()
+            start = time.perf_counter()
+            while self.urgent_set or self.dirty:
+                if self.urgent_set:
+                    t = self.urgent_set.pop()
+                    self.dirty.discard(t)
+                    urgent = True
+                else:
+                    t, urgent = self.dirty.pop(), False
+                if t not in self.busy:
+                    try:
+                        self.evaluate(t, urgent)
+                    except Exception:
+                        print(f"eval error {t}:")
+                        traceback.print_exc()
+                elif urgent:
+                    self.urgent_after.add(t)        # its task re-marks it urgent when done
+                if time.perf_counter() - start > EVAL_SLICE_S:
+                    break
+            if self.urgent_set or self.dirty:
+                self.wake.set()
+            await asyncio.sleep(0)
+
+    def evaluate(self, t: str, urgent: bool):
+        """Exits first, then (only now) the cancels a trip owes, then the guard."""
+        self.n_evals += 1
+        cfg = self.cfg
+        others = self.ws_others(t)
+        if others is not None:
+            self.books[t] = others
+        self.exits(t, cfg, takes=urgent)
+        if t in self.pull:
+            self.pull.discard(t)
+            for k in self.keys_of(t, hedges=False):
+                self.cancel(k, reason="lipfarm:trip")
+        if others is not None and t not in self.busy:
+            self.guard_market(t, others, cfg)
+
+    def exits(self, t: str, cfg: Cfg, takes: bool):
+        """farm.hedge for one market: informed fill -> pair lock off the book or
+        sell at once; dust -> sell; still falling -> chase; the rest rests an
+        exit bid. Every write is spawned; t is busy until they're answered."""
+        v = self.free_positions().get(t, 0.0)
+        if abs(v) < 0.01 or t not in self.books or t not in self.meta:
+            self.dumping.discard(t)
+            self.exit_bid(t, 0.0)
+            return
+        held = "yes" if v > 0 else "no"
+        fill_px = self.avg_cost(t, held)
+        tk = self.tick(t, fill_px)
+        lowest = fill_px - cfg.max_chase_ticks * tk
+        if t in self.dumping:
+            if t in self.state.get("dump_misses", {}) and self.dump_seq.get(t) == self.book_seq.get(t, 0):
+                return                               # a retry waits for the book to change
+            self.dumping.discard(t)
+            if takes and self.pair_lock(t, held, abs(v)):
+                return
+            self.dump_seq[t] = self.book_seq.get(t, 0)
+            self.dump(t, floor=fill_px - min(cfg.dump_slip_ticks, cfg.max_chase_ticks) * tk, why="informed")
+            return
+        if takes and self.baskets.get((t, held)):
+            # Not urgent (an informed fill sold above): the market waits on its REST reads.
+            self.spawn(self.basket_lock(t, held), t)
+            return
+        if time.time() - self.state.get("chased", {}).get(t, 0.0) >= EXIT_REPRICE_S:
+            if abs(v) <= DUST_LOTS:
+                self.dump(t, floor=None, adverse=False, why="dust")
+                return
+            best = max(self.books[t][held]) if self.books[t][held] else 0.0
+            if lowest - 1e-9 <= best <= fill_px - cfg.chase_ticks * tk + 1e-9:
+                self.dump(t, floor=max(best - cfg.dump_slip_ticks * tk, lowest), adverse=False, why="chase")
+                return
+        self.exit_bid(t, v)
+
+    def pair_lock(self, t: str, held: str, qty: float) -> bool:
+        """Take the market's other side when the pair costs at most $1 after fees (off the book in hand)."""
+        other = "no" if held == "yes" else "yes"
+        a = self.ask(t, other)
+        if not a:
+            return False
+        px, sz = a
+        if self.avg_cost(t, held) + px + kfee(px, 1.0, self.taker_rate(t)) > 1.0 + 1e-9:
+            return False
+        q = math.floor(min(qty, sz))
+        if q < 1:
+            return False
+
+        async def go():
+            got = await self.take(t, other, px, q, "pair lock")
+            if got >= 1.0:
+                print(f"lock: {t} {held} x{got:.0f} (pair)")
+        self.spawn(go(), t)
+        return True
+
+    async def basket_lock(self, t: str, held: str):
+        """farm.try_lock's basket half: other legs' books may need REST reads, so
+        it runs after the market's own exit, as its own task."""
+        bs = self.baskets.get((t, held), [])
+        if not bs:
+            return
+        need = sorted({tk for _, legs in bs for tk, _ in legs if tk != t and tk not in self.books})
+        for tk, ob in zip(need, await asyncio.gather(*(self.run_io(farm.fetch_book, x) for x in need))):
+            if ob is not None:
+                self.books[tk] = self.others_of(tk, parse_book(ob))
+        qty = abs(self.free_positions().get(t, 0.0))
+        cost = self.avg_cost(t, held)
+        best = None
+        for pay, legs in bs:
+            buys, c = [], cost
+            for tk, sd in legs:
+                if (tk, sd) == (t, held):
+                    continue
+                a = self.ask(tk, sd)
+                if a is None:
+                    break
+                c += a[0] + kfee(a[0], 1.0, self.taker_rate(tk))
+                buys.append((tk, sd, a[0], a[1]))
+            else:
+                if c <= pay + 1e-9 and (best is None or c / pay < best[0] / best[1]):
+                    best = (c, pay, buys)
+        if best is None:
+            return
+        q = math.floor(min([qty] + [sz for *_, sz in best[2]]))
+        if q < 1:
+            return
+        got = await asyncio.gather(*(self.take(tk, sd, px, q, "basket lock") for tk, sd, px, _ in best[2]))
+        locked = min([q] + list(got))
+        if locked >= 1.0:
+            lk = self.state.setdefault("locked", {})
+            for tk, sd in [(t, held)] + [(tk, sd) for tk, sd, *_ in best[2]]:
+                lk[tk] = lk.get(tk, 0.0) + (locked if sd == "yes" else -locked)
+            print(f"lock: {t} {held} x{locked:.0f} at ${best[0]:.3f} for ${best[1]:.0f} (basket)")
+
+    def dump(self, t: str, floor: float | None = None, adverse: bool = True, why: str = ""):
+        """Sell what we hold in t into others' bids from `floor` up, as one IOC,
+        with the market's exit bids (and, adverse, its LIP bids) cancelled in
+        the same gather -- never ahead of it."""
+        v = self.free_positions().get(t, 0.0)
+        held, other = ("yes", "no") if v > 0 else ("no", "yes")
+        cancels = [k for k in self.keys_of(t) if is_hedge(k)]
+        if adverse and abs(v) > DUST_LOTS:
+            cancels += self.keys_of(t, hedges=False)
+            self.state.setdefault("cooldown", {})[t] = time.time() + TRIP_COOLDOWN_S
+        need, cum, worst = abs(v), 0.0, None
+        for p in sorted(self.books[t][held], reverse=True):
+            if floor is not None and p < floor - 1e-9:
+                break
+            cum += self.books[t][held][p]
+            worst = p
+            if cum >= need:
+                break
+        q = math.floor(min(need, cum) * 100) / 100 if worst is not None else 0.0
+        go = worst is not None and q >= 0.01
+        if go:
+            self.state.setdefault("chased", {})[t] = time.time()
+            self.spawn(self.take(t, other, round(1.0 - worst, 4), q, why), t)
+        for k in cancels:
+            self.cancel(k, reason="lipfarm:adverse" if not is_hedge(k) else "lipfarm:dump")
+        if not go:
+            print(f"exit: {t} no bids to sell {held} into above {floor}; resting an exit")
+            self.exit_bid(t, v)
+            return
+        print(f"exit: {t} selling {held} x{q} down to {worst} ({why})")
+
+    def exit_bid(self, t: str, v: float):
+        """The resting exit: a bid of what we hold one tick above the other
+        side's touch, under its offer; stepped up when outbid (not more often
+        than EXIT_REPRICE_S)."""
+        k_have = [k for k in self.keys_of(t) if is_hedge(k)]
+        want = None
+        others = self.books.get(t)
+        if abs(v) >= 0.01 and others:
+            held, side = ("yes", "no") if v > 0 else ("no", "yes")
+            touch = max(others[side]) if others[side] else 0.0
+            ask = 1.0 - max(others[held]) if others[held] else 1.0
+            px = min(round(touch + self.tick(t, touch), 4), round(ask - self.tick(t, ask - 1e-9), 4))
+            if px >= 0.001:
+                want = (key(t, side, True), px, abs(v))
+        now = time.time()
+        for k in k_have:
+            o = self.state["orders"][k]
+            if o.get("oid") is None:
+                continue                                    # still being placed
+            if (want is None or k != want[0] or o["remaining"] > want[2] + 1e-9 or o["remaining"] < 0.5 * want[2]
+                    or (want[1] > o["price"] + 1e-9 and now - o["placed"] >= EXIT_REPRICE_S)):
+                self.cancel(k, reason="lipfarm:hedge")
+        if want and want[0] not in self.state["orders"]:
+            k, px, q = want
+            side = unkey(k)[1]
+
+            async def go():
+                if await self.place(t, side, px, q, reserve=0.0, reason="lipfarm:hedge", hedge=True):
+                    print(f"exit: {t} {side}@{px} x{q:.0f}")
+            self.spawn(go(), t)
+
+    def guard_market(self, t: str, others: dict, cfg: Cfg):
+        """A quoted side its market's plan no longer has is pulled (and the
+        market cooled down); our rate there is re-scored."""
+        if t not in self.programs:
+            return
+        keys = self.keys_of(t, hedges=False)
+        if not keys:
+            return
+        P = self.params(t)
+        pl = self.plan(t, others, P, cfg, self.signed_positions())
+        sides = {s for s, _ in pl.legs} if pl else set()
+        for k in keys:
+            o = self.state["orders"].get(k)
+            if o is None or o.get("oid") is None or unkey(k)[1] in sides:
+                continue
+            print(f"guard: pull {k} @{o['price']} (not in its plan now)")
+            self.cancel(k, reason="lipfarm:guard")
+            self.state.setdefault("cooldown", {})[t] = time.time() + GUARD_COOLDOWN_S
+        self.rates[t] = self.our_rate(t, others, P)
+
+    def capital_check(self):
+        exp = self.exposure()
+        for k, o in list(self.state["orders"].items()):
+            if not is_hedge(k) and exp + o["price"] * o["remaining"] > self.cfg.max_capital + 1e-9:
+                print(f"capital: pull {k} (exposure ${exp:.0f})")
+                self.cancel(k, reason="lipfarm:capital")
+
+    def params(self, t: str) -> lip.LipParams:
+        P = self.P.get(t)
+        if P is None:
+            P = self.P[t] = super().params(t)
+        return P
+
+    def candidates(self, cfg: Cfg) -> list[str]:
+        """farm.candidates on pool rates cached at refresh (it re-parsed every program: 1.5 s on the loop)."""
+        everything = sorted(self.programs)
+        est, pr = self.est, self.pool_rate
+        ranked = sorted(everything, key=lambda t: (-est.get(t, -1.0), -pr.get(t, 0.0)))
+        top = ranked[:cfg.scan_markets]
+        topset = set(top)
+        rest = [t for t in everything if t not in topset]
+        rot = []
+        if rest and cfg.scan_rotate:
+            i = self.rot % len(rest)
+            rot = (rest[i:] + rest[:i])[:cfg.scan_rotate]
+            self.rot = i + len(rot)
+        held = sorted(self.order_tickers() | set(self.signed_positions()))
+        return list(dict.fromkeys(top + rot + [t for t in held if t in self.programs]))
+
+    # ---- the cycle ----
+    async def cycle(self, cfg: Cfg):
+        await self.poll_fills()
+        await self.sync_live_orders()
+        self.accrue()
+        tickers = self.candidates(cfg)
+        obs = await asyncio.gather(*(self.run_io(farm.fetch_book, t) for t in tickers))
+        self.held_events = await self.run_io(farm.arbs_held_events)
+        pos = self.signed_positions()
+        jobs, books = [], {}
+        for t, ob in zip(tickers, obs):
+            if ob is None or t not in self.programs:
+                continue
+            others = self.others_of(t, ob)
+            books[t] = others
+            self.est[t] = 0.0
+            m = self.meta.get(t, {})
+            if (m and m.get("status") != "active") or event_of(t) in self.held_events:
+                continue
+            v = pos.get(t, 0.0)
+            current = {}
+            for k in self.keys_of(t, hedges=False):
+                sd = unkey(k)[1]
+                current[sd] = "sentinel" if (is_sentinel(k) or current.get(sd) == "sentinel") else "touch"
+            ranges = tuple((float(r["start"]), float(r["end"]), float(r["step"]))
+                           for r in m.get("price_ranges") or [])
+            jobs.append((t, others, self.programs[t], cfg, {"yes": max(v, 0.0), "no": max(-v, 0.0)}, ranges,
+                         current))
+        planned = await self.run_io(plan_batch, jobs)
+        plans, rates = {}, {}
+        for t, (pl, P) in planned.items():
+            self.P[t] = P
+            ok = self.flow_ok(t, cfg) if pl else False
+            self.est[t] = pl.rate / max(pl.capital, 1e-9) if pl and ok is not False else 0.0
+            if pl and ok:
+                plans[t] = pl
+        for t in books:
+            if t in self.order_tickers():
+                rates[t] = self.our_rate(t, books[t], self.params(t))
+        # Books from the socket are fresher than this cycle's REST reads.
+        for t, others in books.items():
+            if self.ws_others(t) is None:
+                self.books[t] = others
+        self.plans, self.rates = plans, {**self.rates, **rates}
+        await self.reconcile(cfg)
+        await self.tidy_groups()
+        self.report(cfg)
+        await self.save()
+
+    async def reconcile(self, cfg: Cfg):
+        want = self.choose(cfg)
+        if self.live:
+            self.write_claims(want)          # small file; on the loop, so state isn't shared with a thread
+        now = time.time()
+
+        def settle(t: str) -> float:
+            if not self.live:
+                return 0.0
+            c = self.state["claims"].get(t)
+            return CLAIM_SETTLE_S if c is None else max(0.0, CLAIM_SETTLE_S - (now - c))
+        self.waiting = [t for t in want if settle(t) > 0]
+        legs = {k: v for pl in want.values() for k, v in desired_orders(pl).items()}
+        self.wanted = legs
+        for k, o in list(self.state["orders"].items()):
+            if is_hedge(k) or o.get("oid") is None or unkey(k)[0] in self.busy:
+                continue
+            w = legs.get(k)
+            if (w is None or abs(w[0] - o["price"]) > 1e-9 or abs(o["size"] - w[1]) > 1e-9
+                    or o["remaining"] < 0.5 * w[1] or settle(unkey(k)[0]) > 0):
+                self.cancel(k)
+        await self.prefetch_fees(want)
+        self.ensure_feed(set(want) | self.order_tickers() | set(self.signed_positions()))
+        by_side: dict[tuple[str, str], dict] = {}
+        for k, w in legs.items():
+            t, side = unkey(k)
+            by_side.setdefault((t, side), {})[k] = w
+        for (t, side), ws in by_side.items():
+            if t in self.busy or all(k in self.state["orders"] for k in ws):
+                continue
+            wait = settle(t)
+            self.spawn(self.place_side(t, side, ws, wait), None if wait > 0 else t)
+        for t, pl in want.items():
+            if t in self.order_tickers():
+                self.rates.setdefault(t, pl.rate)
+
+    async def place_side(self, t: str, side: str, ws: dict, wait: float):
+        """One side's bids: a sentinel layout's main bid, then its sentinel right
+        after (main pulled if the sentinel can't go); a touch bid alone."""
+        if wait > 0:
+            await asyncio.sleep(wait)
+        ws = {k: w for k, w in ws.items() if self.wanted.get(k) == w}
+        main, sk = key(t, side), f"{t}|{side}|s"
+        if main in ws and main not in self.state["orders"]:
+            px, q, behind = ws[main]
+            if behind and sk in ws:
+                c = self.gw.client(t)
+                if self.live and (not self.bucket.has(2 * ORDER_TOKENS) or c is None):
+                    return
+                if not await self.place(t, side, px, q):
+                    return
+                sp, sq, _ = ws[sk]
+                if not await self.place(t, side, sp, sq, sentinel=True):
+                    print(f"sentinel {t} {side}: not placed; pulling its bid")
+                    self.cancel(main, reason="lipfarm:sentinel")
+                return
+            await self.place(t, side, px, q)
+        elif sk in ws and sk not in self.state["orders"] and main in self.state["orders"]:
+            sp, sq, _ = ws[sk]
+            await self.place(t, side, sp, sq, sentinel=True)
+
+    async def poll_fills(self):
+        """REST backstop for the socket's fills."""
+        if not self.live or not self.gw.clients:
+            return
+        c = next(iter(self.gw.clients.values()))
+        since = self.state.get("fills_since", self.state["t0"]) - 120
+        self.state["fills_since"] = time.time()
+        try:
+            fills = await self.run_io(lambda: c.fills("", min_ts=int(since)))
+        except Exception as e:
+            print(f"fills poll: {e}")
+            return
+        self.take_fills(fills)
+
+    async def sync_live_orders(self):
+        """farm.sync_live_orders, its reads on the pool. Orders still being
+        created, or younger than SYNC_GRACE_S, are left alone."""
+        if not self.live or not self.gw.clients:
+            return
+        c = self.gw.clients.get(0) or next(iter(self.gw.clients.values()))
+        try:
+            listed = {oid: (t, cid) for oid, t, cid in await self.run_io(c._resting, "")}
+        except Exception as e:
+            print(f"sync: {e}")
+            return
+        now = time.time()
+        check = [(k, o) for k, o in self.state["orders"].items()
+                 if o.get("oid") and o["oid"] not in listed and now - o["placed"] > SYNC_GRACE_S]
+        for (k, o), st in zip(check, await asyncio.gather(*(self.run_io(c.order, o["oid"]) for _, o in check),
+                                                          return_exceptions=True)):
+            if isinstance(st, Exception):
+                print(f"sync: lookup {k}: {st}")
+                continue
+            if (st or {}).get("status") != "resting" and self.state["orders"].get(k) is o:
+                del self.state["orders"][k]
+        mine = {o.get("oid") for o in self.state["orders"].values()}
+        for oid, (t, cid) in listed.items():
+            if (cid or "").startswith(CID_PREFIX) and oid not in mine:
+                print(f"sync: cancel orphan {t} {oid}")
+                self.spawn(self._cancel(t, oid, "lipfarm:orphan"))
+
+    # ---- loops ----
+    async def guard_loop(self):
+        """Every GUARD_S (FILL_POLL_DOWN_S with the socket down): REST fills,
+        every market we quote or hold re-checked, back-of-queue moves."""
+        last = 0.0
+        while True:
+            down = self.feed is None or not self.feed.up
+            await asyncio.sleep(FILL_POLL_DOWN_S if down else 0.5)
+            if self.cfg is None or time.time() - last < (FILL_POLL_DOWN_S if down else GUARD_S):
+                continue
+            last = time.time()
+            try:
+                await self.poll_fills()
+                mine = self.order_tickers() | set(self.signed_positions())
+                if down and mine:
+                    obs = await asyncio.gather(*(self.run_io(farm.fetch_book, t) for t in sorted(mine)))
+                    for t, ob in zip(sorted(mine), obs):
+                        if ob is not None:
+                            self.books[t] = self.others_of(t, parse_book(ob))
+                self.dirty |= mine
+                if not down:
+                    await self.move_back()
+            except Exception:
+                traceback.print_exc()
+
+    async def move_back(self):
+        """farm.move_back: a touch bid or sentinel with size joined behind it
+        goes back to the end of its queue (cancel + create)."""
+        if not self.live:
+            return
+        now = time.time()
+        due = {}
+        for t in self.order_tickers():
+            pl, others = self.plans.get(t), self.books.get(t)
+            if pl is None or others is None or t in self.busy:
+                continue
+            want = desired_orders(pl)
+            for k in self.keys_of(t, hedges=False):
+                o = self.state["orders"][k]
+                if (o.get("oid") and k in want and abs(want[k][0] - o["price"]) < 1e-9
+                        and (is_sentinel(k) or not want[k][2]) and now - o["placed"] >= MOVE_MIN_S):
+                    due[k] = others
+        if not due:
+            return
+        c = self.gw.clients.get(0) or next(iter(self.gw.clients.values()), None)
+        if c is None:
+            return
+        try:
+            ahead = await self.run_io(farm.queue_ahead, c, sorted({unkey(k)[0] for k in due}))
+        except Exception as e:
+            print(f"queue positions: {e}")
+            return
+        moves = 0
+        for k, others in sorted(due.items(), key=lambda kv: self.state["orders"].get(kv[0], {}).get("placed", 0)):
+            o = self.state["orders"].get(k)
+            if o is None:
+                continue
+            t, side = unkey(k)
+            a = ahead.get(o["oid"])
+            behind = others[side].get(round(o["price"], 4), 0.0) - (a or 0.0)
+            if a is None or behind < (1.0 if is_sentinel(k) else MOVE_BEHIND_FRAC * o["size"]):
+                continue
+            cl = self.gw.client(t)
+            if (moves >= MAX_MOVES or cl is None or not self.bucket.has(ORDER_TOKENS + CANCEL_TOKENS)
+                    or not cl.can_afford("order", reserve=MOVE_RESERVE * cl.tokens_per_s + cl.COST["cancel"])):
+                return
+            moves += 1
+            self.cancel(k, reason="lipfarm:move")
+            self.spawn(self.place(t, side, o["price"], o["size"], reserve=0.0, reason="lipfarm:move",
+                                  sentinel=is_sentinel(k)), t)
+
+    async def cycle_loop(self):
+        last = 0.0
+        while True:
+            await asyncio.sleep(0.5)
+            if self.cfg is None or not self.programs or time.time() - last < self.cfg.refresh_s:
+                continue
+            last = time.time()
+            try:
+                await self.cycle(self.cfg)
+            except Exception:
+                traceback.print_exc()
+
+    async def refresh_loop(self):
+        while True:
+            cfg = self.cfg
+            if cfg is not None and time.time() - self.last_programs > cfg.programs_refresh_s:
+                try:
+                    self.apply_refresh(await self.run_io(farm.refresh_job, set(self.signed_positions())))
+                    self.pool_rate = await self.run_io(pool_rates, self.programs)
+                    self.P = {}
+                    freeze_heap()
+                    await self.setup_clients()
+                except Exception:
+                    traceback.print_exc()
+                    self.last_programs = time.time() - cfg.programs_refresh_s + 60.0
+            await asyncio.sleep(1.0)
+
+    async def status_loop(self):
+        while True:
+            await asyncio.sleep(STATUS_S)
+            if self.cfg is None or not self.programs:
+                continue
+            try:
+                held = sorted({f["ticker"] for f in self.state["fills"]})
+                if held and time.time() - self.marks_at > MARKS_S:
+                    self.marks_at = time.time()
+                    for t, m in (await self.run_io(farm.fetch_meta, held)).items():
+                        self.meta[t] = m
+                self.accrue()
+                self.report(self.cfg, log=False)
+            except Exception:
+                traceback.print_exc()
+
+    async def lag_loop(self):
+        """How late the loop wakes: anything blocking it (a slow save, planning
+        on the loop) delays every fill behind it."""
+        while True:
+            t0 = time.perf_counter()
+            await asyncio.sleep(0.05)
+            self.lag_max = max(self.lag_max, time.perf_counter() - t0 - 0.05)
+
+    async def keepalive_loop(self):
+        while True:
+            await asyncio.sleep(KEEPALIVE_S)
+            for c in list(self.gw.clients.values()):
+                try:
+                    await self.run_io(c.keepalive)
+                except Exception as e:
+                    print(f"keepalive: {e}")
+
+    async def control_loop(self, arm: str | None, stop_ev: asyncio.Event):
+        modes, stop = TradingModeWatcher(NAME), StopWatcher()
+        if arm and not self.shadow_only:
+            await self.set_live(True, arm)
+        while True:
+            try:
+                self.cfg = Cfg.load()
+                self.bucket.rate = self.cfg.write_tokens_per_s
+                self.cfg_adverse = self.cfg.adverse_lots
+                reason = stop.poll()
+                if reason:
+                    print(f"STOP: {reason}")
+                    stop_ev.set()
+                    return
+                want = modes.poll()
+                if want is not None and not self.shadow_only:
+                    await self.set_live(want, f"dashboard {modes.origin()}")
+            except Exception:
+                traceback.print_exc()
+            await asyncio.sleep(1.0)
+
+    async def set_live(self, want: bool, why: str):
+        self.arm_requested = want
+        if want == self.live:
+            return
+        print(f"{'ARM' if want else 'DISARM'}: {why}")
+        self.accrue()
+        await self.cancel_all()
+        if self.live:
+            self.write_claims({})
+        await self.save()
+        self._open_mode(want)
+        self.positions_now = set(self.signed_positions())
+        if want:
+            await self.setup_clients()
+            await self.cancel_strays()
+
+    async def cancel_all(self):
+        orders = list(self.state["orders"].items())
+        self.state["orders"] = {}
+        if self.live:
+            await asyncio.gather(*(self._cancel(unkey(k)[0], o["oid"], "lipfarm:stop")
+                                   for k, o in orders if o.get("oid")))
+
+    async def cancel_strays(self):
+        c = self.gw.clients.get(0) or next(iter(self.gw.clients.values()), None)
+        if c is None:
+            return
+        for oid, t, cid in await self.run_io(c._resting, ""):
+            if cid and cid.startswith(CID_PREFIX):
+                await self._cancel(t, oid, "lipfarm:stray")
+        self.state["orders"] = {}
+
+    # ---- report (file writes off the loop) ----
+    def positions(self) -> list[dict]:
+        pos: dict[tuple, dict] = {}
+        for f in self.state["fills"]:
+            p = pos.setdefault((f["ticker"], f["side"]), {"ticker": f["ticker"], "side": f["side"],
+                                                          "lots": 0.0, "cost": 0.0, "fees": 0.0})
+            p["lots"] += f["size"]
+            p["cost"] += f["size"] * f["price"]
+            p["fees"] += f["fee"] or 0.0
+        for (t, side), p in pos.items():
+            m = self.meta.get(t, {})
+            res = m.get("result")
+            pair = min(p["lots"], pos.get((t, "no" if side == "yes" else "yes"), {}).get("lots", 0.0))
+            p["mark"] = (1.0 if res == side else 0.0) if res in ("yes", "no") else float(
+                m.get(f"{side}_bid_dollars") or 0.0)
+            p["paired"] = pair
+            p["value"] = pair * 0.5 + (p["lots"] - pair) * p["mark"]
+            p["pnl"] = p["value"] - p["cost"] - p["fees"]
+        return list(pos.values())
+
+    def report(self, cfg: Cfg, log: bool = True):
+        rows = []
+        for t in sorted(self.order_tickers(), key=lambda t: -self.rates.get(t, 0.0)):
+            legs = sorted(self.legs_of(t), key=lambda so: so[0])
+            hedged = {unkey(k)[1] for k in self.state["orders"] if is_hedge(k) and unkey(k)[0] == t}
+            pl = self.plans.get(t)
+            rows.append({"ticker": t, "mode": pl.mode if pl else ("hedge" if hedged else ""),
+                         "bids": " + ".join(f"{s}@{o['price']:.3f}x{o['remaining']:g}" for s, o in legs),
+                         "layout": ",".join(f"{s}:{l}" for s, l in sorted((pl.layout if pl else {}).items())),
+                         "resting": sum(o["remaining"] for _, o in legs),
+                         "capital_usd": sum(o["price"] * o["remaining"] for _, o in legs),
+                         "our_usd_day": self.rates.get(t, 0.0) * 86400,
+                         "pool_usd_day": (pl.pool_rate if pl else 0.0) * 86400,
+                         "exp_lip_usd": self.state["accrued"].get(t, 0.0),
+                         "period_lip_usd": self.period_accrued(t) if t in self.programs else 0.0})
+        pos = self.positions()
+        tot_lip = sum(self.state["accrued"].values())
+        locked = sum(v for v in self.state.get("period_accrued", {}).values() if v >= farm.LIP_MIN_PAYOUT_USD)
+        fill_pnl = sum(p["pnl"] for p in pos)
+        at_risk = sum(r["capital_usd"] for r in rows)
+        hrs = (time.time() - self.state["t0"]) / 3600
+        summary = {"mode": "LIVE" if self.live else "shadow", "live_trading": self.live,
+                   "arm_requested": self.arm_requested, "hours": hrs, "quoting": len(rows),
+                   "our_usd_day_now": sum(r["our_usd_day"] for r in rows), "exp_lip_usd": tot_lip,
+                   "lip_locked_usd": locked, "lip_pending_usd": tot_lip - locked,
+                   "fills": len(self.state["fills"]), "fill_lots": sum(p["lots"] for p in pos),
+                   "fill_pnl_usd": fill_pnl, "net_usd": tot_lip + fill_pnl, "resting_cost_usd": at_risk,
+                   "max_capital_usd": cfg.max_capital, "exposure_usd": self.exposure(),
+                   "locked_bundles": len(self.state.get("locked", {})),
+                   "write_tps_10m": self.bucket.rate_10m(), "write_tps_cap": cfg.write_tokens_per_s,
+                   "ws_up": bool(self.feed and self.feed.up), "ws_updates": self.n_evals,
+                   "waiting_on_arbs": len(self.waiting), "arbs_events_skipped": len(self.held_events),
+                   "runner": "async", "loop_lag_ms_max": 1000 * self.lag_max, "updated_at": time.time()}
+        doc = json.dumps({"summary": summary, "quotes": rows, "positions": pos, "waiting": self.waiting},
+                         indent=1)
+        asyncio.get_running_loop().run_in_executor(self.io_pool, _atomic_write,
+                                                   os.path.join(self.root, "status.json"), doc)
+        if not log:
+            return
+        print(f"\n=== LIPFARM {summary['mode']} (async) {pd.Timestamp.now(tz='UTC'):%Y-%m-%d %H:%M:%S}Z "
+              f"| {hrs:.2f}h | quoting {len(rows)} | now ${summary['our_usd_day_now']:.0f}/day "
+              f"| exp LIP ${tot_lip:.2f} | fills {summary['fills']} pnl ${fill_pnl:+.2f} "
+              f"| net ${summary['net_usd']:+.2f} | resting ${at_risk:.0f} | exposure "
+              f"${summary['exposure_usd']:.0f} of ${cfg.max_capital:.0f} | loop lag max "
+              f"{1000 * self.lag_max:.0f} ms | evals {self.n_evals}", flush=True)
+        self.lag_max = 0.0
+        for r in rows:
+            print(f"{r['ticker']:40} {r['mode']:7} {r['bids']:26} {r['capital_usd']:6.0f} "
+                  f"{r['our_usd_day']:7.1f} {r['pool_usd_day']:7.1f} {r['exp_lip_usd']:7.2f}")
+
+    # ---- main ----
+    async def main(self, arm: str | None):
+        loop = asyncio.get_running_loop()
+        self.wake = asyncio.Event()
+        self.urgent_set, self.dirty = _Dirty(self.wake), _Dirty(self.wake)
+        self.positions_now = set(self.signed_positions())
+        stop_ev = asyncio.Event()
+        self.cfg = Cfg.load()
+        self.apply_refresh(await self.run_io(farm.refresh_job, set(self.signed_positions())))
+        self.pool_rate = await self.run_io(pool_rates, self.programs)
+        freeze_heap()
+        await self.setup_clients()
+        held = self.order_tickers() | set(self.signed_positions())
+        self.ensure_feed(held or set(list(self.programs)[:1]))
+        coros = [self.control_loop(arm, stop_ev), self.eval_loop(), self.cycle_loop(), self.guard_loop(),
+                 self.refresh_loop(), self.status_loop(), self.keepalive_loop(), self.flush_loop(),
+                 self.lag_loop()]
+        tasks = [loop.create_task(c) for c in coros]
+        try:
+            await stop_ev.wait()
+        finally:
+            for t in tasks:
+                t.cancel()
+            print("stopping: cancelling quotes")
+            try:
+                self.accrue()
+                await self.cancel_all()
+                if self.live:
+                    self.write_claims({})
+                await self.save()
+            except Exception:
+                print("WARN: shutdown cleanup failed -- CHECK KALSHI BY HAND for resting orders:")
+                traceback.print_exc()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def freeze_heap():
+    """One full collection, then move what survived (programs, market records:
+    ~10k dicts) out of the collector's reach: a full pass over them stalled the
+    loop 0.2-0.3 s at random (local profile 11-05). Once per program refresh."""
+    gc.unfreeze()
+    gc.collect()
+    gc.freeze()
+
+
+def _atomic_write(path: str, data: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{uuid.uuid4().hex[:8]}.tmp"           # status writes may overlap on the pool
+    with open(tmp, "w") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def _append_rows(path: str, rows: list[dict]):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r, default=str) + "\n")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--live", action="store_true", help="arm at start: real orders")
+    ap.add_argument("--resume-arm", action="store_true",
+                    help="re-arm if the dashboard's last request was an arm and no STOP since")
+    ap.add_argument("--shadow-only", action="store_true",
+                    help="never arm (ignores the dashboard): a side-by-side test beside the live farm")
+    ap.add_argument("--root", default=ROOT, help="state, status and journal directory")
+    ap.add_argument("--reads-per-s", type=float, default=None,
+                    help="REST read pace (default farm.READS_PER_S; the account's read limit is shared with ARBS)")
+    a = ap.parse_args()
+    if a.reads_per_s:
+        farm.PACER = farm.ReadPacer(a.reads_per_s)
+    arm = None
+    if not a.shadow_only:
+        arm = "--live" if a.live else (resumable_arm(NAME) if a.resume_arm else None)
+    r = Runner(root=a.root, shadow_only=a.shadow_only)
+    try:
+        asyncio.run(r.main(arm))
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
