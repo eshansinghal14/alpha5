@@ -246,6 +246,9 @@ class Cfg:
                                  "that the rest waits on a passive exit. 11-04 sweeps of 300+ lots: a further "
                                  "fall of up to ~5c in 10 s kept falling (holding lost 2-6c), one of 6c+ came "
                                  "back (holding gained 6-26c).", min=0, max=99, step=1, group="exits")
+    recover_s: float = param("A fill of any size whose market hasn't recovered this long after (others' best bid "
+                             "on our side still under our fill price) is adverse too: its event is pulled for "
+                             "event_pull_s. 0 = off.", min=0.0, max=1800.0, step=15.0, group="exits")
     event_pull_s: float = param("After an adverse fill or a sentinel trip, every market in its event is off this "
                                 "long. 14-day tape (10-22..11-05): another market in the event was swept "
                                 "adversely within 5 min of an adverse sweep 15% of the time vs 3% at random, "

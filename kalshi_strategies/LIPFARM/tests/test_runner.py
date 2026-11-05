@@ -705,3 +705,44 @@ def test_stopping_keeps_exit_bids_and_the_next_run_adopts_them(tmp_path, monkeyp
     asyncio.run(go())
     assert list(r.state["orders"]) == ["Z-1-A|no|h"]
     assert [x[3] for x in c.calls if x[1] == "cancel"] == ["lip", "stray"]
+
+
+def test_a_small_fill_whose_market_stays_down_pulls_the_event(tmp_path, monkeypatch):
+    # FOC-70 11-05: 83 lots at 83c (under adverse_lots); the no bid never came back.
+    books = {"F-1-70": {"yes": {0.15: 900.0}, "no": {0.80: 900.0}},
+             "F-1-55": {"yes": {0.40: 900.0}, "no": {0.54: 900.0}},
+             "F-1-90": {"yes": {0.05: 900.0}, "no": {0.93: 900.0}}}
+    r, c = make(tmp_path, monkeypatch, books)
+    r.cfg = dataclasses.replace(CFG, recover_s=0.05, event_pull_s=1800.0)
+    r.state["orders"] = {"F-1-70|no": _order("no", 0.83, oid="a", group=None),
+                         "F-1-55|no": _order("no", 0.54, oid="b", group=None)}
+    r.state.update(lip_oid_size={"a": 1000, "b": 1000}, hedged_oids=["a"], all_oids=["a", "b"])
+
+    async def go():
+        await boot(r)
+        task = asyncio.get_running_loop().create_task(r.recovery_loop())
+        r._on_fill(_fill("F-1-70", "no", 0.83, 83.0, "a", "t1"))
+        await asyncio.sleep(1.3)
+        task.cancel()
+        await settle(r)
+    asyncio.run(go())
+    assert r.state["cooldown"]["F-1-55"] > time.time() + 1700            # the event is off
+    assert "F-1-55|no" not in r.state["orders"]
+    assert any(x["kind"] == "unrecovered" for x in r.rows)
+
+
+def test_the_exit_ignores_a_few_lots_and_steps_back_down(tmp_path, monkeypatch):
+    # FOC-70 11-05: we hold 72 no; others' yes bids 5 at 30c, then 46 at 17c, 353 at 16c.
+    books = {"Z-1-A": {"yes": {0.30: 5.0, 0.17: 46.0, 0.16: 353.0}, "no": {0.69: 15.0, 0.52: 59.0}}}
+    r, c = make(tmp_path, monkeypatch, books)
+    _held(r, "Z-1-A", "no", 0.83, 72.0)
+    r.state["orders"] = {"Z-1-A|yes|h": _order("yes", 0.30, size=72.0, oid="x", group=None,
+                                               placed=time.time() - 60)}
+
+    async def go():
+        await boot(r)
+        r.dirty.add("Z-1-A")
+        await settle(r)
+        await settle(r)
+    asyncio.run(go())
+    assert r.state["orders"]["Z-1-A|yes|h"]["price"] == 0.18                  # one over the 17c bid, not 31c

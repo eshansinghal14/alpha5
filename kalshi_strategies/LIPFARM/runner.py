@@ -86,6 +86,10 @@ QUEUE_CHECK_S = 60.0
 # at the sentinel's level and the bid a tick under scored nothing), at most once
 # per REPRICE_MIN_S per side so bots stepping over us don't start a write war.
 REPRICE_FRAC = 0.5
+# The exit prices off the first level where others hold this much (or this share of
+# our exit): FOC-70 11-05, a 5-lot bid kept our 72-lot exit 13 ticks over the real bid.
+EXIT_TOUCH_LOTS = 25.0
+EXIT_TOUCH_FRAC = 0.1
 REPRICE_MIN_S = 30.0
 # Manual holds (an operator or agent writes holds.json: {ticker: {"until": epoch, "why": str}}):
 # our LIP bids there are pulled and kept off until then; exits are untouched. Re-read this often.
@@ -217,6 +221,7 @@ class Runner:
         self.flow_held: dict[str, dict] = {}                   # ticker -> its plan the flow filter holds back
         self.depth_hist: dict[str, collections.deque] = {}     # ticker -> (time, depth snapshot), DEPTH_KEEP_S
         self.levels = Levels()
+        self.recovery: list[tuple] = []                        # (seen, ticker, side, price) of LIP fills to re-check
         self.repriced_at: dict[tuple, float] = {}              # (ticker, side) -> last guard re-place
         self.queue_err: collections.deque = collections.deque(maxlen=500)   # |inferred - actual| ahead, last checks
         self.book_seq: dict[str, int] = {}                     # ticker -> socket book updates seen
@@ -681,6 +686,8 @@ class Runner:
             if f.get("ticker") in new:
                 self.seen_at[f["ticker"]] = (now, f.get("time"))
                 if f.get("order_id") in sizes:
+                    # Adverse after the fact if the price hasn't come back by recover_s (recovery_loop).
+                    self.recovery.append((now, f["ticker"], f["side"], f["price"]))
                     hist = [(round(now - at, 3), snap) for at, snap in self.depth_hist.get(f["ticker"], ())
                             if at >= now - FILL_CONTEXT_S]
                     self.journal({"kind": "fill_context", "ticker": f["ticker"], "side": f["side"],
@@ -1156,14 +1163,21 @@ class Runner:
 
     def exit_bid(self, t: str, v: float):
         """The resting exit: a bid of what we hold one tick above the other
-        side's touch, under its offer; stepped up when outbid (not more often
-        than EXIT_REPRICE_S)."""
+        side's touch, under its offer. The touch is the first level from the top
+        where others' size reaches EXIT_TOUCH_LOTS (or EXIT_TOUCH_FRAC of ours),
+        so a few lots can't push it; re-priced up or down to it, at most every
+        EXIT_REPRICE_S."""
         k_have = [k for k in self.keys_of(t) if is_hedge(k)]
         want = None
         others = self.books.get(t)
         if abs(v) >= 0.01 and others:
             held, side = ("yes", "no") if v > 0 else ("no", "yes")
-            touch = max(others[side]) if others[side] else 0.0
+            need, cum, touch = max(EXIT_TOUCH_LOTS, EXIT_TOUCH_FRAC * abs(v)), 0.0, 0.0
+            for p in sorted(others[side], reverse=True):
+                cum += others[side][p]
+                touch = p
+                if cum >= need:
+                    break
             ask = 1.0 - max(others[held]) if others[held] else 1.0
             px = min(round(touch + self.tick(t, touch), 4), round(ask - self.tick(t, ask - 1e-9), 4))
             if px >= 0.001:
@@ -1174,7 +1188,7 @@ class Runner:
             if o.get("oid") is None:
                 continue                                    # still being placed
             if (want is None or k != want[0] or o["remaining"] > want[2] + 1e-9 or o["remaining"] < 0.5 * want[2]
-                    or (want[1] > o["price"] + 1e-9 and now - o["placed"] >= EXIT_REPRICE_S)):
+                    or (abs(want[1] - o["price"]) > 1e-9 and now - o["placed"] >= EXIT_REPRICE_S)):
                 self.cancel(k, reason="lipfarm:hedge")
         if want and want[0] not in self.state["orders"]:
             k, px, q = want
@@ -1558,6 +1572,31 @@ class Runner:
             await asyncio.sleep(0.05)
             self.lag_max = max(self.lag_max, time.perf_counter() - t0 - 0.05)
 
+    async def recovery_loop(self):
+        """A LIP fill whose market's bid on our side is still under our fill price
+        recover_s later is adverse: its event is pulled (pull_event)."""
+        while True:
+            await asyncio.sleep(1.0)
+            cfg = self.cfg
+            if cfg is None or cfg.recover_s <= 0 or not self.recovery:
+                continue
+            now, keep = time.time(), []
+            for item in self.recovery:
+                seen, t, side, price = item
+                if now - seen < cfg.recover_s:
+                    keep.append(item)
+                    continue
+                others = self.ws_others(t) or self.books.get(t)
+                if not others:
+                    continue
+                best = max(others[side]) if others[side] else 0.0
+                if best < price - 1e-9:
+                    self.journal({"kind": "unrecovered", "ticker": t, "side": side, "price": price, "best": best,
+                                  "after_s": round(now - seen)})
+                    print(f"unrecovered: {t} {side} filled at {price}, best bid {best} after {now - seen:.0f} s")
+                    self.pull_event(t)
+            self.recovery = keep
+
     async def levels_loop(self):
         """Classify level decreases on time; every QUEUE_CHECK_S, test the guessed
         orders against Kalshi's queue positions for our LIP bids (live)."""
@@ -1797,7 +1836,7 @@ class Runner:
         self.ensure_feed(held or set(list(self.programs)[:1]))
         coros = [self.control_loop(arm, stop_ev), self.eval_loop(), self.cycle_loop(), self.guard_loop(),
                  self.refresh_loop(), self.status_loop(), self.keepalive_loop(), self.flush_loop(),
-                 self.lag_loop(), self.ghost_loop(), self.levels_loop(), self.holds_loop()]
+                 self.lag_loop(), self.ghost_loop(), self.levels_loop(), self.holds_loop(), self.recovery_loop()]
         tasks = [loop.create_task(c) for c in coros]
         try:
             await stop_ev.wait()
