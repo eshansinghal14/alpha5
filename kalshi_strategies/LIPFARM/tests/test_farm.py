@@ -654,6 +654,11 @@ def test_narrow_market_needs_exit_liquidity_and_is_sized_by_it():
     thin = {"yes": {0.45: 1500.0}, "no": {0.50: 500.0, 0.49: 600.0}}
     pl = plan_market("T", thin, P, CFG, {}, exit=farm.exit_lots(thin, CFG, 1000))
     assert pl.legs == (("no", 0.50),)
+    # min_leg_price is for wide markets only.
+    cheap = {"yes": {0.05: 1500.0, 0.04: 600.0}, "no": {0.90: 1500.0, 0.89: 600.0}}
+    pl = plan_market("T", cheap, P, dataclasses.replace(CFG, min_leg_price=0.2), {},
+                     exit=farm.exit_lots(cheap, CFG, 1000))
+    assert pl.mode == "narrow" and ("yes", 0.05) in pl.legs
 
 
 def test_wide_and_decided_quote_target_whatever_the_exit_depth():

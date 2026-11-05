@@ -190,11 +190,11 @@ class Cfg:
                              group="pricing")
     max_position: float = param("Stop quoting a side once we hold this many contracts of it.", min=0.0,
                                 step=100.0, group="pricing")
-    min_leg_price: float = param("Don't quote a side bid under this. A full fill on a 5-6c leg was an "
-                                 "informed dump every time, sold back at 1c (ORAN, NMAN, IDS 11-04).",
-                                 min=0.0, max=0.5, step=0.01, group="pricing")
     wide_spread: float = param("Wide: quote both sides at the touch, Target size, when ask - bid is at least "
                                "this.", min=0.01, max=0.98, step=0.01, group="pricing", sub="wide markets")
+    min_leg_price: float = param("Wide: don't quote a side bid under this. A full fill on a 5-6c leg was an "
+                                 "informed dump every time, sold back at 1c (ORAN, NMAN, IDS 11-04).",
+                                 min=0.0, max=0.5, step=0.01, group="pricing", sub="wide markets")
     decided_min: float = param("Decided: quote the expensive side, Target size, when its best bid is at least "
                                "this.", min=0.5, max=0.999, step=0.01, group="pricing", sub="decided markets")
     flow_days: float = param("Every quoted market must be low-flow over this many trailing days (public "
@@ -359,13 +359,12 @@ def plan_market(ticker: str, others: dict[str, dict[float, float]], params: lip.
         return None
     by, bn = max(others["yes"]), max(others["no"])
     hi_side, hi = ("yes", by) if by >= bn else ("no", bn)
-    both = [(s, p) for s, p in (("yes", by), ("no", bn)) if p >= cfg.min_leg_price - 1e-9]
     if hi >= cfg.decided_min - 1e-9:
         mode, legs = "decided", [(hi_side, hi)]
     elif 1.0 - by - bn >= cfg.wide_spread - 1e-9:
-        mode, legs = "wide", both
+        mode, legs = "wide", [(s, p) for s, p in (("yes", by), ("no", bn)) if p >= cfg.min_leg_price - 1e-9]
     elif exit is not None:
-        mode, legs = "narrow", both
+        mode, legs = "narrow", [("yes", by), ("no", bn)]
         side_lots = {s: min(side_lots.get(s, 0.0), exit.get(s, 0.0)) for s in ("yes", "no")}
     else:
         return None
