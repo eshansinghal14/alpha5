@@ -2350,7 +2350,11 @@ class ArbsRunner:
             _, exc, _ = await self.gw.cancel(q.ticker, q.exchange_id, reason)
             self.order_times.append({"kind": "cancel", "reason": reason, "ticker": q.ticker, "sent": t0,
                                      "answered": time.time(), "book": book, "order_id": q.exchange_id})
-            if exc is not None and http_status(exc) != 404:    # 404: already gone
+            # 404, or the market closed for good: Kalshi already cancelled it.
+            # Retrying a market_inactive cancel each pass tripped the order-error
+            # breaker in a minute (KXHOUSERACE-VA05 called, 11-05 17:05).
+            gone = exc is not None and (http_status(exc) == 404 or (error_code(exc) or "").lower() == "market_inactive")
+            if exc is not None and not gone:
                 self._order_err(q.basket_id, f"cancel {q.ticker}", exc, q.ticker)
                 return            # stays tracked; the next pass retries
         self._retire(q)

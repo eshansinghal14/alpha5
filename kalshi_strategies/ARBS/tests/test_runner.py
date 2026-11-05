@@ -873,6 +873,22 @@ def test_paused_market_is_held_with_one_alert(arbs):
     assert b.basket_id in r.shadow_ledger.baskets
 
 
+def test_cancel_on_an_inactive_market_retires_the_quote_without_an_error(arbs):
+    r, b = arbs
+    import requests
+    q = R.Quote(basket_id=b.basket_id, leg=0, ticker="X-A", side="yes", price=0.40, size=5, cid="c", edge=0.0,
+                max_price=0.40, pending=False, exchange_id="oid")
+    r.quotes[q.key] = q
+    r.live = True
+
+    async def cancel(ticker, oid, reason):
+        return None, requests.HTTPError('409 for x: {"error":{"code":"market_inactive"}}'), True
+    r.gw.cancel = cancel
+    asyncio.run(r.cancel_quote(q, "no_edge"))
+    assert q.key not in r.quotes and r.order_errors == 0 and r.blocked() is None
+    r.live = False
+
+
 def test_exchange_pause_blocks_and_silences_market_pauses(arbs):
     r, b = arbs
     import requests
