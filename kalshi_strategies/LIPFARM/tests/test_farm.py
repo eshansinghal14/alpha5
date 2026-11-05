@@ -195,3 +195,13 @@ def test_wide_bids_as_deep_as_keeps_most_of_the_lip():
     # Others past Target/5 above it: deep scores nothing, so it stays up top.
     crowded = dict(others, no={0.57: 300.0, 0.56: 173.0, 0.09: 2.5, 0.06: 27.0, 0.05: 3025.0})
     assert plan_market("T", crowded, P, cfg, {}, 1000).big["no"] >= 0.56
+
+
+
+def test_a_side_goes_deep_on_its_own_lip_not_the_markets():
+    cfg = dataclasses.replace(CFG, deep_keep=0.8, min_leg_price=0.2)
+    # ANTHVREQ 11-05: the yes touch is crowded (12.6k), so yes earns little anywhere; the no side
+    # carries the market. Yes must not be pushed to 1c just because the no side's LIP dominates.
+    others = {"yes": {0.36: 12662.0, 0.26: 292.0, 0.15: 1.0}, "no": {0.26: 23.0, 0.15: 3001.0}}
+    pl = plan_market("T", others, P, cfg, {}, 1000)
+    assert pl.big["yes"] >= 0.26

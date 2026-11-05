@@ -454,11 +454,15 @@ def deepest_price(s: str, touch: float, others, rest: list, lots: float, params,
         up = round(lv + tick(lv), 4)
         if up < touch - 1e-9:
             cands.add(up)
+    # This side's own LIP: the market's with our bid here, less without it. Comparing the whole
+    # market's let the other side's LIP carry a bid down to 1c where it earned nothing (11-05).
+    base = book_score(others, rest, params) if rest else None
+    base = base.expected_reward_this_snapshot_usd if base is not None and base.qualifies else 0.0
     scored = []
     for c in sorted(cands, reverse=True):
         r = book_score(others, rest + [(s, c, lots)], params)
         if r.qualifies:
-            scored.append((c, r.expected_reward_this_snapshot_usd))
+            scored.append((c, r.expected_reward_this_snapshot_usd - base))
     if not scored:
         return None
     best = max(v for _, v in scored)
