@@ -80,8 +80,10 @@ def render(page: str, stale_fn):
         st.header("Config")
         config_form.render(_FORM)
     st.title("LIP farm")
-    st.caption("Wide markets (spread >= `wide_spread`): a bid of the market's Target (where LIP stops counting) at both touches. Decided markets "
-               "(expensive bid >= `decided_min`, below the market's top price): a bid on the expensive side only. Every "
+    st.caption("Only low-flow markets (`max_sweeps_day`, `max_trades_day`, not `skip_categories`). "
+               "Wide markets (spread >= `wide_spread`): a bid of the market's Target (where LIP stops counting) at both touches. Decided markets "
+               "(expensive bid >= `decided_min`, below the market's top price): a bid on the expensive side only. "
+               "Other markets: both touches, sized by exit liquidity (`exit_depth_frac`). Every "
                "side must reach Target, so the snapshot pays. Best LIP per dollar first, up to `max_capital`. "
                "Expected LIP is our modelled share over time, not Kalshi's payout (nothing under $1 per "
                "market-period). Skips events ARBS holds; when live, ARBS stays off our claimed markets.")
@@ -129,14 +131,14 @@ def render(page: str, stale_fn):
         else:
             view = pd.DataFrame({
                 "market": q["ticker"],
-                "m": q["mode"].map({"wide": "W", "decided": "D", "hedge": "X"}).fillna(""),
+                "m": q["mode"].map({"wide": "W", "decided": "D", "narrow": "N", "hedge": "X"}).fillna(""),
                 "quote": q["bids"].map(_compact_bids),
                 "$/day": q["our_usd_day"], "pool/d": q["pool_usd_day"],
                 "period $": q.get("period_lip_usd", 0.0), "LIP $": q["exp_lip_usd"], "cap $": q["capital_usd"]})
             num = st.column_config.NumberColumn
             st.dataframe(view, hide_index=True, use_container_width=True, column_config={
                 "market": st.column_config.TextColumn(width="medium"),
-                "m": st.column_config.TextColumn(width="small", help="W wide, D decided, X exit only"),
+                "m": st.column_config.TextColumn(width="small", help="W wide, D decided, N narrow (exit-liquidity sized), X exit only"),
                 "quote": st.column_config.TextColumn(width="medium", help="⚑ = 1.1-lot sentinel one tick above, "
                                                                           "in the bid's order group"),
                 "$/day": num(format="%.0f", width="small"), "pool/d": num(format="%.0f", width="small"),

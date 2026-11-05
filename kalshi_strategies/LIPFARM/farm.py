@@ -1,6 +1,7 @@
 """
-LIP farmer. Quotes LIP markets in one of two shapes, chosen per market each
-cycle from today's book:
+LIP farmer. Quotes only low-flow LIP markets (at most max_sweeps_day and
+max_trades_day over the trailing flow_days, not in skip_categories), in one of
+three shapes, chosen per market each cycle from today's book:
 
   wide     the yes/no spread is at least `wide_spread`: one bid of the market's
            Target at each side's touch, owning both halves of a thin book.
@@ -8,6 +9,8 @@ cycle from today's book:
            Target there only (fills gain the last cents; the risk is a
            reversal). A bid at the market's top price (0.99, or 0.999 on 0.1c
            ticks) earns no LIP; the scorer rules those out.
+  narrow   neither: both touches, only where exit liquidity backs it (each bid
+           at most exit_depth_frac of others' bids just under its touch).
 
 Each quoted side takes one of two layouts, whichever the LIP scorer prefers:
   touch     the bid at the touch, kept at the back of its queue (moves first):
@@ -25,9 +28,6 @@ ranked by LIP per dollar of resting bids. Kalshi holds no cash for resting
 orders (11-04: $9.6k resting on a $16.3k balance, balance unchanged), so
 `max_capital` caps what fills have left us holding: a bid that could fill us
 past it isn't placed, and one is pulled as soon as a fill makes that true.
-Each bid is at most `exit_depth_frac` of the others' bids resting on its own
-side within `exit_depth_slip` of the touch: what an informed fill could be
-sold back into.
 
 On a fill we first look for a way to lock the position by taking: the same
 market's other side, or the other legs of any ARBS basket holding our leg
@@ -139,6 +139,10 @@ GUARD_COOLDOWN_S = 300.0
 # After a sentinel trip or adverse fill: 11-04, from 10 s after a sweep on, a further
 # 2c fall was no likelier than a 2c rise (22% vs 18% to 60 s), so a short pull is enough.
 TRIP_COOLDOWN_S = 60.0
+# Trailing flow (max_sweeps_day, max_trades_day) is re-read this often per
+# market; at most FLOW_QUEUE reads wait at once, best markets first.
+FLOW_TTL_S = 3600.0
+FLOW_QUEUE = 40
 MOVE_MIN_S = 5.0
 MOVE_BEHIND_FRAC = 0.2
 # Moves come before new bids (crowded touches, sentinels), but at most this
@@ -169,58 +173,77 @@ DEFAULT_TAKER_RATE = 0.07
 
 @section
 class Cfg:
+    # ---- pricing: which markets, how much ----
     max_capital: float = param("Most dollars our fills may leave us holding (unexited positions at cost). A bid "
                                "that could take us past it isn't placed; after a fill, bids that could are "
-                               "pulled. Resting bids hold no cash at Kalshi.", min=0.0, step=500.0)
-    num_markets: int = param("Most markets quoted.", min=0, step=1)
+                               "pulled. Resting bids hold no cash at Kalshi.", min=0.0, step=500.0, group="pricing")
+    num_markets: int = param("Most markets quoted.", min=0, step=1, group="pricing")
     sentinel_keep: float = param("Use the sentinel layout on a side when it keeps at least this share of the "
                                  "touch layout's LIP. 11-04, 366 sides: thin touches (<200 ahead) keep ~97%, "
-                                 "crowded ones (>1000) nothing.", min=0.0, max=1.0, step=0.05)
-    dump_slip_ticks: int = param("After an informed fill, sell at once into bids down to this many ticks under "
-                                 "our fill; rest the rest. 11-04: median 46 lots rest within 2 ticks under the "
-                                 "touch.", min=0, max=50, step=1)
-    chase_ticks: int = param("Then sell more (again dump_slip_ticks deep) whenever the best bid is this many ticks "
-                             "under our fill. 11-04: after a sweep the price fell 2+ ticks within 1 min ~22% "
-                             "of the time on 10-90c markets, whatever its size.", min=1, max=50, step=1)
-    max_chase_ticks: int = param("Never sell (dump or chase) more than this many ticks under our fill; below "
-                                 "that the rest waits on a passive exit. 11-04 sweeps of 300+ lots: a further "
-                                 "fall of up to ~5c in 10 s kept falling (holding lost 2-6c), one of 6c+ came "
-                                 "back (holding gained 6-26c).", min=0, max=99, step=1)
+                                 "crowded ones (>1000) nothing.", min=0.0, max=1.0, step=0.05, group="pricing")
+    min_lots_frac: float = param("Don't quote a side whose bid would be under this fraction of the market's "
+                                 "Target size: LIP stays small until a bid reaches Target/5, where it sets the "
+                                 "reference price (11-04: 1 to 49 lot bids earned ~$0).", min=0.0, max=1.0,
+                                 step=0.05, group="pricing")
+    min_ahead: float = param("Quote a side only where others already rest at least this many contracts at our "
+                             "price (they are filled before us). 0 = may be alone.", min=0.0, step=100.0,
+                             group="pricing")
+    max_position: float = param("Stop quoting a side once we hold this many contracts of it.", min=0.0,
+                                step=100.0, group="pricing")
+    min_leg_price: float = param("Don't quote a side bid under this. A full fill on a 5-6c leg was an "
+                                 "informed dump every time, sold back at 1c (ORAN, NMAN, IDS 11-04).",
+                                 min=0.0, max=0.5, step=0.01, group="pricing")
+    wide_spread: float = param("Wide: quote both sides at the touch, Target size, when ask - bid is at least "
+                               "this.", min=0.01, max=0.98, step=0.01, group="pricing", sub="wide markets")
+    decided_min: float = param("Decided: quote the expensive side, Target size, when its best bid is at least "
+                               "this.", min=0.5, max=0.999, step=0.01, group="pricing", sub="decided markets")
+    flow_days: float = param("Every quoted market must be low-flow over this many trailing days (public "
+                             "trades, re-read hourly).", min=0.5, max=14.0, step=0.5, group="pricing",
+                             sub="low flow (all markets)")
+    max_sweeps_day: float = param("Most sweeps per day: a burst of sells (1 s) that cleared a bid level. "
+                                  "11-01..05 tape, 2,600 markets: <= 0.12/day were all safe, > 0.5/day "
+                                  "~70%.", min=0.0, step=0.1, group="pricing", sub="low flow (all markets)")
+    max_trades_day: float = param("Most trades per day. 11-01..05: > 20/day ~55% safe, <= 5/day 94-99%. "
+                                  "Over 1000 trades in flow_days reads as busy.", min=0.0, step=1.0,
+                                  group="pricing", sub="low flow (all markets)")
+    skip_categories: str = param("Comma-separated series categories never quoted (11-01..05: Sports, "
+                                 "Mentions ~50-60% safe).", group="pricing", sub="low flow (all markets)")
+    exit_depth_frac: float = param("Neither wide nor decided: quote both touches only with exit liquidity, "
+                                   "each bid at most this fraction of others' bids within exit_depth_slip "
+                                   "under the touch (what a fill could be sold into), and at least "
+                                   "min_lots_frac of Target.", min=0.05, max=10.0, step=0.1, group="pricing",
+                                   sub="other markets: exit liquidity")
+    exit_depth_slip: float = param("How far below the touch counts as exit depth (dollars).", min=0.0, max=0.5,
+                                   step=0.01, group="pricing", sub="other markets: exit liquidity")
+    # ---- exits ----
     adverse_lots: float = param("Fills of at least this many lots on one of our bids: sell up to "
                                 "dump_slip_ticks under our fill at once, instead of waiting on an exit bid. "
                                 "A risk cap, not a signal: 11-04 sweeps of 50 to 3000+ lots, and 0.5x to 10x+ "
                                 "a market's median sweep, were all followed by a 2+ tick further fall "
-                                "~21-24% of the time within 1 min.", min=1, max=10000, step=50)
-    min_lots_frac: float = param("Don't quote a side whose bid would be under this fraction of the market's "
-                                 "Target size: LIP stays small until a bid reaches Target/5, where it sets the "
-                                 "reference price (11-04: 1 to 49 lot bids earned ~$0).", min=0.0, max=1.0,
-                                 step=0.05)
-    exit_depth_frac: float = param("A bid is at most this fraction of others' bids on its side within "
-                                   "exit_depth_slip of the touch: what a fill could be sold back into.",
-                                   min=0.05, max=10.0, step=0.1)
-    exit_depth_slip: float = param("How far below the touch counts as exit depth (dollars).", min=0.0, max=0.5,
-                                   step=0.01)
-    wide_spread: float = param("Wide: quote both sides at the touch when ask - bid is at least this.",
-                               min=0.01, max=0.98, step=0.01)
-    min_leg_price: float = param("Wide: don't quote a side bid under this. A full fill on a 5-6c leg was an "
-                                 "informed dump every time, sold back at 1c (ORAN, NMAN, IDS 11-04).",
-                                 min=0.0, max=0.5, step=0.01)
-    decided_min: float = param("Decided: quote the expensive side when its best bid is at least this.",
-                               min=0.5, max=0.999, step=0.01)
-    min_ahead: float = param("Quote a side only where others already rest at least this many contracts at our "
-                             "price (they are filled before us). 0 = may be alone.", min=0.0, step=100.0)
-    max_position: float = param("Stop quoting a side once we hold this many contracts of it.", min=0.0,
-                                step=100.0)
+                                "~21-24% of the time within 1 min.", min=1, max=10000, step=50, group="exits")
+    dump_slip_ticks: int = param("After an informed fill, sell at once into bids down to this many ticks under "
+                                 "our fill; rest the rest. 11-04: median 46 lots rest within 2 ticks under the "
+                                 "touch.", min=0, max=50, step=1, group="exits")
+    chase_ticks: int = param("Then sell more (again dump_slip_ticks deep) whenever the best bid is this many ticks "
+                             "under our fill. 11-04: after a sweep the price fell 2+ ticks within 1 min ~22% "
+                             "of the time on 10-90c markets, whatever its size.", min=1, max=50, step=1,
+                             group="exits")
+    max_chase_ticks: int = param("Never sell (dump or chase) more than this many ticks under our fill; below "
+                                 "that the rest waits on a passive exit. 11-04 sweeps of 300+ lots: a further "
+                                 "fall of up to ~5c in 10 s kept falling (holding lost 2-6c), one of 6c+ came "
+                                 "back (holding gained 6-26c).", min=0, max=99, step=1, group="exits")
+    # ---- operations ----
     write_tokens_per_s: float = param("Our write budget (tokens/s; an order 10, a cancel 2) out of the 300 the "
                                       "shard shares with ARBS, which caps itself at 150-250. 11-04: our "
                                       "requotes need ~1/s; ARBS's last tokens are worth <$0.30/day each "
                                       "(its ranking at 125+ tokens/s covers every basket worth >$8/h, vs "
                                       "~$150/day realized). Spare goes to back-of-queue moves; exits and "
-                                      "cancels always go.", min=1.0, max=50.0, step=1.0)
+                                      "cancels always go.", min=1.0, max=50.0, step=1.0, group="operations")
     scan_markets: int = param("Books read each cycle: the markets our last read of them says pay us most per "
-                              "dollar.", min=1, step=50)
+                              "dollar.", min=1, step=50, group="operations")
     scan_rotate: int = param("Plus this many more each cycle, rotating through every other LIP market (any "
-                             "category), so each is re-read every programs/scan_rotate cycles.", min=0, step=100)
+                             "category), so each is re-read every programs/scan_rotate cycles.", min=0, step=100,
+                             group="operations")
     refresh_s: float = param("Seconds between cycles.", min=5.0, editable=False)
     programs_refresh_s: float = param("Seconds between re-reads of the LIP program list.", min=60.0,
                                       editable=False)
@@ -320,12 +343,14 @@ def market_rate(others, legs, params) -> float:
 
 def plan_market(ticker: str, others: dict[str, dict[float, float]], params: lip.LipParams, cfg: Cfg,
                 held: dict[str, float] | None = None, lots=None, tick=lambda p: 0.01,
-                current: dict[str, str] | None = None) -> Plan | None:
+                current: dict[str, str] | None = None, exit: dict[str, float] | None = None) -> Plan | None:
     """How to quote this market now, or None. Joins others' best bids (never
     improves them). `held`: contracts we already hold per side; `lots`: bid
-    size, one number or per side (exit_lots), default the program's Target (LIP
-    stops counting past it); a side sized under 1 isn't
-    quoted. Every quoted side gets the smallest of the quoted sides' sizes."""
+    size, one number or per side, default the program's Target (LIP stops
+    counting past it); a side sized under 1 isn't quoted. Every quoted side
+    gets the smallest of the quoted sides' sizes. A market neither wide nor
+    decided ("narrow") is quoted only with `exit` (exit_lots), which then caps
+    `lots`; without it, None. Flow is checked by the caller."""
     held = held or {}
     if lots is None:
         lots = params.target_size
@@ -334,10 +359,14 @@ def plan_market(ticker: str, others: dict[str, dict[float, float]], params: lip.
         return None
     by, bn = max(others["yes"]), max(others["no"])
     hi_side, hi = ("yes", by) if by >= bn else ("no", bn)
+    both = [(s, p) for s, p in (("yes", by), ("no", bn)) if p >= cfg.min_leg_price - 1e-9]
     if hi >= cfg.decided_min - 1e-9:
         mode, legs = "decided", [(hi_side, hi)]
     elif 1.0 - by - bn >= cfg.wide_spread - 1e-9:
-        mode, legs = "wide", [(s, p) for s, p in (("yes", by), ("no", bn)) if p >= cfg.min_leg_price - 1e-9]
+        mode, legs = "wide", both
+    elif exit is not None:
+        mode, legs = "narrow", both
+        side_lots = {s: min(side_lots.get(s, 0.0), exit.get(s, 0.0)) for s in ("yes", "no")}
     else:
         return None
     legs = [(s, p) for s, p in legs
@@ -495,8 +524,46 @@ def fetch_meta(tickers) -> dict[str, dict]:
     return out
 
 
-def refresh_job(held: set[str]) -> tuple[dict, dict, dict]:
-    """(programs, their markets' records, basket index): the slow refresh, for a worker thread."""
+def count_sweeps(trades: list[dict]) -> int:
+    """Bursts of same-side taker trades within 1 s that printed at more than
+    one price: a level cleared. By price span, not order: one sweep's prints
+    share a timestamp and come back in any order (KXOPENSHARE 11-05 12:18)."""
+    tr = sorted(trades, key=lambda x: x["created_time"])
+    n, i = 0, 0
+    while i < len(tr):
+        t0, side = pd.Timestamp(tr[i]["created_time"]).timestamp(), tr[i]["taker_side"]
+        j = i + 1
+        while j < len(tr) and tr[j]["taker_side"] == side and pd.Timestamp(tr[j]["created_time"]).timestamp() - t0 <= 1.0:
+            j += 1
+        px = [float(x["yes_price_dollars"]) for x in tr[i:j]]
+        n += max(px) - min(px) > 1e-9
+        i = j
+    return n
+
+
+def fetch_flow(t: str, days: float) -> dict | None:
+    """{trades_day, sweeps_day, days, at} over the trailing `days`, one read.
+    A full page (1000 trades) means busier than any sane limit: counted as inf."""
+    try:
+        d = read("/trade-api/v2/markets/trades",
+                 params={"ticker": t, "min_ts": int(time.time() - days * 86400), "limit": 1000})
+    except Exception:
+        return None
+    tr = d.get("trades") or []
+    if d.get("cursor"):
+        return {"trades_day": math.inf, "sweeps_day": math.inf, "days": days, "at": time.time()}
+    return {"trades_day": len(tr) / days, "sweeps_day": count_sweeps(tr) / days, "days": days, "at": time.time()}
+
+
+def load_categories() -> dict[str, str]:
+    """Series ticker -> category."""
+    d = read("/trade-api/v2/series", params={"include_product_metadata": "false"})
+    return {x["ticker"]: x.get("category") or "" for x in d.get("series") or []}
+
+
+def refresh_job(held: set[str]) -> tuple[dict, dict, dict, dict | None]:
+    """(programs, their markets' records, basket index, series categories): the
+    slow refresh, for a worker thread."""
     programs = load_programs()
     meta = fetch_meta(set(programs) | held)
     try:
@@ -504,7 +571,12 @@ def refresh_job(held: set[str]) -> tuple[dict, dict, dict]:
     except Exception:
         traceback.print_exc()
         baskets = None
-    return programs, meta, baskets
+    try:
+        cats = load_categories()
+    except Exception:
+        traceback.print_exc()
+        cats = None
+    return programs, meta, baskets, cats
 
 
 def queue_ahead(c, tickers: list[str]) -> dict[str, float]:
@@ -657,6 +729,9 @@ class Farm:
         self.cfg_slip, self.cfg_chase, self.cfg_max_chase = 2, 2, 5  # cfg.dump_slip_ticks, chase_ticks, max_chase_ticks
         self.n_refused, self.last_refused_log = 0, 0.0
         self.marks_at = 0.0
+        self.categories: dict[str, str] = {}  # series -> category
+        self.flow_pool = cf.ThreadPoolExecutor(1, thread_name_prefix="lipfarm-flow")
+        self.flow_futs: dict[str, cf.Future] = {}
 
     # ---- mode ----
     def _open_mode(self, live: bool):
@@ -737,11 +812,13 @@ class Farm:
         self.apply_refresh(refresh_job(set(self.signed_positions())))
 
     def apply_refresh(self, result):
-        programs, meta, baskets = result
+        programs, meta, baskets, cats = result
         self.programs = programs
         self.meta.update(meta)
         if baskets is not None:
             self.baskets = baskets
+        if cats:
+            self.categories = cats
         self.last_programs = time.time()
 
     def candidates(self, cfg: Cfg) -> list[str]:
@@ -783,6 +860,30 @@ class Farm:
         tickers = self.candidates(cfg)
         self.scan_finish(cfg, list(zip(tickers, self.pool.map(fetch_book, tickers))))
 
+    def category(self, t: str) -> str:
+        ev = self.meta.get(t, {}).get("event_ticker") or event_of(t)
+        return self.categories.get(ev.split("-")[0], "")
+
+    def flow_ok(self, t: str, cfg: Cfg) -> bool | None:
+        """Low-flow check: True/False, None while its trades haven't been read.
+        A stale or missing reading is queued for a re-read; a stale one still answers."""
+        skip = {c.strip().lower() for c in cfg.skip_categories.split(",") if c.strip()}
+        if self.category(t).lower() in skip:
+            return False
+        flows = self.state.setdefault("flow", {})
+        fut = self.flow_futs.get(t)
+        if fut is not None and fut.done():
+            del self.flow_futs[t]
+            if fut.result() is not None:
+                flows[t] = fut.result()
+        f = flows.get(t)
+        stale = f is None or time.time() - f["at"] > FLOW_TTL_S or abs(f["days"] - cfg.flow_days) > 1e-9
+        if stale and t not in self.flow_futs and len(self.flow_futs) < FLOW_QUEUE:
+            self.flow_futs[t] = self.flow_pool.submit(fetch_flow, t, cfg.flow_days)
+        if f is None:
+            return None
+        return f["trades_day"] <= cfg.max_trades_day + 1e-9 and f["sweeps_day"] <= cfg.max_sweeps_day + 1e-9
+
     def scan_finish(self, cfg: Cfg, got: list[tuple[str, dict | None]]):
         plans, rates, books = {}, {}, {}
         self.held_events = arbs_held_events()
@@ -792,19 +893,20 @@ class Farm:
                 continue
             others = self.others_of(t, ob)
             books[t] = others
+            self.est[t] = 0.0
             m = self.meta.get(t, {})
             if m and m.get("status") != "active":
                 continue
             P = self.params(t)
             if t in self.order_tickers():
                 rates[t] = self.our_rate(t, others, P)
-            pl = self.plan(t, others, P, cfg, pos)
-            if pl:
+            pl = self.plan(t, others, P, cfg, pos, flow=False)
+            # What each read market would pay us per dollar, for the next cycle's ranking;
+            # a market still waiting on its flow read keeps its place.
+            ok = self.flow_ok(t, cfg) if pl else False
+            self.est[t] = pl.rate / max(pl.capital, 1e-9) if pl and ok is not False else 0.0
+            if pl and ok:
                 plans[t] = pl
-        # What each read market would pay us per dollar, for the next cycle's ranking.
-        for t in books:
-            pl = plans.get(t)
-            self.est[t] = pl.rate / max(pl.capital, 1e-9) if pl else 0.0
         self.books, self.plans, self.rates = books, plans, rates
 
     def sync_live_orders(self):
@@ -1153,8 +1255,9 @@ class Farm:
         return dataclasses.replace(lip.params_from_program(self.programs[t]), price_ranges=tuple(
             (float(r["start"]), float(r["end"]), float(r["step"])) for r in m.get("price_ranges") or []))
 
-    def plan(self, t: str, others: dict, P: lip.LipParams, cfg: Cfg, pos: dict[str, float]) -> Plan | None:
-        """plan_market, or None on an event ARBS holds."""
+    def plan(self, t: str, others: dict, P: lip.LipParams, cfg: Cfg, pos: dict[str, float],
+             flow: bool = True) -> Plan | None:
+        """plan_market, or None on an event ARBS holds or (`flow`) one whose flow read failed."""
         if event_of(t) in self.held_events:
             return None
         v = pos.get(t, 0.0)
@@ -1162,8 +1265,12 @@ class Farm:
         for k in self.keys_of(t, hedges=False):
             sd = unkey(k)[1]
             current[sd] = "sentinel" if (is_sentinel(k) or current.get(sd) == "sentinel") else "touch"
-        return plan_market(t, others, P, cfg, {"yes": max(v, 0.0), "no": max(-v, 0.0)}, exit_lots(others, cfg, P.target_size),
-                           tick=lambda px: self.tick(t, px), current=current)
+        # Unread flow doesn't pull a resting bid (scan_finish only places on a read that passed).
+        if flow and self.flow_ok(t, cfg) is False:
+            return None
+        return plan_market(t, others, P, cfg, {"yes": max(v, 0.0), "no": max(-v, 0.0)},
+                           tick=lambda px: self.tick(t, px), current=current,
+                           exit=exit_lots(others, cfg, P.target_size))
 
     def fresh_books(self, tickers) -> dict[str, dict]:
         """Others' books now: from the socket where it has the market, else REST."""

@@ -19,6 +19,10 @@
     "scan_markets": 400,
     "scan_rotate": 500,
     "refresh_s": 30,
-    "programs_refresh_s": 600
+    "programs_refresh_s": 600,
+    "flow_days": 4,
+    "max_sweeps_day": 0.5,
+    "max_trades_day": 20,
+    "skip_categories": "Sports,Mentions"
   }
 }

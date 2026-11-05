@@ -81,13 +81,20 @@ def render(series, markets: list[str] | None = None) -> None:
     fields = [d for d in describe(series.config_cls) if d["editable"] and d["name"] not in HIDDEN]
     sections: dict[str, list] = {}
     for d in fields:
-        sections.setdefault(d["name"].split(".")[0], []).append(d)
+        sections.setdefault(d.get("group") or d["name"].split(".")[0], []).append(d)
 
     changes, bad = {}, []
     with st.form(f"cfg_{series.ticker}"):
         for sec, ds in sections.items():
-            with st.expander(sec, expanded=sec == "quoting" or len(sections) == 1):
+            with st.expander(sec, expanded=sec in ("quoting", "pricing") or len(sections) == 1):
+                sub = None
                 for d in ds:
+                    if d.get("sub") and d["sub"] != sub:
+                        if sub is not None or d is not ds[0]:
+                            st.markdown('<hr style="margin:6px 0;border:none;border-top:1px solid #8886">',
+                                        unsafe_allow_html=True)
+                        st.caption(d["sub"])
+                    sub = d.get("sub") or sub
                     cur = get_dotted(cfg, d["name"])
                     if d["type"] == "list" and not markets:
                         continue            # no market list to draw checkboxes from: leave as is

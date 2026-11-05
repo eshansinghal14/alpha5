@@ -3,6 +3,8 @@ import json
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from kalshi_infra.trading import lip
 from kalshi_strategies.LIPFARM import farm
 from kalshi_strategies.LIPFARM.farm import parse_book, plan_market, remove_ours
@@ -11,7 +13,15 @@ P = lip.LipParams(target_size=1000, discount_factor=0.5, period_reward_usd=86.4,
 CFG = farm.Cfg(max_capital=5000, num_markets=5, min_lots_frac=0.0, sentinel_keep=2.0, dump_slip_ticks=2, chase_ticks=2, max_chase_ticks=5,
                adverse_lots=300, exit_depth_frac=10.0, exit_depth_slip=0.03, wide_spread=0.20, min_leg_price=0.0, decided_min=0.97,
                min_ahead=0.0, max_position=1e9, write_tokens_per_s=5.0, scan_markets=1, scan_rotate=0, refresh_s=30,
-               programs_refresh_s=600)
+               programs_refresh_s=600, flow_days=4.0, max_sweeps_day=0.5, max_trades_day=20.0,
+               skip_categories="Sports,Mentions")
+
+
+@pytest.fixture(autouse=True)
+def _quiet_flow(monkeypatch):
+    """No trade reads in tests: every market reads as having no flow."""
+    monkeypatch.setattr(farm, "fetch_flow", lambda t, days: {"trades_day": 0.0, "sweeps_day": 0.0, "days": days,
+                                                             "at": time.time()})
 
 
 def test_decided_quotes_only_the_expensive_side():
@@ -620,3 +630,65 @@ def test_bid_size_follows_the_programs_target():
     for target in (1000, 2500):
         Pt = dataclasses.replace(P, target_size=target)
         assert plan_market("T", deep, Pt, CFG, {}, farm.exit_lots(deep, CFG, target)).lots == target
+
+
+def _tr(ts, side, yes_px):
+    return {"created_time": f"2026-11-05T12:00:{ts:06.3f}Z", "taker_side": side, "yes_price_dollars": f"{yes_px:.2f}"}
+
+
+def test_count_sweeps_counts_bursts_that_cleared_a_level():
+    trades = [_tr(0.0, "yes", 0.88), _tr(0.2, "yes", 0.89), _tr(0.4, "yes", 0.90),   # through 3 levels: 1
+              _tr(5.0, "no", 0.50), _tr(5.5, "no", 0.50),                           # one level only: 0
+              _tr(9.0, "no", 0.50), _tr(9.5, "no", 0.49),                           # 1
+              _tr(20.0, "yes", 0.50), _tr(22.0, "yes", 0.60)]                       # > 1 s apart: 0
+    assert farm.count_sweeps(trades) == 2
+
+
+def test_narrow_market_needs_exit_liquidity_and_is_sized_by_it():
+    others = {"yes": {0.45: 500.0, 0.44: 300.0}, "no": {0.50: 500.0, 0.49: 600.0}}
+    assert plan_market("T", others, P, CFG) is None                     # 5c spread: needs exit
+    pl = plan_market("T", others, P, dataclasses.replace(CFG, exit_depth_frac=1.0), {},
+                     exit=farm.exit_lots(others, dataclasses.replace(CFG, exit_depth_frac=1.0), 1000))
+    assert pl.mode == "narrow" and set(pl.legs) == {("yes", 0.45), ("no", 0.50)} and pl.lots == 300
+    # No depth under a touch: that side isn't backed, so it isn't quoted.
+    thin = {"yes": {0.45: 1500.0}, "no": {0.50: 500.0, 0.49: 600.0}}
+    pl = plan_market("T", thin, P, CFG, {}, exit=farm.exit_lots(thin, CFG, 1000))
+    assert pl.legs == (("no", 0.50),)
+
+
+def test_wide_and_decided_quote_target_whatever_the_exit_depth():
+    others = {"yes": {0.11: 2000.0}, "no": {0.37: 2000.0}}              # nothing under either touch
+    pl = plan_market("T", others, P, CFG, {}, exit=farm.exit_lots(others, CFG, 1000))
+    assert pl.mode == "wide" and pl.lots == 1000
+    dec = {"yes": {0.97: 2000.0}, "no": {0.02: 5000.0}}
+    assert plan_market("T", dec, P, CFG, {}, exit=farm.exit_lots(dec, CFG, 1000)).lots == 1000
+
+
+def test_flow_gate(tmp_path, monkeypatch):
+    monkeypatch.setattr(farm, "ROOT", str(tmp_path))
+    f = farm.Farm()
+    f.meta = {"S-1-A": {"event_ticker": "S-1"}, "Q-1-A": {"event_ticker": "Q-1"}}
+    f.categories = {"S": "Sports", "Q": "Politics"}
+    assert f.flow_ok("S-1-A", CFG) is False and not f.flow_futs       # skipped category, no read
+    assert f.flow_ok("Q-1-A", CFG) is None                            # unread: read queued
+    f.flow_futs["Q-1-A"].result()
+    assert f.flow_ok("Q-1-A", CFG) is True and "Q-1-A" in f.state["flow"]
+    f.state["flow"]["Q-1-A"].update(sweeps_day=0.75)                  # MT1's 0.75/day
+    assert f.flow_ok("Q-1-A", CFG) is False
+    f.state["flow"]["Q-1-A"].update(sweeps_day=0.0, trades_day=21.0)
+    assert f.flow_ok("Q-1-A", CFG) is False
+
+
+def test_scan_places_only_after_a_passing_flow_read(tmp_path, monkeypatch):
+    monkeypatch.setattr(farm, "ROOT", str(tmp_path))
+    monkeypatch.setattr(farm, "arbs_held_events", lambda: set())
+    f = farm.Farm()
+    f.programs = {"Q-1-A": {"id": "p", "end_date": "2099-01-01T00:00:00Z", "target_size": 1000,
+                            "discount_factor_bps": 5000, "period_reward": 8640000, "period_duration": 86400}}
+    monkeypatch.setattr(f, "params", lambda t: P)
+    ob = {"yes_dollars": [["0.97", "2000"]], "no_dollars": [["0.02", "5000"]]}
+    f.scan_finish(CFG, [("Q-1-A", ob)])
+    assert f.plans == {} and f.est["Q-1-A"] > 0                       # unread: not placed, keeps its rank
+    f.flow_futs["Q-1-A"].result()
+    f.scan_finish(CFG, [("Q-1-A", ob)])
+    assert list(f.plans) == ["Q-1-A"]

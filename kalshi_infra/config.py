@@ -35,13 +35,16 @@ class ConfigError(ValueError):
 
 
 def param(help: str, *, min: float | None = None, max: float | None = None,
-          step: float | None = None, apply: str = APPLY_LIVE, editable: bool = True):
+          step: float | None = None, apply: str = APPLY_LIVE, editable: bool = True,
+          group: str | None = None, sub: str | None = None):
     """A required config field. `editable=False` hides it from the dashboard
-    form (still loaded and validated)."""
+    form (still loaded and validated). `group`: the dashboard expander it goes
+    in (default its section's name); `sub`: a ruled-off block within it."""
     if apply not in (APPLY_LIVE, APPLY_NEXT_EVENT):
         raise ValueError(f"apply must be {APPLY_LIVE!r} or {APPLY_NEXT_EVENT!r}")
     return dataclasses.field(metadata={"help": help, "min": min, "max": max, "step": step,
-                                       "apply": apply, "editable": editable})
+                                       "apply": apply, "editable": editable,
+                                       "group": group, "sub": sub})
 
 
 def section(cls):
