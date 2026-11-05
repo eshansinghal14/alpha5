@@ -178,6 +178,7 @@ class Runner:
         self.pool_rate: dict[str, float] = {}
         self.P: dict[str, lip.LipParams] = {}                  # params by ticker, from the last cycle
         self.io_pool = cf.ThreadPoolExecutor(1, thread_name_prefix="lipfarm-io")   # file writes, in order
+        self.flow_held: dict[str, dict] = {}                   # ticker -> its plan the flow filter holds back
         self.book_seq: dict[str, int] = {}                     # ticker -> socket book updates seen
         self.dump_seq: dict[str, int] = {}                     # ticker -> book_seq its last informed sell saw
 
@@ -1153,6 +1154,13 @@ class Runner:
             self.est[t] = pl.rate / max(pl.capital, 1e-9) if pl and ok is not False else 0.0
             if pl and ok:
                 plans[t] = pl
+            # What the flow filter costs: plans it holds back (False) or hasn't read yet (None).
+            if pl and not ok:
+                f = self.state.get("flow", {}).get(t) or {}
+                self.flow_held[t] = {"usd_day": pl.rate * 86400, "per_k": pl.rate * 86400 / max(pl.capital / 1000, 0.05),
+                                     "trades_day": f.get("trades_day"), "mode": pl.mode, "at": time.time()}
+            else:
+                self.flow_held.pop(t, None)
         for t in books:
             if t in self.order_tickers():
                 rates[t] = self.our_rate(t, books[t], self.params(t))
@@ -1509,8 +1517,12 @@ class Runner:
                    "ws_up": bool(self.feed and self.feed.up), "ws_updates": self.n_evals,
                    "waiting_on_arbs": len(self.waiting), "arbs_events_skipped": len(self.held_events),
                    "runner": "async", "loop_lag_ms_max": 1000 * self.lag_max, "updated_at": time.time()}
-        doc = json.dumps({"summary": summary, "quotes": rows, "positions": pos, "waiting": self.waiting},
-                         indent=1)
+        held = {t: h for t, h in self.flow_held.items() if time.time() - h["at"] < 3600}
+        summary["flow_held"] = len(held)
+        summary["flow_held_usd_day"] = sum(h["usd_day"] for h in held.values())
+        top = sorted(held.items(), key=lambda kv: -kv[1]["per_k"])[:40]
+        doc = json.dumps({"summary": summary, "quotes": rows, "positions": pos, "waiting": self.waiting,
+                          "flow_held": [{"ticker": t, **h} for t, h in top]}, indent=1, default=str)
         asyncio.get_running_loop().run_in_executor(self.io_pool, _atomic_write,
                                                    os.path.join(self.root, "status.json"), doc)
         if not log:
