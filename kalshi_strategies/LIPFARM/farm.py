@@ -188,8 +188,8 @@ class Cfg:
                                "this.", min=0.01, max=0.98, step=0.01, group="pricing", sub="wide markets")
     deep_keep: float = param("Wide: bid each side at the deepest price that keeps this share of its best LIP "
                              "(LIP scores every bid at or above the reference price in full, and on a thin book "
-                             "our own size sets it; 11-05 T130: no at 7c scored as much as at 56c). A sentinel "
-                             "rides one tick above. 0 = always at the touch.", min=0.0, max=1.0, step=0.05,
+                             "our own size sets it; 11-05 T130: no at 6-7c scored ~84% of the side vs ~99% "
+                             "at 57c). No sentinel there. 0 = always at the touch.", min=0.0, max=1.0, step=0.05,
                              group="pricing", sub="wide markets")
     min_leg_price: float = param("Wide and narrow: don't quote a side bid under this. A full fill on a 2-6c leg "
                                  "was an informed dump every time, sold back at 1c (ORAN, NMAN, IDS 11-04; "
@@ -308,12 +308,14 @@ def is_sentinel(k: str) -> bool:
 
 
 def desired_orders(pl: Plan) -> dict[str, tuple[float, float, bool]]:
-    """Order key -> (price, size, part of a sentinel layout) for a plan."""
+    """Order key -> (price, size, not a plain touch bid: a sentinel layout or a deep bid, never moved back)."""
     out = {}
     for s, p in pl.legs:
         if pl.layout.get(s) == "sentinel":
             out[f"{pl.ticker}|{s}|s"] = (p, SENTINEL_LOTS, True)
             out[key(pl.ticker, s)] = (pl.big[s], pl.lots, True)
+        elif pl.layout.get(s) == "deep":
+            out[key(pl.ticker, s)] = (p, pl.lots, True)          # not a touch bid: never moved back
         else:
             out[key(pl.ticker, s)] = (p, pl.lots, False)
     return out
@@ -404,7 +406,9 @@ def plan_market(ticker: str, others: dict[str, dict[float, float]], params: lip.
     if not sc.qualifies or sc.expected_reward_this_snapshot_usd <= 0:
         return None
     layout, big = {s: "touch" for s, _ in legs}, {s: p for s, p in legs}
-    # Wide: as deep as keeps deep_keep of the side's best LIP, a sentinel one tick above.
+    # Wide: as deep as keeps deep_keep of the side's best LIP. No sentinel there: a sweep that
+    # reaches a deep bid comes as one order and fills both in one match, and the event's order
+    # group already pulls the rest on the bid's own fill.
     deep = {}
     if mode == "wide" and cfg.deep_keep > 0:
         for s, p in legs:
@@ -412,10 +416,9 @@ def plan_market(ticker: str, others: dict[str, dict[float, float]], params: lip.
             if d is not None and d < p - 1e-9:
                 deep[s] = d
         for s, d in deep.items():
-            sent = min(round(d + tick(d), 4), next(p for x, p in legs if x == s))
-            layout[s], big[s] = "sentinel", d
-            sized = [(x, px, q) for x, px, q in sized if x != s] + [(s, sent, SENTINEL_LOTS), (s, d, lots)]
-            legs = [(x, sent if x == s else px) for x, px in legs]
+            layout[s], big[s] = "deep", d
+            sized = [(x, px, q) for x, px, q in sized if x != s] + [(s, d, lots)]
+            legs = [(x, d if x == s else px) for x, px in legs]
     # Per side, the sentinel layout where it keeps sentinel_keep of the touch layout's LIP.
     base = sc.expected_reward_this_snapshot_usd
     for s, p in legs:

@@ -188,8 +188,8 @@ def test_wide_bids_as_deep_as_keeps_most_of_the_lip():
     # T130 11-05 without our bids: 184 lots above 9c, then thin down to 5c.
     others = {"yes": {0.10: 89.0, 0.04: 3926.0}, "no": {0.57: 11.0, 0.56: 173.0, 0.09: 2.5, 0.06: 27.0, 0.05: 3025.0}}
     pl = plan_market("T", others, P, cfg, {}, 1000)
-    assert pl.mode == "wide" and pl.big["no"] == 0.06 and pl.legs == (("no", 0.07),)    # main 6c, sentinel 7c
-    assert pl.layout["no"] == "sentinel" and pl.capital == pytest.approx(60.0)
+    assert pl.mode == "wide" and pl.big["no"] == 0.06 and pl.legs == (("no", 0.06),) and pl.layout["no"] == "deep"
+    assert pl.capital == pytest.approx(60.0) and farm.desired_orders(pl) == {"T|no": (0.06, 1000, True)}
     touch = plan_market("T", others, P, dataclasses.replace(cfg, deep_keep=0.0), {}, 1000)
     assert pl.rate >= 0.8 * touch.rate
     # Others past Target/5 above it: deep scores nothing, so it stays up top.
