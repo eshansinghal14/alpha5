@@ -81,6 +81,9 @@ FILL_CONTEXT_S = 10.0
 # Accuracy test for levels.Levels: every QUEUE_CHECK_S, Kalshi's size ahead of
 # each of our LIP bids vs the size ahead our reconstruction of the level gives.
 QUEUE_CHECK_S = 60.0
+# Manual holds (an operator or agent writes holds.json: {ticker: {"until": epoch, "why": str}}):
+# our LIP bids there are pulled and kept off until then; exits are untouched. Re-read this often.
+HOLDS_S = 5.0
 
 
 def lip_feed_class():
@@ -792,6 +795,8 @@ class Runner:
         rec = {"oid": None, "side": side, "price": price, "size": lots, "remaining": lots, "placed": time.time()}
         if not hedge:
             rec["group"] = gid
+            # Others' size at or above our price when we joined (status: has it grown since?).
+            rec["crowd0"] = round(sum(q for p, q in self.books.get(t, {}).get(side, {}).items() if p >= price - 1e-9), 2)
         self.state["orders"][k] = rec
         if not self.live:
             rec["oid"] = "shadow-" + uuid.uuid4().hex[:12]
@@ -1515,6 +1520,36 @@ class Runner:
                 self.journal({"kind": "queue_check", "ticker": t, "side": side, "price": o["price"], "actual": a,
                               "guessed": g, "chunks": v["sizes"], "snap": v["snap"]})
 
+    def crowd(self, others: dict, side: str, price: float) -> float:
+        return sum(q for p, q in others.get(side, {}).items() if p >= price - 1e-9)
+
+    async def holds_loop(self):
+        """Apply holds.json: pull our LIP bids on each held market and keep it on
+        cooldown until its hold ends (the hold-and-watch experiment, 11-05)."""
+        path = os.path.join(self.root, "holds.json")
+        while True:
+            await asyncio.sleep(HOLDS_S)
+            if not self.live:
+                continue
+            try:
+                holds = json.loads(await self.run_io(_read, path)) if os.path.exists(path) else {}
+                now = time.time()
+                for t, h in holds.items():
+                    until = float(h.get("until", 0))
+                    if until <= now:
+                        continue
+                    cool = self.state.setdefault("cooldown", {})
+                    if cool.get(t, 0.0) < until:
+                        cool[t] = until
+                    keys = self.keys_of(t, hedges=False)
+                    if keys:
+                        for k in keys:
+                            self.cancel(k, reason="lipfarm:hold")
+                        self.journal({"kind": "hold", "ticker": t, "until": until, "why": h.get("why")})
+                        print(f"hold: pulled {t} until {pd.Timestamp(until, unit='s', tz='UTC'):%H:%M:%S}Z ({h.get('why')})")
+            except Exception as e:
+                print(f"holds: {e!r}")
+
     async def keepalive_loop(self):
         while True:
             await asyncio.sleep(KEEPALIVE_S)
@@ -1616,7 +1651,11 @@ class Runner:
                          "our_usd_day": self.rates.get(t, 0.0) * 86400,
                          "pool_usd_day": (pl.pool_rate if pl else 0.0) * 86400,
                          "exp_lip_usd": self.state["accrued"].get(t, 0.0),
-                         "period_lip_usd": self.period_accrued(t) if t in self.programs else 0.0})
+                         "period_lip_usd": self.period_accrued(t) if t in self.programs else 0.0,
+                         "crowd": {f"{o['side']}@{o['price']:g}": [round(self.crowd(self.books.get(t, {}), o["side"],
+                                                                                    o["price"]), 1), o.get("crowd0")]
+                                   for k, o in self.state["orders"].items()
+                                   if unkey(k)[0] == t and not is_hedge(k) and not is_sentinel(k)}})
         pos = self.positions()
         tot_lip = sum(self.state["accrued"].values())
         locked = sum(v for v in self.state.get("period_accrued", {}).values() if v >= farm.LIP_MIN_PAYOUT_USD)
@@ -1683,7 +1722,7 @@ class Runner:
         self.ensure_feed(held or set(list(self.programs)[:1]))
         coros = [self.control_loop(arm, stop_ev), self.eval_loop(), self.cycle_loop(), self.guard_loop(),
                  self.refresh_loop(), self.status_loop(), self.keepalive_loop(), self.flush_loop(),
-                 self.lag_loop(), self.ghost_loop(), self.levels_loop()]
+                 self.lag_loop(), self.ghost_loop(), self.levels_loop(), self.holds_loop()]
         tasks = [loop.create_task(c) for c in coros]
         try:
             await stop_ev.wait()

@@ -625,3 +625,23 @@ def test_the_ten_seconds_of_depth_before_a_lip_fill_are_journaled(tmp_path, monk
     row = next(x for x in r.rows if x["kind"] == "fill_context")
     assert [snap["at_ours"]["yes@0.4"] for _, snap in row["depth_before"]] == [300.0, 50.0]
     assert row["depth_before"][0][1]["no_top"] == [0.5, 900.0]
+
+
+def test_a_hold_pulls_our_lip_bids_and_keeps_the_market_off_until_it_ends(tmp_path, monkeypatch):
+    books = {"Z-1-A": {"yes": {0.40: 1500.0}, "no": {0.30: 900.0}}}
+    r, c = make(tmp_path, monkeypatch, books)
+    monkeypatch.setattr(runner, "HOLDS_S", 0.01)
+    r.state["orders"] = {"Z-1-A|yes": _order("yes", 0.40, oid="a"), "Z-1-A|no|h": _order("no", 0.55, oid="h")}
+    until = time.time() + 600
+    (tmp_path / "holds.json").write_text(json.dumps({"Z-1-A": {"until": until, "why": "test"}}))
+
+    async def go():
+        await boot(r)
+        task = asyncio.get_running_loop().create_task(r.holds_loop())
+        await asyncio.sleep(0.2)
+        task.cancel()
+        await settle(r)
+    asyncio.run(go())
+    assert list(r.state["orders"]) == ["Z-1-A|no|h"]                     # the exit stays
+    assert r.state["cooldown"]["Z-1-A"] == until
+    assert [x[1:] for x in c.calls if x[1] == "cancel"] == [("cancel", "Z-1-A", "a")]
