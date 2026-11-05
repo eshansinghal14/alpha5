@@ -572,7 +572,9 @@ def test_sentinel_and_bid_go_in_the_sides_group_and_a_sentinel_fill_trips_it(tmp
     f.book_fills([{"ticker": "Z-1-A", "side": "yes", "price": 0.40, "size": 1.1, "fee": 0.0, "order_id": sent_oid,
                    "trade_id": "t1"}])
     assert f.state["groups"]["Z-1-A|yes"]["tripped"] and "Z-1-A" in f.dumping
-    assert not f.keys_of("Z-1-A", hedges=False) and f.state["cooldown"]["Z-1-A"] > time.time()
+    assert f.state["cooldown"]["Z-1-A"] > time.time()
+    f.hedge(CFG)                                                 # bids go after any sell
+    assert not f.keys_of("Z-1-A", hedges=False)
     f.group("Z-1-A", "yes")                                      # re-placing later resets the group first
     assert b.resets == ["g1"] and not f.state["groups"]["Z-1-A|yes"]["tripped"]
 
@@ -697,3 +699,44 @@ def test_scan_places_only_after_a_passing_flow_read(tmp_path, monkeypatch):
     f.flow_futs["Q-1-A"].result()
     f.scan_finish(CFG, [("Q-1-A", ob)])
     assert list(f.plans) == ["Q-1-A"]
+
+
+def test_informed_fill_sells_before_basket_reads_and_other_side_pulls(tmp_path, monkeypatch):
+    b = _Bucket()
+    f = _live(tmp_path, monkeypatch, b, placed_ago=1.0)
+    f.state["orders"]["Z-1-A|no"] = {"oid": "oidn", "side": "no", "price": 0.02, "size": 1000, "remaining": 1000,
+                                     "placed": time.time() - 1.0}
+    f.state["lip_oid_size"] = {"oid0": 1000}
+    f.state["hedged_oids"] = ["oid0"]
+    f.books = {"Z-1-A": {"yes": {0.96: 300.0, 0.95: 500.0}, "no": {0.02: 5000.0}}}
+    f.baskets = {("Z-1-A", "yes"): [(1.0, (("Z-1-A", "yes"), ("Z-1-B", "no")))]}    # Z-1-B's book isn't read
+    events = []
+    monkeypatch.setattr(f, "take", lambda t, side, px, q: events.append(("take", side, px)) or q)
+    real_cancel = f.cancel
+    monkeypatch.setattr(f, "cancel", lambda k, reason="": events.append(("cancel", k)) or real_cancel(k, reason))
+    monkeypatch.setattr(f, "fresh_books", lambda ts: events.append(("read", tuple(ts))) or {})
+    f.book_fills([{"ticker": "Z-1-A", "side": "yes", "price": 0.97, "size": 300.0, "fee": 0.0,
+                   "order_id": "oid0", "trade_id": "t1"}])
+    f.hedge(CFG, takes=True)
+    # Our yes bid (the side we sell into) first, then the sell, then the no bid; basket reads last.
+    assert events[:3] == [("cancel", "Z-1-A|yes"), ("take", "no", 0.04), ("cancel", "Z-1-A|no")]
+    assert ("read", ("Z-1-B",)) not in events[:3]
+
+
+def test_socket_fill_is_exited_before_the_next_bid_goes_out(tmp_path, monkeypatch):
+    b = _Bucket()
+    f = _live(tmp_path, monkeypatch, b, placed_ago=1.0)
+    f.cfg = CFG
+    f.state["lip_oid_size"] = {"oid0": 1000}
+    f.state["hedged_oids"] = ["oid0"]
+    fill = {"ticker": "Z-1-A", "side": "yes", "price": 0.97, "size": 300.0, "fee": 0.0, "order_id": "oid0",
+            "trade_id": "t1"}
+    q = [fill]
+    f.ws.fills = q
+    f.ws.take_fills = lambda: [q.pop() for _ in list(q)]
+    monkeypatch.setattr(farm, "fetch_book", lambda t: {"yes_dollars": [["0.96", "300"]], "no_dollars": [["0.02", "5000"]]})
+    took = []
+    monkeypatch.setattr(f, "take", lambda t, side, px, qq: took.append((t, side, px)) or qq)
+    # A cycle's bid on the same market: the fill is exited first, and the bid isn't placed.
+    assert f.place("Z-1-A", "no", 0.02, 1000) is False
+    assert took == [("Z-1-A", "no", 0.04)] and not q

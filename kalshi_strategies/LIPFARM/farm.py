@@ -693,6 +693,11 @@ class WsBooks:
             self.dirty, self.fills = set(), []
         return d, f
 
+    def take_fills(self) -> list[dict]:
+        with self.lock:
+            f, self.fills = self.fills, []
+        return f
+
 
 def remove_ours(book: dict[float, float], price: float, size: float) -> dict[float, float]:
     out = dict(book)
@@ -724,6 +729,9 @@ class Farm:
         self.pending: dict[str, tuple] = {}   # leg key -> (price, lots, grouped) awaiting its claim
         self.pending_sentinels: dict[str, dict] = {}            # ticker -> its pending legs' sentinels
         self.dumping: set[str] = set()        # markets an informed fill hit: sell out now
+        self.pull: set[str] = set()           # markets whose LIP bids go once their sells are out
+        self.cfg: Cfg | None = None           # this loop's config, for urgent()
+        self._urgent = False
         self.cfg_adverse = 300.0              # cfg.adverse_lots, refreshed each loop
         self.cfg_slip, self.cfg_chase, self.cfg_max_chase = 2, 2, 5  # cfg.dump_slip_ticks, chase_ticks, max_chase_ticks
         self.n_refused, self.last_refused_log = 0, 0.0
@@ -888,6 +896,7 @@ class Farm:
         self.held_events = arbs_held_events()
         pos = self.signed_positions()
         for t, ob in got:
+            self.urgent()
             if ob is None or t not in self.programs:
                 continue
             others = self.others_of(t, ob)
@@ -985,6 +994,11 @@ class Farm:
     def place(self, t: str, side: str, price: float, lots: float, reserve: float = PLACE_RESERVE,
               reason: str = "lipfarm:quote", hedge: bool = False, sentinel: bool = False,
               grouped: bool = False) -> bool:
+        if not hedge:
+            self.urgent()
+            # A fill handled just now may have pulled this market.
+            if self.state.get("cooldown", {}).get(t, 0.0) > time.time():
+                return False
         if self.live:
             c = self.client(self.shard(t))
             if hedge:
@@ -1093,11 +1107,11 @@ class Farm:
         print(f"take: {t} {side}@{fill.price} x{fill.size:.0f}")
         return fill.size
 
-    def try_lock(self, t: str, held: str, qty: float) -> float:
+    def try_lock(self, t: str, held: str, qty: float, baskets: bool = True) -> float:
         """Lock `qty` of our `held` side of t by taking the cheapest bundle
         that costs at most its payout after taker fees: the same market's other
-        side, or the other legs of an ARBS basket holding our leg. Returns the
-        contracts locked."""
+        side, or (`baskets`) the other legs of an ARBS basket holding our leg.
+        Returns the contracts locked."""
         other = "no" if held == "yes" else "yes"
         cost = self.avg_cost(t, held)
         best = None                                   # (cost per payout dollar, payout, [(t, side, px, size)])
@@ -1107,11 +1121,12 @@ class Farm:
             c = cost + px + kfee(px, 1.0, self.taker_rate(t))
             if c <= 1.0 + 1e-9:
                 best = (c, 1.0, [(t, other, px, sz)])
-        legs_needed = {tk for pay, legs in self.baskets.get((t, held), []) for tk, _ in legs if tk != t}
+        bs = self.baskets.get((t, held), []) if baskets else []
+        legs_needed = {tk for pay, legs in bs for tk, _ in legs if tk != t}
         missing = [tk for tk in legs_needed if tk not in self.books]
         if missing:
             self.books.update(self.fresh_books(missing))
-        for pay, legs in self.baskets.get((t, held), []):
+        for pay, legs in bs:
             buys, c = [], cost
             for tk, sd in legs:
                 if (tk, sd) == (t, held):
@@ -1147,13 +1162,17 @@ class Farm:
         (a fill beyond dust): also pull its LIP bids and cool it down."""
         self.dumping.discard(t)
         v = self.free_positions().get(t, 0.0)
+        held, other = ("yes", "no") if v > 0 else ("no", "yes")
         if adverse and abs(v) > DUST_LOTS:
+            # Only the side we sell into must go first (our IOC would cross our own bid there);
+            # the other side's bids are pulled after the take.
             for k in self.keys_of(t, hedges=False):
-                self.cancel(k, reason="lipfarm:adverse")
+                if unkey(k)[1] == held:
+                    self.cancel(k, reason="lipfarm:adverse")
+            self.pull.add(t)
             self.state.setdefault("cooldown", {})[t] = time.time() + TRIP_COOLDOWN_S
         if abs(v) < 0.01:
             return
-        held, other = ("yes", "no") if v > 0 else ("no", "yes")
         # Selling `held` = buying `other` against others' `held` bids, best first.
         need, cum, worst = abs(v), 0.0, None
         for p in sorted(self.books[t][held], reverse=True):
@@ -1183,6 +1202,23 @@ class Farm:
         the other side's touch, under its offer. Live only."""
         if not self.live:
             return
+        # Informed fills first: a pair lock off the book we have, then sell into the book.
+        # Basket locks may read other books over REST; done first, they held these
+        # sells up 1-7 s on 11-05 (11-04, before them: 26-46 ms after Kalshi's fill).
+        for t in sorted(self.dumping):
+            v = self.free_positions().get(t, 0.0)
+            if abs(v) < 0.01 or t not in self.books or t not in self.meta:
+                continue
+            held = "yes" if v > 0 else "no"
+            if takes and self.try_lock(t, held, abs(v), baskets=False) and                     abs(self.free_positions().get(t, 0.0)) < 0.01:
+                continue
+            fill_px = self.avg_cost(t, held)
+            tk = self.tick(t, fill_px)
+            self.dump(t, floor=fill_px - min(self.cfg_slip, self.cfg_max_chase) * tk)
+        for t in sorted(self.pull):
+            for k in self.keys_of(t, hedges=False):
+                self.cancel(k, reason="lipfarm:adverse")
+        self.pull.clear()
         pos = self.free_positions()
         if takes:
             for t, v in list(pos.items()):
@@ -1320,6 +1356,20 @@ class Farm:
             self.rates[t] = self.our_rate(t, others, P)
         if moves:
             self.move_back(cfg, keep)
+
+    def urgent(self):
+        """Fills that came over the socket while the main thread was busy
+        (a cycle's bids going out, a scan being planned): book them and exit now,
+        not after the work in hand."""
+        if not self.live or self._urgent or self.cfg is None or not self.ws.fills:
+            return
+        self._urgent = True
+        try:
+            new = self.book_fills(self.ws.take_fills())
+            if new:
+                self.check(self.cfg, sorted(new), moves=False, takes=True)
+        finally:
+            self._urgent = False
 
     def guard(self, cfg: Cfg):
         """Live, every GUARD_S: fills (REST backstop), then check every market we
@@ -1524,9 +1574,9 @@ class Farm:
                     g = self.state.get("groups", {}).get(sent[o])
                     if g:
                         g["tripped"] = True          # Kalshi cancelled the bid behind it
-                    # The touch was just cleared: off this market both sides, for the cooldown.
-                    for k in self.keys_of(tick[o], hedges=False):
-                        self.cancel(k, reason="lipfarm:sentinel")
+                    # The touch was just cleared: off this market both sides, for the cooldown
+                    # (pulled in hedge, after the dump: each cancel is a write in the way).
+                    self.pull.add(tick[o])
                     self.state.setdefault("cooldown", {})[tick[o]] = time.time() + TRIP_COOLDOWN_S
                     print(f"sentinel: {sent[o]} cleared; its market is pulled for {TRIP_COOLDOWN_S:.0f} s")
                 else:
@@ -1692,7 +1742,7 @@ class Farm:
         refresh, scan, last_cycle, last_guard, last_status = None, None, 0.0, time.time(), 0.0
         try:
             while True:
-                cfg = Cfg.load()
+                cfg = self.cfg = Cfg.load()
                 self.bucket.rate = cfg.write_tokens_per_s
                 self.cfg_adverse = cfg.adverse_lots
                 self.cfg_slip, self.cfg_chase, self.cfg_max_chase = cfg.dump_slip_ticks, cfg.chase_ticks, cfg.max_chase_ticks
@@ -1717,12 +1767,14 @@ class Farm:
                     if self.programs and scan is None and now - last_cycle >= cfg.refresh_s:
                         self.poll_fills()
                         self.sync_live_orders()
+                        self.urgent()
                         self.accrue()
                         tickers = self.candidates(cfg)
                         scan, last_cycle = (tickers, [self.pool.submit(fetch_book, t) for t in tickers]), now
                     if scan is not None and all(fu.done() for fu in scan[1]):
                         (tickers, futs), scan = scan, None
                         self.scan_finish(cfg, [(t, fu.result()) for t, fu in zip(tickers, futs)])
+                        self.urgent()
                         self.reconcile(cfg)
                         self.report(cfg)
                         self._save()
