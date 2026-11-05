@@ -1250,6 +1250,13 @@ class Runner(Farm):
         self.urgent_set, self.dirty = _Dirty(self.wake), _Dirty(self.wake)
         self.positions_now = set(self.signed_positions())
         stop_ev = asyncio.Event()
+        # systemd stops us with SIGINT (KillSignal): end through the cleanup below, which pulls every bid.
+        import signal
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop_ev.set)
+            except (NotImplementedError, RuntimeError):
+                pass                                    # Windows: KeyboardInterrupt still ends asyncio.run
         self.cfg = Cfg.load()
         self.apply_refresh(await self.run_io(farm.refresh_job, set(self.signed_positions())))
         self.pool_rate = await self.run_io(pool_rates, self.programs)
