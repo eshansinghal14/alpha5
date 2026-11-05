@@ -18,6 +18,7 @@ import itertools
 import os
 import socket
 import statistics
+import sys
 import threading
 import time
 
@@ -118,7 +119,9 @@ def install() -> list[str]:
         uc.create_connection = _wrap(uc.create_connection)
     threading.Thread(target=_loop, daemon=True, name="kalshi-route").start()
     _installed = True
-    print(f"[route] {HOST}: connecting to {len(near)} near node(s) {near}", flush=True)
+    # stderr: a venue child process imports this too, and its stdout is the
+    # binary frame pipe -- a line there cut every venue feed (11-05 20:19).
+    print(f"[route] {HOST}: connecting to {len(near)} near node(s) {near}", file=sys.stderr, flush=True)
     return near
 
 
@@ -127,7 +130,7 @@ def install_from_env() -> None:
         try:
             install()
         except Exception as e:
-            print(f"[route] not installed ({e!r}); plain DNS", flush=True)
+            print(f"[route] not installed ({e!r}); plain DNS", file=sys.stderr, flush=True)
 
 
 __all__ = ["install", "install_from_env", "pick_near", "refresh", "preferred"]
