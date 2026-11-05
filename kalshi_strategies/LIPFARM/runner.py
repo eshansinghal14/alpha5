@@ -939,7 +939,10 @@ class Runner(Farm):
                 if not await self.place(t, side, px, q):
                     return
                 sp, sq, _ = ws[sk]
-                if sk not in self.state["orders"] and not await self.place(t, side, sp, sq, sentinel=True):
+                # No shard reserve for the sentinel: its bid already rests, and refusing it at the
+                # reserve line pulled that bid every cycle (shard ~155 of 300, 11-05 17:55).
+                if sk not in self.state["orders"] and not await self.place(t, side, sp, sq, reserve=0.0,
+                                                                            sentinel=True):
                     print(f"sentinel {t} {side}: not placed; pulling its bid")
                     self.cancel(main, reason="lipfarm:sentinel")
                 return

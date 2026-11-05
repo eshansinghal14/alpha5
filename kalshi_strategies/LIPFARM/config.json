@@ -1,7 +1,7 @@
 {
   "farm": {
-    "max_capital": 5000,
-    "num_markets": 20,
+    "max_capital": 7000.0,
+    "num_markets": 30,
     "sentinel_keep": 0.8,
     "dump_slip_ticks": 2,
     "chase_ticks": 2,
@@ -11,11 +11,11 @@
     "exit_depth_frac": 1.0,
     "exit_depth_slip": 0.03,
     "wide_spread": 0.2,
-    "min_leg_price": 0.1,
+    "min_leg_price": 0.2,
     "decided_min": 0.97,
     "min_ahead": 0,
     "max_position": 1000,
-    "write_tokens_per_s": 30,
+    "write_tokens_per_s": 40,
     "scan_markets": 400,
     "scan_rotate": 500,
     "refresh_s": 30,
