@@ -80,7 +80,7 @@ def render(page: str, stale_fn):
         st.header("Config")
         config_form.render(_FORM)
     st.title("LIP farm")
-    st.caption("Wide markets (spread >= `wide_spread`): a bid of `lots` at both touches. Decided markets "
+    st.caption("Wide markets (spread >= `wide_spread`): a bid of the market's Target (where LIP stops counting) at both touches. Decided markets "
                "(expensive bid >= `decided_min`, below the market's top price): a bid on the expensive side only. Every "
                "side must reach Target, so the snapshot pays. Best LIP per dollar first, up to `max_capital`. "
                "Expected LIP is our modelled share over time, not Kalshi's payout (nothing under $1 per "

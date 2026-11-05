@@ -2,10 +2,10 @@
 LIP farmer. Quotes LIP markets in one of two shapes, chosen per market each
 cycle from today's book:
 
-  wide     the yes/no spread is at least `wide_spread`: one bid of `lots` at
-           each side's touch, owning both halves of a thin book.
+  wide     the yes/no spread is at least `wide_spread`: one bid of the market's
+           Target at each side's touch, owning both halves of a thin book.
   decided  the expensive side's best bid is at least decided_min: one bid of
-           `lots` there only (fills gain the last cents; the risk is a
+           Target there only (fills gain the last cents; the risk is a
            reversal). A bid at the market's top price (0.99, or 0.999 on 0.1c
            ticks) earns no LIP; the scorer rules those out.
 
@@ -170,8 +170,6 @@ class Cfg:
                                "that could take us past it isn't placed; after a fill, bids that could are "
                                "pulled. Resting bids hold no cash at Kalshi.", min=0.0, step=500.0)
     num_markets: int = param("Most markets quoted.", min=0, step=1)
-    lots: float = param("Contracts per bid (one bid per quoted side), before exit_vol_frac.", min=1.0,
-                        step=100.0)
     sentinel_keep: float = param("Use the sentinel layout on a side when it keeps at least this share of the "
                                  "touch layout's LIP. 11-04, 366 sides: thin touches (<200 ahead) keep ~97%, "
                                  "crowded ones (>1000) nothing.", min=0.0, max=1.0, step=0.05)
@@ -318,11 +316,12 @@ def plan_market(ticker: str, others: dict[str, dict[float, float]], params: lip.
                 current: dict[str, str] | None = None) -> Plan | None:
     """How to quote this market now, or None. Joins others' best bids (never
     improves them). `held`: contracts we already hold per side; `lots`: bid
-    size, one number or per side (exit_lots); a side sized under 1 isn't
+    size, one number or per side (exit_lots), default the program's Target (LIP
+    stops counting past it); a side sized under 1 isn't
     quoted. Every quoted side gets the smallest of the quoted sides' sizes."""
     held = held or {}
     if lots is None:
-        lots = cfg.lots
+        lots = params.target_size
     side_lots = lots if isinstance(lots, dict) else {"yes": lots, "no": lots}
     if not others["yes"] or not others["no"]:
         return None
@@ -368,8 +367,8 @@ def plan_market(ticker: str, others: dict[str, dict[float, float]], params: lip.
                 layout, big)
 
 
-def exit_lots(others: dict[str, dict[float, float]], cfg: Cfg) -> dict[str, float]:
-    """Bid size per side: cfg.lots, capped by that side's exit depth, others'
+def exit_lots(others: dict[str, dict[float, float]], cfg: Cfg, target: float) -> dict[str, float]:
+    """Bid size per side: the program's `target`, capped by that side's exit depth, others'
     bids strictly BELOW the touch we'd join, within exit_depth_slip. Bids at
     our own price don't count: a seller who fills us full size has cleared
     that level too (NMAN 11-04: 1000 of 1000 at 5c, the next bid 1c)."""
@@ -380,7 +379,7 @@ def exit_lots(others: dict[str, dict[float, float]], cfg: Cfg) -> dict[str, floa
             continue
         top = max(book)
         d = sum(q for p, q in book.items() if top - cfg.exit_depth_slip - 1e-9 <= p < top - 1e-9)
-        out[s] = min(cfg.lots, math.floor(cfg.exit_depth_frac * d))
+        out[s] = min(target, math.floor(cfg.exit_depth_frac * d))
     return out
 
 
@@ -1154,7 +1153,7 @@ class Farm:
         for k in self.keys_of(t, hedges=False):
             sd = unkey(k)[1]
             current[sd] = "sentinel" if (is_sentinel(k) or current.get(sd) == "sentinel") else "touch"
-        return plan_market(t, others, P, cfg, {"yes": max(v, 0.0), "no": max(-v, 0.0)}, exit_lots(others, cfg),
+        return plan_market(t, others, P, cfg, {"yes": max(v, 0.0), "no": max(-v, 0.0)}, exit_lots(others, cfg, P.target_size),
                            tick=lambda px: self.tick(t, px), current=current)
 
     def fresh_books(self, tickers) -> dict[str, dict]:
@@ -1248,7 +1247,7 @@ class Farm:
             behind = others[side].get(round(o["price"], 4), 0.0) - (a or 0.0)
             # A sentinel must be last in line to mean "the touch was cleared"; a
             # crowded-touch bid wants as much ahead of it as there is.
-            if a is None or behind < (1.0 if is_sentinel(k) else MOVE_BEHIND_FRAC * cfg.lots):
+            if a is None or behind < (1.0 if is_sentinel(k) else MOVE_BEHIND_FRAC * o["size"]):
                 continue
             c = self.client(self.shard(t))
             if (moves >= MAX_MOVES or not self.bucket.has(ORDER_TOKENS + CANCEL_TOKENS)

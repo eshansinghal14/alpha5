@@ -2,7 +2,6 @@
   "farm": {
     "max_capital": 5000,
     "num_markets": 20,
-    "lots": 1000,
     "sentinel_keep": 0.8,
     "dump_slip_ticks": 2,
     "chase_ticks": 2,

@@ -8,7 +8,7 @@ from kalshi_strategies.LIPFARM import farm
 from kalshi_strategies.LIPFARM.farm import parse_book, plan_market, remove_ours
 
 P = lip.LipParams(target_size=1000, discount_factor=0.5, period_reward_usd=86.4, snapshots_per_period=86400)
-CFG = farm.Cfg(max_capital=5000, num_markets=5, lots=1000, min_lots_frac=0.0, sentinel_keep=2.0, dump_slip_ticks=2, chase_ticks=2,
+CFG = farm.Cfg(max_capital=5000, num_markets=5, min_lots_frac=0.0, sentinel_keep=2.0, dump_slip_ticks=2, chase_ticks=2,
                adverse_lots=300, exit_depth_frac=10.0, exit_depth_slip=0.03, wide_spread=0.20, min_leg_price=0.0, decided_min=0.97,
                min_ahead=0.0, max_position=1e9, write_tokens_per_s=5.0, scan_markets=1, scan_rotate=0, refresh_s=30,
                programs_refresh_s=600)
@@ -385,9 +385,9 @@ def test_exit_depth_counts_only_bids_below_ours(tmp_path, monkeypatch):
     cfg = dataclasses.replace(CFG, exit_depth_frac=1.0, exit_depth_slip=0.03)
     # no touch 0.05 with 1500 there and only 1c bids below: no exit depth on no.
     o = {"yes": {0.80: 1500.0, 0.78: 400.0}, "no": {0.05: 1500.0, 0.01: 9000.0}}
-    assert farm.exit_lots(o, cfg) == {"yes": 400, "no": 0}
+    assert farm.exit_lots(o, cfg, 1000) == {"yes": 400, "no": 0}
     P1 = lip.LipParams(target_size=1000, discount_factor=0.5, period_reward_usd=86.4, snapshots_per_period=86400)
-    pl = plan_market("T", o, P1, dataclasses.replace(cfg, wide_spread=0.15), {}, farm.exit_lots(o, cfg))
+    pl = plan_market("T", o, P1, dataclasses.replace(cfg, wide_spread=0.15), {}, farm.exit_lots(o, cfg, 1000))
     assert pl.mode == "wide" and pl.legs == (("yes", 0.80),) and pl.lots == 400      # the 5c no leg isn't quoted
 
 
@@ -517,7 +517,7 @@ def test_fractional_dust_is_sold_exactly_and_never_churns(tmp_path, monkeypatch)
 def test_wide_skips_legs_under_min_leg_price():
     others = {"yes": {0.70: 50.0, 0.68: 2000.0}, "no": {0.06: 20.0, 0.05: 5000.0}}
     cfg = dataclasses.replace(CFG, min_leg_price=0.10, exit_depth_frac=10.0)
-    pl = plan_market("T", others, P, cfg, {}, farm.exit_lots(others, cfg))
+    pl = plan_market("T", others, P, cfg, {}, farm.exit_lots(others, cfg, 1000))
     assert pl.mode == "wide" and pl.legs == (("yes", 0.70),)    # the 6c no leg isn't quoted
 
 
@@ -606,3 +606,10 @@ def test_fill_of_adverse_lots_dumps_even_on_a_small_bid(tmp_path, monkeypatch):
     f.book_fills([{"ticker": "Z-1-A", "side": "yes", "price": 0.97, "size": 300.0, "fee": 0.0,
                    "order_id": "oid0", "trade_id": "t1"}])
     assert f.dumping == {"Z-1-A"}                                       # 300 of 5000: 6%, still a dump
+
+
+def test_bid_size_follows_the_programs_target():
+    deep = {"yes": {0.40: 50.0, 0.39: 9000.0}, "no": {0.35: 50.0, 0.34: 9000.0}}
+    for target in (1000, 2500):
+        Pt = dataclasses.replace(P, target_size=target)
+        assert plan_market("T", deep, Pt, CFG, {}, farm.exit_lots(deep, CFG, target)).lots == target
