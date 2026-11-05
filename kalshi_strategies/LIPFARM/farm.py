@@ -34,8 +34,8 @@ market's other side, or the other legs of any ARBS basket holding our leg
 (ARBS's scanned and hand specs), whenever the bundle costs at most its payout
 after taker fees. Whatever is left gets an exit bid one tick above the other
 side's touch (Kalshi nets a yes+no pair to $1), at any price -- getting out
-comes before the pair's profit. A fill taking `adverse_fill_frac` or more of a
-bid is taken as informed: we sell into the book at once (sweeping others'
+comes before the pair's profit. Fills of `adverse_lots` or more on one bid
+are too much to wait out: we sell into the book at once (sweeping others'
 bids on the side we hold), pull that market's bids and cool it down. Exits
 sit ahead of our own LIP bids, follow
 the touch, are never pulled or moved to the back, and the market's LIP bids
@@ -181,10 +181,11 @@ class Cfg:
     chase_ticks: int = param("Then sell more (again dump_slip_ticks deep) whenever the best bid is this many ticks "
                              "under our fill. 11-04: after a sweep the price fell 2+ ticks within 1 min ~22% "
                              "of the time on 10-90c markets, whatever its size.", min=1, max=50, step=1)
-    adverse_fill_frac: float = param("A fill of at least this fraction of one of our bids is informed: sell "
-                                     "into the book at once, at any price, instead of waiting on an exit bid "
-                                     "(ORAN 11-04: 1000 of 1000 at 6c, then 1c within 10 min).", min=0.05,
-                                     max=1.0, step=0.05)
+    adverse_lots: float = param("Fills of at least this many lots on one of our bids: sell up to "
+                                "dump_slip_ticks under our fill at once, instead of waiting on an exit bid. "
+                                "A risk cap, not a signal: 11-04 sweeps of 50 to 3000+ lots, and 0.5x to 10x+ "
+                                "a market's median sweep, were all followed by a 2+ tick further fall "
+                                "~21-24% of the time within 1 min.", min=1, max=10000, step=50)
     min_lots_frac: float = param("Don't quote a side whose bid would be under this fraction of the market's "
                                  "Target size: LIP stays small until a bid reaches Target/5, where it sets the "
                                  "reference price (11-04: 1 to 49 lot bids earned ~$0).", min=0.0, max=1.0,
@@ -646,7 +647,7 @@ class Farm:
         self.pending: dict[str, tuple] = {}   # leg key -> (price, lots, grouped) awaiting its claim
         self.pending_sentinels: dict[str, dict] = {}            # ticker -> its pending legs' sentinels
         self.dumping: set[str] = set()        # markets an informed fill hit: sell out now
-        self.cfg_adverse = 0.8                # cfg.adverse_fill_frac, refreshed each loop
+        self.cfg_adverse = 300.0              # cfg.adverse_lots, refreshed each loop
         self.cfg_slip, self.cfg_chase = 2, 2  # cfg.dump_slip_ticks, cfg.chase_ticks
         self.n_refused, self.last_refused_log = 0, 0.0
         self.marks_at = 0.0
@@ -1389,8 +1390,8 @@ class Farm:
         return new
 
     def flag_adverse(self):
-        """Mark markets where fills took adverse_fill_frac of one of our LIP bids."""
-        frac = self.cfg_adverse
+        """Mark markets where fills on one of our LIP bids reached adverse_lots."""
+        lim = self.cfg_adverse
         sizes = self.state.get("lip_oid_size", {})
         done = set(self.state.setdefault("adverse_oids", []))
         got: dict[str, float] = {}
@@ -1402,7 +1403,7 @@ class Farm:
                 tick[o] = f["ticker"]
         sent = self.state.get("sentinel_oids", {})
         for o, q in got.items():
-            if o in sent or q >= frac * sizes[o] - 1e-9:
+            if o in sent or q >= lim - 1e-9:
                 self.state["adverse_oids"].append(o)
                 self.dumping.add(tick[o])
                 if o in sent:
@@ -1579,7 +1580,7 @@ class Farm:
             while True:
                 cfg = Cfg.load()
                 self.bucket.rate = cfg.write_tokens_per_s
-                self.cfg_adverse = cfg.adverse_fill_frac
+                self.cfg_adverse = cfg.adverse_lots
                 self.cfg_slip, self.cfg_chase = cfg.dump_slip_ticks, cfg.chase_ticks
                 try:
                     reason = stop.poll()

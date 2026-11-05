@@ -9,7 +9,7 @@ from kalshi_strategies.LIPFARM.farm import parse_book, plan_market, remove_ours
 
 P = lip.LipParams(target_size=1000, discount_factor=0.5, period_reward_usd=86.4, snapshots_per_period=86400)
 CFG = farm.Cfg(max_capital=5000, num_markets=5, lots=1000, min_lots_frac=0.0, sentinel_keep=2.0, dump_slip_ticks=2, chase_ticks=2,
-               adverse_fill_frac=0.8, exit_depth_frac=10.0, exit_depth_slip=0.03, wide_spread=0.20, min_leg_price=0.0, decided_min=0.97,
+               adverse_lots=300, exit_depth_frac=10.0, exit_depth_slip=0.03, wide_spread=0.20, min_leg_price=0.0, decided_min=0.97,
                min_ahead=0.0, max_position=1e9, write_tokens_per_s=5.0, scan_markets=1, scan_rotate=0, refresh_s=30,
                programs_refresh_s=600)
 
@@ -445,13 +445,13 @@ def test_full_fill_is_informed_and_sold_into_the_book_at_once(tmp_path, monkeypa
     assert [(o.side, o.price, o.size) for o in ioc][-1] == ("no", 0.08, 700)
 
 
-def test_partial_fill_keeps_the_passive_exit(tmp_path, monkeypatch):
+def test_fill_under_adverse_lots_keeps_the_passive_exit(tmp_path, monkeypatch):
     b = _Bucket()
     f = _live(tmp_path, monkeypatch, b, placed_ago=1.0)
     f.state["lip_oid_size"] = {"oid0": 1000}
     f.state["hedged_oids"] = ["oid0"]
     f.books = {"Z-1-A": {"yes": {0.96: 300.0}, "no": {0.02: 5000.0}}}      # 1 tick under: no chase
-    f.book_fills([{"ticker": "Z-1-A", "side": "yes", "price": 0.97, "size": 300.0, "fee": 0.0,
+    f.book_fills([{"ticker": "Z-1-A", "side": "yes", "price": 0.97, "size": 299.0, "fee": 0.0,
                    "order_id": "oid0", "trade_id": "t1"}])
     assert not f.dumping
     f.hedge(CFG)
@@ -595,3 +595,14 @@ def test_sides_sized_under_target_fifth_are_not_quoted():
     others = {"yes": {0.97: 900.0}, "no": {0.02: 5000.0}}          # the yes side reaches Target with us
     assert plan_market("T", others, P, cfg, {}, 199) is None        # Target 1000: under 200 lots
     assert plan_market("T", others, P, cfg, {}, 200).lots == 200
+
+
+def test_fill_of_adverse_lots_dumps_even_on_a_small_bid(tmp_path, monkeypatch):
+    b = _Bucket()
+    f = _live(tmp_path, monkeypatch, b, placed_ago=1.0)
+    f.state["lip_oid_size"] = {"oid0": 5000}
+    f.state["hedged_oids"] = ["oid0"]
+    f.books = {"Z-1-A": {"yes": {0.96: 300.0}, "no": {0.02: 5000.0}}}
+    f.book_fills([{"ticker": "Z-1-A", "side": "yes", "price": 0.97, "size": 300.0, "fee": 0.0,
+                   "order_id": "oid0", "trade_id": "t1"}])
+    assert f.dumping == {"Z-1-A"}                                       # 300 of 5000: 6%, still a dump

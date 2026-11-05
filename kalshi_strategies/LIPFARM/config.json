@@ -6,7 +6,7 @@
     "sentinel_keep": 0.8,
     "dump_slip_ticks": 2,
     "chase_ticks": 2,
-    "adverse_fill_frac": 0.8,
+    "adverse_lots": 300,
     "min_lots_frac": 0.2,
     "exit_depth_frac": 1.0,
     "exit_depth_slip": 0.03,
