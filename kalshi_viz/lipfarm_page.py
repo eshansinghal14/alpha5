@@ -39,6 +39,23 @@ def _compact_bids(bids: str) -> str:
     return " · ".join(out)
 
 
+def _by_market(p: pd.DataFrame) -> pd.DataFrame:
+    """One row per market from status.json's per-side positions, which split each
+    yes+no pair's $1 half to each side (so a side alone reads as a big win or loss)."""
+    rows = []
+    for t, g in p.groupby("ticker", sort=False):
+        lots = dict(zip(g["side"], g["lots"]))
+        marks = dict(zip(g["side"], g["mark"]))
+        paired = min(lots.get("yes", 0.0), lots.get("no", 0.0))
+        open_ = [f"{s} {lots[s] - paired:g} @ {marks[s] * 100:g}¢" for s in ("yes", "no")
+                 if lots.get(s, 0.0) - paired >= 0.01]
+        cost = float((g["cost"] + g["fees"]).sum())
+        value = float(g["value"].sum())
+        rows.append({"market": t, "paired": paired, "open": ", ".join(open_) or "-",
+                     "cost $": cost, "value $": value, "P&L $": value - cost})
+    return pd.DataFrame(rows).sort_values("P&L $")
+
+
 def _status() -> dict | None:
     try:
         with open(os.path.join(ROOT, "status.json"), encoding="utf-8") as fh:
@@ -130,7 +147,12 @@ def render(page: str, stale_fn):
         if p.empty:
             st.caption("No fills.")
         else:
-            st.dataframe(p, hide_index=True, use_container_width=True)
+            st.dataframe(_by_market(p), hide_index=True, use_container_width=True, column_config={
+                "paired": st.column_config.NumberColumn(format="%.0f", help="yes+no pairs: worth $1 each at settlement"),
+                "open": st.column_config.TextColumn(help="Unpaired contracts left, marked at today's bid"),
+                "cost $": st.column_config.NumberColumn(format="%.2f", help="Everything paid, fees included"),
+                "value $": st.column_config.NumberColumn(format="%.2f"),
+                "P&L $": st.column_config.NumberColumn(format="%+.2f")})
         if doc.get("waiting"):
             with st.expander(f"Waiting for ARBS ({len(doc['waiting'])})"):
                 st.write(doc["waiting"])
