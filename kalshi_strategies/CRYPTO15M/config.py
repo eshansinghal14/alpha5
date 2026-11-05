@@ -113,6 +113,11 @@ class UpDownPricingParams:
         min=0.1, max=10, step=0.1)
     cme_pull_window_s: float = param("Window for cme_pull_bp.", min=0.01, max=2, step=0.05)
     cme_pull_hold_s: float = param("How long a cme_pull lasts after the last qualifying shift.", min=0, max=5, step=0.05)
+    take_min_shift_bp: float | None = param(
+        "Smallest CME whole-touch shift (bp, full, capped at 2) that prices a take; below it no take_prob, so "
+        "with take_lead_only no take. KXBTC15M takes 11-04..05: at a shift under 0.25bp -2.34c/contract at 10s "
+        "after fee (118), 0.5-1bp -0.16c (721), 1-2bp -0.06c (168), over 2bp +2.37c (18). null = any shift.",
+        min=0, max=2, step=0.1)
     take_lead_only: bool = param(
         "Take only on a fair carrying a CME whole-touch shift (take_prob); quotes are unaffected. Our spot "
         "median is no faster than Kalshi's makers: anchored-fair takes on it marked out -3.0c at 10s, CME "

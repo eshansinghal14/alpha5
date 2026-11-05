@@ -371,3 +371,12 @@ def test_cme_shift_pulls_the_exposed_side_for_the_hold():
     pnc._touch_hist[("cme", "BTC")] = collections.deque([(t - 0.5, lb, la), (t, lb, la)])
     m._cme_pull_until["no"] = t - 1
     assert m.side_block(m.ticker, "no", f, now) is None
+
+
+def test_take_needs_a_big_enough_lead_shift():
+    now = time.time()
+    m, spot = _anchored(now, take_min_shift_bp=1.0)
+    assert not m._shift_ok(0.6) and not m._shift_ok(-0.6)
+    assert m._shift_ok(1.2) and m._shift_ok(-1.0)
+    m.cfg.pricing.take_min_shift_bp = None
+    assert m._shift_ok(0.1)

@@ -390,7 +390,7 @@ class UpDownModel:
             if lead in TOUCH_VENUES:
                 # Takes price on the whole-touch shift in full; quotes on TOUCH_WEIGHT of it.
                 _, full_inc = pnc.increment(self.coin, mono, mid, leads=(lead,), full=True)
-                if full_inc is not None and full_inc != p_inc:
+                if full_inc is not None and full_inc != p_inc and self._shift_ok(full_inc):
                     dxf = full_inc * 1e-4
                     I_f = I + (dxf * (n_eff - n_end) / L if tau < L else 0.0)
                     take_prob = prob_up(x + sh + dxf, I_f, tau, rate, nu=p.t_nu, basis_sd=bsd,
@@ -467,7 +467,7 @@ class UpDownModel:
         take = None
         if take_full:
             _, full = pnc.increment(self.coin, mono, mid, leads=("cme",), full=True)
-            if full is not None and full != inc_bp:
+            if full is not None and full != inc_bp and self._shift_ok(full):
                 take = prob_from_mu(mu_mkt + core(full) - mu_ref, sd, p.t_nu)
         return prob, take, {"anchor_mid": 0.5 * (touch[0] + touch[1]), "anchor_age_s": now_s - t_a,
                             "anchor_move_bp": (mu_core - mu_ref) * 1e4}
@@ -533,6 +533,11 @@ class UpDownModel:
         if p.cme_pull_bp is not None and self._cme_pulled(side, p):
             return "cme_pull"
         return None
+
+    def _shift_ok(self, full_bp: float) -> bool:
+        """A lead shift big enough to price takes on (take_min_shift_bp)."""
+        thr = self.cfg.pricing.take_min_shift_bp
+        return thr is None or abs(full_bp) >= thr - 1e-9
 
     def _cme_pulled(self, side: str, p) -> bool:
         """A CME up-shift exposes our offer (the NO bid), a down-shift our YES bid."""
