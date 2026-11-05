@@ -787,7 +787,9 @@ class Runner:
         return True
 
     async def place(self, t: str, side: str, price: float, lots: float, reserve: float = PLACE_RESERVE,
-                    reason: str = "lipfarm:quote", hedge: bool = False, sentinel: bool = False) -> bool:
+                    reason: str = "lipfarm:quote", hedge: bool = False, sentinel: bool = False,
+                    force: bool = False) -> bool:
+        """`force`: spend the write tokens regardless, as an exit does (a sentinel whose bid rests)."""
         if not hedge and self.state.get("cooldown", {}).get(t, 0.0) > time.time():
             return False
         k = f"{t}|{side}|s" if sentinel else key(t, side, hedge)
@@ -798,7 +800,7 @@ class Runner:
             gid = await self.group_id(t)
             if gid is None:
                 return False
-        if not self.budget_ok(t, hedge, reserve):
+        if not self.budget_ok(t, hedge or force, reserve):
             return False
         rec = {"oid": None, "side": side, "price": price, "size": lots, "remaining": lots, "placed": time.time()}
         if not hedge:
@@ -1351,10 +1353,10 @@ class Runner:
                 if not await self.place(t, side, px, q):
                     return
                 sp, sq, _ = ws[sk]
-                # No shard reserve for the sentinel: its bid already rests, and refusing it at the
-                # reserve line pulled that bid every cycle (shard ~155 of 300, 11-05 17:55).
-                if sk not in self.state["orders"] and not await self.place(t, side, sp, sq, reserve=0.0,
-                                                                            sentinel=True):
+                # Its bid already rests: the sentinel always goes. Refused for budget (the shard's,
+                # then our own bucket's), it had the bid pulled every cycle (11-05 17:55, 21:25).
+                if sk not in self.state["orders"] and not await self.place(t, side, sp, sq, sentinel=True,
+                                                                            force=True):
                     print(f"sentinel {t} {side}: not placed; pulling its bid")
                     self.cancel(main, reason="lipfarm:sentinel")
                 return
