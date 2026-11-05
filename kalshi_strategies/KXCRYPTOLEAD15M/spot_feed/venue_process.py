@@ -121,6 +121,13 @@ def _child_main(plan: dict[str, list[str]]):
     # which the parent leaves on the console/run log.
     out = os.fdopen(os.dup(sys.stdout.fileno()), "wb")
     sys.stdout = sys.stderr
+    # CME's touch is shipped from Databento's reader thread (CmeFuturesAdapter.
+    # direct): frame writes and the `latest` batch share this lock, so a batch
+    # can't carry a CME touch older than one already sent.
+    out_lock = threading.Lock()
+    # That thread needs the GIL from a busy loop, which holds it up to the
+    # switch interval (default 5 ms); same reason as the trading process's.
+    sys.setswitchinterval(0.0005)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     if hasattr(signal, "SIGBREAK"):
         signal.signal(signal.SIGBREAK, signal.SIG_IGN)
@@ -172,7 +179,8 @@ def _child_main(plan: dict[str, list[str]]):
             return
         recv_wall = time.time() - (time.monotonic() - as_of)
         try:
-            _write_frame(out, ([], [], [], {"trips": [r + (recv_wall, exch_ts) for r in rows]}))
+            with out_lock:
+                _write_frame(out, ([], [], [], {"trips": [r + (recv_wall, exch_ts) for r in rows]}))
         except (BrokenPipeError, OSError):
             os._exit(0)
 
@@ -217,17 +225,18 @@ def _child_main(plan: dict[str, list[str]]):
                tuple((l.price, l.size) for l in vb.asks[:SHIP_LEVELS]),
                time.time() - (time.monotonic() - vb.receive_ts), vb.exchange_ts, vb.is_resyncing)
         touch = (vb.best_bid(), vb.best_ask(), vb.is_resyncing)
-        if not IMMEDIATE or last_touch.get(k) == touch:
-            latest[k] = row            # size-only change: rides the next batch
-            return
-        # Touch moved: send it now. Waiting for the batch cost 0-50ms here plus
-        # 0-50ms on the parent's drain tick, about the size of the perps' lead.
-        last_touch[k] = touch
-        latest.pop(k, None)
-        try:
-            _write_frame(out, ([row], [], [], {"sent": time.time()}))
-        except (BrokenPipeError, OSError):
-            os._exit(0)
+        with out_lock:
+            if not IMMEDIATE or last_touch.get(k) == touch:
+                latest[k] = row            # size-only change: rides the next batch
+                return
+            # Touch moved: send it now. Waiting for the batch cost 0-50ms here plus
+            # 0-50ms on the parent's drain tick, about the size of the perps' lead.
+            last_touch[k] = touch
+            latest.pop(k, None)
+            try:
+                _write_frame(out, ([row], [], [], {"sent": time.time()}))
+            except (BrokenPipeError, OSError):
+                os._exit(0)
 
     perp_rows: list[dict] = []
     perp_usd: dict[tuple[str, str], tuple] = {}
@@ -285,9 +294,7 @@ def _child_main(plan: dict[str, list[str]]):
         while True:
             await asyncio.sleep(SHIP_S)
             apply_control()
-            books, ps = list(latest.values()), prints
-            latest.clear()
-            prints = []
+            ps, prints = prints, []
             # Same 5-tuple shape as a print, with the batch's notional as a
             # size-1 "print" at price=usd. The parent only calibrates on these
             # now; the trip itself came from lead_print.
@@ -295,8 +302,12 @@ def _child_main(plan: dict[str, list[str]]):
                 ps.append((kind, coin, {"price": usd, "size": 1.0, "trade_id": None, "side": None}, wall, exch_ts))
             perp_usd.clear()
             extra = {"status": dict(status)} if status else {}
+            alive_ = alive()
             try:
-                _write_frame(out, (books, ps, alive(), extra))
+                with out_lock:
+                    books = list(latest.values())
+                    latest.clear()
+                    _write_frame(out, (books, ps, alive_, extra))
             except (BrokenPipeError, OSError):
                 os._exit(0)
 
@@ -323,6 +334,8 @@ def _child_main(plan: dict[str, list[str]]):
         tasks = []
         for venue, coins in plan.items():
             ad = ADAPTERS[venue](coins)
+            if hasattr(ad, "direct"):
+                ad.direct = True
             if hasattr(ad, "on_print"):
                 ad.on_print = on_print if recorder is None else on_print_rec
             adapters.append(ad)

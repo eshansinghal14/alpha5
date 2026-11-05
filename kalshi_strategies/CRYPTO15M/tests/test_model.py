@@ -385,3 +385,19 @@ def test_take_needs_a_big_enough_lead_shift():
     assert m._shift_ok(1.2) and m._shift_ok(-1.0)
     m.cfg.pricing.take_min_shift_bp = None
     assert m._shift_ok(0.1)
+
+
+def test_best_others_matches_the_full_ladder_filter():
+    import random
+    from kalshi_infra.trading.lip import others_ladder
+    from kalshi_strategies.CRYPTO15M.model import _best_others
+    rng = random.Random(7)
+    for _ in range(2000):
+        levels = {round(rng.randint(1, 99) / 100, 2): rng.choice([0.5, 1.0, 3.0, 10.0, 50.0]) for _ in range(rng.randint(1, 12))}
+        ours = [(rng.choice(list(levels)), rng.choice([0.1, 1.0, 3.0, 10.0])) for _ in range(rng.randint(0, 3))]
+        m = rng.choice([0.0, 1.0, 5.0])
+        lv = [p for p, sz in others_ladder(dict(levels), ours).items() if sz >= m]
+        merged = {}
+        for p, s in ours:
+            merged[p] = merged.get(p, 0.0) + s
+        assert _best_others(levels, merged, m) == (max(lv) if lv else None)

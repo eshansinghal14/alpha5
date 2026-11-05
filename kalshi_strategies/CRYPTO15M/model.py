@@ -22,7 +22,6 @@ from kalshi_infra.kalshi.markets import EventInfo
 from kalshi_infra.trading.fair import Fair
 from kalshi_strategies.CRYPTO15M.implied_vol import observe
 from kalshi_strategies.CRYPTO15M.shared_feed import extend, hold, implied_ema
-from kalshi_infra.trading.lip import others_ladder
 from kalshi_strategies.CRYPTO15M.pricer import implied_mu, prob_from_mu, prob_up, variance_clock
 from kalshi_strategies.KXCRYPTOLEAD15M.cf_index import STALE_S as CF_STALE_S
 from kalshi_strategies.KXCRYPTOLEAD15M.model import BASIS_MIN_S, BASIS_WINDOW_S
@@ -31,6 +30,16 @@ from kalshi_strategies.KXCRYPTOLEAD15M.series import START_END_AVG_S
 from kalshi_strategies.KXCRYPTOLEAD15M.settlement_tracker import EventWindow
 
 L = float(START_END_AVG_S)
+
+
+def _best_others(levels: dict, ours: dict, m: float) -> float | None:
+    """Highest price whose size net of ours is positive and >= m. Runs on every
+    Kalshi delta, so the top level is tried before a pass over the ladder."""
+    top = max(levels)
+    n = levels[top] - ours.get(top, 0.0)
+    if n > 1e-9 and n >= m:
+        return top
+    return max((p for p, sz in levels.items() if (n := sz - ours.get(p, 0.0)) > 1e-9 and n >= m), default=None)
 
 
 class UpDownModel:
@@ -107,11 +116,15 @@ class UpDownModel:
         m = self.cfg.pricing.anchor_min_size
         best = []
         for side, levels in (("yes", lad.yes_bids), ("no", lad.no_bids)):
-            ours = list(own(self.ticker, side)) if own is not None else []
-            lv = [px for px, sz in others_ladder(dict(levels), ours).items() if sz >= m]
-            if not lv:
+            if not levels:
                 return None
-            best.append(max(lv))
+            ours: dict[float, float] = {}
+            for p, s in (own(self.ticker, side) if own is not None else ()):
+                ours[p] = ours.get(p, 0.0) + s
+            px = _best_others(levels, ours, m)
+            if px is None:
+                return None
+            best.append(px)
         bid, ask = round(best[0], 2), round(1.0 - best[1], 2)
         # A locked book (bid == ask) is the market agreeing on one price: a valid
         # anchor. It withheld the fair 1.4% of 11-03 00:57-02:44 UTC as None.

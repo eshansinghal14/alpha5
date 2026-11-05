@@ -694,8 +694,15 @@ class CmeFuturesAdapter(_PerpSignal):
     and for an hour each weekday; the books then just stop updating.
 
     Databento's async iterator polls its queue every 100 ms, so records come
-    through its reader-thread callback instead, stamped on arrival there."""
+    through its reader-thread callback instead, stamped on arrival there.
+
+    With `direct` set, the touch is applied and `on_update` called on that
+    reader thread, so a CME move doesn't queue behind the other venues on the
+    event loop; the caller's on_update must then be thread-safe. Trades still
+    go through the loop."""
     venue = "cme"
+    direct = False
+    _gen = None
     # Root followed per coin: the contract whose top of book changed most,
     # 10-29 13-21 UTC (MBT 282k, ETH 87k, MSL 42k, MXP 42k mid changes).
     # CME has no HYPE contract.
@@ -709,10 +716,24 @@ class CmeFuturesAdapter(_PerpSignal):
             subs = {cme_front(self.symbols[c], time.time()): c for c in self.coins}
             q: asyncio.Queue = asyncio.Queue()
             client = None
+            # A terminated client's thread can still deliver a record or two:
+            # only the current generation may touch the books.
+            gen = self._gen = object()
+            direct, dids = self.direct, {}
+
+            def callback(r, gen=gen, direct=direct, dids=dids, subs=subs):
+                as_of = time.monotonic()
+                if direct and self._gen is gen:
+                    try:
+                        self._record(r, dids, subs, as_of, on_update, prints=False)
+                    except Exception as e:
+                        self.last_error = repr(e)
+                loop.call_soon_threadsafe(q.put_nowait, (as_of, r))
+
             try:
                 client = db.Live(key=keys.DATABENTO_API_KEY)
                 client.subscribe(dataset="GLBX.MDP3", schema="mbp-1", symbols=sorted(subs), stype_in="raw_symbol")
-                client.add_callback(lambda r: loop.call_soon_threadsafe(q.put_nowait, (time.monotonic(), r)))
+                client.add_callback(callback)
                 for pb in self._books.values():
                     pb.clear()
                 self._last_touch.clear()
@@ -727,13 +748,14 @@ class CmeFuturesAdapter(_PerpSignal):
                             raise ConnectionError("databento session closed")
                         continue
                     self.n_msgs += 1
-                    await self._call(self._record(rec, ids, subs, as_of, on_update))
+                    await self._call(self._record(rec, ids, subs, as_of, on_update, books=not direct))
                     self._mark_fresh(as_of)
                 continue        # resubscribe on the (possibly rolled) front month
             except Exception as e:
                 self.last_error = repr(e)
                 print(f"[spot/cme] {e!r}; reconnecting", flush=True)
             finally:
+                self._gen = None
                 if client is not None:
                     try:
                         client.terminate()
@@ -744,7 +766,7 @@ class CmeFuturesAdapter(_PerpSignal):
             self.n_resyncs += 1
             await asyncio.sleep(RECONNECT_DELAY_S * 5)
 
-    def _record(self, r, ids: dict, subs: dict, as_of: float, on_update):
+    def _record(self, r, ids: dict, subs: dict, as_of: float, on_update, books=True, prints=True):
         """One Databento record. Duck-typed so tests need no databento."""
         if hasattr(r, "stype_out_symbol"):                      # SymbolMappingMsg
             sym = r.stype_out_symbol if r.stype_out_symbol in subs else r.stype_in_symbol
@@ -754,6 +776,8 @@ class CmeFuturesAdapter(_PerpSignal):
             return None
         if not hasattr(r, "levels"):
             if hasattr(r, "err"):                                # ErrorMsg
+                if not prints:
+                    return None                              # the loop's pass raises it
                 raise ConnectionError(f"databento: {r.err}")
             return None
         hit = ids.get(r.instrument_id)
@@ -761,11 +785,11 @@ class CmeFuturesAdapter(_PerpSignal):
             return None
         coin, unit = hit
         exch = r.ts_event / 1e9
-        if str(r.action) == "T" and r.price != _UNDEF_PRICE:
+        if prints and str(r.action) == "T" and r.price != _UNDEF_PRICE:
             self._print(coin, r.price / 1e9, r.size * unit, str(r.sequence),
                         "BUY" if str(r.side) == "B" else "SELL", as_of, exch)
         lv = r.levels[0]
-        if lv.bid_px == _UNDEF_PRICE or lv.ask_px == _UNDEF_PRICE:
+        if not books or lv.bid_px == _UNDEF_PRICE or lv.ask_px == _UNDEF_PRICE:
             return None
         return self._bbo(coin, lv.bid_px / 1e9, lv.bid_sz * unit, lv.ask_px / 1e9, lv.ask_sz * unit,
                          as_of, exch, on_update)

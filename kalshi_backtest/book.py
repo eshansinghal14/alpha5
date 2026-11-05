@@ -89,7 +89,7 @@ class L2Book:
         ages = [t for t in self.last_snapshot_time.values() if t is not None]
         if len(ages) < 2:
             return None
-        return max((now - t).total_seconds() for t in ages)
+        return (now - min(ages)).total_seconds()
 
     def to_quote(self, time: pd.Timestamp, max_snapshot_age_s: float | None = None) -> Quote:
         """max_snapshot_age_s, if given, distrusts (reports as unknown --

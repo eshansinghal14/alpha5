@@ -24,3 +24,4 @@ matplotlib==3.11.2
 Markdown==3.11.2
 # CME crypto futures live feed (Coin Race lead signal; research/latency/cme_live_rec.py).
 databento==0.89.0
+orjson>=3.10

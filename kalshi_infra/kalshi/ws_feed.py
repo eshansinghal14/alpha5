@@ -7,6 +7,11 @@ import asyncio
 import json
 import time
 
+try:
+    from orjson import loads as _loads
+except ImportError:          # orjson is optional: same parse, ~3x slower
+    _loads = json.loads
+
 import pandas as pd
 import websockets
 
@@ -23,7 +28,7 @@ WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
 # BookView's MAX_SNAPSHOT_AGE_S guard blanks the book, so this must stay below it.
 RESYNC_INTERVAL_S = 900.0
 RECONNECT_DELAY_S = 1.0
-RECV_TIMEOUT_S = 5.0     # only bounds how late the resync timer is checked
+RECV_TIMEOUT_S = 5.0     # ARBS feed: bounds how late its resync timer is checked
 OPEN_TIMEOUT_S = 15.0
 assert RESYNC_INTERVAL_S < MAX_SNAPSHOT_AGE_S
 
@@ -116,33 +121,38 @@ class LiveKalshiFeed:
                             "params": {"channels": [channel], "market_tickers": self._tickers},
                         }))
                         sub_id += 1
-                    resync_at = time.monotonic() + RESYNC_INTERVAL_S
-                    # Per-connection counter shared across tickers; a jump means
-                    # a dropped message and unverifiable ladders, so reconnect
-                    # for fresh snapshots.
-                    last_seq = None
-                    while time.monotonic() <= resync_at:
-                        try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=RECV_TIMEOUT_S)
-                        except asyncio.TimeoutError:
-                            continue
-                        self.last_msg_mono = time.monotonic()
-                        d = json.loads(raw)
-                        # Only orderbook messages carry this counter; trade
-                        # messages on the same connection would otherwise read
-                        # as a gap every time.
-                        seq = d.get("seq") if d.get("type", "").startswith("orderbook") else None
-                        if seq is not None:
-                            if last_seq is not None and seq != last_seq + 1:
-                                self.n_seq_gaps += 1
-                                print(f"[{self.label}] kalshi ws seq gap {last_seq} -> {seq}; reconnecting")
-                                break
-                            last_seq = seq
-                        self._handle_message(d)
+                    # One deadline for the connection, not a wait_for per
+                    # message: that was 7% of KXBTC15M's loop (py-spy 11-05).
+                    try:
+                        async with asyncio.timeout(RESYNC_INTERVAL_S):
+                            await self._recv_loop(ws)
+                    except TimeoutError:     # an OSError: resync here, not a connection error below
+                        pass
             except (websockets.ConnectionClosed, OSError) as e:
                 print(f"[{self.label}] kalshi ws connection error ({e!r}); reconnecting")
                 await asyncio.sleep(RECONNECT_DELAY_S)
             self.n_reconnects += 1
+
+    async def _recv_loop(self, ws):
+        """Handle messages until a seq gap (returns, to reconnect for fresh
+        snapshots) or the caller's resync deadline."""
+        # Per-connection counter shared across tickers; a jump means a dropped
+        # message and unverifiable ladders.
+        last_seq = None
+        while True:
+            raw = await ws.recv()
+            self.last_msg_mono = time.monotonic()
+            d = _loads(raw)
+            # Only orderbook messages carry this counter; trade messages on the
+            # same connection would otherwise read as a gap every time.
+            seq = d.get("seq") if d.get("type", "").startswith("orderbook") else None
+            if seq is not None:
+                if last_seq is not None and seq != last_seq + 1:
+                    self.n_seq_gaps += 1
+                    print(f"[{self.label}] kalshi ws seq gap {last_seq} -> {seq}; reconnecting")
+                    return
+                last_seq = seq
+            self._handle_message(d)
 
     def _emit_book(self, book: L2Book):
         now = pd.Timestamp.now(tz="UTC")

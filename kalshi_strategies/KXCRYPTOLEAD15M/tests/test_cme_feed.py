@@ -61,6 +61,24 @@ def test_records_become_coin_unit_books_and_prints():
     assert len(books) == n
 
 
+def test_direct_mode_splits_books_and_prints_between_the_two_passes():
+    # Reader thread: books only. Loop: prints only. Each pass maps ids itself.
+    ad = CmeFuturesAdapter(COINS)
+    books, prints, tids, lids = [], [], {}, {}
+    ad.on_print = lambda coin, t, as_of, exch, kind: prints.append(coin)
+    subs = {"MBTX6": "BTC"}
+    trade = _mbp(11, action="T", side="B", price=int(81005 * 1e9), size=2, bid=81001.0)
+    for r in (_mapping(11, "MBTX6"), _mbp(11), trade):
+        ad._record(r, tids, subs, 1.0, books.append, prints=False)
+        ad._record(r, lids, subs, 1.0, books.append, books=False)
+    assert [vb.best_bid() for vb in books] == [pytest.approx(81000.0), pytest.approx(81001.0)]
+    assert prints == ["BTC"]
+    err = types.SimpleNamespace(err="boom")
+    assert ad._record(err, tids, subs, 1.0, books.append, prints=False) is None
+    with pytest.raises(ConnectionError):
+        ad._record(err, lids, subs, 1.0, books.append, books=False)
+
+
 def test_cme_trips_alone_and_stays_out_of_the_perp_vote():
     lt = LeadTrigger(COINS, ("binance_perp", "okx_perp"), solo=("cme",))
     lt.configure(move_thr={"cme": {"BTC": 2.0}, "binance_perp": {"BTC": 2.0}, "okx_perp": {"BTC": 2.0}})

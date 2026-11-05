@@ -35,6 +35,7 @@ STOP_TIMEOUT_S = 15.0
 # ticks from the touch still has its queue recorded (ETH 10-19: 99% of real
 # maker fills were within 3 ticks of the touch).
 DEPTH_LEVELS = 5
+_DEPTH_PRICES: dict[tuple[float, int], list[float]] = {}     # (best, levels) -> prices, per delta
 
 
 def _thin(seq: list, cap: int):
@@ -336,8 +337,10 @@ class SnapshotWriter:
             # ticks of the best price only if the book is dense there; a gap
             # just means fewer rows. Avoids sorting a 100-level ladder per update.
             best = max(ladder)
-            for i in range(levels):
-                p = round(best - i * 0.01, 2)
+            prices = _DEPTH_PRICES.get((best, levels))
+            if prices is None:
+                prices = _DEPTH_PRICES[(best, levels)] = [round(best - i * 0.01, 2) for i in range(levels)]
+            for p in prices:
                 k = (tk, side, p)
                 z = ladder.get(p, 0.0)
                 if self._last_depth.get(k, 0.0) != z:
