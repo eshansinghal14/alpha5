@@ -34,11 +34,11 @@ def risk(**r):
 
 
 def cfg(risk_kw=None, **q):
-    base = dict(order_lots=1.0, max_position=10.0, constant_edge=0.01, constant_edge_ref_s=None, edge_fraction=1.0,
+    base = dict(order_lots=1.0, max_position=10.0, take_lots=None, take_max_position=None, constant_edge=0.01, constant_edge_ref_s=None, edge_fraction=1.0,
                 lean_dollars=0.02, max_markets=None, atm_hysteresis=0,
                 enable_taking=True, enable_quoting=True, quoting_edge=0.0, max_improve_ticks=1, quote_levels_behind=0, take_move_window_s=None,
                 skip_quote_depth_ahead=None, max_book_delta=None, quote_keep_inside=0.0, quote_ahead_grace_s=1.0,
-                cancels_token=20.0, requote_delay_s=1.0, max_write_tokens_per_s=None,
+                cancels_token=20.0, requote_delay_s=1.0, requote_after_move_s=0.0, requote_move_min=0.005, max_write_tokens_per_s=None,
                 order_group_limit=None, order_group_reset_s=0.2)
     base.update(q)
     return types.SimpleNamespace(
@@ -1695,3 +1695,43 @@ def test_per_market_constant_edge_overrides_the_global():
     step(q, ctx, {"A": Fair(0.60, 0.59, 0.61, constant_edge=0.06)}, Book("A", 0.40, 0.55))
     assert takes(ctx) == []                        # 0.60 - 0.06 < 0.55; the global 1c would have taken
     assert q.debug_log[-1]["constant_edge"] == pytest.approx(0.06)
+
+
+def test_a_real_move_holds_new_levels_for_requote_after_move():
+    q, ctx = Quoter(cfg(requote_after_move_s=0.2, requote_move_min=0.005, enable_taking=False), Model(), FREE,
+                    close_time=None), Ctx()
+    step(q, ctx, {"A": Fair(0.50, 0.49, 0.51)}, Book("A", 0.40, 0.60))
+    assert ladder(ctx, "yes")                      # quiet: quotes go up
+    step(q, ctx, {"A": Fair(0.47, 0.46, 0.48)}, dt=0.05)   # fair -3c within the window: a real move
+    assert ladder(ctx, "yes") == [] and ladder(ctx, "no") == []
+    step(q, ctx, {"A": Fair(0.47, 0.46, 0.48)}, dt=0.30)   # move done, delay over
+    assert ladder(ctx, "yes") and ladder(ctx, "no")
+
+
+def test_small_jitter_does_not_hold():
+    q, ctx = Quoter(cfg(requote_after_move_s=0.2, requote_move_min=0.005, enable_taking=False), Model(), FREE,
+                    close_time=None), Ctx()
+    step(q, ctx, {"A": Fair(0.500, 0.49, 0.51)}, Book("A", 0.40, 0.60))
+    step(q, ctx, {"A": Fair(0.502, 0.492, 0.512)}, dt=0.05)
+    assert ladder(ctx, "yes") and ladder(ctx, "no")
+
+
+def test_take_lots_sizes_takes_only():
+    q, ctx = Quoter(cfg(take_lots=3.0), Model(), FREE, close_time=None), Ctx()
+    step(q, ctx, {"A": Fair(0.60, 0.59, 0.61)}, Book("A", 0.40, 0.55))
+    assert takes(ctx)[0][5] == 3.0
+
+
+def test_separate_take_position_has_no_lean_and_its_own_cap():
+    c = cfg(take_max_position=1.0, lean_dollars=0.10, max_position=2.0)
+    q, ctx = Quoter(c, Model(), FREE, close_time=None), Ctx()
+    # A take fill: long 1 YES from taking.
+    o = Order(99, "A", "yes", "limit", 0.5, 1.0, ctx.time, "take")
+    ctx.portfolio.record_fill(o, 0.5, 1.0, ctx.time, "taker", fee=0.0)
+    q._sync_quote_fills(ctx)
+    assert q._take_net["A"] == 1.0
+    # At the take cap: no more YES takes, even with a clear edge.
+    step(q, ctx, {"A": Fair(0.70, 0.69, 0.71)}, Book("A", 0.40, 0.55))
+    assert takes(ctx) == []
+    r = q.debug_log[-1]
+    assert r["lean_bid"] == pytest.approx(0.0)      # quotes don't lean on the take position (portfolio has none here)

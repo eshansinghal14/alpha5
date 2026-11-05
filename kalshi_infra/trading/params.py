@@ -25,6 +25,11 @@ class QuotingParams:
     max_position: float = param(
         "Cap on |yes - no| PER MARKET, on effective position (fills + in-flight + resting). "
         "Lowering it does not unwind, only caps growth.", min=0, step=1.0)
+    take_lots: float | None = param("Contracts per take; empty = order_lots.", min=0.01, step=1.0)
+    take_max_position: float | None = param(
+        "Separate cap on |yes - no| from takes (fills + in-flight), per market. When set, takes and quotes keep "
+        "separate positions: take fills don't count toward the quotes' lean or max_position, and the take edge "
+        "carries no lean. Empty = one shared position, lean on takes too.", min=0, step=1.0)
     constant_edge: float = param(
         "Flat $ edge floor on every take AND every resting quote. The one term that still bites "
         "when the band is tight and the touch is cheap.", min=0, max=0.5, step=0.005)
@@ -112,6 +117,13 @@ class QuotingParams:
     requote_delay_s: float = param(
         "After our quote on a (market, side) is hit, that side adds no new levels this long "
         "(levels already up stay).", min=0, max=120, step=0.5)
+    requote_after_move_s: float = param(
+        "After a real move on a (market, side) -- a lead/jump/lag pull on it, or its quote reservation moving "
+        "requote_move_min within 0.25 s -- that side adds no new levels this long (levels already up stay). "
+        "KXBTC15M maker fills 11-05: quotes under 50 ms old marked out -1.19c at 10s, 50-200 ms -0.79c, older "
+        "-0.5c. 0 = off.", min=0, max=5, step=0.05)
+    requote_move_min: float = param("Reservation move ($) that counts for requote_after_move_s.",
+                                    min=0.001, max=0.1, step=0.001)
     # 10: one full order_lots fill doesn't trip it, the next contract does. Race
     # fills 10-24/25: the 38 fills within 5 ms of a full fill in the same event
     # were 47% bad at 1s (-$11.90 at 10s); nothing arrives 50 ms-1 s after one.

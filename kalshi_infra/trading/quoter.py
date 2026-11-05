@@ -87,6 +87,11 @@ LIP_MIN_RATE_USD_S = 1e-9
 # A LIP quote rests up to this many ticks behind the best bid if it keeps
 # LIP_STEP_BACK_KEEP of the best bid's reward rate (see _lip_step_back).
 LIP_STEP_BACK_TICKS = 3
+# requote_after_move_s: the window a reservation move is measured over, and
+# the side blocks that count as a move (they pull on a price move, unlike the
+# tail/close/ATM blocks).
+REQUOTE_MOVE_WINDOW_S = 0.25
+MOVE_BLOCKS = ("cme_pull", "fair_jump", "fair_lag")
 LIP_STEP_BACK_KEEP = 0.98
 
 
@@ -107,6 +112,10 @@ class Quoter:
         self.fairs: dict[str, Fair | None] = {}
         self._sent: dict[tuple[str, str], list[tuple[pd.Timestamp, float]]] = {}
         self._quote_block_until: dict[tuple[str, str], pd.Timestamp] = {}
+        # requote_after_move_s: per (ticker, side), recent (time, quote reservation).
+        self._res_hist: dict[tuple[str, str], deque] = {}
+        # take_max_position: net YES bought by take fills, per market.
+        self._take_net: dict[str, float] = {}
         self._fills_seen = 0
         self._atm_set: set[str] = set()
         self._take_since: dict[tuple[str, str], float] = {}
@@ -209,13 +218,36 @@ class Quoter:
         delay = pd.Timedelta(seconds=self.cfg.quoting.requote_delay_s)
         if self._fills_seen == 0:
             self._lip_inv = {}
+            self._take_net = {}
         for f in fills[self._fills_seen:]:
             if getattr(f, "role", None) == "lip":
                 # Net yes bought by LIP orders, per market: what the LIP exit offers back.
                 self._lip_inv[f.ticker] = self._lip_inv.get(f.ticker, 0.0) + (f.size if f.side == "yes" else -f.size)
             if f.liquidity == "maker":
                 self._quote_block_until[(f.ticker, f.side)] = f.time + delay
+            elif f.liquidity == "taker":
+                self._take_net[f.ticker] = self._take_net.get(f.ticker, 0.0) + (f.size if f.side == "yes" else -f.size)
         self._fills_seen = len(fills)
+
+    def _note_move(self, ticker: str, now: pd.Timestamp, now_s: float, sides):
+        """Start requote_after_move_s on a side a real move just hit: a
+        MOVE_BLOCKS pull on it (held from the block's end), or its reservation
+        moving requote_move_min within REQUOTE_MOVE_WINDOW_S."""
+        q = self.cfg.quoting
+        d = getattr(q, "requote_after_move_s", 0.0) or 0.0
+        if d <= 0:
+            return
+        for side, blk, res in sides:
+            h = self._res_hist.setdefault((ticker, side), deque())
+            h.append((now_s, res))
+            while h[0][0] < now_s - REQUOTE_MOVE_WINDOW_S:
+                h.popleft()
+            moved = max(abs(res - r) for _, r in h) >= q.requote_move_min - 1e-12
+            if blk in MOVE_BLOCKS or moved:
+                until = now + pd.Timedelta(seconds=d)
+                cur = self._quote_block_until.get((ticker, side))
+                if cur is None or cur < until:
+                    self._quote_block_until[(ticker, side)] = until
 
     def _inflight(self, ticker: str, side: str, now: pd.Timestamp) -> float:
         """Take size sent on (ticker, side) within CONFIRM_S. A take fills on
@@ -457,8 +489,14 @@ class Quoter:
         inflight_yes, inflight_no = self._inflight(ticker, "yes", now), self._inflight(ticker, "no", now)
         # Every live quote level counts: a fast move can fill all of them.
         resting_yes, resting_no = self._resting(ticker, "yes"), self._resting(ticker, "no")
-        eff_yes = net + inflight_yes + resting_yes
-        eff_no = net - inflight_no - resting_no
+        # take_max_position: quotes lean and cap on their own position (take
+        # fills and in-flight takes left out); takes cap on theirs, no lean.
+        sep = getattr(q, "take_max_position", None) is not None
+        take_net = self._take_net.get(ticker, 0.0) if sep else 0.0
+        qnet = net - take_net
+        qin_yes, qin_no = (0.0, 0.0) if sep else (inflight_yes, inflight_no)
+        eff_yes = qnet + qin_yes + resting_yes
+        eff_no = qnet - qin_no - resting_no
 
         def _ratio(x):
             return 0.0 if max_pos <= 0 else max(-1.0, min(1.0, x / max_pos))
@@ -474,8 +512,9 @@ class Quoter:
         fee_ask = self.fees.taker(market_bid) if market_bid is not None else 0.0
         const = self._constant_edge(now, fair.constant_edge) + fair.edge_add
         # Floored at 0 before the fee: a negative lean may bring a side to fair, never past it.
-        bid_edge = max(const + ci_bid + lean_bid, 0.0) + fee_bid
-        ask_edge = max(const + ci_ask + lean_ask, 0.0) + fee_ask
+        tlean_bid, tlean_ask = (0.0, 0.0) if sep else (lean_bid, lean_ask)
+        bid_edge = max(const + ci_bid + tlean_bid, 0.0) + fee_bid
+        ask_edge = max(const + ci_ask + tlean_ask, 0.0) + fee_ask
         tprob = prob if fair.take_prob is None else min(max(fair.take_prob, FAIR_CLIP_EPS), 1.0 - FAIR_CLIP_EPS)
         bid_res, ask_res = tprob - bid_edge, tprob + ask_edge
 
@@ -513,8 +552,14 @@ class Quoter:
         # Takes are capped on fills + in-flight takes only: a resting quote
         # isn't position yet, and counting the whole ladder here would stop us
         # taking a clear edge just because we're also bidding.
-        cap_yes = net + inflight_yes < max_pos - 1e-9
-        cap_no = net - inflight_no > -max_pos + 1e-9
+        if sep:
+            tmax = q.take_max_position
+            cap_yes = take_net + inflight_yes < tmax - 1e-9
+            cap_no = take_net - inflight_no > -tmax + 1e-9
+        else:
+            cap_yes = net + inflight_yes < max_pos - 1e-9
+            cap_no = net - inflight_no > -max_pos + 1e-9
+        take_lots = getattr(q, "take_lots", None) or q.order_lots
 
         key_b, key_a = (ticker, "take_yes"), (ticker, "take_no")
         taking = q.enable_taking and fair.takes
@@ -537,7 +582,7 @@ class Quoter:
             self._take_since.pop(key_a, None)
 
         if bid_final is not None:
-            z = self._fit_to_loss(ctx, ticker, "yes", "take", [round(bid_final, 2)], q.order_lots)
+            z = self._fit_to_loss(ctx, ticker, "yes", "take", [round(bid_final, 2)], take_lots)
             if z >= 0.01:
                 ctx.buy(ticker=ticker, side="yes", size=z, price=round(bid_final, 2), order_type="limit")
                 self._sent.setdefault((ticker, "yes"), []).append((now, z))
@@ -545,7 +590,7 @@ class Quoter:
                 self._block("max_loss_budget")
         if ask_final is not None:
             # Selling yes at p == buying no at 1 - p.
-            z = self._fit_to_loss(ctx, ticker, "no", "take", [round(1.0 - ask_final, 2)], q.order_lots)
+            z = self._fit_to_loss(ctx, ticker, "no", "take", [round(1.0 - ask_final, 2)], take_lots)
             if z >= 0.01:
                 ctx.buy(ticker=ticker, side="no", size=z, price=round(1.0 - ask_final, 2), order_type="limit")
                 self._sent.setdefault((ticker, "no"), []).append((now, z))
@@ -560,8 +605,8 @@ class Quoter:
         # max_position x lean_dollars (1.25c on the race) and failed its own
         # check: cancelled and re-sent at the same price ~12/s, resting only
         # 65-73% of the time it was wanted (race 2026-10-27 06-07 UTC).
-        qlean_bid = q.lean_dollars * _ratio(net + inflight_yes + max(resting_yes, q.order_lots))
-        qlean_ask = q.lean_dollars * -_ratio(net - inflight_no - max(resting_no, q.order_lots))
+        qlean_bid = q.lean_dollars * _ratio(qnet + qin_yes + max(resting_yes, q.order_lots))
+        qlean_ask = q.lean_dollars * -_ratio(qnet - qin_no - max(resting_no, q.order_lots))
         q_base_bid = max(const + q.quoting_edge + ci_bid + qlean_bid, 0.0)
         q_base_ask = max(const + q.quoting_edge + ci_ask + qlean_ask, 0.0)
         # During a jump hold the chase side quotes off the pre-jump fair, and
@@ -582,6 +627,7 @@ class Quoter:
         mfee_ask = self.fees.maker(p_ask + q_base_ask)
         qres_bid = p_bid - (q_base_bid + mfee_bid)
         qres_ask = p_ask + (q_base_ask + mfee_ask)
+        self._note_move(ticker, now, now_s, (("yes", block_bid, qres_bid), ("no", block_ask, qres_ask)))
 
         quoting = q.enable_quoting
         qblock = getattr(self.model, "quote_block", None)
@@ -602,7 +648,7 @@ class Quoter:
             self._block("lip_stale_signal")
         out, lips = {}, {}
         for side, res in (("yes", res_b), ("no", res_a)):
-            d = self._ladder(ticker, side, res, market_bid, market_ask, ladder, net, now)
+            d = self._ladder(ticker, side, res, market_bid, market_ask, ladder, qnet, now, with_takes=not sep)
             if d.prices:
                 # Worst case assumes every level fills; shrink the lots (and the
                 # side's room) until the whole ladder fits under max_loss_usd.
@@ -1086,7 +1132,7 @@ class Quoter:
         best = max(others)
         return round(best, 2) if side == "yes" else round(1.0 - best, 2)
 
-    def _ladder(self, ticker, side, res, market_bid, market_ask, ladder, net, now) -> Desired:
+    def _ladder(self, ticker, side, res, market_bid, market_ask, ladder, net, now, with_takes=True) -> Desired:
         """The levels this side should have resting, own-side terms, best
         first. Empty (edge_limit None) when the side may not be quoted.
 
@@ -1104,9 +1150,9 @@ class Quoter:
         # Room for resting size under max_position, counting fills and
         # in-flight takes. Every level counts (all can fill together).
         if side == "yes":
-            room = q.max_position - (net + self._inflight(ticker, "yes", now))
+            room = q.max_position - (net + (self._inflight(ticker, "yes", now) if with_takes else 0.0))
         else:
-            room = q.max_position + (net - self._inflight(ticker, "no", now))
+            room = q.max_position + (net - (self._inflight(ticker, "no", now) if with_takes else 0.0))
         room = max(room, 0.0)
         ahead = self._max_ahead_price(ticker, side, market_bid, market_ask, ladder)
         # One level per side. quote_levels_behind is how far an earlier
