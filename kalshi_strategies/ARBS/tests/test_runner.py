@@ -1688,3 +1688,40 @@ def test_late_cutoff_stops_quoting_a_soccer_game_past_its_minute(arbs):
     assert r.may_quote(late, now)                                   # only the listed groups
     r.series_group = {}
     assert r.may_quote(late, now)                                   # groups not loaded yet: no cutoff
+
+
+def test_fill_booked_into_the_best_subset_at_todays_books_even_if_unlisted(arbs):
+    from kalshi_backtest.book import L2Book
+    r, _ = arbs
+    mk = lambda bid, rel, ts, payout: Basket(basket_id=bid, relationship_id=rel, type="mutually_exclusive_no",
+                                             cluster="E", legs=tuple(Leg(f"E-{t}", "no") for t in ts), payout=payout,
+                                             quote_until=None, resume_quoting=None)
+    # Scanned when D ranked third: A+B+D was listed, not A+B+C. D's YES bid
+    # has since gone and C's come in.
+    ab = mk("mecnet:E:no:A+B", "mecnet:E", "AB", 1.0)
+    abd = mk("mecnet:E:no:A+B+D", "mecnet:E", "ABD", 2.0)
+    full = mk("complete_set:E:buy_all_no", "complete_set:E", "ABCD", 3.0)
+    for t in ("E-A", "E-B", "E-C", "E-D"):
+        r.feed._books[t] = L2Book(t)
+        r.meta[t] = R.Meta(ticker=t, event="E", status="active", shard=0, taker_rate=0.07, maker_rate=0.0)
+    r.set_baskets([ab, abd, full])
+    r.hot = [ab.basket_id]
+    book(r, "E-A", [(0.45, 10)], [(0.20, 10)])
+    book(r, "E-B", [(0.30, 10)], [(0.60, 10)])     # B's NO ask 0.70
+    book(r, "E-C", [(0.40, 10)], [(0.50, 10)])     # C's NO ask 0.60
+    book(r, "E-D", [], [(0.90, 10)])               # no NO ask: left out
+    rows = []
+    r.journal = rows.append
+    _eval(r, ab)
+    q = r.quotes[(ab.basket_id, 0)]
+    r._quote_fill(q, 5, 5 * q.price, None, "shadow")
+    fill = [x for x in rows if x["kind"] == "fill"][0]
+    assert fill["basket_id"] == "mecnet:E:no:A+B+C" and fill["quoted_in"] == ab.basket_id
+    assert r.n["live_subset_fills"] == 1
+    ac = r.baskets["mecnet:E:no:A+B+C"]
+    assert ac.payout == 2.0 and ac.relationship_id == "mecnet:E"
+    _eval(r, ac)
+    assert r.shadow_ledger.baskets[ac.basket_id].bundles(ac.tickers) == 5     # completed by buying B and C
+    assert ac.basket_id in {b.basket_id for b in r.all_baskets} and ac.basket_id in r.by_ticker["E-C"]
+    r.set_baskets([ab, abd, full])                 # a rescan keeps it while it holds the position
+    assert ac.basket_id in r.baskets

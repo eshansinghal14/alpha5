@@ -51,7 +51,7 @@ from kalshi_strategies.ARBS.ledger import Ledger
 from kalshi_strategies.ARBS.depth import MoveWatch, PullWatch, TopHistory
 from kalshi_strategies.ARBS.liquidity import Liquidity
 from kalshi_strategies.ARBS.prints import AFTER_S, Prints, top as prints_top
-from kalshi_strategies.ARBS.spec import Basket, basket_from_dict, basket_to_dict, load_spec, merge, parse_spec
+from kalshi_strategies.ARBS.spec import Basket, Leg, basket_from_dict, basket_to_dict, load_spec, merge, parse_spec
 
 # Client-id prefix of LIPFARM's orders (LIPFARM.farm.CID_PREFIX): never ours to sweep.
 LIPFARM_CID_PREFIX = "lipf-"
@@ -375,7 +375,7 @@ class ArbsRunner:
         self.tasks: set[asyncio.Task] = set()
         self.n = {"takes": 0, "take_bundles": 0.0, "quotes_placed": 0, "quote_moves": 0, "quote_cancels": 0,
                   "quote_fills": 0, "completions": 0, "unwinds": 0, "exit_unpriced": 0, "post_only_rejects": 0,
-                  "moves_refused": 0, "pulls": 0, "alt_fills": 0}
+                  "moves_refused": 0, "pulls": 0, "alt_fills": 0, "live_subset_fills": 0}
         self.started = _utc()
         self.liq = Liquidity(self.root)
         self.prints = Prints(self.root)
@@ -567,6 +567,11 @@ class ArbsRunner:
         for b in self.all_baskets:
             for t in b.tickers:
                 self.by_ticker.setdefault(t, []).append(b.basket_id)
+        self.event_markets: dict[str, set[str]] = {}
+        for b in self.all_baskets:
+            kind, _, et = b.relationship_id.partition(":")
+            if kind in ("mecnet", "complete_set") and b.exact:
+                self.event_markets.setdefault(et, set()).update(b.tickers)
         self.dirty = {d for d in self.dirty if d in new} | changed
         self.rank_rows = {k: v for k, v in self.rank_rows.items() if k in new}
         self.hot = [h for h in self.hot if h in new]
@@ -1266,7 +1271,9 @@ class ArbsRunner:
             self._retire(q)
 
     def basket_quotes(self, basket_id: str) -> list[Quote]:
-        b = self.baskets[basket_id]
+        b = self.baskets.get(basket_id)
+        if b is None:
+            return []
         return [q for j in range(len(b.legs)) for k in ((basket_id, j), (basket_id, j, "deep"))
                 if (q := self.quotes.get(k)) is not None]
 
@@ -1744,18 +1751,59 @@ class ArbsRunner:
         leg, now_ts, out = b.legs[j], _utc(), []
         for oid in self.by_ticker.get(leg.ticker, ()):
             y = self.baskets.get(oid)
-            if oid == b.basket_id or y is None or oid in self.busy or self.excluded(y):
+            if oid == b.basket_id or y is None:
                 continue
             k = next((i for i, l in enumerate(y.legs) if l.ticker == leg.ticker and l.side == leg.side), None)
-            if k is None or not self.tradeable(y) or not self.may_quote(y, now_ts) or self.room_bundles(y) < 1:
-                continue
-            pos = self.ledger.baskets.get(oid)
-            if pos is not None and pos.unhedged(y.tickers):
+            if k is None or not self.can_book(y, now_ts):
                 continue
             out.append((y, k))
             if len(out) >= MAX_ALTS:
                 break
         return out
+
+    def can_book(self, y: Basket, now_ts: pd.Timestamp) -> bool:
+        if y.basket_id in self.busy or self.excluded(y) or not self.tradeable(y) or not self.may_quote(y, now_ts) \
+                or self.room_bundles(y) < 1:
+            return False
+        pos = self.ledger.baskets.get(y.basket_id)
+        return pos is None or not pos.unhedged(y.tickers)
+
+    def live_subsets(self, b: Basket, j: int) -> list[tuple[Basket, int]]:
+        """(basket, its leg) for NO on leg j's market plus the k-1 other
+        markets of its event with the cheapest NO asks now, k = 2 up to
+        scan.mecnet_max_legs. The scan lists subsets ranked by its own prices,
+        up to a scan interval old when a fill lands. Unlisted ones are built
+        here, not registered; book_target registers the one it books into."""
+        leg = b.legs[j]
+        kind, _, et = b.relationship_id.partition(":")
+        if leg.side != "no" or kind not in ("mecnet", "complete_set") or not b.exact:
+            return []
+        markets = self.event_markets.get(et, set())
+        others = []
+        for t in markets:
+            v = self.leg_view(t, "no") if t != leg.ticker and self.is_open(t) else None
+            if v is not None and v.best_ask is not None:
+                others.append((v.best_ask, t))
+        others.sort()
+        out = []
+        for k in range(2, min(len(others) + 1, self.cfg.scan.mecnet_max_legs) + 1):
+            ts = [leg.ticker] + [t for _, t in others[:k - 1]]
+            if len(ts) == len(markets):
+                break  # every market: the complete set's buy_all_no
+            bid = f"mecnet:{et}:no:" + "+".join(sorted(scanner._sfx(et, t) for t in ts))
+            y = self.baskets.get(bid) or dataclasses.replace(
+                b, basket_id=bid, relationship_id=f"mecnet:{et}", type="mutually_exclusive_no",
+                legs=tuple(Leg(t, "no") for t in ts), payout=float(k - 1))
+            out.append((y, y.tickers.index(leg.ticker)))
+        return out
+
+    def add_basket(self, y: Basket):
+        """Trade an unlisted basket from now on; set_baskets keeps it while it
+        holds a position (its spec is in the ledger)."""
+        self.baskets[y.basket_id] = y
+        self.all_baskets.append(y)
+        for t in y.tickers:
+            self.by_ticker.setdefault(t, []).append(y.basket_id)
 
     def best_plan(self, b: Basket, j: int, plan, size: float, room: float):
         """(plan, size) for b's quote on leg j, priced through whichever basket
@@ -1810,12 +1858,19 @@ class ArbsRunner:
             after = list(held)
             after[k] += size
             return self._finish_cost(y, after) - self._finish_cost(y, held)
-        best, cost = b.basket_id, rise(b, q.leg)
-        for y, k in self.alternatives(b, q.leg):
+        best, cost = b, rise(b, q.leg)
+        now_ts = _utc()
+        alts = self.alternatives(b, q.leg)
+        seen = {b.basket_id} | {y.basket_id for y, _ in alts}
+        alts += [(y, k) for y, k in self.live_subsets(b, q.leg) if y.basket_id not in seen and self.can_book(y, now_ts)]
+        for y, k in alts:
             c = rise(y, k)
             if c < cost - _EPS:
-                best, cost = y.basket_id, c
-        return best
+                best, cost = y, c
+        if best.basket_id not in self.baskets:
+            self.add_basket(best)
+            self.n["live_subset_fills"] += 1
+        return best.basket_id
 
     def quoted_elsewhere(self, basket_id: str, ticker: str, side: str) -> Quote | None:
         """Another basket's arb quote resting on this market side, if any."""
