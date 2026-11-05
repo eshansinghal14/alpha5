@@ -675,7 +675,8 @@ class ArbsRunner:
             for mt in ms:
                 mt.series, mt.shard = ev["series_ticker"], int(ev["exchange_index"])
                 mt.taker_rate, mt.maker_rate = sched.taker_rate, sched.maker_rate
-        if self.cfg.runtime.live_params_shadow and time.time() - self.series_group_at >= SERIES_GROUPS_S:
+        if ((self.cfg.runtime.live_params_shadow or self.cfg.trading.late_quote_cutoff_min)
+                and time.time() - self.series_group_at >= SERIES_GROUPS_S):
             try:
                 self.series_group = series_groups()
                 self.series_group_at = time.time()
@@ -1722,7 +1723,19 @@ class ArbsRunner:
         return acts
 
     def may_quote(self, b: Basket, now: pd.Timestamp) -> bool:
-        return b.quoting_allowed(now) and (self.cfg.trading.quote_live_events or not self.live_now(b, now))
+        return (b.quoting_allowed(now) and (self.cfg.trading.quote_live_events or not self.live_now(b, now))
+                and not self.past_cutoff(b, now))
+
+    def past_cutoff(self, b: Basket, now: pd.Timestamp) -> bool:
+        """Past its group's late_quote_cutoff_min after the event started. Off
+        until series_groups() has loaded (an hourly fetch)."""
+        cut = self.cfg.trading.late_quote_cutoff_min
+        if not cut or b.live_from is None:
+            return False
+        t = b.legs[0].ticker
+        m = self.meta.get(t)
+        lim = cut.get(self.series_group.get((m.series if m else None) or t.split("-", 1)[0], ""))
+        return lim is not None and now >= b.live_from + pd.Timedelta(minutes=lim)
 
     def alternatives(self, b: Basket, j: int) -> list[tuple[Basket, int]]:
         """(basket, its leg) for other baskets holding leg j's market side

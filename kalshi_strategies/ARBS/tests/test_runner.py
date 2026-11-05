@@ -1656,3 +1656,19 @@ def test_regime_shadow_journals_once_per_hold_and_ignores_our_own_top(arbs):
     r.quotes[q.key] = q
     r._note_top(types.SimpleNamespace(ticker="X-A", bid=0.30, bid_depth=5, ask=0.44, ask_depth=10))
     assert "X-A" not in r.move_watch.h
+
+
+def test_late_cutoff_stops_quoting_a_soccer_game_past_its_minute(arbs):
+    r, b = arbs
+    now = R._utc()
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_live_events=True, late_quote_cutoff_min={"S:Soccer": 75.0})
+    for t in b.tickers:
+        r.meta[t] = dataclasses.replace(r.meta[t], series="KXEPLGAME")
+    r.series_group = {"KXEPLGAME": "S:Soccer"}
+    early = dataclasses.replace(b, live_from=now - pd.Timedelta(minutes=60))
+    late = dataclasses.replace(b, live_from=now - pd.Timedelta(minutes=80))
+    assert r.may_quote(early, now) and not r.may_quote(late, now)
+    r.series_group = {"KXEPLGAME": "S:Football"}
+    assert r.may_quote(late, now)                                   # only the listed groups
+    r.series_group = {}
+    assert r.may_quote(late, now)                                   # groups not loaded yet: no cutoff

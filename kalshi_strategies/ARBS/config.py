@@ -45,6 +45,13 @@ class TradingParams:
                                     "exits on live events are taken at once.")
     live_edge_add: float = param("Extra edge ($ per bundle) quotes and takes need on a live event, or on a market "
                                  "flagged live by a bad exit.", min=0.0, max=0.5, step=0.005)
+    # 11-01..04 fills: soccer 75-120 min after kickoff was 1,110 arbs and -$47,
+    # the rest of the game positive; 11-04's two goal sweeps (-$34) fell in it.
+    # A stopgap until the live estimator learns game phase.
+    late_quote_cutoff_min: dict[str, float] = param("Group (S:<sport tags> for Sports, else Kalshi's category) -> "
+                                                    "minutes after a live event's start past which its baskets "
+                                                    "stop quoting. Exits and takes are unaffected.",
+                                                    editable=False)
     take_live_events: bool = param("Take arbs (and flips) on events that have started. A visible arb on a live "
                                    "game is mostly one leg not yet repriced after a score, which faster traders "
                                    "take first: 6 of 7 live takes filled unevenly (10-29). Exits of broken "

@@ -11,6 +11,7 @@
     "quote_live_events": false,
     "take_live_events": false,
     "live_edge_add": 0.01,
+    "late_quote_cutoff_min": {"S:Soccer": 75.0},
     "live_quote_size": 5,
     "live_take_size": 1,
     "live_order_groups": false,
