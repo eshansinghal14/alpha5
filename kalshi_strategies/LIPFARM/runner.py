@@ -335,14 +335,15 @@ class Runner:
         that can still reach the $1 payout before their period ends. Quoted
         markets past $1 this period come first (every further dollar there is
         paid), then quoted ones under $1 (dropping one forfeits its accrual),
-        then new ones; best LIP per dollar first within each."""
+        then new ones; most LIP per day net of expected loss first within each
+        (resting bids hold no cash, so the market count, not capital, is what binds)."""
         now = time.time()
 
         def left(t):
             return max(pd.Timestamp(self.programs[t]["end_date"]).timestamp() - now, 0.0)
 
-        def per_dollar(p):
-            return (p.rate - p.loss_rate) / max(p.capital, 1e-9)
+        def net(p):
+            return p.rate - p.loss_rate
         cool = self.state.setdefault("cooldown", {})
         cands = [p for p in self.plans.values() if p.ticker in self.programs and cool.get(p.ticker, 0.0) <= now
                  and self.period_accrued(p.ticker) + p.rate * left(p.ticker) >= farm.LIP_MIN_PAYOUT_USD]
@@ -353,7 +354,7 @@ class Runner:
                 return 2
             return 0 if self.period_accrued(p.ticker) >= farm.LIP_MIN_PAYOUT_USD else 1
         out, exp = {}, self.exposure()
-        for p in sorted(cands, key=lambda p: (rank(p), -per_dollar(p))):
+        for p in sorted(cands, key=lambda p: (rank(p), -net(p))):
             if len(out) >= cfg.num_markets:
                 break
             if exp + p.lots * max(px for _, px in p.legs) <= cfg.max_capital + 1e-9:
@@ -1239,7 +1240,7 @@ class Runner:
                 f = self.state["flow"][t]
                 pl.loss_rate = farm.expected_loss_day(f["trades_day"], pl, cfg) / 86400
                 ok = pl.rate >= cfg.min_lip_to_loss * pl.loss_rate
-            self.est[t] = (pl.rate - pl.loss_rate) / max(pl.capital, 1e-9) if pl and ok is not False else 0.0
+            self.est[t] = pl.rate - pl.loss_rate if pl and ok is not False else 0.0
             if pl and ok:
                 plans[t] = pl
             # What the flow filter costs: plans it holds back (False) or hasn't read yet (None).

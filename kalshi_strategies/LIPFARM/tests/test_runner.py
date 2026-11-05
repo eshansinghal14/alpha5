@@ -335,12 +335,13 @@ def _held(r, t, side, price, size, oid="f1"):
                              "trade_id": "x" + oid, "time": "2026-11-05T00:00:00", "liquidity": "maker"})
 
 
-def test_choose_ranks_per_dollar_and_caps_by_exposure(tmp_path, monkeypatch):
+def test_choose_ranks_by_net_lip_per_day_and_caps_by_exposure(tmp_path, monkeypatch):
     books = {t: {"yes": {}, "no": {}} for t in ("A-1-X", "B-1-X", "C-1-X")}
     r, _ = make(tmp_path, monkeypatch, books)
-    r.plans = {"A-1-X": _plan("A-1-X"), "C-1-X": _plan("C-1-X", legs=(("no", 0.98),), rate=5e-4, capital=980.0),
+    r.plans = {"A-1-X": _plan("A-1-X", rate=2e-3), "C-1-X": _plan("C-1-X", legs=(("no", 0.98),), rate=5e-4, capital=980.0),
                "B-1-X": _plan("B-1-X", "wide", (("yes", 0.1), ("no", 0.4)), capital=500.0)}
-    assert list(r.choose(dataclasses.replace(CFG, max_capital=1000))) == ["B-1-X", "A-1-X", "C-1-X"]
+    r.plans["A-1-X"].loss_rate = 1.7e-3                                   # A pays most, but nets least
+    assert list(r.choose(dataclasses.replace(CFG, max_capital=1000))) == ["B-1-X", "C-1-X", "A-1-X"]
     monkeypatch.setattr(r, "exposure", lambda: 500.0)
     assert list(r.choose(dataclasses.replace(CFG, max_capital=1000))) == ["B-1-X"]
 
@@ -604,7 +605,8 @@ def test_a_busier_market_is_quoted_only_when_its_lip_pays_for_the_risk(tmp_path,
     # 10 trades/day: expected loss min(30, 30) / 2 x 1 leg = $15/day; R's LIP clears 2x that, P's doesn't.
     assert "R-1-A" in r.plans and "P-1-A" not in r.plans
     assert r.flow_held["P-1-A"]["exp_loss_day"] == pytest.approx(15.0)
-    assert r.est["R-1-A"] < r.plans["R-1-A"].rate / r.plans["R-1-A"].capital     # ranked net of the loss
+    pl = r.plans["R-1-A"]
+    assert r.est["R-1-A"] == pytest.approx(pl.rate - pl.loss_rate)              # ranked by LIP net of the loss
 
 
 def test_the_ten_seconds_of_depth_before_a_lip_fill_are_journaled(tmp_path, monkeypatch):

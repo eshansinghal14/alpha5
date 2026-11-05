@@ -25,7 +25,7 @@ Each quoted side takes one of two layouts, whichever the LIP scorer prefers:
 
 Every side must reach Kalshi's Target size, ours included where we quote and
 from others alone where we don't, or the snapshot pays nobody. Markets are
-ranked by LIP per dollar of resting bids. Kalshi holds no cash for resting
+ranked by LIP per day net of expected loss. Kalshi holds no cash for resting
 orders (11-04: $9.6k resting on a $16.3k balance, balance unchanged), so
 `max_capital` caps what fills have left us holding: a bid that could fill us
 past it isn't placed, and one is pulled as soon as a fill makes that true.
