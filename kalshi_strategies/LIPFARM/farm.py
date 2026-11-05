@@ -182,7 +182,9 @@ class Cfg:
     min_ahead: float = param("Quote a side only where others already rest at least this many contracts at our "
                              "price (they are filled before us). 0 = may be alone.", min=0.0, step=100.0,
                              group="pricing")
-    max_position: float = param("Stop quoting a side once we hold this many contracts of it.", min=0.0,
+    max_position: float = param("Bid size, and the most contracts we hold on a side: a side holding this many "
+                                "isn't quoted. Size past Target still counts at the level where the book crosses "
+                                "it, so it raises our share (narrow sides are capped by exit depth).", min=0.0,
                                 step=100.0, group="pricing")
     wide_spread: float = param("Wide: quote both sides at the touch, Target size, when ask - bid is at least "
                                "this.", min=0.01, max=0.98, step=0.01, group="pricing", sub="wide markets")
@@ -367,14 +369,14 @@ def plan_market(ticker: str, others: dict[str, dict[float, float]], params: lip.
                 current: dict[str, str] | None = None, exit: dict[str, float] | None = None) -> Plan | None:
     """How to quote this market now, or None. Joins others' best bids (never
     improves them). `held`: contracts we already hold per side; `lots`: bid
-    size, one number or per side, default the program's Target (LIP stops
-    counting past it); a side sized under 1 isn't quoted. Every quoted side
+    size, one number or per side, default max_position; a side sized under 1
+    isn't quoted. Every quoted side
     gets the smallest of the quoted sides' sizes. A market neither wide nor
     decided ("narrow") is quoted only with `exit` (exit_lots), which then caps
     `lots`; without it, None. Flow is checked by the caller."""
     held = held or {}
     if lots is None:
-        lots = params.target_size
+        lots = cfg.max_position
     side_lots = lots if isinstance(lots, dict) else {"yes": lots, "no": lots}
     if not others["yes"] or not others["no"]:
         return None

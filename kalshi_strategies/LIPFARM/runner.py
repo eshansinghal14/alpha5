@@ -144,7 +144,7 @@ def plan_batch(jobs: list[tuple]) -> dict[str, tuple]:
     for t, others, prog, cfg, held, ranges, current in jobs:
         P = dataclasses.replace(lip.params_from_program(prog), price_ranges=ranges)
         out[t] = (plan_market(t, others, P, cfg, held, tick=lambda px, r=ranges: tick_in(r, px), current=current,
-                             exit=exit_lots(others, cfg, P.target_size)), P)
+                             exit=exit_lots(others, cfg, cfg.max_position)), P)
     return out
 
 
@@ -299,7 +299,7 @@ class Runner:
             return None
         return plan_market(t, others, P, cfg, {"yes": max(v, 0.0), "no": max(-v, 0.0)},
                            tick=lambda px: self.tick(t, px), current=current,
-                           exit=exit_lots(others, cfg, P.target_size))
+                           exit=exit_lots(others, cfg, cfg.max_position))
 
     def signed_positions(self, hedged_only: bool = False) -> dict[str, float]:
         """Signed YES contracts (negative = long NO) from our fills, unsettled
