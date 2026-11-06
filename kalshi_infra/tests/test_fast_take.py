@@ -51,3 +51,15 @@ def test_no_side_fires_on_a_down_shift():
                                   price=0.45, size=1.0, not_before=0.0, expires=1e18, req_prob=0.4))
     assert ft.on_cme_touch("BTC", b * (1 + 1.5e-4), a * (1 + 1.5e-4), 0.0) is None
     assert ft.on_cme_touch("BTC", b * (1 - 1.1e-4), a * (1 - 1.1e-4), 0.0) is not None
+
+
+def test_a_bounce_back_to_a_recent_level_does_not_fire():
+    ft, sent = _taker()
+    b, a = 100000.0, 100005.0
+    up = (b * (1 + 1.5e-4), a * (1 + 1.5e-4))
+    assert ft.on_cme_touch("BTC", *up, 0.0) is None                            # held up here first
+    assert ft.on_cme_touch("BTC", b, a, 0.0) is None                           # dips back
+    ft.publish("KX", "yes", Ticket("KX", "yes", "BTC", math.log(b), math.log(a), thr_bp=1.2, cap_bp=2.0,
+                                   price=0.56, size=1.0, not_before=0.0, expires=1e18, req_prob=0.57))
+    assert ft.on_cme_touch("BTC", *up, 0.0) is None                            # back up: not a new high
+    assert ft.on_cme_touch("BTC", b * (1 + 1.8e-4), a * (1 + 1.8e-4), 0.0) is not None

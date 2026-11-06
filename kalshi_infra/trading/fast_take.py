@@ -10,7 +10,7 @@ p50 / ~9.5 ms p90 through the loop; misses lost the touch by 9 ms p50.
 """
 from __future__ import annotations
 
-import asyncio
+import collections
 import math
 import threading
 import time
@@ -21,6 +21,11 @@ import pandas as pd
 from kalshi_backtest.core import Order
 
 TICKET_TTL_S = 0.5
+# A fire needs the CME touch at a new high (yes) / low (no) over this window.
+# Unfiltered, all 98 fast takes on KXBTC15M 11-06 22:30-22:37 were the touch
+# bouncing back 2-3 ticks to a level it held <2 s before, alternating sides
+# (~$1, mostly fees); none of them was a 2 s breakout.
+BREAKOUT_S = 2.0
 
 
 @dataclass(frozen=True)
@@ -62,6 +67,7 @@ class FastTaker:
         self.fired: dict[tuple[str, str], float] = {}
         self.n_fired = 0
         self._lock = threading.Lock()
+        self._hist: dict[str, collections.deque] = {}       # coin -> (wall s, bid, ask)
 
     # --- loop thread -----------------------------------------------------
 
@@ -80,14 +86,23 @@ class FastTaker:
         """Returns a callable that sends the take(s) this touch crosses, or None.
         Split so the reader can queue the frame for the loop (quote pulls)
         before blocking on the send."""
-        if bid <= 0 or ask <= 0 or not self._tickets:
+        if bid <= 0 or ask <= 0:
             return None
         now = time.time()
+        h = self._hist.setdefault(coin, collections.deque())
+        while h and h[0][0] < now - BREAKOUT_S:
+            h.popleft()
+        new_high = bool(h) and bid > max(e[1] for e in h) and ask > max(e[2] for e in h)
+        new_low = bool(h) and bid < min(e[1] for e in h) and ask < min(e[2] for e in h)
+        h.append((now, bid, ask))
+        if not (new_high or new_low) or not self._tickets:
+            return None
         lb, la = math.log(bid), math.log(ask)
         hits = []
         with self._lock:
             for key, tk in list(self._tickets.items()):
-                if tk.coin != coin or now > tk.expires or now < tk.not_before:
+                if (tk.coin != coin or now > tk.expires or now < tk.not_before
+                        or not (new_high if tk.side == "yes" else new_low)):
                     continue
                 s = whole_touch_shift_bp(lb, la, tk.ref_lb, tk.ref_la, tk.cap_bp)
                 if (s >= tk.thr_bp) if tk.side == "yes" else (s <= tk.thr_bp):
