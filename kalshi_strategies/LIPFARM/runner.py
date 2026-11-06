@@ -349,12 +349,12 @@ class Runner:
         return self.state.setdefault("period_accrued", {}).get(self.programs[t]["id"], 0.0)
 
     def choose(self, cfg: Cfg) -> dict[str, farm.Plan]:
-        """The markets to quote, within max_capital and num_markets. Only ones
-        that can still reach the $1 payout before their period ends. Quoted
-        markets past $1 this period come first (every further dollar there is
-        paid), then quoted ones under $1 (dropping one forfeits its accrual),
-        then new ones; most LIP per day net of expected loss first within each
-        (resting bids hold no cash, so the market count, not capital, is what binds)."""
+        """The markets to quote, within max_capital and num_markets, by what they've
+        accrued this period (not whether a bid rests now, which a restart or a
+        cooldown resets): past $1 first, most LIP net of expected loss first (every
+        further dollar is paid); then started under $1, nearest to $1 first (dropping
+        one forfeits it); then new ones, only if they can earn START_PAYOUT_MARGIN x
+        the $1 minimum before their period ends."""
         now = time.time()
 
         def left(t):
@@ -363,16 +363,21 @@ class Runner:
         def net(p):
             return p.rate - p.loss_rate
         cool = self.state.setdefault("cooldown", {})
+        def need(p):
+            return farm.LIP_MIN_PAYOUT_USD * (1.0 if self.period_accrued(p.ticker) > 0 else farm.START_PAYOUT_MARGIN)
         cands = [p for p in self.plans.values() if p.ticker in self.programs and cool.get(p.ticker, 0.0) <= now
-                 and self.period_accrued(p.ticker) + p.rate * left(p.ticker) >= farm.LIP_MIN_PAYOUT_USD]
-        held = self.order_tickers()
+                 and (self.period_accrued(p.ticker) >= farm.LIP_MIN_PAYOUT_USD
+                      or self.period_accrued(p.ticker) + p.rate * left(p.ticker) >= need(p))]
 
         def rank(p):
-            if p.ticker not in held:
-                return 2
-            return 0 if self.period_accrued(p.ticker) >= farm.LIP_MIN_PAYOUT_USD else 1
+            a = self.period_accrued(p.ticker)
+            if a >= farm.LIP_MIN_PAYOUT_USD:
+                return (0, -net(p))
+            if a > 0:
+                return (1, (farm.LIP_MIN_PAYOUT_USD - a) / max(p.rate, 1e-12))     # seconds still needed
+            return (2, -net(p))
         out, exp = {}, self.exposure()
-        for p in sorted(cands, key=lambda p: (rank(p), -net(p))):
+        for p in sorted(cands, key=rank):
             if len(out) >= cfg.num_markets:
                 break
             if exp + p.lots * max(px for _, px in p.legs) <= cfg.max_capital + 1e-9:
@@ -1322,7 +1327,11 @@ class Runner:
             rot = (rest[i:] + rest[:i])[:cfg.scan_rotate]
             self.rot = i + len(rot)
         held = sorted(self.order_tickers() | set(self.signed_positions()))
-        return list(dict.fromkeys(top + rot + [t for t in held if t in self.programs]))
+        # Markets started this period but under $1, most accrued first, so a restart or a
+        # cooldown doesn't leave them unplanned (and their accrual forfeited).
+        started = sorted((t for t in everything if 0 < self.period_accrued(t) < farm.LIP_MIN_PAYOUT_USD),
+                         key=lambda t: -self.period_accrued(t))[:cfg.num_markets]
+        return list(dict.fromkeys(top + rot + [t for t in held if t in self.programs] + started))
 
     # ---- the cycle ----
     async def cycle(self, cfg: Cfg):

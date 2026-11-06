@@ -109,6 +109,10 @@ CLAIMS_PATH = os.path.join(ROOT, "live", "claimed.json")
 CLAIM_SETTLE_S = 3.0
 # Kalshi pays nothing for a market-period whose LIP is under $1 (help article).
 LIP_MIN_PAYOUT_USD = 1.0
+# A market not yet started this period must be able to earn this many times the $1
+# minimum before its period ends: planned rates run above what bids then earn, and
+# brief starts forfeited $83 of $475 accrued by 11-06 (420 periods ended under $1).
+START_PAYOUT_MARGIN = 2.0
 # Our writes share ARBS's shard bucket (300 tokens/s on shard 0); ARBS caps itself
 # at 250/s and our own bucket (write_tokens_per_s) is what bounds us. A new quote
 # goes out only with this fraction of the shard's bucket left after it, a

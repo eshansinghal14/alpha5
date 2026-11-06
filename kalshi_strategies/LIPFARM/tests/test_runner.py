@@ -365,8 +365,7 @@ def test_quoted_past_one_dollar_first_then_under_then_new(tmp_path, monkeypatch)
     books = {t: {"yes": {}, "no": {}} for t in ("PAST-1-A", "UNDER-1-A", "NEW-1-A")}
     r, _ = make(tmp_path, monkeypatch, books)
     r.plans = {t: _plan(t, rate=rate) for t, rate in (("PAST-1-A", 1e-4), ("UNDER-1-A", 2e-4), ("NEW-1-A", 9e-4))}
-    r.state["orders"] = {"PAST-1-A|yes": _order("yes", 0.97), "UNDER-1-A|yes": _order("yes", 0.97, oid="o2")}
-    r.state["period_accrued"] = {"pPAST-1-A": 1.5, "pUNDER-1-A": 0.4}
+    r.state["period_accrued"] = {"pPAST-1-A": 1.5, "pUNDER-1-A": 0.4}            # no bids resting: a restart
     assert list(r.choose(dataclasses.replace(CFG, num_markets=3))) == ["PAST-1-A", "UNDER-1-A", "NEW-1-A"]
     assert list(r.choose(dataclasses.replace(CFG, num_markets=1))) == ["PAST-1-A"]
 
@@ -875,3 +874,16 @@ def test_a_fill_taking_most_of_the_bid_is_informed_under_adverse_lots(tmp_path, 
     r.cfg_adverse, r.cfg_adverse_frac = 300.0, 0.9
     r.flag_adverse()
     assert r.state["adverse_oids"] == ["o1"]                  # 180 of 200 is informed; 100 of 200 isn't
+
+
+def test_started_markets_nearest_to_one_dollar_go_first_and_new_ones_need_a_margin(tmp_path, monkeypatch):
+    books = {t: {"yes": {}, "no": {}} for t in ("NEAR-1-A", "FAR-1-A", "NEW-1-A", "THIN-1-A")}
+    r, _ = make(tmp_path, monkeypatch, books)
+    for t in books:
+        r.programs[t]["end_date"] = (pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=1)).isoformat()
+    # $/s: NEAR needs 0.1/1e-5 = 10,000 s, FAR 0.9/1e-4 = 9,000 s; NEW earns $8.6 in the day left, THIN $1.7 (< 2 x $1).
+    r.plans = {"NEAR-1-A": _plan("NEAR-1-A", rate=1e-5), "FAR-1-A": _plan("FAR-1-A", rate=1e-4),
+               "NEW-1-A": _plan("NEW-1-A", rate=1e-4), "THIN-1-A": _plan("THIN-1-A", rate=2e-5)}
+    r.state["period_accrued"] = {"pNEAR-1-A": 0.9, "pFAR-1-A": 0.1}
+    assert list(r.choose(dataclasses.replace(CFG, num_markets=10))) == ["FAR-1-A", "NEAR-1-A", "NEW-1-A"]
+    assert "NEAR-1-A" in r.candidates(dataclasses.replace(CFG, scan_markets=0, scan_rotate=0))
