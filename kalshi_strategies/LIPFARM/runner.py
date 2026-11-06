@@ -1327,7 +1327,8 @@ class Runner:
             if pl and ok:
                 # LIP must pay for the market's expected adverse-sweep loss.
                 f = self.state["flow"][t]
-                pl.loss_rate = farm.expected_loss_day(f["trades_day"], pl, cfg, self.days_to_close(t)) / 86400
+                pl.loss_rate = farm.expected_loss_day(f["trades_day"], pl, cfg, self.days_to_close(t),
+                                                      books.get(t)) / 86400
                 ok = pl.rate >= cfg.min_lip_to_loss * pl.loss_rate
                 # Taking most of the pool means nobody else wants to quote here.
                 if ok and farm.pool_share(pl) > cfg.max_pool_share + 1e-9:

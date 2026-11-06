@@ -219,3 +219,17 @@ def test_pool_share_counts_only_the_sides_we_quote():
     one = farm.Plan("T", "decided", (("yes", 0.97),), 1e-3, 970.0, 4e-3, 1000)      # 1e-3 of a 2e-3 side
     two = farm.Plan("T", "wide", (("yes", 0.4), ("no", 0.5)), 1e-3, 900.0, 4e-3, 1000)
     assert farm.pool_share(one) == pytest.approx(0.5) and farm.pool_share(two) == pytest.approx(0.25)
+
+
+def test_exit_ticks_skips_what_a_sweep_takes_and_prices_the_hole():
+    assert farm.exit_ticks({0.39: 5000.0, 0.36: 1000.0}, 0.40, 1000) == pytest.approx(4.0)    # 0.39 is swept
+    assert farm.exit_ticks({0.36: 500.0}, 0.40, 1000) == pytest.approx((500 * 4 + 500 * 20) / 1000)
+    assert farm.exit_ticks({}, 0.05, 100) == pytest.approx(5.0)                                # capped at the price
+
+
+def test_expected_loss_charges_a_hole_under_the_bid_more():
+    pl = farm.Plan("T", "wide", (("yes", 0.4),), 1e-3, 400.0, 0.002, 1000)
+    deep = farm.expected_loss_day(4.0, pl, CFG, others={"yes": {0.36: 2000.0}, "no": {}})
+    hole = farm.expected_loss_day(4.0, pl, CFG, others={"yes": {}, "no": {}})
+    flat = farm.expected_loss_day(4.0, pl, CFG)
+    assert deep == pytest.approx(flat * 4 / 7.6) and hole == pytest.approx(flat * 20 / 7.6)

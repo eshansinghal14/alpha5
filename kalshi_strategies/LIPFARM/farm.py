@@ -328,13 +328,46 @@ def pool_share(pl: Plan) -> float:
     return pl.rate / max(pl.pool_rate * len(pl.legs) / 2.0, 1e-15)
 
 
-def expected_loss_day(trades_day: float, pl: Plan, cfg: Cfg, days_to_close: float | None = None) -> float:
+# Gap pricing, from the 14-day tape (10-22..11-05, <= 50 trades/day): adverse sweeps reach a
+# median 3 ticks below where they start (p90 12), and the price ends 7.6 ticks down by 2 h
+# (lot-weighted mean, p90 17). loss_per_trade was fitted to that average drop.
+SWEEP_REACH_TICKS = 3
+MEAN_ADVERSE_DROP_TICKS = 7.6
+GAP_CAP_TICKS = 20
+
+
+def exit_ticks(bids: dict, price: float, lots: float, tick: float = 0.01) -> float:
+    """Average ticks below `price` at which `lots` sell into others' `bids` ({price: size})
+    left after a sweep clears SWEEP_REACH_TICKS; what finds no bid counts at GAP_CAP_TICKS
+    (or the whole price, if lower)."""
+    cap = min(GAP_CAP_TICKS, price / tick)
+    left, cost = lots, 0.0
+    for p in sorted(bids, reverse=True):
+        d = (price - p) / tick
+        if d <= SWEEP_REACH_TICKS + 1e-9:
+            continue
+        if d > cap + 1e-9 or left <= 0:
+            break
+        take = min(left, bids[p])
+        cost += take * d
+        left -= take
+    return (cost + max(left, 0.0) * cap) / max(lots, 1e-9)
+
+
+def expected_loss_day(trades_day: float, pl: Plan, cfg: Cfg, days_to_close: float | None = None,
+                      others: dict | None = None) -> float:
     """Expected adverse-sweep loss, $/day, of quoting `pl` on a market trading
     `trades_day`: loss_per_trade per trade/day up to loss_cap, for 1000 lots
     on each side, scaled by the lots we actually bid (fit, max_trades_day),
-    times tte_mult for how close the market is to its close."""
+    times tte_mult for how close the market is to its close. With `others`
+    (others' bids, {"yes": {price: size}, "no": ...}) each leg is also scaled by
+    its exit_ticks over the tape's average drop: a hole under the bid costs more."""
     per_side = min(cfg.loss_per_trade * trades_day, cfg.loss_cap) / 2.0
-    return per_side * pl.lots * len(pl.legs) / 1000.0 * tte_mult(days_to_close)
+    if others is None:
+        legs = float(len(pl.legs))
+    else:
+        legs = sum(exit_ticks(others.get(s) or {}, p, pl.lots) / MEAN_ADVERSE_DROP_TICKS for s, p in pl.legs)
+    return per_side * pl.lots * legs / 1000.0 * tte_mult(days_to_close)
 
 
 def key(ticker: str, side: str, hedge: bool = False) -> str:

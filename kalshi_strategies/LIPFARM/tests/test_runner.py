@@ -579,9 +579,10 @@ def test_expected_loss_grows_with_trades_up_to_the_cap():
 
 
 def test_a_busier_market_is_quoted_only_when_its_lip_pays_for_the_risk(tmp_path, monkeypatch):
-    books = {"R-1-A": {"yes": {0.97: 2000.0}, "no": {0.02: 5000.0}}, "P-1-A": {"yes": {0.97: 2000.0}, "no": {0.02: 5000.0}}}
+    books = {"R-1-A": {"yes": {0.97: 2000.0, 0.93: 5000.0}, "no": {0.02: 5000.0}},
+             "P-1-A": {"yes": {0.97: 2000.0, 0.93: 5000.0}, "no": {0.02: 5000.0}}}
     r, c = make(tmp_path, monkeypatch, books)
-    ob = {"yes_dollars": [["0.97", "2000"]], "no_dollars": [["0.02", "5000"]]}
+    ob = {"yes_dollars": [["0.93", "5000"], ["0.97", "2000"]], "no_dollars": [["0.02", "5000"]]}
     monkeypatch.setattr(farm, "fetch_book", lambda t: ob)
     monkeypatch.setattr(farm, "arbs_held_events", lambda: set())
     rich = {"R-1-A": 10.0, "P-1-A": 10.0}
@@ -602,9 +603,9 @@ def test_a_busier_market_is_quoted_only_when_its_lip_pays_for_the_risk(tmp_path,
             f.result()
         await r.cycle(cfg)
     asyncio.run(go())
-    # 10 trades/day: expected loss min(30, 30) / 2 x 1 leg = $15/day; R's LIP clears 2x that, P's doesn't.
+    # 10 trades/day: min(30, 30) / 2 x 1 leg = $15/day, x 4/7.6 for exiting 4 ticks down at 0.93.
     assert "R-1-A" in r.plans and "P-1-A" not in r.plans
-    assert r.flow_held["P-1-A"]["exp_loss_day"] == pytest.approx(15.0)
+    assert r.flow_held["P-1-A"]["exp_loss_day"] == pytest.approx(15.0 * 4 / 7.6)
     pl = r.plans["R-1-A"]
     assert r.est["R-1-A"] == pytest.approx(pl.rate - pl.loss_rate)              # ranked by LIP net of the loss
 
