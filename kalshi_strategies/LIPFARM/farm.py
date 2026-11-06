@@ -190,6 +190,14 @@ class Cfg:
                                 step=100.0, group="pricing")
     wide_spread: float = param("Wide: quote both sides at the touch, Target size, when ask - bid is at least "
                                "this.", min=0.01, max=0.98, step=0.01, group="pricing", sub="wide markets")
+    wide_exit_frac: float = param("Wide: each bid at most this fraction of others' bids strictly below it within "
+                                  "wide_exit_slip (a sweep that fills us clears our own level too); a side capped "
+                                  "under min_lots_frac of Target isn't quoted. 0 = off. Wide legs had no bid "
+                                  "within 20 ticks under them on 14 of 16 quoted markets (11-06).", min=0.0,
+                                  max=10.0, step=0.1, group="pricing", sub="wide markets")
+    wide_exit_slip: float = param("Wide: how far under our bid counts as exit depth (dollars). Adverse sweeps "
+                                  "reach a median 3 ticks, p90 12 (14-day tape to 11-05).", min=0.0, max=0.5,
+                                  step=0.01, group="pricing", sub="wide markets")
     deep_keep: float = param("Wide: bid each side at the deepest price that keeps this share of its best LIP "
                              "(LIP scores every bid at or above the reference price in full, and on a thin book "
                              "our own size sets it; 11-05 T130: no at 6-7c scored ~84% of the side vs ~99% "
@@ -521,6 +529,20 @@ def plan_market(ticker: str, others: dict[str, dict[float, float]], params: lip.
             layout[s], big[s] = "deep", d
             sized = [(x, px, q) for x, px, q in sized if x != s] + [(s, d, lots)]
             legs = [(x, d if x == s else px) for x, px in legs]
+    if mode == "wide" and cfg.wide_exit_frac > 0:
+        cap = {s: math.floor(cfg.wide_exit_frac * sum(q for px, q in others[s].items()
+                                                      if p - cfg.wide_exit_slip - 1e-9 <= px < p - 1e-9))
+               for s, p in legs}
+        legs = [(s, p) for s, p in legs if cap[s] >= max(1.0, cfg.min_lots_frac * params.target_size)]
+        if not legs:
+            return None
+        lots = min([lots] + [cap[s] for s, _ in legs])
+        sized = [(s, p, lots) for s, p in legs]
+        layout = {s: layout[s] for s, _ in legs}
+        big = {s: big[s] for s, _ in legs}
+        sc = book_score(others, sized, params)
+        if not sc.qualifies or sc.expected_reward_this_snapshot_usd <= 0:
+            return None
     # Per side, the sentinel layout where it keeps sentinel_keep of the touch layout's LIP.
     base = sc.expected_reward_this_snapshot_usd
     for s, p in legs:

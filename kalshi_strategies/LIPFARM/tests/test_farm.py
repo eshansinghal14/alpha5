@@ -14,7 +14,7 @@ CFG = farm.Cfg(max_capital=5000, num_markets=5, min_lots_frac=0.0, sentinel_keep
                min_ahead=0.0, max_position=1000.0, write_tokens_per_s=5.0, scan_markets=1, scan_rotate=0, refresh_s=30,
                programs_refresh_s=600, flow_days=4.0, max_trades_day=50.0, loss_per_trade=3.0, loss_cap=30.0,
                min_lip_to_loss=2.0,
-               skip_categories="Sports,Mentions", skip_series="KXRT", min_close_h=48.0, max_pool_share=1.0, loss_min_trades=0.0)
+               skip_categories="Sports,Mentions", skip_series="KXRT", min_close_h=48.0, max_pool_share=1.0, loss_min_trades=0.0, wide_exit_frac=0.0, wide_exit_slip=0.10)
 
 
 @pytest.fixture(autouse=True)
@@ -248,3 +248,12 @@ def test_a_decided_market_pays_for_its_odds_of_flipping():
     assert farm.flip_loss_day(pl, others, 87.0) == pytest.approx(800 * 0.97 * 0.025 / 87.0)
     wide = farm.Plan("T", "wide", (("no", 0.40),), 1e-3, 320.0, 0.002, 800)
     assert farm.flip_loss_day(wide, others, 87.0) == 0.0
+
+
+def test_wide_bids_are_sized_to_the_exit_under_them():
+    cfg = dataclasses.replace(CFG, wide_exit_frac=1.0, wide_exit_slip=0.10, min_lots_frac=0.2)
+    # yes: 600 lots of others' bids 2-9c under its 0.40 touch; no: only at its own price, nothing under.
+    others = {"yes": {0.40: 50.0, 0.38: 400.0, 0.31: 200.0, 0.20: 5000.0}, "no": {0.35: 1500.0}}
+    pl = plan_market("T", others, P, cfg)
+    assert pl.mode == "wide" and [s for s, _ in pl.legs] == ["yes"] and pl.lots == 600
+    assert plan_market("T", {"yes": {0.40: 50.0}, "no": {0.35: 1500.0}}, P, cfg) is None   # no exit anywhere
