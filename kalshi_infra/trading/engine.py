@@ -297,6 +297,8 @@ class LiveEngine:
         self._audit_strikes: dict[str, int] = {}
         self.over_limit: dict[str, float] = {}
         self._last_abs_position: dict[str, float] = {}
+        self._take_fills_seen = 0
+        self._take_net_by_ticker: dict[str, float] = {}
         self.blocked_counts: dict[str, int] = {}
         # (ticker, side, touch price) -> (Kalshi depth we saw, how much of it
         # our shadow takes have used). See _net_of_shadow_takes.
@@ -482,9 +484,9 @@ class LiveEngine:
         limit = self.position_limit()
         if self.halted:
             return self.halted
-        take_net = getattr(self.strategy, "_take_net", None)
         take_max = getattr(self.quoting, "take_max_position", None)
-        if positions is None and take_max is not None and take_net is not None:
+        if positions is None and take_max is not None:
+            take_net = self._take_net_now()
             # Takes keep their own position: each part is checked on its own
             # cap, so neither can grow inside the other's headroom.
             total = {t: p.yes_qty - p.no_qty for t, p in self.portfolio.positions.items()}
@@ -514,6 +516,20 @@ class LiveEngine:
         for (ticker, part), qty in parts.items():
             self._last_abs_position[ticker if part is None else f"{ticker}|{part}"] = abs(qty)
         return self.halted
+
+    def _take_net_now(self) -> dict[str, float]:
+        """Net YES from taker fills per market, off the portfolio itself: the
+        quoter's own count lags until its next pass, and that lag read as the
+        quotes' part jumping past its cap (KXBTC15M 11-05 23:57 UTC)."""
+        fills = self.portfolio.fills
+        if len(fills) < self._take_fills_seen:          # arming swaps in a fresh Portfolio
+            self._take_fills_seen, self._take_net_by_ticker = 0, {}
+        for f in fills[self._take_fills_seen:]:
+            if f.liquidity == "taker":
+                self._take_net_by_ticker[f.ticker] = (self._take_net_by_ticker.get(f.ticker, 0.0)
+                                                      + (f.size if f.side == "yes" else -f.size))
+        self._take_fills_seen = len(fills)
+        return self._take_net_by_ticker
 
     def ledger_positions(self) -> dict[str, float]:
         """Our signed YES position per ticker, for an audit's before-snapshot."""

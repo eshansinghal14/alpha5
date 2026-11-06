@@ -777,12 +777,15 @@ def test_legacy_order_path_does_not_pump_on_ack(monkeypatch):
 def test_take_position_is_capped_on_its_own():
     from kalshi_backtest.core import Order
     eng, _, _ = setup(real=True, max_position=0.5, take_max_position=10.0)
-    eng.strategy._take_net = {}
+    eng.strategy._take_net = {"KX-A": 5.0}               # the quoter's count is stale: ignored
     t = "KX-A"
     o = Order(1, t, "yes", "limit", 0.5, 1.0, pd.Timestamp("2026-11-05", tz="UTC"), "take")
     eng.portfolio.record_fill(o, 0.5, 1.0, o.decision_time, "taker", fee=0.0)
-    eng.strategy._take_net[t] = 1.0
     assert eng.check_position_limit() is False          # a 1-lot take on a 0.5 quote cap is fine
+    eng.portfolio.record_fill(o, 0.5, 1.0, o.decision_time, "taker", fee=0.0)
+    on = Order(2, t, "no", "limit", 0.5, 1.0, o.decision_time, "take")
+    eng.portfolio.record_fill(on, 0.5, 1.0, o.decision_time, "taker", fee=0.0)   # takes back to +1
+    assert eng.check_position_limit() is False
     eng.portfolio.record_fill(o, 0.5, 1.0, o.decision_time, "maker", fee=0.0)   # quotes now +1: over 0.5
     assert eng.check_position_limit() is False          # over the cap is reported, not halted
     eng.portfolio.record_fill(o, 0.5, 0.5, o.decision_time, "maker", fee=0.0)   # quotes grow further
