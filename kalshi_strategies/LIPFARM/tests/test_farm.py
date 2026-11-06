@@ -240,3 +240,11 @@ def test_a_market_that_never_trades_is_still_charged_for_its_gap():
     cfg = dataclasses.replace(CFG, loss_min_trades=0.3)
     assert farm.expected_loss_day(0.0, pl, CFG) == 0.0
     assert farm.expected_loss_day(0.0, pl, cfg) == pytest.approx(farm.expected_loss_day(0.3, pl, CFG))
+
+
+def test_a_decided_market_pays_for_its_odds_of_flipping():
+    pl = farm.Plan("T", "decided", (("no", 0.97),), 1e-3, 776.0, 0.002, 800)
+    others = {"no": {0.94: 200.0}, "yes": {0.02: 29000.0}}          # mid (0.97 + 0.98) / 2
+    assert farm.flip_loss_day(pl, others, 87.0) == pytest.approx(800 * 0.97 * 0.025 / 87.0)
+    wide = farm.Plan("T", "wide", (("no", 0.40),), 1e-3, 320.0, 0.002, 800)
+    assert farm.flip_loss_day(wide, others, 87.0) == 0.0

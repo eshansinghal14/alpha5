@@ -359,6 +359,22 @@ def exit_ticks(bids: dict, price: float, lots: float, tick: float = 0.01) -> flo
     return (cost + max(left, 0.0) * cap) / max(lots, 1e-9)
 
 
+def flip_loss_day(pl: Plan, others: dict | None, days_to_close: float | None) -> float:
+    """A decided market's expected loss, $/day, from the long shot coming in: a flip
+    sweeps every bid, so each leg loses its whole price, with the market's own odds
+    (1 - the favourite's mid) spread evenly over the days left to the close."""
+    if pl.mode != "decided" or not others:
+        return 0.0
+    days = max(days_to_close if days_to_close is not None else 365.0, 1.0)
+    out = 0.0
+    for s, p in pl.legs:
+        o = "no" if s == "yes" else "yes"
+        bid = max([p] + list(others.get(s) or {}))
+        ask = 1.0 - max(list(others.get(o) or {}) or [0.0])
+        out += pl.lots * p * max(0.0, 1.0 - (bid + ask) / 2.0) / days
+    return out
+
+
 def expected_loss_day(trades_day: float, pl: Plan, cfg: Cfg, days_to_close: float | None = None,
                       others: dict | None = None) -> float:
     """Expected adverse-sweep loss, $/day, of quoting `pl` on a market trading
@@ -366,13 +382,14 @@ def expected_loss_day(trades_day: float, pl: Plan, cfg: Cfg, days_to_close: floa
     on each side, scaled by the lots we actually bid (fit, max_trades_day),
     times tte_mult for how close the market is to its close. With `others`
     (others' bids, {"yes": {price: size}, "no": ...}) each leg is also scaled by
-    its exit_ticks over the tape's average drop: a hole under the bid costs more."""
+    its exit_ticks over the tape's average drop: a hole under the bid costs more.
+    Decided markets add flip_loss_day."""
     per_side = min(cfg.loss_per_trade * max(trades_day, cfg.loss_min_trades), cfg.loss_cap) / 2.0
     if others is None:
         legs = float(len(pl.legs))
     else:
         legs = sum(exit_ticks(others.get(s) or {}, p, pl.lots) / MEAN_ADVERSE_DROP_TICKS for s, p in pl.legs)
-    return per_side * pl.lots * legs / 1000.0 * tte_mult(days_to_close)
+    return per_side * pl.lots * legs / 1000.0 * tte_mult(days_to_close) + flip_loss_day(pl, others, days_to_close)
 
 
 def key(ticker: str, side: str, hedge: bool = False) -> str:

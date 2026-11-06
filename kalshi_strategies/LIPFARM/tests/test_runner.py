@@ -616,7 +616,7 @@ def test_a_busier_market_is_quoted_only_when_its_lip_pays_for_the_risk(tmp_path,
     asyncio.run(go())
     # 10 trades/day: min(30, 30) / 2 x 1 leg = $15/day, x 4/7.6 for exiting 4 ticks down at 0.93.
     assert "R-1-A" in r.plans and "P-1-A" not in r.plans
-    assert r.flow_held["P-1-A"]["exp_loss_day"] == pytest.approx(15.0 * 4 / 7.6)
+    assert r.flow_held["P-1-A"]["exp_loss_day"] == pytest.approx(15.0 * 4 / 7.6, abs=0.1)     # + a small flip term
     pl = r.plans["R-1-A"]
     assert r.est["R-1-A"] == pytest.approx(pl.rate - pl.loss_rate)              # ranked by LIP net of the loss
 
