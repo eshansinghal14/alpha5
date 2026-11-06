@@ -118,7 +118,8 @@ def render(page: str, stale_fn):
         _toggle(s, idle)
         c = st.columns(6)
         c[0].metric("Quoting", s["quoting"])
-        c[1].metric("LIP rate now", f"${s['our_usd_day_now'] / 1440:,.3f}/min")
+        c[1].metric("LIP rate now", f"${s['our_usd_day_now'] / 1440:,.3f}/min", f"${s['our_usd_day_now']:,.0f}/day",
+                    delta_color="off")
         c[2].metric("Expected LIP", f"${s['exp_lip_usd']:,.2f}",
                     f"${s.get('lip_locked_usd', 0):,.2f} locked (past $1)", delta_color="off",
                     help="Locked: program periods already past Kalshi's $1 minimum, paid in full. The rest "
