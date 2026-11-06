@@ -268,6 +268,9 @@ class Cfg:
                                 "A risk cap, not a signal: 11-04 sweeps of 50 to 3000+ lots, and 0.5x to 10x+ "
                                 "a market's median sweep, were all followed by a 2+ tick further fall "
                                 "~21-24% of the time within 1 min.", min=1, max=10000, step=50, group="exits")
+    adverse_frac: float = param("Also informed: fills reaching this share of the bid, whatever adverse_lots. "
+                                "Since the 60 s recovery check (11-06), 9 of 9 fills that took our whole bid "
+                                "didn't recover. 1 = off.", min=0.1, max=1.0, step=0.05, group="exits")
     dump_slip_ticks: int = param("After an informed fill, sell at once into bids down to this many ticks under "
                                  "our fill; rest the rest. 11-04: median 46 lots rest within 2 ticks under the "
                                  "touch.", min=0, max=50, step=1, group="exits")

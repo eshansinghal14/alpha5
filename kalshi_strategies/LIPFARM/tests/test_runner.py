@@ -865,3 +865,13 @@ def test_expected_loss_uses_the_long_window_when_it_is_busier(tmp_path, monkeypa
     assert r.flow_ok("W-1-A", cfg) is None                 # not quoted until the long read is in
     r.flow_futs["W-1-A|long"].result()
     assert r.flow_ok("W-1-A", cfg) is True and r.trades_day("W-1-A") == pytest.approx(0.95)
+
+
+def test_a_fill_taking_most_of_the_bid_is_informed_under_adverse_lots(tmp_path, monkeypatch):
+    books = {"Z-1-A": {"yes": {0.40: 500.0, 0.39: 500.0}, "no": {0.50: 500.0}}}
+    r, _ = make(tmp_path, monkeypatch, books)
+    r.state["lip_oid_size"] = {"o1": 200.0, "o2": 200.0}
+    r.state["fills"] = [_fill("Z-1-A", "yes", 0.40, 180.0, "o1", "t1"), _fill("Z-1-A", "yes", 0.40, 100.0, "o2", "t2")]
+    r.cfg_adverse, r.cfg_adverse_frac = 300.0, 0.9
+    r.flag_adverse()
+    assert r.state["adverse_oids"] == ["o1"]                  # 180 of 200 is informed; 100 of 200 isn't

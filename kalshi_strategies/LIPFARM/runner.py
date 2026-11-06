@@ -191,6 +191,7 @@ class Runner:
         self.pull: set[str] = set()           # markets whose LIP bids go once their sells are out
         self.arm_requested = False
         self.cfg_adverse = 300.0              # cfg.adverse_lots, refreshed each second
+        self.cfg_adverse_frac = 1.0           # cfg.adverse_frac, likewise
         self.n_refused, self.last_refused_log = 0, 0.0
         self.marks_at = 0.0
         self.categories: dict[str, str] = {}  # series -> category
@@ -409,7 +410,7 @@ class Runner:
         return new
 
     def flag_adverse(self):
-        """Mark markets where fills on one of our LIP bids reached adverse_lots."""
+        """Mark markets where fills on one of our LIP bids reached adverse_lots, or adverse_frac of the bid."""
         lim = self.cfg_adverse
         sizes = self.state.get("lip_oid_size", {})
         done = set(self.state.setdefault("adverse_oids", []))
@@ -422,7 +423,7 @@ class Runner:
                 tick[o] = f["ticker"]
         sent = self.state.get("sentinel_oids", {})
         for o, q in got.items():
-            if o in sent or q >= lim - 1e-9:
+            if o in sent or q >= min(lim, self.cfg_adverse_frac * sizes[o]) - 1e-9:
                 self.state["adverse_oids"].append(o)
                 self.dumping.add(tick[o])
                 self.pull_event(tick[o])
@@ -1723,6 +1724,7 @@ class Runner:
                 self.cfg = Cfg.load()
                 self.bucket.rate = self.cfg.write_tokens_per_s
                 self.cfg_adverse = self.cfg.adverse_lots
+                self.cfg_adverse_frac = self.cfg.adverse_frac
                 reason = stop.poll()
                 if reason:
                     print(f"STOP: {reason}")
