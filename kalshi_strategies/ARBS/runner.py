@@ -1115,14 +1115,21 @@ class ArbsRunner:
                 (m.maker_rate if m and m.maker_rate is not None else 0.0))
 
     def _shadow_live(self, rows: list[dict]) -> tuple[dict, int]:
-        """Pool thread. Score each live print at every candidate edge (as a
-        quote priced SHADOW_LAG_S before it, at live_quote_size, with the pull
-        rule's gate), choose the event's edge before learning from the print,
-        then learn. Returns the view for the loop and the rows that raised."""
+        """Pool thread. Score each live print met by one of our arb quotes at
+        every candidate edge (as a quote priced SHADOW_LAG_S before it, at
+        live_quote_size, with the pull rule's gate), choose the event's edge
+        before learning from the print, then learn. Returns the view for the
+        loop and the rows that raised."""
         t = self.cfg.trading
         errs = 0
         for r in rows:
             try:
+                # Only prints we were quoting: scoring every print assumed a quote on every basket,
+                # and the late soccer, out-of-budget and pulled prints it added (596 soccer fills at
+                # -$382 vs 49 real at +$10, 11-05..06) taught it to turn live soccer off.
+                q = r.get("quote")
+                if q is None or q.get("tripped"):
+                    continue
                 s = replay.score(r, self._rates, self.lp.edges, t.live_quote_size, lag=SHADOW_LAG_S, live_only=True)
                 if s is None or not any(s["fills"]):
                     continue

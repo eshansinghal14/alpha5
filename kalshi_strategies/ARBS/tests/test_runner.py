@@ -1556,7 +1556,11 @@ def test_dollar_room_follows_shard_cash_when_live(arbs):
     r.live = False
 
 
-def _live_print_row(b_ask_after_no_bid, ratio=None):
+_OUR_QUOTE = {"basket_id": "complete_set:X:buy_all_yes", "price": 0.41, "left": 100.0, "edge": 0.05,
+              "age_s": 5.0, "pending": False, "tripped": False}
+
+
+def _live_print_row(b_ask_after_no_bid, ratio=None, quote=_OUR_QUOTE):
     after = {"X-A": {"yes": [[0.40, 100]], "no": [[0.55, 100]]},
              "X-B": {"yes": [[0.45, 100]], "no": [[b_ask_after_no_bid, 100]]}}
     return {"t": time.time(), "ticker": "X-A", "side": "yes", "prints": [[0.0, 0.40, 50]],
@@ -1565,7 +1569,7 @@ def _live_print_row(b_ask_after_no_bid, ratio=None):
                       "X-B": {"yes": [[0.45, 100]], "no": [[0.50, 100]]}},
             "pre": {"X-B": [[0.02, 0.45, 100, 0.50, 100]]},
             "after": {"0.03": after, "0.1": after, "1.0": after},
-            "pull": {"on": False, "ratio": ratio}, "quote": None}
+            "pull": {"on": False, "ratio": ratio}, "quote": quote}
 
 
 def test_shadow_live_learns_an_event_and_reports_it(arbs):
@@ -1584,6 +1588,15 @@ def test_shadow_live_counts_a_pulled_side_as_no_fill(arbs):
     r.cfg.trading = dataclasses.replace(r.cfg.trading, pull_drop=0.5)
     r._shadow_live([_live_print_row(0.50, ratio=0.2)])
     assert sum(r.lp.nodes[()].f) == 0.0
+
+
+def test_shadow_live_learns_only_from_prints_we_were_quoting(arbs):
+    r, b = arbs
+    tripped = {**_OUR_QUOTE, "tripped": True}
+    view, errs = r._shadow_live([_live_print_row(0.50, quote=None), _live_print_row(0.50, quote=tripped)])
+    assert errs == 0 and not r.lp.nodes and not view["events"]
+    r._shadow_live([_live_print_row(0.50)])
+    assert r.lp.nodes[()].w == pytest.approx(1.0)
 
 
 def test_series_groups_read_sports_tags(monkeypatch):
