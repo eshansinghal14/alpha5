@@ -753,3 +753,12 @@ def test_a_skipped_series_is_never_quoted(tmp_path, monkeypatch):
     r, _ = make(tmp_path, monkeypatch, books)
     assert r.flow_ok("KXRT-FOC-55", CFG) is False and not r.flow_futs
     assert r.flow_ok("KXOTHER-1-A", CFG) is None                          # read queued as usual
+
+
+def test_booking_fills_with_an_order_still_being_created(tmp_path, monkeypatch):
+    books = {"Z-1-A": {"yes": {0.40: 900.0}, "no": {0.30: 900.0}}}
+    r, _ = make(tmp_path, monkeypatch, books)
+    r.state["orders"] = {"Z-1-A|yes": _order("yes", 0.40, oid=None), "Z-1-A|no": _order("no", 0.30, oid="n")}
+    r.state["all_oids"] = ["n"]
+    assert r.book_fills([_fill("Z-1-A", "no", 0.30, 5.0, "n", "t1")]) == {"Z-1-A"}
+    assert None not in r.state["all_oids"]

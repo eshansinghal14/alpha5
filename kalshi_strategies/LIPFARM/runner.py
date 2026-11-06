@@ -376,8 +376,10 @@ class Runner:
     def book_fills(self, fills: list[dict]) -> set[str]:
         """Record fills of our orders (deduped on trade_id, from the socket or
         REST); returns the tickers that had new ones."""
-        ours = {o["oid"]: k for k, o in self.state["orders"].items()}
-        known = set(self.state.get("all_oids", [])) | set(ours)
+        # An order still being created has no id yet (None): it can't have fills, and None
+        # in the set made sorting it raise and abort the cycle (11-06 00:5x).
+        ours = {o["oid"]: k for k, o in self.state["orders"].items() if o.get("oid")}
+        known = (set(self.state.get("all_oids", [])) | set(ours)) - {None}
         self.state["all_oids"] = sorted(known)
         seen = set(self.state["trade_ids"])
         booked = set(self.state.get("ioc_booked", []))
