@@ -29,6 +29,7 @@
     "deep_keep": 0.8,
     "event_pull_s": 1800.0,
     "recover_s": 60.0,
-    "skip_series": "KXRT"
+    "skip_series": "KXRT",
+    "min_close_h": 48.0
   }
 }

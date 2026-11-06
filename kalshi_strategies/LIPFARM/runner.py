@@ -473,6 +473,9 @@ class Runner:
         ev = self.meta.get(t, {}).get("event_ticker") or event_of(t)
         if ev.split("-")[0].upper() in {x.strip().upper() for x in cfg.skip_series.split(",") if x.strip()}:
             return False
+        dtc = self.days_to_close(t)
+        if dtc is not None and dtc * 24 < cfg.min_close_h:
+            return False
         flows = self.state.setdefault("flow", {})
         fut = self.flow_futs.get(t)
         if fut is not None and fut.done():
@@ -492,6 +495,10 @@ class Runner:
     def url(self, t: str) -> str:
         ev = self.meta.get(t, {}).get("event_ticker") or event_of(t)
         return farm.kalshi_url(t, ev, self.series_titles.get(ev.split("-")[0], ""))
+
+    def days_to_close(self, t: str) -> float | None:
+        c = self.meta.get(t, {}).get("close_time")
+        return None if not c else (pd.Timestamp(c).timestamp() - time.time()) / 86400
 
     def category(self, t: str) -> str:
         ev = self.meta.get(t, {}).get("event_ticker") or event_of(t)
@@ -1193,7 +1200,9 @@ class Runner:
             if o.get("oid") is None:
                 continue                                    # still being placed
             if (want is None or k != want[0] or o["remaining"] > want[2] + 1e-9 or o["remaining"] < 0.5 * want[2]
-                    or (abs(want[1] - o["price"]) > 1e-9 and now - o["placed"] >= EXIT_REPRICE_S)):
+                    or ((want[1] > o["price"] + 1e-9 or want[1] < o["price"] - 2 * self.tick(t, o["price"]) + 1e-9)
+                        and now - o["placed"] >= EXIT_REPRICE_S)):
+                # Up whenever outbid; down only from 2+ ticks over (it flapped 33-35-36c on FOOTWEAR 11-05).
                 self.cancel(k, reason="lipfarm:hedge")
         if want and want[0] not in self.state["orders"]:
             k, px, q = want
@@ -1318,7 +1327,7 @@ class Runner:
             if pl and ok:
                 # LIP must pay for the market's expected adverse-sweep loss.
                 f = self.state["flow"][t]
-                pl.loss_rate = farm.expected_loss_day(f["trades_day"], pl, cfg) / 86400
+                pl.loss_rate = farm.expected_loss_day(f["trades_day"], pl, cfg, self.days_to_close(t)) / 86400
                 ok = pl.rate >= cfg.min_lip_to_loss * pl.loss_rate
             self.est[t] = pl.rate - pl.loss_rate if pl and ok is not False else 0.0
             if pl and ok:

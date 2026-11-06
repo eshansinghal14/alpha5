@@ -762,3 +762,26 @@ def test_booking_fills_with_an_order_still_being_created(tmp_path, monkeypatch):
     r.state["all_oids"] = ["n"]
     assert r.book_fills([_fill("Z-1-A", "no", 0.30, 5.0, "n", "t1")]) == {"Z-1-A"}
     assert None not in r.state["all_oids"]
+
+
+def test_a_market_closing_soon_is_not_quoted(tmp_path, monkeypatch):
+    books = {"S-1-A": {"yes": {}, "no": {}}, "L-1-A": {"yes": {}, "no": {}}}
+    r, _ = make(tmp_path, monkeypatch, books)
+    r.meta["S-1-A"]["close_time"] = (pd.Timestamp.now(tz="UTC") + pd.Timedelta(hours=5)).isoformat()
+    r.meta["L-1-A"]["close_time"] = (pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=5)).isoformat()
+    assert r.flow_ok("S-1-A", CFG) is False
+    assert r.flow_ok("L-1-A", CFG) is None                                  # read queued as usual
+
+
+def test_an_exit_moves_down_only_from_two_ticks_over(tmp_path, monkeypatch):
+    books = {"Z-1-A": {"yes": {0.17: 46.0, 0.16: 353.0}, "no": {0.69: 15.0, 0.52: 59.0}}}
+    r, c = make(tmp_path, monkeypatch, books)
+    _held(r, "Z-1-A", "no", 0.83, 72.0)
+    r.state["orders"] = {"Z-1-A|yes|h": _order("yes", 0.19, size=72.0, oid="x", group=None, placed=time.time() - 60)}
+
+    async def go():
+        await boot(r)
+        r.dirty.add("Z-1-A")
+        await settle(r)
+    asyncio.run(go())
+    assert r.state["orders"]["Z-1-A|yes|h"]["price"] == 0.19 and not c.calls       # 1 tick over 0.18: stays

@@ -14,7 +14,7 @@ CFG = farm.Cfg(max_capital=5000, num_markets=5, min_lots_frac=0.0, sentinel_keep
                min_ahead=0.0, max_position=1000.0, write_tokens_per_s=5.0, scan_markets=1, scan_rotate=0, refresh_s=30,
                programs_refresh_s=600, flow_days=4.0, max_trades_day=50.0, loss_per_trade=3.0, loss_cap=30.0,
                min_lip_to_loss=2.0,
-               skip_categories="Sports,Mentions", skip_series="KXRT")
+               skip_categories="Sports,Mentions", skip_series="KXRT", min_close_h=48.0)
 
 
 @pytest.fixture(autouse=True)
@@ -205,3 +205,11 @@ def test_a_side_goes_deep_on_its_own_lip_not_the_markets():
     others = {"yes": {0.36: 12662.0, 0.26: 292.0, 0.15: 1.0}, "no": {0.26: 23.0, 0.15: 3001.0}}
     pl = plan_market("T", others, P, cfg, {}, 1000)
     assert pl.big["yes"] >= 0.26
+
+
+def test_expected_loss_rises_toward_the_close():
+    pl = farm.Plan("T", "wide", (("yes", 0.4), ("no", 0.5)), 1e-3, 900.0, 0.002, 1000)
+    base = farm.expected_loss_day(4.0, pl, CFG)
+    assert farm.expected_loss_day(4.0, pl, CFG, 90.0) == pytest.approx(base)
+    assert farm.expected_loss_day(4.0, pl, CFG, 3.0) == pytest.approx(3.3 * base)
+    assert farm.expected_loss_day(4.0, pl, CFG, 0.5) == pytest.approx(4.0 * base)

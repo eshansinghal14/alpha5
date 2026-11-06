@@ -226,6 +226,10 @@ class Cfg:
                              "of 50+ lot sweeps adverse vs 29% across LIP markets, with review-day bursts not tied "
                              "to the close (FOC 11-05: four sweeps, ~$390, 25 days before close).",
                              group="pricing", sub="low flow (all markets)")
+    min_close_h: float = param("Don't quote a market closing within this many hours. 14-day tape: adverse sweeps "
+                               "per market-day 28 per 100 in the last day vs 3.5 beyond 90 days (11-05: the "
+                               "October ad-spend markets swept 5 h before their close, ~$450).", min=0.0,
+                               max=720.0, step=6.0, group="pricing", sub="low flow (all markets)")
     exit_depth_frac: float = param("Neither wide nor decided: quote both touches only with exit liquidity, "
                                    "each bid at most this fraction of others' bids within exit_depth_slip "
                                    "under the touch (what a fill could be sold into), and at least "
@@ -298,12 +302,28 @@ class Plan:
     loss_rate: float = 0.0             # expected adverse-sweep loss, $/s (expected_loss_day / 86400)
 
 
-def expected_loss_day(trades_day: float, pl: Plan, cfg: Cfg) -> float:
+# Expected-loss multiplier by days to close: adverse-sweep loss per market-day on the
+# 14-day tape (10-22..11-05, <= 50 trades/day) relative to markets 30+ days out
+# ($1.5): < 1 d $6.0, 1-7 d ~$5.0, 7-30 d $2.0.
+TTE_LOSS_MULT = ((1.0, 4.0), (7.0, 3.3), (30.0, 1.3))
+
+
+def tte_mult(days_to_close: float | None) -> float:
+    if days_to_close is None:
+        return 1.0
+    for days, mult in TTE_LOSS_MULT:
+        if days_to_close < days:
+            return mult
+    return 1.0
+
+
+def expected_loss_day(trades_day: float, pl: Plan, cfg: Cfg, days_to_close: float | None = None) -> float:
     """Expected adverse-sweep loss, $/day, of quoting `pl` on a market trading
     `trades_day`: loss_per_trade per trade/day up to loss_cap, for 1000 lots
-    on each side, scaled by the lots we actually bid (fit, max_trades_day)."""
+    on each side, scaled by the lots we actually bid (fit, max_trades_day),
+    times tte_mult for how close the market is to its close."""
     per_side = min(cfg.loss_per_trade * trades_day, cfg.loss_cap) / 2.0
-    return per_side * pl.lots * len(pl.legs) / 1000.0
+    return per_side * pl.lots * len(pl.legs) / 1000.0 * tte_mult(days_to_close)
 
 
 def key(ticker: str, side: str, hedge: bool = False) -> str:
