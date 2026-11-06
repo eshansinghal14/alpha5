@@ -214,6 +214,11 @@ class Cfg:
                                   "(scaled by our bids' size). Same test: <=2 trades/day ~$0.5-1/day, 2-3 $3, "
                                   "3-10 $11-20, 10-50 $23-30.", min=0.0, step=0.5, group="pricing",
                                   sub="low flow (all markets)")
+    loss_min_trades: float = param("Expected loss treats a market as trading at least this many times a day: at 0 a "
+                                   "market that never trades was charged nothing however big the hole under our bid "
+                                   "(ANTHVSPEND 11-06: $0 charged, ~$320 if swept). 0.3 x loss_per_trade ~ $0.9/day, "
+                                   "the measured loss of the <= 2 trades/day band.", min=0.0, step=0.1,
+                                   group="pricing", sub="low flow (all markets)")
     loss_cap: float = param("Expected loss per market-day stops growing here (the 10-50 trades/day band "
                             "lost $23-30).", min=0.0, step=5.0, group="pricing", sub="low flow (all markets)")
     min_lip_to_loss: float = param("Quote a market only if its LIP/day is at least this many times its expected "
@@ -362,7 +367,7 @@ def expected_loss_day(trades_day: float, pl: Plan, cfg: Cfg, days_to_close: floa
     times tte_mult for how close the market is to its close. With `others`
     (others' bids, {"yes": {price: size}, "no": ...}) each leg is also scaled by
     its exit_ticks over the tape's average drop: a hole under the bid costs more."""
-    per_side = min(cfg.loss_per_trade * trades_day, cfg.loss_cap) / 2.0
+    per_side = min(cfg.loss_per_trade * max(trades_day, cfg.loss_min_trades), cfg.loss_cap) / 2.0
     if others is None:
         legs = float(len(pl.legs))
     else:
