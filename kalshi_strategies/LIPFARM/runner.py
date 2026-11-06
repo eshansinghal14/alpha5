@@ -493,9 +493,32 @@ class Runner:
             ot = self.meta.get(t, {}).get("open_time")
             self.flow_futs[t] = self.flow_pool.submit(farm.fetch_flow, t, cfg.flow_days,
                                                       pd.Timestamp(ot).timestamp() if ot else None)
+        if cfg.flow_long_days > 0:
+            longs = self.state.setdefault("flow_long", {})
+            lk = t + "|long"
+            fut = self.flow_futs.get(lk)
+            if fut is not None and fut.done():
+                del self.flow_futs[lk]
+                if fut.result() is not None:
+                    longs[t] = fut.result()
+            g = longs.get(t)
+            stale = (g is None or time.time() - g["at"] > farm.FLOW_LONG_TTL_S
+                     or abs(g["days"] - cfg.flow_long_days) > 1e-9)
+            if stale and lk not in self.flow_futs and len(self.flow_futs) < farm.FLOW_QUEUE:
+                ot = self.meta.get(t, {}).get("open_time")
+                self.flow_futs[lk] = self.flow_pool.submit(farm.fetch_flow_long, t, cfg.flow_long_days,
+                                                           pd.Timestamp(ot).timestamp() if ot else None)
+            if g is None and (f is None or f["trades_day"] <= cfg.max_trades_day + 1e-9):
+                return None
         if f is None:
             return None
         return f["trades_day"] <= cfg.max_trades_day + 1e-9
+
+    def trades_day(self, t: str) -> float:
+        """The expected-loss rate: the higher of the flow_days and flow_long_days readings."""
+        f = self.state.get("flow", {}).get(t) or {}
+        g = self.state.get("flow_long", {}).get(t) or {}
+        return max(f.get("trades_day") or 0.0, g.get("trades_day") or 0.0)
 
     def url(self, t: str) -> str:
         ev = self.meta.get(t, {}).get("event_ticker") or event_of(t)
@@ -1335,8 +1358,7 @@ class Runner:
             ok = self.flow_ok(t, cfg) if pl else False
             if pl and ok:
                 # LIP must pay for the market's expected adverse-sweep loss.
-                f = self.state["flow"][t]
-                pl.loss_rate = farm.expected_loss_day(f["trades_day"], pl, cfg, self.days_to_close(t),
+                pl.loss_rate = farm.expected_loss_day(self.trades_day(t), pl, cfg, self.days_to_close(t),
                                                       books.get(t)) / 86400
                 ok = pl.rate >= cfg.min_lip_to_loss * pl.loss_rate
                 # Taking most of the pool means nobody else wants to quote here.
@@ -1347,9 +1369,8 @@ class Runner:
                 plans[t] = pl
             # What the flow filter costs: plans it holds back (False) or hasn't read yet (None).
             if pl and not ok:
-                f = self.state.get("flow", {}).get(t) or {}
                 self.flow_held[t] = {"usd_day": pl.rate * 86400, "per_k": pl.rate * 86400 / max(pl.capital / 1000, 0.05),
-                                     "exp_loss_day": pl.loss_rate * 86400, "trades_day": f.get("trades_day"),
+                                     "exp_loss_day": pl.loss_rate * 86400, "trades_day": self.trades_day(t),
                                      "pool_share": round(farm.pool_share(pl), 3),
                                      "mode": pl.mode, "at": time.time()}
             else:

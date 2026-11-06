@@ -849,3 +849,19 @@ def test_a_refused_create_waits_before_the_same_order_is_tried_again(tmp_path, m
         assert await r.place("Z-1-A", "yes", 0.11, 100.0, hedge=True) is False
         assert len(c.calls) == n                                            # not sent again
     asyncio.run(go())
+
+
+def test_expected_loss_uses_the_long_window_when_it_is_busier(tmp_path, monkeypatch):
+    books = {"W-1-A": {"yes": {0.30: 500.0}, "no": {0.66: 500.0}}}
+    r, _ = make(tmp_path, monkeypatch, books)
+    r.state["flow"] = {"W-1-A": {"trades_day": 0.0, "days": 10.0, "at": time.time()}}
+    r.state["flow_long"] = {"W-1-A": {"trades_day": 0.95, "days": 60.0, "at": time.time()}}
+    assert r.trades_day("W-1-A") == pytest.approx(0.95)
+    cfg = dataclasses.replace(CFG, flow_long_days=60.0, flow_days=10.0)
+    assert r.flow_ok("W-1-A", cfg) is True
+    del r.state["flow_long"]["W-1-A"]
+    monkeypatch.setattr(farm, "fetch_flow_long", lambda t, days, opened=None: {"trades_day": 0.95, "days": days,
+                                                                                "at": time.time()})
+    assert r.flow_ok("W-1-A", cfg) is None                 # not quoted until the long read is in
+    r.flow_futs["W-1-A|long"].result()
+    assert r.flow_ok("W-1-A", cfg) is True and r.trades_day("W-1-A") == pytest.approx(0.95)

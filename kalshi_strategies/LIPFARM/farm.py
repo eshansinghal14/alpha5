@@ -135,6 +135,8 @@ TRIP_COOLDOWN_S = 60.0
 # Trailing flow (max_trades_day) is re-read this often per
 # market; at most FLOW_QUEUE reads wait at once, best markets first.
 FLOW_TTL_S = 3600.0
+FLOW_LONG_TTL_S = 86400.0
+FLOW_LONG_PAGES = 5                    # 5000 trades: past any max_trades_day over 60 days
 FLOW_QUEUE = 40
 MOVE_MIN_S = 5.0
 MOVE_BEHIND_FRAC = 0.05
@@ -212,6 +214,10 @@ class Cfg:
     flow_days: float = param("Every quoted market must be low-flow over this many trailing days (public "
                              "trades, re-read hourly).", min=0.5, max=14.0, step=0.5, group="pricing",
                              sub="low flow (all markets)")
+    flow_long_days: float = param("Expected loss also counts trades over this many days, using the higher rate "
+                                  "(re-read daily): a 10-day window can land in a lull. WVCOAL T82 11-06: 0 "
+                                  "trades in 10 days, 0.95/day over 60, then one 3,353-lot sweep. 0 = off.",
+                                  min=0.0, max=180.0, step=10.0, group="pricing", sub="low flow (all markets)")
     max_trades_day: float = param("Never quote a market trading more than this per day (a market younger "
                                   "than flow_days over its own age); under it, LIP must pay for the expected "
                                   "loss (min_lip_to_loss). Out of sample (10 days predicting the next 4, "
@@ -732,6 +738,25 @@ def fetch_flow(t: str, days: float, opened: float | None = None) -> dict | None:
     if d.get("cursor"):
         return {"trades_day": math.inf, "days": days, "at": time.time()}
     return {"trades_day": len(tr) / span, "days": days, "at": time.time()}
+
+
+def fetch_flow_long(t: str, days: float, opened: float | None = None) -> dict | None:
+    """fetch_flow over a long window, paging up to FLOW_LONG_PAGES (more is inf)."""
+    span = days if opened is None else min(days, max(1.0, (time.time() - opened) / 86400))
+    n, cur = 0, None
+    try:
+        for _ in range(FLOW_LONG_PAGES):
+            p = {"ticker": t, "min_ts": int(time.time() - days * 86400), "limit": 1000}
+            if cur:
+                p["cursor"] = cur
+            d = read("/trade-api/v2/markets/trades", params=p)
+            n += len(d.get("trades") or [])
+            cur = d.get("cursor")
+            if not cur:
+                return {"trades_day": n / span, "days": days, "at": time.time()}
+    except Exception:
+        return None
+    return {"trades_day": math.inf, "days": days, "at": time.time()}
 
 
 def load_categories() -> dict[str, dict]:

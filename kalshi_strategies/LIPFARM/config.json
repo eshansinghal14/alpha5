@@ -34,6 +34,7 @@
     "max_pool_share": 0.5,
     "loss_min_trades": 0.3,
     "wide_exit_frac": 1.0,
-    "wide_exit_slip": 0.1
+    "wide_exit_slip": 0.1,
+    "flow_long_days": 60.0
   }
 }
