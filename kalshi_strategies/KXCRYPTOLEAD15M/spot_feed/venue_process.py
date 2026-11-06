@@ -387,6 +387,9 @@ class VenueProcess:
         self.status: dict = {}
         self._reader_thread: threading.Thread | None = None
         self.n_reader_restarts = 0
+        # fn(coin, bid, ask, recv_wall) -> callable | None, on the reader
+        # thread for each immediate CME touch (FastTaker.on_cme_touch).
+        self.on_fast_cme = None
 
     def alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
@@ -433,6 +436,14 @@ class VenueProcess:
                 return
             if len(frame) > 3 and isinstance(frame[3], dict):
                 frame[3]["arrived"] = time.time()
+            fire, hook = None, self.on_fast_cme
+            if hook is not None and frame[0] and len(frame) > 3 and "sent" in frame[3]:
+                for venue, coin, _p, bids, asks, recv_wall, _x, resync in frame[0]:
+                    if venue == "cme" and bids and asks and not resync:
+                        try:
+                            fire = hook(coin, bids[0][0], asks[0][0], recv_wall) or fire
+                        except Exception as e:
+                            print(f"[spot/venues] fast take check failed: {e!r}", flush=True)
             with self._lock:
                 if len(self._frames) == self._frames.maxlen:
                     self.n_dropped += 1
@@ -443,6 +454,13 @@ class VenueProcess:
                     self.on_urgent()
                 except Exception:
                     pass
+            # After the frame is queued: the loop pulls quotes on it while this
+            # thread waits on the take's round trip.
+            if fire is not None:
+                try:
+                    fire()
+                except Exception as e:
+                    print(f"[spot/venues] fast take failed: {e!r}", flush=True)
 
     def ensure_running(self):
         """Start the child, or restart a dead one with backoff. Safe to call

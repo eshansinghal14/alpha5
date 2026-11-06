@@ -23,6 +23,7 @@ import collections
 import functools
 import gc
 import os
+import threading
 import time
 import traceback
 
@@ -143,6 +144,20 @@ def _decision_key(row: dict) -> tuple:
     # at 0.1bp it adds a row only on a real lead, not on every tick's jitter.
     g = row.get("x_perp_gap_bp")
     return tuple(row.get(k) for k in _DECISION_FIELDS) + (None if g is None else round(g, 1),)
+
+
+_FAST_CONN = []
+
+
+def _fast_conn(order_client):
+    """One FastOrderConn per process, warmed in the background; each event
+    points it at that event's order client (headers, shard, order group)."""
+    from kalshi_infra.kalshi.fast_orders import FastOrderConn
+    if not _FAST_CONN:
+        _FAST_CONN.append(FastOrderConn(order_client))
+        threading.Thread(target=_FAST_CONN[0].warm, daemon=True, name="fast-order-warm").start()
+    _FAST_CONN[0].client = order_client
+    return _FAST_CONN[0]
 
 
 def coalesce_latest(fn):
@@ -362,6 +377,13 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
     engine.set_clocks(signal_age_fn=model.signal_age_s, feed_age_fn=model.feed_age_s,
                       applied_age_fn=model.applied_age_s)
     engine.order_events = []
+    fast, venues = None, getattr(getattr(model, "spot", None), "venues", None)
+    if hasattr(model, "take_kernel") and venues is not None and hasattr(venues, "on_fast_cme"):
+        from kalshi_infra.trading.fast_take import FastTaker
+        fast = FastTaker(engine, quoter, conn=_fast_conn(order_client) if err is None else None,
+                         loop=asyncio.get_running_loop())
+        quoter.fast = fast
+        venues.on_fast_cme = fast.on_cme_touch
     attach = getattr(model, "attach_engine", None)   # optional: models that read our positions
     if attach is not None:
         attach(engine)
@@ -740,6 +762,9 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
         else:
             _log(S, f"STOP: {stop['reason']} -- disarming, pulling every quote, exiting")
     finally:
+        if fast is not None:
+            venues.on_fast_cme = None
+            fast.clear()
         for t in tasks:
             t.cancel()
         if arm["task"] is not None:

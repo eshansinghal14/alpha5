@@ -30,6 +30,10 @@ class QuotingParams:
         "Take limit this far through the touch (immediate-or-cancel: fills at the touch while it's there, else "
         "up to this much worse). The edge check stays at the touch. Empty = at the touch.", min=0, max=0.05,
         step=0.01)
+    fast_take: bool = param(
+        "Check each CME tick against take triggers the last decision precomputed, off the trading loop "
+        "(needs a model with a take kernel: KXBTC15M). Shadow unless fast_take_live.")
+    fast_take_live: bool = param("Send the fast path's takes; off logs them as fast_take_shadow order events.")
     take_max_position: float | None = param(
         "Separate cap on |yes - no| from takes (fills + in-flight), per market. When set, takes and quotes keep "
         "separate positions: take fills don't count toward the quotes' lean or max_position, and the take edge "

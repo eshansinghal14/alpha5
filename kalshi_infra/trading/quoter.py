@@ -119,6 +119,8 @@ class Quoter:
         self._res_hist: dict[tuple[str, str], deque] = {}
         # take_max_position: net YES bought by take fills, per market.
         self._take_net: dict[str, float] = {}
+        # FastTaker (fast_take): the session attaches it; tickets go out per decision.
+        self.fast = None
         self._fills_seen = 0
         self._atm_set: set[str] = set()
         self._take_since: dict[tuple[str, str], float] = {}
@@ -401,8 +403,55 @@ class Quoter:
             return False
         if now_s - self._take_last.get(key, -1e18) < w:
             return False
+        if self.fast is not None and now_s - self.fast.fired.get((key[0], key[1][5:]), -1e18) < w:
+            return False
         self._take_last[key] = now_s
         return True
+
+    def _fast_tickets(self, ctx, ticker, tprob, market_bid, market_ask, bid_edge, ask_edge, ok_b, ok_a,
+                      move_b, move_a, take_lots, now_s):
+        """Publish this decision's take triggers to the FastTaker: per side, the
+        CME shift at which the take price clears the same edge and move gate
+        the normal path applies (the move measured from the same reference)."""
+        q = self.cfg.quoting
+        kern = getattr(self.model, "take_kernel", None)
+        kern = kern(ticker) if (kern is not None and getattr(q, "fast_take", False)) else None
+        thru = getattr(q, "take_through", None) or 0.0
+        for side, ok, touch, edge, move in (("yes", ok_b, market_ask, bid_edge, move_b),
+                                            ("no", ok_a, market_bid, ask_edge, move_a)):
+            tk = None
+            if ok and kern is not None and touch is not None:
+                if side == "yes":
+                    req = touch + edge if move is None else max(touch + edge, tprob - move + edge)
+                    px = round(min(touch + thru, 0.99), 2)
+                else:
+                    req = touch - edge if move is None else min(touch - edge, tprob + move - edge)
+                    px = round(1.0 - max(touch - thru, 0.01), 2)
+                tk = self._ticket(ctx, ticker, side, kern, req, px, take_lots, now_s)
+            self.fast.publish(ticker, side, tk)
+
+    def _ticket(self, ctx, ticker, side, kern, req, px, take_lots, now_s):
+        from kalshi_infra.trading.fast_take import TICKET_TTL_S, Ticket
+        if not 0.0 < req < 1.0:
+            return None
+        sh = kern.shift_bp_for(req)
+        if sh is None:
+            return None
+        thr = max(sh, kern.min_bp) if side == "yes" else min(sh, -kern.min_bp)
+        if abs(thr) > kern.cap_bp + 1e-9:
+            return None                      # no shift the lead can show gets there
+        z = self._fit_to_loss(ctx, ticker, side, "take", [px], take_lots)
+        if z < 0.01:
+            return None
+        key = (ticker, f"take_{side}")
+        last = max(self._take_last.get(key, -1e18), self.fast.fired.get((ticker, side), -1e18))
+        return Ticket(ticker=ticker, side=side, coin=kern.coin, ref_lb=kern.ref_lb, ref_la=kern.ref_la,
+                      thr_bp=thr, cap_bp=kern.cap_bp, price=px, size=z, not_before=last + TAKE_HOLD_S,
+                      expires=now_s + TICKET_TTL_S, req_prob=req)
+
+    def note_fast_take(self, order):
+        """A fast take went out: count it in flight like the normal path does."""
+        self._sent.setdefault((order.ticker, order.side), []).append((order.decision_time, order.size))
 
     def _note_touch(self, ticker: str, side: str, price: float | None, now_s: float):
         prev = self._touch_set.get((ticker, side))
@@ -582,6 +631,11 @@ class Quoter:
             want_b = want_b and move_b >= bid_edge
             want_a = want_a and move_a >= ask_edge
         hold = move_w is None
+        if self.fast is not None:
+            self._fast_tickets(ctx, ticker, tprob, market_bid, market_ask, bid_edge, ask_edge,
+                               q.enable_taking and block_bid is None and cap_yes,
+                               q.enable_taking and block_ask is None and cap_no,
+                               move_b, move_a, take_lots, now_s)
         # Missed KXBTC15M takes (11-06, 472 of 549) lost the touch to other
         # takers with the next level 1c worse, and were still +1.5c at 10s there.
         thru = getattr(q, "take_through", None) or 0.0

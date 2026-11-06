@@ -34,7 +34,7 @@ def risk(**r):
 
 
 def cfg(risk_kw=None, **q):
-    base = dict(order_lots=1.0, max_position=10.0, take_lots=None, take_through=None, take_max_position=None, constant_edge=0.01, constant_edge_ref_s=None, edge_fraction=1.0,
+    base = dict(order_lots=1.0, max_position=10.0, take_lots=None, take_through=None, fast_take=False, fast_take_live=False, take_max_position=None, constant_edge=0.01, constant_edge_ref_s=None, edge_fraction=1.0,
                 lean_dollars=0.02, max_markets=None, atm_hysteresis=0,
                 enable_taking=True, enable_quoting=True, quoting_edge=0.0, max_improve_ticks=1, quote_levels_behind=0, take_move_window_s=None,
                 skip_quote_depth_ahead=None, max_book_delta=None, quote_keep_inside=0.0, quote_ahead_grace_s=1.0,

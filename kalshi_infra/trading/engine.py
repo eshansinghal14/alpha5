@@ -1291,6 +1291,17 @@ class LiveEngine:
         _order_pool().submit(self._timed(lambda: self._place_blocking(order))).add_done_callback(
             lambda f: _post(loop, lambda res: self._on_real_take_timed(order, res), f))
 
+    def fast_take_sent(self, order: Order, quoter, meta: dict):
+        """A FastTaker take is on the wire (sent off the loop): book it like
+        _send_real_order would have; its result comes to _on_real_take_timed."""
+        self.orders.append(order)
+        self.n_real_orders += 1
+        self.n_real_in_flight += 1
+        self._oev("take_sent", order_id=order.order_id, ticker=order.ticker, side=order.side, price=order.price,
+                  size=order.size, role="take", since_decision_s=0.0, fast=True,
+                  since_cme_ms=meta.get("since_cme_ms"), shift_bp=meta.get("shift_bp"))
+        quoter.note_fast_take(order)
+
     def _on_real_take_timed(self, order: Order, res: tuple):
         result, rtt, pickup, t_done = res
         fill, exc = result

@@ -14,6 +14,7 @@ mid as the fast signal between CF ticks, put on CF's level by a 30s basis:
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 import time
 
 import numpy as np
@@ -25,7 +26,7 @@ from kalshi_strategies.CRYPTO15M.shared_feed import extend, hold, implied_ema
 from kalshi_strategies.CRYPTO15M.pricer import implied_mu, prob_from_mu, prob_up, variance_clock
 from kalshi_strategies.KXCRYPTOLEAD15M.cf_index import STALE_S as CF_STALE_S
 from kalshi_strategies.KXCRYPTOLEAD15M.model import BASIS_MIN_S, BASIS_WINDOW_S
-from kalshi_strategies.KXCRYPTOLEAD15M.perp_nowcast import TOUCH_VENUES
+from kalshi_strategies.KXCRYPTOLEAD15M.perp_nowcast import CAP_BP, TOUCH_VENUES
 from kalshi_strategies.KXCRYPTOLEAD15M.series import START_END_AVG_S
 from kalshi_strategies.KXCRYPTOLEAD15M.settlement_tracker import EventWindow
 
@@ -101,6 +102,10 @@ class UpDownModel:
             if t != self._otouch:
                 self._otouch = t
                 self._dirty = True          # re-anchors on this book's dispatch
+
+    def take_kernel(self, ticker):
+        """This reprice's TakeKernel for the fast take path, or None."""
+        return getattr(self, "_kernel", None) if ticker == self.ticker else None
 
     def set_own_quotes(self, fn):
         """fn(ticker, side) -> [(price, size)] of ours that Kalshi's book shows."""
@@ -326,6 +331,7 @@ class UpDownModel:
     def _price(self, now_s: float):
         p = self.cfg.pricing
         mono = time.monotonic()
+        self._kernel = None
         self.health.observe({self.coin: self.bus.feeds[self.coin].venue_books()}, now=mono)
         if self.health.down_coins([self.coin], mono):
             return self._withhold("coin_down")
@@ -479,6 +485,12 @@ class UpDownModel:
         prob = prob_from_mu(mu_mkt + mu_core - mu_ref, sd, p.t_nu)
         take = None
         if take_full:
+            ref = pnc._touch_at_spot.get(("cme", self.coin))
+            c0 = core(0.0)
+            slope = core(1.0) - c0
+            if ref is not None and slope > 0:
+                self._kernel = TakeKernel(self.coin, ref[0], ref[1], CAP_BP, p.take_min_shift_bp or 0.0,
+                                          mu_mkt + c0 - mu_ref, slope, sd, p.t_nu)
             _, full = pnc.increment(self.coin, mono, mid, leads=("cme",), full=True)
             if full is not None and full != inc_bp and self._shift_ok(full):
                 take = prob_from_mu(mu_mkt + core(full) - mu_ref, sd, p.t_nu)
@@ -611,3 +623,23 @@ class UpDownModel:
 
 
 __all__ = ["UpDownModel"]
+
+
+@dataclass(frozen=True)
+class TakeKernel:
+    """The anchored take price as a function of the CME whole-touch shift x
+    (bp, from the touch at the last spot move): prob_from_mu(m0 + slope * x)."""
+    coin: str
+    ref_lb: float
+    ref_la: float
+    cap_bp: float
+    min_bp: float
+    m0: float
+    slope: float
+    sd: float
+    nu: float | None
+
+    def shift_bp_for(self, prob: float) -> float | None:
+        if not 1e-6 < prob < 1 - 1e-6:
+            return None
+        return (implied_mu(prob, self.sd, self.nu, clip=1e-6) - self.m0) / self.slope
