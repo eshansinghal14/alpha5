@@ -582,8 +582,11 @@ class Quoter:
             want_b = want_b and move_b >= bid_edge
             want_a = want_a and move_a >= ask_edge
         hold = move_w is None
-        bid_final = market_ask if (want_b and self._take_ok(key_b, now_s, hold)) else None
-        ask_final = market_bid if (want_a and self._take_ok(key_a, now_s, hold)) else None
+        # Missed KXBTC15M takes (11-06, 472 of 549) lost the touch to other
+        # takers with the next level 1c worse, and were still +1.5c at 10s there.
+        thru = getattr(q, "take_through", None) or 0.0
+        bid_final = min(market_ask + thru, 0.99) if (want_b and self._take_ok(key_b, now_s, hold)) else None
+        ask_final = max(market_bid - thru, 0.01) if (want_a and self._take_ok(key_a, now_s, hold)) else None
         if not want_b:
             self._take_since.pop(key_b, None)
         if not want_a:

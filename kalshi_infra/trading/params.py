@@ -26,6 +26,10 @@ class QuotingParams:
         "Cap on |yes - no| PER MARKET, on effective position (fills + in-flight + resting). "
         "Lowering it does not unwind, only caps growth.", min=0, step=1.0)
     take_lots: float | None = param("Contracts per take; empty = order_lots.", min=0.01, step=1.0)
+    take_through: float | None = param(
+        "Take limit this far through the touch (immediate-or-cancel: fills at the touch while it's there, else "
+        "up to this much worse). The edge check stays at the touch. Empty = at the touch.", min=0, max=0.05,
+        step=0.01)
     take_max_position: float | None = param(
         "Separate cap on |yes - no| from takes (fills + in-flight), per market. When set, takes and quotes keep "
         "separate positions: take fills don't count toward the quotes' lean or max_position, and the take edge "
