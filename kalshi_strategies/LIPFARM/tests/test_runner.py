@@ -247,6 +247,10 @@ def test_a_cycle_plans_off_the_loop_and_places_after_a_passing_flow_read(tmp_pat
     monkeypatch.setattr(farm, "fetch_book", lambda t: ob)
     monkeypatch.setattr(farm, "arbs_held_events", lambda: set())
     monkeypatch.setattr(runner, "CLAIM_SETTLE_S", 0.0)          # ARBS's stand-aside wait
+    # A one-day program, so its LIP clears the decided market's small flip charge.
+    now = pd.Timestamp.now(tz="UTC")
+    r.programs["Z-1-A"].update(start_date=(now - pd.Timedelta(hours=12)).isoformat(),
+                               end_date=(now + pd.Timedelta(hours=12)).isoformat())
 
     async def go():
         await boot(r)
