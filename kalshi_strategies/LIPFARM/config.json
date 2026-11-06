@@ -9,7 +9,7 @@
     "adverse_lots": 300,
     "min_lots_frac": 0.2,
     "exit_depth_frac": 1.0,
-    "exit_depth_slip": 0.03,
+    "exit_depth_slip": 0.1,
     "wide_spread": 0.2,
     "min_leg_price": 0.2,
     "decided_min": 0.97,

@@ -10,7 +10,7 @@ from kalshi_strategies.LIPFARM.farm import parse_book, plan_market, remove_ours
 FETCH_FLOW = farm.fetch_flow          # the real one; an autouse fixture stubs it
 P = lip.LipParams(target_size=1000, discount_factor=0.5, period_reward_usd=86.4, snapshots_per_period=86400)
 CFG = farm.Cfg(max_capital=5000, num_markets=5, min_lots_frac=0.0, sentinel_keep=2.0, dump_slip_ticks=2, chase_ticks=2, max_chase_ticks=5,
-               adverse_lots=300, recover_s=0.0, event_pull_s=0.0, deep_keep=0.0, exit_depth_frac=10.0, exit_depth_slip=0.03, wide_spread=0.20, min_leg_price=0.0, decided_min=0.97,
+               adverse_lots=300, recover_s=0.0, event_pull_s=0.0, deep_keep=0.0, exit_depth_frac=10.0, exit_depth_slip=0.10, wide_spread=0.20, min_leg_price=0.0, decided_min=0.97,
                min_ahead=0.0, max_position=1000.0, write_tokens_per_s=5.0, scan_markets=1, scan_rotate=0, refresh_s=30,
                programs_refresh_s=600, flow_days=4.0, max_trades_day=50.0, loss_per_trade=3.0, loss_cap=30.0,
                min_lip_to_loss=2.0,
@@ -76,9 +76,9 @@ def _held(f, side="yes", price=0.97, size=600.0):
 
 
 def test_exit_depth_counts_only_bids_below_ours(tmp_path, monkeypatch):
-    cfg = dataclasses.replace(CFG, exit_depth_frac=1.0, exit_depth_slip=0.03)
-    # no touch 0.05 with 1500 there and only 1c bids below: no exit depth on no.
-    o = {"yes": {0.80: 1500.0, 0.78: 400.0}, "no": {0.05: 1500.0, 0.01: 9000.0}}
+    cfg = dataclasses.replace(CFG, exit_depth_frac=1.0, exit_depth_slip=0.10)
+    # Only bids past a sweep's 3-tick reach count: yes has 400 four ticks down; no's 9000 is one tick down.
+    o = {"yes": {0.80: 1500.0, 0.76: 400.0}, "no": {0.05: 1500.0, 0.04: 9000.0}}
     assert farm.exit_lots(o, cfg, 1000) == {"yes": 400, "no": 0}
     P1 = lip.LipParams(target_size=1000, discount_factor=0.5, period_reward_usd=86.4, snapshots_per_period=86400)
     pl = plan_market("T", o, P1, dataclasses.replace(cfg, wide_spread=0.15), {}, farm.exit_lots(o, cfg, 1000))
@@ -93,7 +93,7 @@ def test_forced_spends_borrow_at_most_one_burst():
 
 
 def test_wide_skips_legs_under_min_leg_price():
-    others = {"yes": {0.70: 50.0, 0.68: 2000.0}, "no": {0.06: 20.0, 0.05: 5000.0}}
+    others = {"yes": {0.70: 50.0, 0.66: 2000.0}, "no": {0.06: 20.0, 0.05: 5000.0}}
     cfg = dataclasses.replace(CFG, min_leg_price=0.10, exit_depth_frac=10.0)
     pl = plan_market("T", others, P, cfg, {}, farm.exit_lots(others, cfg, 1000))
     assert pl.mode == "wide" and pl.legs == (("yes", 0.70),)    # the 6c no leg isn't quoted
@@ -133,7 +133,7 @@ def test_sides_sized_under_target_fifth_are_not_quoted():
 
 
 def test_bid_size_follows_the_programs_target():
-    deep = {"yes": {0.40: 50.0, 0.39: 9000.0}, "no": {0.35: 50.0, 0.34: 9000.0}}
+    deep = {"yes": {0.40: 50.0, 0.36: 9000.0}, "no": {0.35: 50.0, 0.31: 9000.0}}
     for target in (1000, 2500):
         Pt = dataclasses.replace(P, target_size=target)
         assert plan_market("T", deep, Pt, CFG, {}, farm.exit_lots(deep, CFG, target)).lots == target
@@ -144,24 +144,24 @@ def _tr(ts, side, yes_px):
 
 
 def test_narrow_market_needs_exit_liquidity_and_is_sized_by_it():
-    others = {"yes": {0.45: 500.0, 0.44: 300.0}, "no": {0.50: 500.0, 0.49: 600.0}}
+    others = {"yes": {0.45: 500.0, 0.41: 300.0}, "no": {0.50: 500.0, 0.46: 600.0}}
     assert plan_market("T", others, P, CFG) is None                     # 5c spread: needs exit
     pl = plan_market("T", others, P, dataclasses.replace(CFG, exit_depth_frac=1.0), {},
                      exit=farm.exit_lots(others, dataclasses.replace(CFG, exit_depth_frac=1.0), 1000))
     assert pl.mode == "narrow" and set(pl.legs) == {("yes", 0.45), ("no", 0.50)} and pl.lots == 300
     # No depth under a touch: that side isn't backed, so it isn't quoted.
-    thin = {"yes": {0.45: 1500.0}, "no": {0.50: 500.0, 0.49: 600.0}}
+    thin = {"yes": {0.45: 1500.0, 0.44: 900.0}, "no": {0.50: 500.0, 0.46: 600.0}}     # 0.44 is inside a sweep's reach
     pl = plan_market("T", thin, P, CFG, {}, exit=farm.exit_lots(thin, CFG, 1000))
     assert pl.legs == (("no", 0.50),)
     # min_leg_price holds for narrow legs too.
-    cheap = {"yes": {0.05: 1500.0, 0.04: 600.0}, "no": {0.90: 1500.0, 0.89: 600.0}}
+    cheap = {"yes": {0.05: 1500.0, 0.01: 600.0}, "no": {0.90: 1500.0, 0.86: 600.0}}
     pl = plan_market("T", cheap, P, dataclasses.replace(CFG, min_leg_price=0.2), {},
                      exit=farm.exit_lots(cheap, CFG, 1000))
     assert pl.mode == "narrow" and pl.legs == (("no", 0.90),)
 
 
 def test_a_side_we_hold_is_not_bid_again():
-    others = {"yes": {0.40: 2000.0, 0.39: 2000.0}, "no": {0.45: 2000.0, 0.44: 2000.0}}
+    others = {"yes": {0.40: 2000.0, 0.36: 2000.0}, "no": {0.45: 2000.0, 0.41: 2000.0}}
     ex = farm.exit_lots(others, CFG, 1000)
     assert set(plan_market("T", others, P, CFG, {"yes": 25.0}, exit=ex).legs) == {("yes", 0.40), ("no", 0.45)}
     assert plan_market("T", others, P, CFG, {"yes": 797.0}, exit=ex).legs == (("no", 0.45),)
@@ -257,3 +257,9 @@ def test_wide_bids_are_sized_to_the_exit_under_them():
     pl = plan_market("T", others, P, cfg)
     assert pl.mode == "wide" and [s for s, _ in pl.legs] == ["yes"] and pl.lots == 600
     assert plan_market("T", {"yes": {0.40: 50.0}, "no": {0.35: 1500.0}}, P, cfg) is None   # no exit anywhere
+
+
+def test_exit_depth_inside_a_sweeps_reach_does_not_count():
+    # WVCOAL 11-06 before the sweep: 1,712 lots 1-3 ticks under the 66c touch, which one 3,353-lot sell took.
+    o = {"yes": {0.30: 500.0}, "no": {0.66: 2457.0, 0.65: 1487.0, 0.64: 25.0, 0.63: 200.0}}
+    assert farm.exit_lots(o, dataclasses.replace(CFG, exit_depth_frac=1.0), 1000)["no"] == 0

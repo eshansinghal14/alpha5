@@ -597,16 +597,17 @@ def deepest_price(s: str, touch: float, others, rest: list, lots: float, params,
 
 def exit_lots(others: dict[str, dict[float, float]], cfg: Cfg, target: float) -> dict[str, float]:
     """Bid size per side: the program's `target`, capped by that side's exit depth, others'
-    bids strictly BELOW the touch we'd join, within exit_depth_slip. Bids at
-    our own price don't count: a seller who fills us full size has cleared
-    that level too (NMAN 11-04: 1000 of 1000 at 5c, the next bid 1c)."""
+    bids more than SWEEP_REACH_TICKS below the touch we'd join, within exit_depth_slip.
+    Bids nearer don't count: a sweep that fills us usually clears them too
+    (WVCOAL 11-06: 3,353 lots took 66c down to 63c, the next bid 58c)."""
     out = {}
     for s, book in others.items():
         if not book:
             out[s] = 0.0
             continue
         top = max(book)
-        d = sum(q for p, q in book.items() if top - cfg.exit_depth_slip - 1e-9 <= p < top - 1e-9)
+        d = sum(q for p, q in book.items()
+                if top - cfg.exit_depth_slip - 1e-9 <= p < top - SWEEP_REACH_TICKS * 0.01 - 1e-9)
         out[s] = min(target, math.floor(cfg.exit_depth_frac * d))
     return out
 
