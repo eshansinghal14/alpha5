@@ -77,6 +77,10 @@ MAX_DUMP_MISSES = 5
 # others' size at our prices and at each touch over the last DEPTH_KEEP_S; the
 # FILL_CONTEXT_S before each LIP fill is journaled ("fill_context").
 DEPTH_KEEP_S = 30.0
+# After a refused create, the same order key waits this long. Without it an exit (which skips
+# the budget) re-sent the moment it failed: 47k 409s in 10 min on a closed market, 11-06.
+PLACE_RETRY_S = 5.0
+PLACE_RETRY_CONFLICT_S = 60.0
 FILL_CONTEXT_S = 10.0
 # Accuracy test for levels.Levels: every QUEUE_CHECK_S, Kalshi's size ahead of
 # each of our LIP bids vs the size ahead our reconstruction of the level gives.
@@ -183,6 +187,7 @@ class Runner:
         self.est: dict[str, float] = {}       # ticker -> our LIP $/s per dollar at its last read
         self.rot = 0
         self.dumping: set[str] = set()        # markets an informed fill hit: sell out now
+        self.place_wait: dict[str, float] = {}  # order key -> earliest retry after a refused create
         self.pull: set[str] = set()           # markets whose LIP bids go once their sells are out
         self.arm_requested = False
         self.cfg_adverse = 300.0              # cfg.adverse_lots, refreshed each second
@@ -837,7 +842,7 @@ class Runner:
         if not hedge and self.state.get("cooldown", {}).get(t, 0.0) > time.time():
             return False
         k = f"{t}|{side}|s" if sentinel else key(t, side, hedge)
-        if k in self.state["orders"]:
+        if k in self.state["orders"] or self.place_wait.get(k, 0.0) > time.time():
             return False
         gid = None
         if not hedge:
@@ -870,6 +875,7 @@ class Runner:
         if exc is not None:
             if self.state["orders"].get(k) is rec:
                 del self.state["orders"][k]
+            self.place_wait[k] = time.time() + (PLACE_RETRY_CONFLICT_S if http_status(exc) == 409 else PLACE_RETRY_S)
             if http_status(exc) == 429:
                 c.note_rate_limited(reason)
             print(f"place {t} {side}@{price}: {exc}")
@@ -1052,6 +1058,9 @@ class Runner:
         sell at once; dust -> sell; still falling -> chase; the rest rests an
         exit bid. Every write is spawned; t is busy until they're answered."""
         v = self.free_positions().get(t, 0.0)
+        dtc = self.days_to_close(t)
+        if dtc is not None and dtc <= 0:
+            v = 0.0                                  # closed: nothing can trade until it settles
         if abs(v) < 0.01 or t not in self.books or t not in self.meta:
             self.dumping.discard(t)
             self.exit_bid(t, 0.0)

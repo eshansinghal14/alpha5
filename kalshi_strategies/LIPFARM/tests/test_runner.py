@@ -15,6 +15,12 @@ import pandas as pd
 import pytest
 
 
+class _Refused(Exception):
+    def __init__(self, status):
+        super().__init__(f"{status} refused")
+        self.response = SimpleNamespace(status_code=status)
+
+
 class FakeClient:
     """A shard client: records every write in order, answers at once."""
     tokens_per_s = 300.0
@@ -23,6 +29,7 @@ class FakeClient:
     def __init__(self):
         self.calls, self.lock, self.n = [], threading.Lock(), 0
         self.ioc_fill = None                     # contracts an IOC fills (None: all)
+        self.fail_next = None                    # HTTP status the next create is refused with
 
     def _log(self, *row):
         with self.lock:
@@ -41,6 +48,10 @@ class FakeClient:
         pass
 
     def place_resting(self, order, order_group_id=None):
+        if self.fail_next:
+            st, self.fail_next = self.fail_next, None
+            self._log("refused", order.ticker)
+            raise _Refused(st)
         self.n += 1
         self._log("rest", order.ticker, order.side, order.price, order.size, order_group_id)
         return SimpleNamespace(exchange_order_id=f"r{self.n}", fill=None, parse_error=None)
@@ -806,3 +817,31 @@ def test_a_market_where_we_would_take_most_of_the_pool_is_held_back(tmp_path, mo
         await r.cycle(cfg)
     asyncio.run(go())
     assert "R-1-A" not in r.plans and r.flow_held["R-1-A"]["pool_share"] > 0.5
+
+
+def test_no_exit_is_sent_in_a_closed_market(tmp_path, monkeypatch):
+    books = {"Z-1-A": {"yes": {0.10: 500.0}, "no": {0.80: 500.0}}}
+    r, c = make(tmp_path, monkeypatch, books)
+    _held(r, "Z-1-A", "no", 0.38, 1000.0)
+    r.meta["Z-1-A"]["close_time"] = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=1)).isoformat()
+
+    async def go():
+        await boot(r)
+        r.dirty.add("Z-1-A")
+        await settle(r)
+    asyncio.run(go())
+    assert not c.calls and not any(k.endswith("|h") for k in r.state["orders"])
+
+
+def test_a_refused_create_waits_before_the_same_order_is_tried_again(tmp_path, monkeypatch):
+    books = {"Z-1-A": {"yes": {0.10: 500.0}, "no": {0.80: 500.0}}}
+    r, c = make(tmp_path, monkeypatch, books)
+
+    async def go():
+        await boot(r)
+        c.fail_next = 409
+        assert await r.place("Z-1-A", "yes", 0.11, 100.0, hedge=True) is False
+        n = len(c.calls)
+        assert await r.place("Z-1-A", "yes", 0.11, 100.0, hedge=True) is False
+        assert len(c.calls) == n                                            # not sent again
+    asyncio.run(go())
