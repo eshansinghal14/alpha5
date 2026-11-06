@@ -30,6 +30,7 @@
     "event_pull_s": 1800.0,
     "recover_s": 60.0,
     "skip_series": "KXRT",
-    "min_close_h": 48.0
+    "min_close_h": 48.0,
+    "max_pool_share": 0.5
   }
 }

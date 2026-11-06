@@ -785,3 +785,23 @@ def test_an_exit_moves_down_only_from_two_ticks_over(tmp_path, monkeypatch):
         await settle(r)
     asyncio.run(go())
     assert r.state["orders"]["Z-1-A|yes|h"]["price"] == 0.19 and not c.calls       # 1 tick over 0.18: stays
+
+
+def test_a_market_where_we_would_take_most_of_the_pool_is_held_back(tmp_path, monkeypatch):
+    books = {"R-1-A": {"yes": {0.97: 2000.0}, "no": {0.02: 5000.0}}}
+    r, c = make(tmp_path, monkeypatch, books)
+    ob = {"yes_dollars": [["0.97", "100"]], "no_dollars": [["0.02", "5000"]]}       # nearly alone on yes
+    monkeypatch.setattr(farm, "fetch_book", lambda t: ob)
+    monkeypatch.setattr(farm, "arbs_held_events", lambda: set())
+    r.programs["R-1-A"].update(start_date="2026-11-05T00:00:00Z", end_date="2026-11-06T00:00:00Z",
+                               period_reward=3600000)
+
+    async def go():
+        await boot(r)
+        cfg = dataclasses.replace(CFG, scan_markets=10, max_pool_share=0.5)
+        await r.cycle(cfg)
+        for f in list(r.flow_futs.values()):
+            f.result()
+        await r.cycle(cfg)
+    asyncio.run(go())
+    assert "R-1-A" not in r.plans and r.flow_held["R-1-A"]["pool_share"] > 0.5

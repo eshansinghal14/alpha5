@@ -1329,6 +1329,9 @@ class Runner:
                 f = self.state["flow"][t]
                 pl.loss_rate = farm.expected_loss_day(f["trades_day"], pl, cfg, self.days_to_close(t)) / 86400
                 ok = pl.rate >= cfg.min_lip_to_loss * pl.loss_rate
+                # Taking most of the pool means nobody else wants to quote here.
+                if ok and farm.pool_share(pl) > cfg.max_pool_share + 1e-9:
+                    ok = False
             self.est[t] = pl.rate - pl.loss_rate if pl and ok is not False else 0.0
             if pl and ok:
                 plans[t] = pl
@@ -1337,6 +1340,7 @@ class Runner:
                 f = self.state.get("flow", {}).get(t) or {}
                 self.flow_held[t] = {"usd_day": pl.rate * 86400, "per_k": pl.rate * 86400 / max(pl.capital / 1000, 0.05),
                                      "exp_loss_day": pl.loss_rate * 86400, "trades_day": f.get("trades_day"),
+                                     "pool_share": round(farm.pool_share(pl), 3),
                                      "mode": pl.mode, "at": time.time()}
             else:
                 self.flow_held.pop(t, None)

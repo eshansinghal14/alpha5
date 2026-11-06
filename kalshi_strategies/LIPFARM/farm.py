@@ -226,6 +226,12 @@ class Cfg:
                              "of 50+ lot sweeps adverse vs 29% across LIP markets, with review-day bursts not tied "
                              "to the close (FOC 11-05: four sweeps, ~$390, 25 days before close).",
                              group="pricing", sub="low flow (all markets)")
+    max_pool_share: float = param("Don't quote a market where our bids would take more than this share of the "
+                                  "pool on the sides we quote (each side is half the pool, so one side caps at "
+                                  "half this of the whole). Our fills 11-04..06: above half, fills per quoted hour "
+                                  "~5-10x and loss per hour ~10x the markets where we held under 25%: nobody else "
+                                  "quoting is a warning. 1 = off.", min=0.0, max=1.0, step=0.05, group="pricing",
+                                  sub="low flow (all markets)")
     min_close_h: float = param("Don't quote a market closing within this many hours. 14-day tape: adverse sweeps "
                                "per market-day 28 per 100 in the last day vs 3.5 beyond 90 days (11-05: the "
                                "October ad-spend markets swept 5 h before their close, ~$450).", min=0.0,
@@ -315,6 +321,11 @@ def tte_mult(days_to_close: float | None) -> float:
         if days_to_close < days:
             return mult
     return 1.0
+
+
+def pool_share(pl: Plan) -> float:
+    """Our LIP as a share of the pool on the sides we quote (each side is half the pool)."""
+    return pl.rate / max(pl.pool_rate * len(pl.legs) / 2.0, 1e-15)
 
 
 def expected_loss_day(trades_day: float, pl: Plan, cfg: Cfg, days_to_close: float | None = None) -> float:
