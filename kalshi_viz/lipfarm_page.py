@@ -81,7 +81,7 @@ def _status() -> dict | None:
 
 WINDOWS = {"6h": pd.Timedelta(hours=6), "24h": pd.Timedelta(hours=24), "7d": pd.Timedelta(days=7), "All": None}
 _LINES = {"net_usd": ("Net", "#1e88e5"), "exp_lip_usd": ("Expected LIP", "#43a047"),
-          "fill_pnl_usd": ("Fill P&L", "#e53935")}
+          "fill_pnl_usd": ("Fill P&L", "#e53935"), "locked_net_usd": ("Locked net", "#0d47a1")}
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -94,14 +94,18 @@ def _history() -> pd.DataFrame:
     if d.empty:
         return d
     d["time"] = pd.to_datetime(d["t"], unit="s", utc=True)
+    # Points rebuilt from the log before 11-07 19:00 UTC have no locked LIP, so no locked net.
+    d["locked_net_usd"] = d.get("lip_locked_usd", pd.Series(float("nan"), index=d.index)) + d["fill_pnl_usd"]
     return d.sort_values("time").reset_index(drop=True)
 
 
 def _window(h: pd.DataFrame, s: dict, span: pd.Timedelta | None) -> pd.DataFrame:
     """History in the window with the live summary appended, each line less its
-    value at the window's start (the last point before it), so all start at 0."""
+    value at the window's start (the last point before it), so all start at 0. A line
+    with no value there (locked net, before it was recorded) starts at its first point."""
     now = pd.Timestamp(s.get("updated_at") or time.time(), unit="s", tz="UTC")
-    live = pd.DataFrame([{"time": now, **{k: s.get(k) for k in _LINES}}])
+    live = pd.DataFrame([{"time": now, **{k: s.get(k) for k in _LINES},
+                          "locked_net_usd": s.get("lip_locked_usd", 0.0) + s.get("fill_pnl_usd", 0.0)}])
     h = pd.concat([h, live], ignore_index=True) if len(h) else live
     since = None if span is None else now - span
     before = h[h.time <= since] if since is not None else h.iloc[:0]
@@ -110,12 +114,15 @@ def _window(h: pd.DataFrame, s: dict, span: pd.Timedelta | None) -> pd.DataFrame
     start = since if len(before) else h.time.iloc[0]
     d = pd.concat([pd.DataFrame([{**base.to_dict(), "time": start}]), d], ignore_index=True)
     for k in _LINES:
-        d[k] = d[k].astype(float) - (float(base[k]) if pd.notna(base.get(k)) else 0.0)
+        v = d[k].astype(float)
+        b0 = base.get(k) if pd.notna(base.get(k)) else (v.dropna().iloc[0] if v.notna().any() else 0.0)
+        d[k] = v - float(b0)
     return d
 
 
 def _chart(d: pd.DataFrame, span: pd.Timedelta | None):
     long = d.melt(id_vars="time", value_vars=list(_LINES), var_name="k", value_name="usd")
+    long = long.dropna(subset=["usd"])
     long["what"] = long.k.map(lambda k: _LINES[k][0])
     names = [v[0] for v in _LINES.values()]
     color = alt.Color("what:N", title=None, sort=names, legend=alt.Legend(orient="top-left"),
@@ -123,6 +130,7 @@ def _chart(d: pd.DataFrame, span: pd.Timedelta | None):
     line = alt.Chart(long).mark_line(interpolate="step-after").encode(
         x=alt.X("time:T", title=None, axis=time_axis(span)), y=alt.Y("usd:Q", title="$ since window start"),
         color=color, strokeWidth=alt.condition(alt.datum.what == "Net", alt.value(2.5), alt.value(1.3)),
+        strokeDash=alt.condition(alt.datum.what == "Locked net", alt.value([2, 3]), alt.value([1, 0])),
         tooltip=[alt.Tooltip("time:T", format="%m-%d %H:%M"), "what:N", alt.Tooltip("usd:Q", format="+,.2f")])
     zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#888", strokeWidth=0.7).encode(y="y:Q")
     st.altair_chart((line + zero).properties(height=260), use_container_width=True)
