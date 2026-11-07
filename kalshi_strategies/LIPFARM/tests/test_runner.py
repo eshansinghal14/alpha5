@@ -887,3 +887,14 @@ def test_started_markets_nearest_to_one_dollar_go_first_and_new_ones_need_a_marg
     r.state["period_accrued"] = {"pNEAR-1-A": 0.9, "pFAR-1-A": 0.1}
     assert list(r.choose(dataclasses.replace(CFG, num_markets=10))) == ["FAR-1-A", "NEAR-1-A", "NEW-1-A"]
     assert "NEAR-1-A" in r.candidates(dataclasses.replace(CFG, scan_markets=0, scan_rotate=0))
+
+
+def test_a_quoted_market_keeps_its_slot_over_a_started_one_nearer_to_one_dollar(tmp_path, monkeypatch):
+    books = {t: {"yes": {}, "no": {}} for t in ("INC-1-A", "NEAR-1-A")}
+    r, _ = make(tmp_path, monkeypatch, books)
+    r.plans = {"INC-1-A": _plan("INC-1-A", rate=1e-5), "NEAR-1-A": _plan("NEAR-1-A", rate=1e-4)}
+    r.state["orders"] = {"INC-1-A|yes": _order("yes", 0.97)}
+    r.state["period_accrued"] = {"pINC-1-A": 0.1, "pNEAR-1-A": 0.95}
+    assert list(r.choose(dataclasses.replace(CFG, num_markets=1))) == ["INC-1-A"]
+    del r.state["orders"]["INC-1-A|yes"]                                   # after a restart: by accrual
+    assert list(r.choose(dataclasses.replace(CFG, num_markets=1))) == ["NEAR-1-A"]

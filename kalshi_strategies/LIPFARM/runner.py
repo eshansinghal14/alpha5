@@ -349,12 +349,12 @@ class Runner:
         return self.state.setdefault("period_accrued", {}).get(self.programs[t]["id"], 0.0)
 
     def choose(self, cfg: Cfg) -> dict[str, farm.Plan]:
-        """The markets to quote, within max_capital and num_markets, by what they've
-        accrued this period (not whether a bid rests now, which a restart or a
-        cooldown resets): past $1 first, most LIP net of expected loss first (every
-        further dollar is paid); then started under $1, nearest to $1 first (dropping
-        one forfeits it); then new ones, only if they can earn START_PAYOUT_MARGIN x
-        the $1 minimum before their period ends."""
+        """The markets to quote, within max_capital and num_markets: past $1 this
+        period first, most LIP net of expected loss first (every further dollar is
+        paid); then ones quoted now and under $1 (incumbents keep their slot); then
+        ones started this period without a bid now (after a restart or a cooldown),
+        nearest to $1 first; then new ones, only if they can earn START_PAYOUT_MARGIN
+        x the $1 minimum before their period ends."""
         now = time.time()
 
         def left(t):
@@ -369,13 +369,19 @@ class Runner:
                  and (self.period_accrued(p.ticker) >= farm.LIP_MIN_PAYOUT_USD
                       or self.period_accrued(p.ticker) + p.rate * left(p.ticker) >= need(p))]
 
+        quoted = self.order_tickers()
+
         def rank(p):
             a = self.period_accrued(p.ticker)
             if a >= farm.LIP_MIN_PAYOUT_USD:
                 return (0, -net(p))
+            # Ordering all ~1,400 started markets by time to $1 swapped those near the cut-off
+            # every cycle: 131 bid and dropped in 2 h for 193 quoted (11-07).
+            if p.ticker in quoted:
+                return (1, -net(p))
             if a > 0:
-                return (1, (farm.LIP_MIN_PAYOUT_USD - a) / max(p.rate, 1e-12))     # seconds still needed
-            return (2, -net(p))
+                return (2, (farm.LIP_MIN_PAYOUT_USD - a) / max(p.rate, 1e-12))     # seconds still needed
+            return (3, -net(p))
         out, exp = {}, self.exposure()
         for p in sorted(cands, key=rank):
             if len(out) >= cfg.num_markets:
