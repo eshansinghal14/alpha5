@@ -263,3 +263,30 @@ def test_exit_depth_inside_a_sweeps_reach_does_not_count():
     # WVCOAL 11-06 before the sweep: 1,712 lots 1-3 ticks under the 66c touch, which one 3,353-lot sell took.
     o = {"yes": {0.30: 500.0}, "no": {0.66: 2457.0, 0.65: 1487.0, 0.64: 25.0, 0.63: 200.0}}
     assert farm.exit_lots(o, dataclasses.replace(CFG, exit_depth_frac=1.0), 1000)["no"] == 0
+
+
+def test_loss_scales_by_the_series_at_its_distance_from_fifty():
+    tab = {"bucket_mult": [1.5, 1.0, 0.8, 0.4], "series": {"KXBAD": [6.0, 4.0, 3.0, 1.0]}}
+    assert farm.loss_mult("KXBAD-26NOV08-T205", 0.43, tab) == 6.0          # 7c from 50
+    assert farm.loss_mult("KXBAD-26NOV08-T205", 0.97, tab) == 1.0          # 47c from 50
+    assert farm.loss_mult("KXOTHER-1-A", 0.30, tab) == 1.0                 # no tape: its bucket's all-market value
+
+
+def test_expected_loss_uses_each_legs_series_multiplier(monkeypatch):
+    tab = {"bucket_mult": [1.0, 1.0, 1.0, 1.0], "series": {"KXBAD": [4.0, 4.0, 1.0, 1.0]}}
+    monkeypatch.setattr(farm, "series_loss_table", lambda: tab)
+    pl = farm.Plan("KXBAD-1-A", "narrow", (("yes", 0.45), ("no", 0.90)), 1e-3, 0.0, 0.002, 200)
+    flat = farm.expected_loss_day(2.0, dataclasses.replace(pl, ticker="KXOK-1-A"), CFG)
+    assert farm.expected_loss_day(2.0, pl, CFG) == pytest.approx(flat * (4.0 + 1.0) / 2.0)
+
+
+def test_series_loss_counts_a_sweep_that_does_not_come_back():
+    from kalshi_strategies.LIPFARM import series_loss as sl
+    t0 = 1_000_000.0
+    # Takers buy no 3 times in 1 s: yes bids at 0.44, 0.43, 0.41 cleared (600 lots); yes stays at 0.35 after.
+    tr = [(t0, "no", 0.44, 300.0), (t0 + 0.2, "no", 0.43, 200.0), (t0 + 0.5, "no", 0.41, 100.0)]
+    tr += [(t0 + 600 * k, "no", 0.35, 5.0) for k in range(1, 14)]
+    assert sl.adverse_losses(tr) == [(0.44, pytest.approx(600 * 0.09))]
+    back = tr[:3] + [(t0 + 600, "no", 0.44, 5.0)] + [(t0 + 600 * k, "no", 0.35, 5.0) for k in range(2, 14)]
+    assert sl.adverse_losses(back) == []                                   # back within 30 min: not adverse
+    assert [sl.bucket(p) for p in (0.45, 0.30, 0.15, 0.97)] == [0, 1, 2, 3]

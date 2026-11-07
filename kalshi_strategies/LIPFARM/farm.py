@@ -104,6 +104,7 @@ ROOT = os.path.join(LIVE_ROOT, NAME)
 ARBS_ROOT = os.path.join(LIVE_ROOT, "ARBS")
 # Read by ARBS's scanner (ARBS.scanner.lipfarm_claimed): it selects no event here.
 CLAIMS_PATH = os.path.join(ROOT, "live", "claimed.json")
+SERIES_LOSS_PATH = os.path.join(ROOT, "series_loss.json")      # series_loss.py's table, built off the box
 # ARBS polls claims every runtime.control_poll_s (1 s) and then cancels its
 # quotes on the claimed tickers; this covers both with room.
 CLAIM_SETTLE_S = 3.0
@@ -396,21 +397,53 @@ def flip_loss_day(pl: Plan, others: dict | None, days_to_close: float | None) ->
     return out
 
 
+_SERIES_LOSS = {"checked": 0.0, "mtime": None, "tab": None}
+
+
+def series_loss_table() -> dict | None:
+    """series_loss.json, re-read when it changes (checked at most once a minute)."""
+    now = time.time()
+    if now - _SERIES_LOSS["checked"] >= 60.0:
+        _SERIES_LOSS["checked"] = now
+        try:
+            m = os.path.getmtime(SERIES_LOSS_PATH)
+        except OSError:
+            m = None
+        if m != _SERIES_LOSS["mtime"]:
+            _SERIES_LOSS.update(mtime=m, tab=None if m is None else _json(SERIES_LOSS_PATH))
+    return _SERIES_LOSS["tab"]
+
+
+def loss_mult(ticker: str, price: float, tab: dict | None = None) -> float:
+    """This series' adverse loss per trade at this price's distance from 50c, over the
+    all-market rate (series_loss.json); a series with no tape gets its bucket's
+    all-market multiplier, and with no table everything is 1."""
+    tab = series_loss_table() if tab is None else tab
+    if not tab:
+        return 1.0
+    from kalshi_strategies.LIPFARM.series_loss import bucket
+    b = bucket(price)
+    row = tab["series"].get(ticker.split("-")[0])
+    return row[b] if row else tab["bucket_mult"][b]
+
+
 def expected_loss_day(trades_day: float, pl: Plan, cfg: Cfg, days_to_close: float | None = None,
                       others: dict | None = None) -> float:
     """Expected adverse-sweep loss, $/day, of quoting `pl` on a market trading
     `trades_day`: loss_per_trade per trade/day up to loss_cap, for 1000 lots
     on each side, scaled by the lots we actually bid (fit, max_trades_day),
-    times tte_mult for how close the market is to its close. With `others`
-    (others' bids, {"yes": {price: size}, "no": ...}) each leg is also scaled by
-    its exit_ticks over the tape's average drop: a hole under the bid costs more.
-    Decided markets add flip_loss_day."""
-    per_side = min(cfg.loss_per_trade * max(trades_day, cfg.loss_min_trades), cfg.loss_cap) / 2.0
-    if others is None:
-        legs = float(len(pl.legs))
-    else:
-        legs = sum(exit_ticks(others.get(s) or {}, p, pl.lots) / MEAN_ADVERSE_DROP_TICKS for s, p in pl.legs)
-    return per_side * pl.lots * legs / 1000.0 * tte_mult(days_to_close) + flip_loss_day(pl, others, days_to_close)
+    times tte_mult for how close the market is to its close. Each leg's
+    loss_per_trade is scaled by loss_mult (its series, at its distance from 50c).
+    With `others` (others' bids, {"yes": {price: size}, "no": ...}) each leg is also
+    scaled by its exit_ticks over the tape's average drop: a hole under the bid costs
+    more. Decided markets add flip_loss_day."""
+    rate = max(trades_day, cfg.loss_min_trades)
+    total = 0.0
+    for s, p in pl.legs:
+        per_side = min(cfg.loss_per_trade * loss_mult(pl.ticker, p) * rate, cfg.loss_cap) / 2.0
+        gap = 1.0 if others is None else exit_ticks(others.get(s) or {}, p, pl.lots) / MEAN_ADVERSE_DROP_TICKS
+        total += per_side * gap
+    return total * pl.lots / 1000.0 * tte_mult(days_to_close) + flip_loss_day(pl, others, days_to_close)
 
 
 def key(ticker: str, side: str, hedge: bool = False) -> str:
