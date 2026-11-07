@@ -545,6 +545,20 @@ def test_sync_keeps_a_resting_order_the_list_missed_and_cancels_orphans(tmp_path
     assert [x[1:] for x in c.calls if x[1] == "cancel"] == [("cancel", "Z-1-A", "orphan")]
 
 
+def test_sync_leaves_a_listed_order_whose_create_is_still_unanswered(tmp_path, monkeypatch):
+    books = {"Z-1-A": {"yes": {}, "no": {}}}
+    r, c = make(tmp_path, monkeypatch, books)
+    r.state["orders"] = {"Z-1-A|yes": dict(_order("yes", 0.4, oid=None, placed=time.time()), cid="lipf-new")}
+    c._resting = lambda prefix: [("fresh", "Z-1-A", "lipf-new"), ("orphan", "Z-1-A", "lipf-x")]
+
+    async def go():
+        await boot(r)
+        await r.sync_live_orders()
+        await settle(r)
+    asyncio.run(go())
+    assert [x[1:] for x in c.calls if x[1] == "cancel"] == [("cancel", "Z-1-A", "orphan")]
+
+
 def test_moves_go_to_the_back_only_with_size_behind_and_are_capped(tmp_path, monkeypatch):
     books = {f"Z-1-{i}": {"yes": {0.40: 3000.0}, "no": {0.30: 900.0}} for i in range(14)}
     r, c = make(tmp_path, monkeypatch, books)

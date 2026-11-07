@@ -903,6 +903,7 @@ class Runner:
             return True
         c = self.gw.client(t)
         o = self.gw._order(t, side, price, lots, "quote", cid=CID_PREFIX + uuid.uuid4().hex[:24])
+        rec["cid"] = o.client_order_id
         t0 = time.time()
         try:
             ack = await self.gw.write(c.place_resting, o, order_group_id=gid)
@@ -1573,8 +1574,11 @@ class Runner:
             if (st or {}).get("status") != "resting" and self.state["orders"].get(k) is o:
                 del self.state["orders"][k]
         mine = {o.get("oid") for o in self.state["orders"].values()}
+        # A create still unanswered has no oid yet but can already be listed: sync runs right after
+        # reconcile sends its creates, and cancelled fresh bids 0.3 s old as orphans (11-07).
+        creating = {o.get("cid") for o in self.state["orders"].values() if not o.get("oid")}
         for oid, (t, cid) in listed.items():
-            if (cid or "").startswith(CID_PREFIX) and oid not in mine:
+            if (cid or "").startswith(CID_PREFIX) and oid not in mine and cid not in creating:
                 print(f"sync: cancel orphan {t} {oid}")
                 self.spawn(self._cancel(t, oid, "lipfarm:orphan"))
 
