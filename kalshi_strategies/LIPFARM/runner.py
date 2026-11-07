@@ -77,6 +77,10 @@ MAX_DUMP_MISSES = 5
 # others' size at our prices and at each touch over the last DEPTH_KEEP_S; the
 # FILL_CONTEXT_S before each LIP fill is journaled ("fill_context").
 DEPTH_KEEP_S = 30.0
+# A market we quote keeps its slot unless another is worth this much more per day: ranking
+# ~1,400 started markets with no margin swapped the ones near the cut-off every cycle
+# (131 bid and dropped in 2 h for 193 quoted, 11-07).
+INCUMBENT_EDGE = 1.2
 # After a refused create, the same order key waits this long. Without it an exit (which skips
 # the budget) re-sent the moment it failed: 47k 409s in 10 min on a closed market, 11-06.
 PLACE_RETRY_S = 5.0
@@ -349,12 +353,12 @@ class Runner:
         return self.state.setdefault("period_accrued", {}).get(self.programs[t]["id"], 0.0)
 
     def choose(self, cfg: Cfg) -> dict[str, farm.Plan]:
-        """The markets to quote, within max_capital and num_markets: past $1 this
-        period first, most LIP net of expected loss first (every further dollar is
-        paid); then ones quoted now and under $1 (incumbents keep their slot); then
-        ones started this period without a bid now (after a restart or a cooldown),
-        nearest to $1 first; then new ones, only if they can earn START_PAYOUT_MARGIN
-        x the $1 minimum before their period ends."""
+        """The markets to quote, within max_capital and num_markets, by what a slot is
+        worth per day: LIP net of expected loss, plus, for a market under $1 this period
+        that can still reach it, its accrual over the days still needed (quoting it that
+        long unlocks it; dropping it forfeits it). Markets quoted now get INCUMBENT_EDGE
+        so a near-tie doesn't swap them. A market not started this period must be able
+        to earn START_PAYOUT_MARGIN x the $1 minimum before its period ends."""
         now = time.time()
 
         def left(t):
@@ -371,19 +375,14 @@ class Runner:
 
         quoted = self.order_tickers()
 
-        def rank(p):
+        def worth(p):
             a = self.period_accrued(p.ticker)
-            if a >= farm.LIP_MIN_PAYOUT_USD:
-                return (0, -net(p))
-            # Ordering all ~1,400 started markets by time to $1 swapped those near the cut-off
-            # every cycle: 131 bid and dropped in 2 h for 193 quoted (11-07).
-            if p.ticker in quoted:
-                return (1, -net(p))
-            if a > 0:
-                return (2, (farm.LIP_MIN_PAYOUT_USD - a) / max(p.rate, 1e-12))     # seconds still needed
-            return (3, -net(p))
+            v = net(p)
+            if 0 < a < farm.LIP_MIN_PAYOUT_USD:
+                v += a / max((farm.LIP_MIN_PAYOUT_USD - a) / max(p.rate, 1e-12), 1.0)
+            return v * (INCUMBENT_EDGE if p.ticker in quoted else 1.0)
         out, exp = {}, self.exposure()
-        for p in sorted(cands, key=rank):
+        for p in sorted(cands, key=lambda p: -worth(p)):
             if len(out) >= cfg.num_markets:
                 break
             if exp + p.lots * max(px for _, px in p.legs) <= cfg.max_capital + 1e-9:
