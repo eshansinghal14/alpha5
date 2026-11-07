@@ -1936,6 +1936,11 @@ class Runner:
                                                    os.path.join(self.root, "status.json"), doc)
         if not log:
             return
+        point = {k: round(summary[k], 4) for k in ("exp_lip_usd", "lip_locked_usd", "fill_pnl_usd", "net_usd",
+                                                    "fill_lots", "exposure_usd", "our_usd_day_now")}
+        point.update(t=round(summary["updated_at"], 1), fills=summary["fills"], quoting=summary["quoting"])
+        asyncio.get_running_loop().run_in_executor(self.io_pool, _append_line,
+                                                   os.path.join(self.root, farm.HISTORY_FILE), json.dumps(point))
         print(f"\n=== LIPFARM {summary['mode']} (async) {pd.Timestamp.now(tz='UTC'):%Y-%m-%d %H:%M:%S}Z "
               f"| {hrs:.2f}h | quoting {len(rows)} | now ${summary['our_usd_day_now']:.0f}/day "
               f"| exp LIP ${tot_lip:.2f} | fills {summary['fills']} pnl ${fill_pnl:+.2f} "
@@ -1997,6 +2002,11 @@ def freeze_heap():
     gc.unfreeze()
     gc.collect()
     gc.freeze()
+
+
+def _append_line(path: str, line: str):
+    with open(path, "a") as f:
+        f.write(line + "\n")
 
 
 def _atomic_write(path: str, data: str):

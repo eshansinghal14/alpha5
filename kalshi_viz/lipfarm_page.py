@@ -8,12 +8,14 @@ import os
 import time
 import types
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
-from kalshi_strategies.LIPFARM.farm import CONFIG_PATH, NAME, ROOT, LipFarmConfig
+from kalshi_strategies.LIPFARM.farm import CONFIG_PATH, HISTORY_FILE, NAME, ROOT, LipFarmConfig
 from kalshi_viz import config_form
 from kalshi_viz.arm import arm_control
+from kalshi_viz.perf_panel import time_axis
 
 STALE_S = 120.0
 # config_form takes a Series; LIPFARM isn't one, but has the fields it reads.
@@ -77,6 +79,57 @@ def _status() -> dict | None:
         return None
 
 
+WINDOWS = {"6h": pd.Timedelta(hours=6), "24h": pd.Timedelta(hours=24), "7d": pd.Timedelta(days=7), "All": None}
+_LINES = {"net_usd": ("Net", "#1e88e5"), "exp_lip_usd": ("Expected LIP", "#43a047"),
+          "fill_pnl_usd": ("Fill P&L", "#e53935")}
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _history() -> pd.DataFrame:
+    """The runner's per-report points (pnl_history.jsonl); empty if none yet."""
+    try:
+        d = pd.read_json(os.path.join(ROOT, HISTORY_FILE), lines=True)
+    except (OSError, ValueError):
+        return pd.DataFrame()
+    if d.empty:
+        return d
+    d["time"] = pd.to_datetime(d["t"], unit="s", utc=True)
+    return d.sort_values("time").reset_index(drop=True)
+
+
+def _window(h: pd.DataFrame, s: dict, span: pd.Timedelta | None) -> tuple[pd.DataFrame, dict, float]:
+    """History in the window with the live summary appended, each column less its
+    value at the window's start (the last point before it); and those starting values
+    and the hours actually covered (less than the window while history is short)."""
+    now = pd.Timestamp(s.get("updated_at") or time.time(), unit="s", tz="UTC")
+    live = pd.DataFrame([{"time": now, **{k: s.get(k) for k in (*_LINES, "fills", "fill_lots")}}])
+    h = pd.concat([h, live], ignore_index=True) if len(h) else live
+    since = None if span is None else now - span
+    before = h[h.time <= since] if since is not None else h.iloc[:0]
+    base = before.iloc[-1] if len(before) else h.iloc[0]
+    d = h[h.time >= since] if since is not None else h
+    start = since if len(before) else h.time.iloc[0]
+    d = pd.concat([pd.DataFrame([{**base.to_dict(), "time": start}]), d], ignore_index=True)
+    b0 = {k: float(base[k]) if pd.notna(base.get(k)) else 0.0 for k in (*_LINES, "fills", "fill_lots")}
+    for k in _LINES:
+        d[k] = d[k].astype(float) - b0[k]
+    return d, b0, (now - start).total_seconds() / 3600
+
+
+def _chart(d: pd.DataFrame, span: pd.Timedelta | None):
+    long = d.melt(id_vars="time", value_vars=list(_LINES), var_name="k", value_name="usd")
+    long["what"] = long.k.map(lambda k: _LINES[k][0])
+    names = [v[0] for v in _LINES.values()]
+    color = alt.Color("what:N", title=None, sort=names, legend=alt.Legend(orient="top-left"),
+                      scale=alt.Scale(domain=names, range=[v[1] for v in _LINES.values()]))
+    line = alt.Chart(long).mark_line(interpolate="step-after").encode(
+        x=alt.X("time:T", title=None, axis=time_axis(span)), y=alt.Y("usd:Q", title="$ since window start"),
+        color=color, strokeWidth=alt.condition(alt.datum.what == "Net", alt.value(2.5), alt.value(1.3)),
+        tooltip=[alt.Tooltip("time:T", format="%m-%d %H:%M"), "what:N", alt.Tooltip("usd:Q", format="+,.2f")])
+    zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#888", strokeWidth=0.7).encode(y="y:Q")
+    st.altair_chart((line + zero).properties(height=260), use_container_width=True)
+
+
 def _toggle(s: dict, idle: bool):
     live = bool(s.get("live_trading")) and not idle
     if live:
@@ -116,17 +169,30 @@ def render(page: str, stale_fn):
         if idle:
             st.warning(f"Farm not running (last update {age / 60:.0f} min ago). Figures are as of then.")
         _toggle(s, idle)
+        win = st.radio("Window", list(WINDOWS), index=1, horizontal=True, key="lipfarm_win",
+                       label_visibility="collapsed")
+        d, b0, hrs = _window(_history(), s, WINDOWS[win])
+        if len(d) > 2:
+            _chart(d, WINDOWS[win])
+        else:
+            st.caption("No P&L history yet (the runner adds a point every ~2 min).")
+        span = f"{win}" if WINDOWS[win] is None or hrs >= WINDOWS[win].total_seconds() / 3600 - 0.1 else f"{hrs:.1f}h"
+        lip, fpl = s["exp_lip_usd"] - b0["exp_lip_usd"], s["fill_pnl_usd"] - b0["fill_pnl_usd"]
         c = st.columns(6)
         c[0].metric("Quoting", s["quoting"])
         c[1].metric("LIP rate now", f"${s['our_usd_day_now'] / 1440:,.3f}/min", f"${s['our_usd_day_now']:,.0f}/day",
                     delta_color="off")
-        c[2].metric("Expected LIP", f"${s['exp_lip_usd']:,.2f}",
-                    f"${s.get('lip_locked_usd', 0):,.2f} locked (past $1)", delta_color="off",
-                    help="Locked: program periods already past Kalshi's $1 minimum, paid in full. The rest "
-                         "is still under $1 for its period and is forfeited if the market drops before $1.")
-        c[3].metric("Fill P&L", f"${s['fill_pnl_usd']:+,.2f}", f"{s['fills']} fills, {s['fill_lots']:,.0f} lots",
-                    delta_color="off")
-        c[4].metric("Net", f"${s['net_usd']:+,.2f}")
+        c[2].metric(f"Expected LIP · {span}", f"${lip:,.2f}",
+                    f"${lip / max(hrs, 1e-9) * 24:,.0f}/day · all ${s['exp_lip_usd']:,.0f}, "
+                    f"${s.get('lip_locked_usd', 0):,.0f} locked", delta_color="off",
+                    help="LIP modelled in the window. Locked (all time): program periods already past Kalshi's "
+                         "$1 minimum, paid in full. The rest is still under $1 for its period and is forfeited "
+                         "if the market drops before $1.")
+        c[3].metric(f"Fill P&L · {span}", f"${fpl:+,.2f}",
+                    f"{s['fills'] - b0['fills']:.0f} fills · all ${s['fill_pnl_usd']:+,.0f}, {s['fills']} fills",
+                    delta_color="off", help="Change in fills' marked value over the window: new fills and "
+                                            "re-marks of older ones.")
+        c[4].metric(f"Net · {span}", f"${lip + fpl:+,.2f}", f"all ${s['net_usd']:+,.0f}", delta_color="off")
         c[5].metric("Exposure", f"${s.get('exposure_usd', 0):,.0f}",
                     f"of ${s.get('max_capital_usd', 0):,.0f} cap · ${s['resting_cost_usd']:,.0f} bids resting",
                     delta_color="off", help="What fills have left us holding, unexited, at cost. Resting bids "

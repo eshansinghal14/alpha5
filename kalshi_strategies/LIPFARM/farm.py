@@ -105,6 +105,8 @@ ARBS_ROOT = os.path.join(LIVE_ROOT, "ARBS")
 # Read by ARBS's scanner (ARBS.scanner.lipfarm_claimed): it selects no event here.
 CLAIMS_PATH = os.path.join(ROOT, "live", "claimed.json")
 SERIES_LOSS_PATH = os.path.join(ROOT, "series_loss.json")      # series_loss.py's table, built off the box
+# One summary point per logged report (~every 2 min), for the dashboard's P&L chart.
+HISTORY_FILE = "pnl_history.jsonl"
 # ARBS polls claims every runtime.control_poll_s (1 s) and then cancels its
 # quotes on the claimed tickers; this covers both with room.
 CLAIM_SETTLE_S = 3.0
