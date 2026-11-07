@@ -29,7 +29,7 @@ import pandas as pd
 from kalshi_infra.kalshi.markets import EventInfo
 from kalshi_infra.trading.fair import Fair
 from kalshi_strategies.KXCRYPTOLEAD15M.composite import DATA_ROOT, CompositeBar, CompositeBus, bar_files
-from kalshi_strategies.KXCRYPTOLEAD15M.pricer import BaseRateTracker, CoinRacePricer, FairResult
+from kalshi_strategies.KXCRYPTOLEAD15M.pricer import L, BaseRateTracker, CoinRacePricer, FairResult
 from kalshi_strategies.KXCRYPTOLEAD15M.robust_har import RobustHarForecaster
 from kalshi_strategies.KXCRYPTOLEAD15M.series import COINS, SPOT_VENUES, START_END_AVG_S, coin_from_market_ticker
 from kalshi_strategies.KXCRYPTOLEAD15M.settlement_tracker import EventWindow, SettlementTracker
@@ -470,8 +470,14 @@ class CoinRaceModel:
         k = p.ci_vol_multiplier
         # Both perp nowcasts logged per market; only perp_priced_markets price on one.
         mono = time.monotonic()
+        # delta is dp/dmu; dmu/dx is 1 in the window, tau/60 in the last minute, 0 before the start locks.
+        ph, tau_r = self.result.phase, self.result.tau
+        g_dx = 1.0 if ph == "in_window" else (tau_r / L if ph == "last_minute" else 0.0)
         out = {}
         for i, c in enumerate(COINS):
+            # This market's probability change per 1bp of each coin's spot, for
+            # attributing its adverse fills to the coin that moved.
+            dpdx = {f"dpdx_{cj.lower()}": float(self.result.delta[i, j]) * g_dx * 1e-4 for j, cj in enumerate(COINS)}
             prob, tv = float(self.result.probs[i]), float(self.result.theo_vol[i])
             m_spot = self.bus.mid_nowcast(c)
             _, p_gap, p_n = pnc.nowcast(c, mono, m_spot) if pnc is not None else (None, None, 0)
@@ -484,7 +490,7 @@ class CoinRaceModel:
             out[self.ticker_of[c]] = Fair(prob=prob, lo=prob - k * tv, hi=prob + k * tv,
                                           edge_add=p.held_vol_edge if held else 0.0,
                                           constant_edge=getattr(p, f"{c.lower()}_constant_edge", None),
-                                          extras={"coin": c, "theo_vol": tv, "tau": self.result.tau,
+                                          extras={"coin": c, "theo_vol": tv, "tau": self.result.tau, **dpdx,
                                                   "phase": self.result.phase, "cf_basis_bp": self.basis_bp[c],
                                                   "cf_end_n": snap.end_n[c],
                                                   "vol_bp": math.sqrt(float(self.pricer._last_rate[i])) * 1e4,
