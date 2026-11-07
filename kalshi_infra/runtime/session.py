@@ -382,6 +382,8 @@ async def run_event(series: Series, ev: km.EventInfo, store: ConfigStore,
         from kalshi_infra.trading.fast_take import FastTaker
         fast = FastTaker(engine, quoter, conn=_fast_conn(order_client) if err is None else None,
                          loop=asyncio.get_running_loop())
+        fast.touch_ok = getattr(model, "cme_touch_ok", None)
+        fast.ref_fn = getattr(model, "cme_ref", None)
         quoter.fast = fast
         venues.on_fast_cme = fast.on_cme_touch
     attach = getattr(model, "attach_engine", None)   # optional: models that read our positions

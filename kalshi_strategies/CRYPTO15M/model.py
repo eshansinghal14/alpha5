@@ -103,6 +103,15 @@ class UpDownModel:
                 self._otouch = t
                 self._dirty = True          # re-anchors on this book's dispatch
 
+    def cme_ref(self, coin):
+        """CME (log bid, log ask) as of the last spot move: the take shift's reference."""
+        pnc = getattr(self.spot, "perp_nowcast", None)
+        return None if pnc is None else pnc._touch_at_spot.get(("cme", coin))
+
+    def cme_touch_ok(self, bid, ask) -> bool:
+        pnc = getattr(self.spot, "perp_nowcast", None)
+        return pnc is None or pnc.touch_ok("cme", bid, ask)
+
     def take_kernel(self, ticker):
         """This reprice's TakeKernel for the fast take path, or None."""
         return getattr(self, "_kernel", None) if ticker == self.ticker else None

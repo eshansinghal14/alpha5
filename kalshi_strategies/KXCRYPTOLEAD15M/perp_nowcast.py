@@ -31,7 +31,10 @@ it by ~200ms. Shadow only on the race: logged as x_perp_* on decision rows.
 from __future__ import annotations
 
 import collections
+import datetime as dt
 import math
+import time
+from zoneinfo import ZoneInfo
 
 import numpy as np
 
@@ -57,6 +60,25 @@ TOUCH_VENUES = ("cme",)
 TOUCH_WEIGHT = 0.5
 # How much touch history touch_shift() can look back over (s).
 TOUCH_HIST_S = 2.0
+# CME's touch is ignored (so it goes stale and the lead falls back) while
+# Globex crypto is in its daily halt or weekend close, and when wider than
+# this. In the halt (16:00-17:00 Chicago) the feed keeps sending a pre-open
+# book: 11-06 22:00 UTC its spread was 8.5bp p50 vs 2.0 open, its touch jumped
+# 1-2bp on order entry, and KXBTC15M traded those jumps both ways (174 takes,
+# -2c at 10s). Open hours 11-05/06: spread p99 11-12.5bp.
+TOUCH_MAX_SPREAD_BP = 8.0
+CME_TZ = ZoneInfo("America/Chicago")
+
+
+def cme_closed(t_wall: float) -> bool:
+    """Globex crypto futures closed: 16:00-17:00 CT Mon-Thu, Fri 16:00 CT to Sun 17:00 CT."""
+    d = dt.datetime.fromtimestamp(t_wall, CME_TZ)
+    wd, h = d.weekday(), d.hour
+    if wd == 5 or (wd == 4 and h >= 16) or (wd == 6 and h < 17):
+        return True
+    return wd < 4 and h == 16
+
+
 # Binance vs OKX, both net of basis. Above the cap so a real lead (|gap| p90
 # 1.4bp, SOL 10-20) isn't vetoed while OKX catches up. 6 h replay 10-20: it
 # fired 73-122/h (~0.2s each) and spot 1s later sided with the others 66-85%.
@@ -93,6 +115,7 @@ class PerpNowcast:
         self._touch_at_spot: dict[tuple[str, str], tuple[float, float]] = {}
         # TOUCH_VENUES: (t, log bid, log ask) over the last TOUCH_HIST_S, for touch_shift().
         self._touch_hist: dict[tuple[str, str], collections.deque] = {}
+        self._closed = (0.0, False)       # (wall s checked, cme_closed) -- rechecked each second
         # Venues increment() tries, first fresh one wins (the owner's
         # pricing.nowcast_leads; SpotFeed sets this).
         self.leads_fn = lambda: (LEAD,)
@@ -167,9 +190,23 @@ class PerpNowcast:
             self.lead_used[coin] = None
         return spot_mid, None
 
+    def touch_ok(self, venue: str, bid: float | None, ask: float | None) -> bool:
+        """False for a TOUCH_VENUES touch that must not be used (CME closed, or
+        spread over TOUCH_MAX_SPREAD_BP)."""
+        if venue not in TOUCH_VENUES:
+            return True
+        now = time.time()
+        if now - self._closed[0] >= 1.0:
+            self._closed = (now, cme_closed(now))
+        if self._closed[1]:
+            return False
+        if bid is None or ask is None:
+            return True
+        return bid > 0 and ask >= bid and (ask - bid) / (0.5 * (ask + bid)) * 1e4 <= TOUCH_MAX_SPREAD_BP
+
     def on_perp(self, venue: str, coin: str, price: float, t: float,
                 bid: float | None = None, ask: float | None = None):
-        if price <= 0:
+        if price <= 0 or not self.touch_ok(venue, bid, ask):
             return
         k = (venue, coin)
         lp = math.log(price)

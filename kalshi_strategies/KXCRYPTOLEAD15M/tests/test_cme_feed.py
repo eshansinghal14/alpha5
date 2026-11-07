@@ -163,3 +163,25 @@ def test_touch_shift_holds_through_spot_ticks():
     n.on_perp("cme", "BTC", 81400.0 * math.exp(1e-4), 0.12, 81397.5 * math.exp(1e-4), 81402.5 * math.exp(2e-4))
     assert n.touch_shift("cme", "BTC", 0.12, 0.3) == pytest.approx(1.0, rel=1e-3)   # smaller side counts
     assert n.touch_shift("cme", "BTC", 0.12 + pn.FRESH_S + 0.1, 0.3) == 0.0           # stale book: nothing
+
+
+_CME_CLOSED = pn.cme_closed
+
+
+def test_cme_closed_follows_chicago_time_across_the_clock_change():
+    assert _CME_CLOSED(_ts("2026-11-06T22:30"))          # Fri 16:30 CT (CST)
+    assert not _CME_CLOSED(_ts("2026-11-05T21:30"))      # Thu 15:30 CT
+    assert _CME_CLOSED(_ts("2026-11-05T22:10"))          # Thu 16:10 CT: daily halt
+    assert not _CME_CLOSED(_ts("2026-11-05T23:05"))      # Thu 17:05 CT
+    assert _CME_CLOSED(_ts("2026-10-29T21:30"))          # Thu 16:30 CDT, before Nov 1
+    assert _CME_CLOSED(_ts("2026-11-08T20:00"))          # Sun 14:00 CT
+    assert not _CME_CLOSED(_ts("2026-11-08T23:30"))      # Sun 17:30 CT
+
+
+def test_a_wide_cme_touch_is_ignored():
+    n = pn.PerpNowcast()
+    n.on_perp("cme", "BTC", 76000.0, 1.0, 75995.0, 76005.0)    # 1.3bp
+    assert ("cme", "BTC") in n._touch
+    n._touch.clear()
+    n.on_perp("cme", "BTC", 76000.0, 2.0, 75950.0, 76050.0)    # 13bp
+    assert ("cme", "BTC") not in n._touch

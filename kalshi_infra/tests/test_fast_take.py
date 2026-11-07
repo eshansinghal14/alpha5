@@ -63,3 +63,16 @@ def test_a_bounce_back_to_a_recent_level_does_not_fire():
                                    price=0.56, size=1.0, not_before=0.0, expires=1e18, req_prob=0.57))
     assert ft.on_cme_touch("BTC", *up, 0.0) is None                            # back up: not a new high
     assert ft.on_cme_touch("BTC", b * (1 + 1.8e-4), a * (1 + 1.8e-4), 0.0) is not None
+
+
+def test_a_ticket_on_an_old_reference_does_not_fire():
+    ft, sent = _taker()
+    b, a = 100000.0, 100005.0
+    ref = [(math.log(b), math.log(a))]
+    ft.ref_fn = lambda coin: ref[0]
+    ft.publish("KX", "yes", Ticket("KX", "yes", "BTC", math.log(b), math.log(a), thr_bp=1.2, cap_bp=2.0,
+                                   price=0.56, size=1.0, not_before=0.0, expires=1e18, req_prob=0.57))
+    assert ft.on_cme_touch("BTC", b, a, 0.0) is None
+    ref[0] = (math.log(b * 1.0001), math.log(a * 1.0001))                      # spot moved: reference reset
+    assert ft.on_cme_touch("BTC", b * (1 + 1.5e-4), a * (1 + 1.5e-4), 0.0) is None
+    assert ("KX", "yes") not in ft._tickets

@@ -68,6 +68,13 @@ class FastTaker:
         self.n_fired = 0
         self._lock = threading.Lock()
         self._hist: dict[str, collections.deque] = {}       # coin -> (wall s, bid, ask)
+        # fn(bid, ask) -> bool: a touch the model would use (CME open, spread ok).
+        self.touch_ok = None
+        # fn(coin) -> (log bid, log ask) the model measures the shift from now.
+        # It resets on every spot move; a ticket built on an older one counts a
+        # move spot already priced (5 of 7 fast fires 11-06 21:49-21:55 UTC,
+        # where the model's next decision saw half the shift or none).
+        self.ref_fn = None
 
     # --- loop thread -----------------------------------------------------
 
@@ -86,7 +93,7 @@ class FastTaker:
         """Returns a callable that sends the take(s) this touch crosses, or None.
         Split so the reader can queue the frame for the loop (quote pulls)
         before blocking on the send."""
-        if bid <= 0 or ask <= 0:
+        if bid <= 0 or ask <= 0 or (self.touch_ok is not None and not self.touch_ok(bid, ask)):
             return None
         now = time.time()
         h = self._hist.setdefault(coin, collections.deque())
@@ -103,6 +110,9 @@ class FastTaker:
             for key, tk in list(self._tickets.items()):
                 if (tk.coin != coin or now > tk.expires or now < tk.not_before
                         or not (new_high if tk.side == "yes" else new_low)):
+                    continue
+                if self.ref_fn is not None and self.ref_fn(coin) != (tk.ref_lb, tk.ref_la):
+                    self._tickets.pop(key, None)
                     continue
                 s = whole_touch_shift_bp(lb, la, tk.ref_lb, tk.ref_la, tk.cap_bp)
                 if (s >= tk.thr_bp) if tk.side == "yes" else (s <= tk.thr_bp):
