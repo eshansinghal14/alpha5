@@ -1486,7 +1486,25 @@ def test_print_row_keeps_the_book_a_resting_quote_saw(arbs):
     assert s["pre"]["X-B"][0] == [0.02, 0.45, 50, 0.53, 40]
     assert s["pull"] == {"on": True, "ratio": 0.3}
     assert s["quote"]["price"] == 0.42 and s["quote"]["left"] == 5 and s["quote"]["age_s"] == 2.0
-    assert not s["quote"]["tripped"]
+    assert not s["quote"]["tripped"] and s["quote"]["gone_s"] is None
+
+
+def test_print_row_keeps_a_quote_its_own_fill_just_removed(arbs):
+    r, b = arbs
+    now = time.time()
+    q = R.Quote(basket_id=b.basket_id, leg=0, ticker="X-A", side="yes", price=0.42, size=5, cid="c", edge=0.04,
+                max_price=0.42, pending=False, placed_at=now - 2.0)
+    r.quotes[q.key] = q
+    q.filled = 5.0
+    del r.quotes[q.key]                                              # the fill landed before the print
+    s = r._print_state("X-A", "yes", ["X-A", "X-B"], time.time())
+    assert s["quote"]["price"] == 0.42 and s["quote"]["left"] == 0 and s["quote"]["gone_s"] is not None
+    assert r._print_state("X-A", "yes", ["X-A", "X-B"], time.time() + 2 * R.QUOTE_GONE_S)["quote"] is None
+    c = R.Quote(basket_id=b.basket_id, leg=0, ticker="X-A", side="yes", price=0.42, size=5, cid="d", edge=0.04,
+                max_price=0.42, pending=False, placed_at=now - 2.0)
+    r.quotes[c.key] = c
+    del r.quotes[c.key]                                              # cancelled unfilled: not quoting
+    assert r._print_state("X-A", "yes", ["X-A", "X-B"], time.time())["quote"] is None
 
 
 def test_top_history_lookup_and_pull_ratio(tmp_path):
@@ -1592,11 +1610,13 @@ def test_shadow_live_counts_a_pulled_side_as_no_fill(arbs):
 
 def test_shadow_live_learns_only_from_prints_we_were_quoting(arbs):
     r, b = arbs
-    tripped = {**_OUR_QUOTE, "tripped": True}
+    tripped = {**_OUR_QUOTE, "tripped": True, "tripped_s": 5.0}
     view, errs = r._shadow_live([_live_print_row(0.50, quote=None), _live_print_row(0.50, quote=tripped)])
     assert errs == 0 and not r.lp.nodes and not view["events"]
     r._shadow_live([_live_print_row(0.50)])
     assert r.lp.nodes[()].w == pytest.approx(1.0)
+    r._shadow_live([_live_print_row(0.50, quote={**tripped, "tripped_s": 0.01})])   # tripped by this print's fill
+    assert r.lp.nodes[()].w == pytest.approx(2.0, rel=0.01)
 
 
 def test_series_groups_read_sports_tags(monkeypatch):

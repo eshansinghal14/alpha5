@@ -151,6 +151,9 @@ PRINT_MAX_TICKERS = 20
 # Book ages a print row keeps (s before the print): our book->order reaction
 # sits in this range, so a replay can price a quote on the book it saw.
 PRINT_LAGS_S = (0.02, 0.05, 0.1, 0.25)
+# A quote filled away (or a group trip) this recently before a print still counts as quoting it:
+# fill-to-print row gaps on 11-05..06 were -0.25..+0.16 s.
+QUOTE_GONE_S = 1.0
 # The shadow edge estimator prices each print's quote on the book this long
 # before it: book update -> amend/cancel sent 2.4/~10 ms p50/p90, Kalshi's ack
 # 8.5/~18 ms (order log, 11-04, 185k amends + 186k cancels).
@@ -221,6 +224,7 @@ class _Quotes(dict):
     def __init__(self):
         super().__init__()
         self.side: dict[tuple[str, str], dict] = collections.defaultdict(dict)
+        self.gone: dict[tuple[str, str], tuple[float, "Quote"]] = {}   # (ticker, side) -> (when, last quote removed)
 
     def __setitem__(self, k, q):
         old = self.get(k)
@@ -233,6 +237,7 @@ class _Quotes(dict):
         q = self[k]
         super().__delitem__(k)
         self.side[(q.ticker, q.side)].pop(k, None)
+        self.gone[(q.ticker, q.side)] = (time.time(), q)
 
     def pop(self, k, *default):
         if k in self:
@@ -246,6 +251,7 @@ class _Quotes(dict):
     def clear(self):
         super().clear()
         self.side.clear()
+        self.gone.clear()
 
     def on(self, ticker: str, side: str):
         return list(self.side.get((ticker, side), {}).values())
@@ -1091,14 +1097,21 @@ class ArbsRunner:
             if rows:
                 pre[t] = rows
         c = self.cfg.trading
+        live = [q for q in self.quotes.on(ticker, side) if q.kind == "arb" and not q.deep]
+        gone_s = None
+        if not live and (g0 := self.quotes.gone.get((ticker, side))) is not None and now - g0[0] <= QUOTE_GONE_S \
+                and g0[1].kind == "arb" and not g0[1].deep and g0[1].filled > 0:
+            # The fill often lands before its print: half the live quote fills of 11-05..06
+            # found their quote already removed (or the group tripped) when the print row was made.
+            live, gone_s = [g0[1]], round(now - g0[0], 3)
         mine = None
-        for q in self.quotes.on(ticker, side):
-            if q.kind == "arb" and not q.deep:
-                g = self.groups.get(self.meta[ticker].event) if q.group and ticker in self.meta else None
-                mine = {"basket_id": q.basket_id, "price": q.price, "left": q.remaining, "edge": round(q.edge, 4),
-                        "age_s": round(now - max(q.placed_at, q.moved_at), 3), "pending": q.pending,
-                        "tripped": bool(g and g["tripped_at"] is not None)}
-                break
+        for q in live[:1]:
+            g = self.groups.get(self.meta[ticker].event) if q.group and ticker in self.meta else None
+            tripped_at = g["tripped_at"] if g else None
+            mine = {"basket_id": q.basket_id, "price": q.price, "left": q.remaining, "edge": round(q.edge, 4),
+                    "age_s": round(now - max(q.placed_at, q.moved_at), 3), "pending": q.pending,
+                    "tripped": tripped_at is not None,
+                    "tripped_s": None if tripped_at is None else round(now - tripped_at, 3), "gone_s": gone_s}
         return {"pre": pre, "quote": mine,
                 "pull": {"on": self.pulled.get((ticker, side), 0.0) > time.monotonic(),
                          "ratio": self.top_hist.pull_ratio(ticker, side, now, c.pull_window_s)}}
@@ -1128,7 +1141,7 @@ class ArbsRunner:
                 # and the late soccer, out-of-budget and pulled prints it added (596 soccer fills at
                 # -$382 vs 49 real at +$10, 11-05..06) taught it to turn live soccer off.
                 q = r.get("quote")
-                if q is None or q.get("tripped"):
+                if q is None or (q.get("tripped") and (q.get("tripped_s") or 0.0) > QUOTE_GONE_S):
                     continue
                 s = replay.score(r, self._rates, self.lp.edges, t.live_quote_size, lag=SHADOW_LAG_S, live_only=True)
                 if s is None or not any(s["fills"]):
