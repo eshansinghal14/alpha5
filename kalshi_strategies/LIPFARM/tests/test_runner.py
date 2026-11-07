@@ -898,3 +898,34 @@ def test_an_incumbent_keeps_its_slot_against_a_near_tie(tmp_path, monkeypatch):
     assert list(r.choose(dataclasses.replace(CFG, num_markets=1))) == ["NEW-1-A"]
     r.state["orders"] = {"INC-1-A|yes": _order("yes", 0.97)}
     assert list(r.choose(dataclasses.replace(CFG, num_markets=1))) == ["INC-1-A"]          # 10% better isn't enough
+
+
+def _sibling_case(tmp_path, monkeypatch, sib_yes_bids):
+    books = {"Z-1-A": {"yes": {0.96: 100.0, 0.95: 1000.0}, "no": {0.02: 5000.0}},
+             "Z-1-B": {"yes": sib_yes_bids, "no": {0.01: 10.0}}}
+    r, c = make(tmp_path, monkeypatch, books)
+    r.state["orders"] = {"Z-1-A|yes": _order("yes", 0.97, oid="o1", group=None)}
+    r.state.update(lip_oid_size={"o1": 1000}, hedged_oids=["o1"], all_oids=["o1"])
+    # Z-1-A yes + Z-1-B no pays $1 (a ladder): NO on B covers a YES held on A.
+    r.baskets = {("Z-1-A", "yes"): [(1.0, (("Z-1-A", "yes"), ("Z-1-B", "no")))]}
+
+    async def go():
+        await boot(r)
+        r._on_fill(_fill("Z-1-A", "yes", 0.97, 300.0, "o1", "t1"))       # informed: 300 >= adverse_lots
+        await settle(r)
+    asyncio.run(go())
+    return r, [x[1:] for x in c.calls if x[1] == "ioc"]
+
+
+def test_an_informed_fill_covers_part_through_a_cheaper_sibling_after_its_own_ioc(tmp_path, monkeypatch):
+    # Covers within the 2-tick slip: B no at 0.03 x150, then A's own no at 0.04 x100 and 0.05.
+    r, iocs = _sibling_case(tmp_path, monkeypatch, {0.97: 150.0})
+    assert iocs == [("ioc", "Z-1-A", "no", 0.05, 150.0), ("ioc", "Z-1-B", "no", 0.03, 150)]
+    assert r.state["locked"] == {"Z-1-A": 150.0, "Z-1-B": -150.0}
+    assert abs(r.free_positions().get("Z-1-A", 0.0)) < 1e-9 and abs(r.free_positions().get("Z-1-B", 0.0)) < 1e-9
+
+
+def test_a_sibling_dearer_than_the_slip_leaves_the_dump_as_it_was(tmp_path, monkeypatch):
+    r, iocs = _sibling_case(tmp_path, monkeypatch, {0.94: 500.0})          # B no asks 0.06 > 0.05 cap
+    assert iocs == [("ioc", "Z-1-A", "no", 0.05, 300.0)]
+    assert not r.state.get("locked")

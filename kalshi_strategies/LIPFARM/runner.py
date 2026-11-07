@@ -73,6 +73,10 @@ MARKS_S = 60.0
 # (the socket book still showed bids the sweep had taken) is retried on the
 # market's next book update, at most this many times in a row.
 MAX_DUMP_MISSES = 5
+# Markets whose contracts cover one we quote (a lower ladder strike, NO on another
+# outcome) kept on the socket so a dump can buy them with no read. 221 quoted sides
+# had 376 such markets on 11-07 (<= 3 per side); capped so the feed stays light.
+SIBLING_FEED_MAX = 200
 # Research log for a depth-drop pull (ARBS's pull_drop): per market we rest on,
 # others' size at our prices and at each touch over the last DEPTH_KEEP_S; the
 # FILL_CONTEXT_S before each LIP fill is journaled ("fill_context").
@@ -283,6 +287,8 @@ class Runner:
         """Hedged-fill positions not already locked in a taken basket."""
         pos = self.signed_positions(hedged_only=True)
         for t, v in self.state.get("locked", {}).items():
+            if self.meta.get(t, {}).get("result"):
+                continue                             # settled: signed_positions has dropped it too
             pos[t] = pos.get(t, 0.0) - v
         # Kalshi fills in hundredths of a contract; less than that is rounding.
         return {t: v for t, v in pos.items() if abs(v) >= 0.01}
@@ -1185,36 +1191,98 @@ class Runner:
                 lk[tk] = lk.get(tk, 0.0) + (locked if sd == "yes" else -locked)
             print(f"lock: {t} {held} x{locked:.0f} at ${best[0]:.3f} for ${best[1]:.0f} (basket)")
 
+    def sibling_covers(self, t: str, held: str) -> list[tuple[float, float, str, str]]:
+        """(offer, its size, market, side) for contracts in other markets that pay $1
+        whenever `held` of t pays nothing (ARBS's two-leg $1 baskets), from books the
+        socket already has: nothing is read, so a dump never waits on one."""
+        out = []
+        for pay, legs in self.baskets.get((t, held), ()):
+            rest = [leg for leg in legs if leg[0] != t]
+            if len(legs) != 2 or len(rest) != 1 or abs(pay - 1.0) > 1e-9:
+                continue
+            tk, sd = rest[0]
+            others = self.ws_others(tk)
+            if others is None:
+                continue
+            self.books[tk] = others
+            opp = "no" if sd == "yes" else "yes"
+            out += [(round(1.0 - p, 4), q, tk, sd) for p, q in others[opp].items() if q > 0]
+        return out
+
+    def sibling_tickers(self, tickers: set[str]) -> set[str]:
+        """Markets sibling_covers could buy for these, best-earning markets first, up to SIBLING_FEED_MAX."""
+        out: set[str] = set()
+        for t in sorted(tickers, key=lambda x: -self.est.get(x, 0.0)):
+            for side in ("yes", "no"):
+                for pay, legs in self.baskets.get((t, side), ()):
+                    rest = [leg[0] for leg in legs if leg[0] != t]
+                    if len(legs) == 2 and len(rest) == 1 and abs(pay - 1.0) < 1e-9 and rest[0] not in tickers:
+                        out.add(rest[0])
+                        if len(out) >= SIBLING_FEED_MAX:
+                            return out
+        return out
+
     def dump(self, t: str, floor: float | None = None, adverse: bool = True, why: str = ""):
         """Sell what we hold in t into others' bids from `floor` up, as one IOC,
         with the market's exit bids (and, adverse, its LIP bids) cancelled in
-        the same gather -- never ahead of it."""
+        the same gather -- never ahead of it. A cover in another market
+        (sibling_covers) cheaper after fees takes its share of the lots; the
+        market's own IOC is still sent first."""
         v = self.free_positions().get(t, 0.0)
         held, other = ("yes", "no") if v > 0 else ("no", "yes")
         cancels = [k for k in self.keys_of(t) if is_hedge(k)]
         if adverse and abs(v) > DUST_LOTS:
             cancels += self.keys_of(t, hedges=False)
             self.cool(t, TRIP_COOLDOWN_S)
-        need, cum, worst = abs(v), 0.0, None
-        for p in sorted(self.books[t][held], reverse=True):
-            if floor is not None and p < floor - 1e-9:
+        need = abs(v)
+        cap = None if floor is None else round(1.0 - floor, 4)       # most we pay to cover a lot
+        levels = [(round(1.0 - p, 4), q, t, other) for p, q in self.books[t][held].items()]
+        if need >= 1.0 and self.baskets.get((t, held)):
+            levels += self.sibling_covers(t, held)
+        levels.sort(key=lambda x: (x[0] + self.taker_rate(x[2]) * x[0] * (1.0 - x[0]), x[2] != t))
+        buys: dict[tuple[str, str], list] = {}
+        cum = 0.0
+        for px, q, tk, sd in levels:
+            if cum >= need - 1e-9:
                 break
-            cum += self.books[t][held][p]
-            worst = p
-            if cum >= need:
-                break
-        q = math.floor(min(need, cum) * 100) / 100 if worst is not None else 0.0
-        go = worst is not None and q >= 0.01
+            if cap is not None and px > cap + 1e-9:
+                continue
+            k = min(q, need - cum)
+            if tk != t:
+                k = math.floor(k)                    # whole lots in markets we don't quote
+                if k < 1:
+                    continue
+            b = buys.setdefault((tk, sd), [px, 0.0])
+            b[0], b[1] = max(b[0], px), b[1] + k
+            cum += k
+        own = buys.pop((t, other), None)
+        q = math.floor(own[1] * 100) / 100 if own else 0.0
+        go = q >= 0.01 or bool(buys)
         if go:
             self.state.setdefault("chased", {})[t] = time.time()
-            self.spawn(self.take(t, other, round(1.0 - worst, 4), q, why), t)
+        if q >= 0.01:
+            self.spawn(self.take(t, other, own[0], q, why), t)
+        for (tk, sd), (px, k) in buys.items():
+            self.spawn(self.cover_take(t, held, tk, sd, px, k, why), t)
         for k in cancels:
             self.cancel(k, reason="lipfarm:adverse" if not is_hedge(k) else "lipfarm:dump")
         if not go:
             print(f"exit: {t} no bids to sell {held} into above {floor}; resting an exit")
             self.exit_bid(t, v)
             return
-        print(f"exit: {t} selling {held} x{q} down to {worst} ({why})")
+        print(f"exit: {t} selling {held} x{q} up to {own[0] if own else None}"
+              + "".join(f", cover {tk} {sd} x{k:g} up to {px}" for (tk, sd), (px, k) in buys.items()) + f" ({why})")
+
+    async def cover_take(self, t: str, held: str, tk: str, sd: str, px: float, q: float, why: str):
+        """Buy `sd` of tk to cover `held` of t; what fills is locked as a pair."""
+        got = await self.take(tk, sd, px, q, f"cover {why}")
+        if got >= 0.01:
+            lk = self.state.setdefault("locked", {})
+            lk[t] = lk.get(t, 0.0) + (got if held == "yes" else -got)
+            lk[tk] = lk.get(tk, 0.0) + (got if sd == "yes" else -got)
+            self.journal({"kind": "sibling_cover", "ticker": t, "held": held, "cover": tk, "side": sd,
+                          "price": px, "lots": got, "why": why})
+            print(f"lock: {t} {held} x{got:.0f} covered by {tk} {sd} up to {px} ({why})")
 
     def exit_bid(self, t: str, v: float):
         """The resting exit: a bid of what we hold one tick above the other
@@ -1425,7 +1493,8 @@ class Runner:
                     or o["remaining"] < 0.5 * w[1] or settle(unkey(k)[0]) > 0):
                 self.cancel(k)
         await self.prefetch_fees(want)
-        self.ensure_feed(set(want) | self.order_tickers() | set(self.signed_positions()))
+        held = set(self.signed_positions())
+        self.ensure_feed(set(want) | self.order_tickers() | held | self.sibling_tickers(set(want) | held))
         by_side: dict[tuple[str, str], dict] = {}
         for k, w in legs.items():
             t, side = unkey(k)
