@@ -80,8 +80,9 @@ def _status() -> dict | None:
 
 
 WINDOWS = {"6h": pd.Timedelta(hours=6), "24h": pd.Timedelta(hours=24), "7d": pd.Timedelta(days=7), "All": None}
-_LINES = {"net_usd": ("Net", "#1e88e5"), "exp_lip_usd": ("Expected LIP", "#43a047"),
-          "fill_pnl_usd": ("Fill P&L", "#e53935"), "locked_net_usd": ("Locked net", "#0d47a1")}
+# Net counts only LIP past Kalshi's $1 minimum for its period; the dotted line adds what is still under it.
+_LINES = {"locked_net_usd": ("Net", "#1e88e5"), "lip_locked_usd": ("Locked LIP", "#43a047"),
+          "fill_pnl_usd": ("Fill P&L", "#e53935"), "net_usd": ("Net incl. LIP under $1", "#1e88e5")}
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -94,7 +95,7 @@ def _history() -> pd.DataFrame:
     if d.empty:
         return d
     d["time"] = pd.to_datetime(d["t"], unit="s", utc=True)
-    # Points rebuilt from the log before 11-07 19:00 UTC have no locked LIP, so no locked net.
+    # Locked LIP before 11-07 19:00 UTC was rebuilt from the log's per-market rows (within $3 of the runner's).
     d["locked_net_usd"] = d.get("lip_locked_usd", pd.Series(float("nan"), index=d.index)) + d["fill_pnl_usd"]
     return d.sort_values("time").reset_index(drop=True)
 
@@ -104,7 +105,7 @@ def _window(h: pd.DataFrame, s: dict, span: pd.Timedelta | None) -> pd.DataFrame
     value at the window's start (the last point before it), so all start at 0. A line
     with no value there (locked net, before it was recorded) starts at its first point."""
     now = pd.Timestamp(s.get("updated_at") or time.time(), unit="s", tz="UTC")
-    live = pd.DataFrame([{"time": now, **{k: s.get(k) for k in _LINES},
+    live = pd.DataFrame([{"time": now, **{k: s.get(k) for k in ("lip_locked_usd", "fill_pnl_usd", "net_usd")},
                           "locked_net_usd": s.get("lip_locked_usd", 0.0) + s.get("fill_pnl_usd", 0.0)}])
     h = pd.concat([h, live], ignore_index=True) if len(h) else live
     since = None if span is None else now - span
@@ -121,6 +122,9 @@ def _window(h: pd.DataFrame, s: dict, span: pd.Timedelta | None) -> pd.DataFrame
 
 
 def _chart(d: pd.DataFrame, span: pd.Timedelta | None):
+    step = -(-len(d) // 1000)                  # Altair refuses over 5,000 rows (4 lines x points)
+    if step > 1:
+        d = pd.concat([d.iloc[:-1:step], d.iloc[[-1]]])
     long = d.melt(id_vars="time", value_vars=list(_LINES), var_name="k", value_name="usd")
     long = long.dropna(subset=["usd"])
     long["what"] = long.k.map(lambda k: _LINES[k][0])
@@ -130,7 +134,7 @@ def _chart(d: pd.DataFrame, span: pd.Timedelta | None):
     line = alt.Chart(long).mark_line(interpolate="step-after").encode(
         x=alt.X("time:T", title=None, axis=time_axis(span)), y=alt.Y("usd:Q", title="$ since window start"),
         color=color, strokeWidth=alt.condition(alt.datum.what == "Net", alt.value(2.5), alt.value(1.3)),
-        strokeDash=alt.condition(alt.datum.what == "Locked net", alt.value([2, 3]), alt.value([1, 0])),
+        strokeDash=alt.condition(alt.datum.what == _LINES["net_usd"][0], alt.value([2, 3]), alt.value([1, 0])),
         tooltip=[alt.Tooltip("time:T", format="%m-%d %H:%M"), "what:N", alt.Tooltip("usd:Q", format="+,.2f")])
     zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#888", strokeWidth=0.7).encode(y="y:Q")
     st.altair_chart((line + zero).properties(height=260), use_container_width=True)
@@ -186,13 +190,14 @@ def render(page: str, stale_fn):
         c[0].metric("Quoting", s["quoting"])
         c[1].metric("LIP rate now", f"${s['our_usd_day_now'] / 1440:,.3f}/min", f"${s['our_usd_day_now']:,.0f}/day",
                     delta_color="off")
-        c[2].metric("Expected LIP", f"${s['exp_lip_usd']:,.2f}",
-                    f"${s.get('lip_locked_usd', 0):,.2f} locked (past $1)", delta_color="off",
+        locked = s.get("lip_locked_usd", 0.0)
+        c[2].metric("Locked LIP", f"${locked:,.2f}", f"${s['exp_lip_usd']:,.2f} incl. under $1", delta_color="off",
                     help="Locked: program periods already past Kalshi's $1 minimum, paid in full. The rest "
                          "is still under $1 for its period and is forfeited if the market drops before $1.")
         c[3].metric("Fill P&L", f"${s['fill_pnl_usd']:+,.2f}", f"{s['fills']} fills, {s['fill_lots']:,.0f} lots",
                     delta_color="off")
-        c[4].metric("Net", f"${s['net_usd']:+,.2f}")
+        c[4].metric("Net", f"${locked + s['fill_pnl_usd']:+,.2f}", f"${s['net_usd']:+,.2f} incl. LIP under $1",
+                    delta_color="off", help="Locked LIP + fill P&L.")
         c[5].metric("Exposure", f"${s.get('exposure_usd', 0):,.0f}",
                     f"of ${s.get('max_capital_usd', 0):,.0f} cap · ${s['resting_cost_usd']:,.0f} bids resting",
                     delta_color="off", help="What fills have left us holding, unexited, at cost. Resting bids "
