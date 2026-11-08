@@ -246,6 +246,14 @@ class Cfg:
                                    "loss. Above 1 because the replay model understated our real fills' losses "
                                    "~1.5x (11-04/05).", min=0.0, step=0.25, group="pricing",
                                    sub="low flow (all markets)")
+    realized_loss_days: float = param("Each series is also charged at least the fill loss it actually cost us per "
+                                      "market-day quoted over this many days (positions marked at the bid, dated by "
+                                      "their first fill). The tape model put House races at ~$0.10/day a market; our "
+                                      "fills there lost ~$4/day a market (11-06..08). 0 = off.", min=0.0, max=30.0,
+                                      step=1.0, group="pricing", sub="low flow (all markets)")
+    realized_loss_prior: float = param("Market-days of no loss added to each series' quoted time, so one fill on a "
+                                       "barely quoted series doesn't shut it out.", min=0.0, step=1.0,
+                                       group="pricing", sub="low flow (all markets)")
     skip_categories: str = param("Comma-separated series categories never quoted (11-01..05: Sports, "
                                  "Mentions ~50-60% safe).", group="pricing", sub="low flow (all markets)")
     skip_series: str = param("Comma-separated series never quoted. KXRT (Rotten Tomatoes): 25 settled movies, 54% "
@@ -446,6 +454,17 @@ def expected_loss_day(trades_day: float, pl: Plan, cfg: Cfg, days_to_close: floa
         gap = 1.0 if others is None else exit_ticks(others.get(s) or {}, p, pl.lots) / MEAN_ADVERSE_DROP_TICKS
         total += per_side * gap
     return total * pl.lots / 1000.0 * tte_mult(days_to_close) + flip_loss_day(pl, others, days_to_close)
+
+
+def series_of(ticker: str) -> str:
+    return ticker.split("-")[0]
+
+
+def realized_loss_day(loss_usd: float, quoted_days: float, prior: float) -> float:
+    """$/day per market quoted at max_position: a series' net fill loss (a gain counts as 0)
+    over its quoted market-days plus `prior`."""
+    days = quoted_days + prior
+    return max(loss_usd, 0.0) / days if days > 0 else 0.0
 
 
 def key(ticker: str, side: str, hedge: bool = False) -> str:

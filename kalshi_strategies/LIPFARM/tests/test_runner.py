@@ -943,3 +943,34 @@ def test_a_sibling_dearer_than_the_slip_leaves_the_dump_as_it_was(tmp_path, monk
     r, iocs = _sibling_case(tmp_path, monkeypatch, {0.94: 500.0})          # B no asks 0.06 > 0.05 cap
     assert iocs == [("ioc", "Z-1-A", "no", 0.05, 300.0)]
     assert not r.state.get("locked")
+
+
+def test_realized_loss_charges_a_series_its_window_fills_over_its_quoted_days(tmp_path, monkeypatch):
+    books = {"KXA-1-X": {"yes": {}, "no": {}}}
+    r, c = make(tmp_path, monkeypatch, books)
+    now = time.time()
+    iso = lambda t: pd.Timestamp(t, unit="s", tz="UTC").isoformat()
+    fill = lambda t, side, px, at: {"ticker": t, "side": side, "price": px, "size": 200.0, "fee": 0.0, "time": iso(at)}
+    r.meta.update({"KXA-1-X": {"yes_bid_dollars": "0.80"}, "KXA-2-Y": {"no_bid_dollars": "0.50"},
+                   "KXB-1-Z": {"yes_bid_dollars": "0.10"}})
+    r.state["fills"] = [fill("KXA-1-X", "yes", 0.95, now - 3600),       # -30 in the window
+                        fill("KXA-2-Y", "no", 0.70, now - 20 * 86400),  # -40, before the window
+                        fill("KXB-1-Z", "yes", 0.20, now - 3600),       # -20, but no mark read yet
+                        fill("KXC-1-Q", "yes", 0.50, now - 3600)]
+    day = time.strftime("%Y-%m-%d", time.gmtime(now))
+    r.state["quoted_days"] = {"KXA": {day: 5.0, "2000-01-01": 100.0}}
+    cfg = dataclasses.replace(CFG, realized_loss_days=7.0, realized_loss_prior=5.0)
+    out = r.realized_loss(cfg)
+    assert out["KXA"] == pytest.approx(30.0 / 10.0) and "KXC" not in out
+    assert r.realized_loss(dataclasses.replace(cfg, realized_loss_days=0.0)) == {}
+
+
+def test_accrue_counts_market_days_with_lip_bids_up_per_series(tmp_path, monkeypatch):
+    books = {"KXA-1-X": {"yes": {}, "no": {}}}
+    r, c = make(tmp_path, monkeypatch, books)
+    r.state["orders"] = {"KXA-1-X|yes": _order("yes", 0.4, oid="o1"), "KXA-2-Y|no|h": _order("no", 0.3, oid="o2"),
+                         "KXB-1-Z|no|h": _order("no", 0.3, oid="o3")}
+    r.last_accrue = time.time() - 8640
+    r.accrue()
+    qd = r.state["quoted_days"]
+    assert sum(qd["KXA"].values()) == pytest.approx(0.1, rel=1e-3) and "KXB" not in qd

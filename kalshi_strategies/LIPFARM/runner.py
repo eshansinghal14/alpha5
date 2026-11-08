@@ -56,7 +56,7 @@ from kalshi_strategies.LIPFARM.farm import (CANCEL_TOKENS, CID_PREFIX, CLAIM_SET
                                             ORDER_TOKENS, PLACE_RESERVE, ROOT, STATUS_S,
                                             TRIP_COOLDOWN_S, WRITE_BURST, Cfg, TokenBucket, desired_orders,
                                             event_of, exit_lots, is_hedge, is_sentinel, key, parse_book,
-                                            plan_market, remove_ours, unkey)
+                                            plan_market, remove_ours, series_of, unkey)
 
 # As ARBS's eval loop: a pass gives the loop back after this long.
 EVAL_SLICE_S = 0.001
@@ -69,6 +69,7 @@ ORPHAN_S = 10.0
 # A journaled order this young may not be in Kalshi's resting list yet.
 SYNC_GRACE_S = 10.0
 MARKS_S = 60.0
+QUOTED_KEEP_DAYS = 30
 # As ARBS's completion.max_exit_misses: an informed sell that comes back short
 # (the socket book still showed bids the sweep had taken) is retried on the
 # market's next book update, at most this many times in a row.
@@ -485,6 +486,41 @@ class Runner:
             if t in self.programs:
                 pid = self.programs[t]["id"]
                 per[pid] = per.get(pid, 0.0) + gain
+        # Market-days each series had LIP bids up, per UTC day, for realized_loss.
+        qd = self.state.setdefault("quoted_days", {})
+        day = time.strftime("%Y-%m-%d", time.gmtime(now))
+        for t in {unkey(k)[0] for k in self.state["orders"] if not is_hedge(k)}:
+            d = qd.setdefault(series_of(t), {})
+            d[day] = d.get(day, 0.0) + dt / 86400
+        cut = time.strftime("%Y-%m-%d", time.gmtime(now - QUOTED_KEEP_DAYS * 86400))
+        for d in qd.values():
+            for x in [x for x in d if x < cut]:
+                del d[x]
+
+    def realized_loss(self, cfg: Cfg) -> dict[str, float]:
+        """Series -> its fill loss, $/day per market quoted at max_position, over the last
+        realized_loss_days: positions first filled in the window, marked as in positions()."""
+        if cfg.realized_loss_days <= 0:
+            return {}
+        now = time.time()
+        since = now - cfg.realized_loss_days * 86400
+        pnl, first = collections.Counter(), {}
+        for p in self.positions():
+            t = p["ticker"]
+            if t not in self.meta or not p.get("first"):
+                continue                      # no mark yet: its bid would read as 0
+            pnl[t] += p["pnl"]
+            first[t] = min(first.get(t, p["first"]), p["first"])
+        loss = collections.Counter()
+        for t, v in pnl.items():
+            if pd.Timestamp(first[t]).timestamp() >= since:
+                loss[series_of(t)] -= v
+        cut = time.strftime("%Y-%m-%d", time.gmtime(since))
+        out = {}
+        for s, v in loss.items():
+            days = sum(x for d, x in self.state.get("quoted_days", {}).get(s, {}).items() if d >= cut)
+            out[s] = farm.realized_loss_day(v, days, cfg.realized_loss_prior)
+        return out
 
     def flow_ok(self, t: str, cfg: Cfg) -> bool | None:
         """Low-flow check: True/False, None while its trades haven't been read.
@@ -1437,13 +1473,16 @@ class Runner:
                          current))
         planned = await self.run_io(plan_batch, jobs)
         plans, rates = {}, {}
+        real = self.realized_loss(cfg)
         for t, (pl, P) in planned.items():
             self.P[t] = P
             ok = self.flow_ok(t, cfg) if pl else False
             if pl and ok:
-                # LIP must pay for the market's expected adverse-sweep loss.
-                pl.loss_rate = farm.expected_loss_day(self.trades_day(t), pl, cfg, self.days_to_close(t),
-                                                      books.get(t)) / 86400
+                # LIP must pay for the market's expected adverse-sweep loss, and at least what
+                # fills in its series have actually cost us.
+                pl.loss_rate = max(farm.expected_loss_day(self.trades_day(t), pl, cfg, self.days_to_close(t),
+                                                          books.get(t)),
+                                   real.get(series_of(t), 0.0) * pl.lots / cfg.max_position) / 86400
                 ok = pl.rate >= cfg.min_lip_to_loss * pl.loss_rate
                 # Taking most of the pool means nobody else wants to quote here.
                 if ok and farm.pool_share(pl) > cfg.max_pool_share + 1e-9:
