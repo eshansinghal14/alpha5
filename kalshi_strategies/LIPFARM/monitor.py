@@ -15,6 +15,7 @@ State between runs: data/live/LIPFARM/monitor.json (delete it to restart the P&L
 """
 from __future__ import annotations
 
+import calendar
 import glob
 import json
 import os
@@ -66,10 +67,12 @@ def marked_pnl(fills: list[dict], value) -> float:
     return out
 
 
-def kalshi_fills(since: float, oids: set) -> list[dict]:
-    """Kalshi's record of fills of `oids` since `since` (unix s)."""
+def kalshi_fills(since: float, oids: set, max_pages: int = 200) -> list[dict]:
+    """Kalshi's record of fills of `oids` since `since` (unix s). Raises rather than return
+    a partial list: the account's fills (ARBS included) ran past a 20-page cap within 3 days,
+    and the cut-off fills read as journal gaps (11-08)."""
     out, cursor = [], None
-    for _ in range(20):
+    for _ in range(max_pages):
         params = {"limit": 1000, "min_ts": int(since)}
         if cursor:
             params["cursor"] = cursor
@@ -81,11 +84,30 @@ def kalshi_fills(since: float, oids: set) -> list[dict]:
             out.append({"ticker": f.get("ticker") or f.get("market_ticker"), "side": side,
                         "price": _dollars(f, "yes_price" if side == "yes" else "no_price") or 0.0,
                         "size": _count(f, "count") or 0.0, "fee": float(f.get("fee_cost") or 0.0),
-                        "order_id": f.get("order_id")})
+                        "order_id": f.get("order_id"), "trade_id": f.get("trade_id"),
+                        "ts": _fill_ts(f)})
         cursor = data.get("cursor")
-        if not cursor:
-            break
-    return out
+        if not cursor or not data.get("fills"):
+            return out
+    raise RuntimeError(f"more than {max_pages} pages of fills")
+
+
+def _fill_ts(f: dict) -> float:
+    if f.get("ts"):
+        return float(f["ts"])
+    t = f.get("created_time")
+    return calendar.timegm(time.strptime(t[:19], "%Y-%m-%dT%H:%M:%S")) if t else 0.0
+
+
+def kalshi_fills_cached(mon: dict, oids: set) -> list[dict]:
+    """kalshi_fills since monitoring began, kept in `mon` between runs: each run reads only
+    fills from 10 min before the newest one it holds, merged by trade id."""
+    have = {f["trade_id"]: f for f in mon.get("kfills", []) if f.get("trade_id")}
+    since = max([mon["started"]] + [f.get("ts", 0.0) - 600 for f in have.values()])
+    for f in kalshi_fills(since, oids):
+        have[f["trade_id"] or f"{f['order_id']}:{f['ts']}:{f['size']}"] = f
+    mon["kfills"] = list(have.values())
+    return [f for f in mon["kfills"] if f["order_id"] in oids]
 
 
 def decide(cur: dict, active: dict) -> tuple[list[str], dict]:
@@ -139,7 +161,7 @@ def main():
     # Kalshi's fills of the orders our journal knows, since monitoring began.
     oids = {f.get("order_id") for f in fills if f.get("order_id")}
     try:
-        kf = kalshi_fills(mon["started"], oids)
+        kf = kalshi_fills_cached(mon, oids)
     except Exception as e:
         kf = None
         print(f"Kalshi fills unavailable ({e}); using the journal's")

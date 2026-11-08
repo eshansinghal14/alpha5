@@ -1,3 +1,5 @@
+import pytest
+
 from kalshi_strategies.LIPFARM import monitor
 
 
@@ -40,3 +42,31 @@ def test_marks_and_pairs():
     fills = [{"ticker": "T", "side": "yes", "price": 0.33, "size": 295.0, "fee": 0.0},
              {"ticker": "T", "side": "no", "price": 0.7034, "size": 295.0, "fee": 4.307}]
     assert abs(monitor.marked_pnl(fills, lambda t, s: 0.0) - (-14.16)) < 0.01      # pair: marks don't matter
+
+
+def test_kalshi_fills_are_cached_and_read_from_the_newest_held(monkeypatch):
+    calls = []
+
+    def get(path, params=None, auth=False):
+        calls.append(params["min_ts"])
+        if params.get("cursor"):
+            return {"fills": [], "cursor": None}
+        fs = [{"order_id": "o1", "outcome_side": "yes", "yes_price_dollars": "0.40", "count_fp": "10",
+               "trade_id": "t1", "ticker": "A-1", "created_time": "2026-11-08T00:00:00Z"}]
+        if params["min_ts"] > 1794050000:
+            fs.append({"order_id": "o1", "outcome_side": "yes", "yes_price_dollars": "0.40", "count_fp": "5",
+                       "trade_id": "t2", "ticker": "A-1", "created_time": "2026-11-08T01:00:00Z"})
+        return {"fills": fs, "cursor": "c"}
+    monkeypatch.setattr(monitor, "kalshi_get", get)
+    mon = {"started": 1794000000.0}
+    assert [f["size"] for f in monitor.kalshi_fills_cached(mon, {"o1"})] == [10.0]
+    out = monitor.kalshi_fills_cached(mon, {"o1"})
+    assert sorted(f["size"] for f in out) == [5.0, 10.0]
+    assert calls[-2] == 1794096000 - 600                     # 2026-11-08T00:00Z less 10 min
+
+
+def test_kalshi_fills_raise_instead_of_returning_part(monkeypatch):
+    monkeypatch.setattr(monitor, "kalshi_get", lambda path, params=None, auth=False: {
+        "fills": [{"order_id": "x"}], "cursor": "more"})
+    with pytest.raises(RuntimeError):
+        monitor.kalshi_fills(0.0, {"o1"}, max_pages=3)
