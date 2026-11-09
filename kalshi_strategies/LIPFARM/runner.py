@@ -1427,8 +1427,11 @@ class Runner:
         while True:
             if self.live and self.gw.clients:
                 try:
+                    # Only shards we quote or hold on: every read shares ARBS's rate limit.
+                    used = {self.shard(t) for t in set(self.state.get("claims", {})) | self.order_tickers()}
                     for s, c in list(self.gw.clients.items()):
-                        self.cash[s] = await self.run_io(c.balance, s)
+                        if s in used:
+                            self.cash[s] = await self.run_io(c.balance, s)
                 except Exception as e:
                     print(f"balance read failed: {e!r}")
             await asyncio.sleep(BALANCE_S)
