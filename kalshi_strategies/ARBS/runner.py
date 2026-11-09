@@ -2802,7 +2802,7 @@ class ArbsRunner:
     def upside(self, b: Basket, bundles: float) -> float:
         """Expected payout above the locked worst case, at mid prices: only
         for baskets where some outcome pays more (a draw, an unlisted winner,
-        a ladder landing between its rungs). 0 without a two-sided book, and
+        a ladder landing between its rungs). 0 with a leg's book empty, and
         for a game in play: its wide spreads put the mids' sum over the payout
         when no outcome pays more (NHL DET+STL showed 7.5c a bundle, 10-31)."""
         if bundles <= 0 or (b.exact and b.type not in UPSIDE_TYPES) or b.is_live(pd.Timestamp.now(tz="UTC")):
@@ -2810,9 +2810,11 @@ class ArbsRunner:
         total = 0.0
         for leg in b.legs:
             v = self.feed.book(leg.ticker)
-            if v is None or v.bid is None or v.ask is None:
+            if v is None or (v.bid is None and v.ask is None):
                 return 0.0
-            mid = (v.bid + v.ask) / 2.0
+            # A side with no orders is the $0/$1 bound: a near-certain leg loses its asks
+            # exactly when the upside becomes likely (AAA gas ladder at 0.98/none, 11-09).
+            mid = ((0.0 if v.bid is None else v.bid) + (1.0 if v.ask is None else v.ask)) / 2.0
             total += mid if leg.side == "yes" else 1.0 - mid
         return bundles * max(0.0, total - b.payout)
 

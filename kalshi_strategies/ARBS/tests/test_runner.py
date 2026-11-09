@@ -1445,6 +1445,17 @@ def test_upside_only_where_an_outcome_pays_more(arbs):
     assert r.upside(started, 10) == 0.0
 
 
+def test_upside_prices_a_one_sided_book_against_its_bound(arbs):
+    r, b = arbs
+    import dataclasses
+    book(r, "X-A", [(0.98, 10)], [])                  # YES bid 0.98, no asks: mid 0.99
+    book(r, "X-B", [(0.12, 10)], [(0.84, 10)])        # B mid 0.14, NO worth 0.86
+    ladder = dataclasses.replace(b, type="implication", legs=(Leg("X-A", "yes"), Leg("X-B", "no")))
+    assert r.upside(ladder, 10) == pytest.approx(10 * (0.99 + 0.86 - 1.0))
+    book(r, "X-A", [], [])
+    assert r.upside(ladder, 10) == 0.0
+
+
 def test_print_recorded_only_where_a_quote_could_make_edge(arbs):
     r, b = arbs
     from kalshi_backtest.core import Trade
