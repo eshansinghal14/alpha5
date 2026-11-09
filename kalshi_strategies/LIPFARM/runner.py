@@ -2032,6 +2032,7 @@ class Runner:
             pair = min(p["lots"], pos.get((t, "no" if side == "yes" else "yes"), {}).get("lots", 0.0))
             p["mark"] = (1.0 if res == side else 0.0) if res in ("yes", "no") else float(
                 m.get(f"{side}_bid_dollars") or 0.0)
+            p["marked"] = res in ("yes", "no") or f"{side}_bid_dollars" in m
             p["paired"] = pair
             p["value"] = pair * 0.5 + (p["lots"] - pair) * p["mark"]
             p["pnl"] = p["value"] - p["cost"] - p["fees"]
@@ -2087,7 +2088,9 @@ class Runner:
                           "flow_held": [{"ticker": t, **h} for t, h in top]}, indent=1, default=str)
         asyncio.get_running_loop().run_in_executor(self.io_pool, _atomic_write,
                                                    os.path.join(self.root, "status.json"), doc)
-        if not log:
+        # A held market not read yet (a restart before its first market read) marks at 0: a
+        # chart point then showed fill P&L at -$5,508 for one report (11-09 07:26).
+        if not log or not all(p["marked"] for p in pos):
             return
         point = {k: round(summary[k], 4) for k in ("exp_lip_usd", "lip_locked_usd", "fill_pnl_usd", "net_usd",
                                                     "fill_lots", "exposure_usd", "our_usd_day_now")}

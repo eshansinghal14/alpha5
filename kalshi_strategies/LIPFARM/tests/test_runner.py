@@ -1060,3 +1060,21 @@ def test_the_dollar_minimum_counts_arbs_lip_in_the_same_period(tmp_path, monkeyp
     assert r.lip_locked() == 0.0
     r.arbs_period = {"pZ-1-A": 0.5}                  # ARBS quoted Z-1-A earlier in the period
     assert r.lip_locked() == pytest.approx(0.6) and r.period_accrued("Z-1-A") == pytest.approx(1.1)
+
+
+def test_no_history_point_while_a_held_market_has_no_mark(tmp_path, monkeypatch):
+    books = {"Z-1-A": {"yes": {}, "no": {}}}
+    r, _ = make(tmp_path, monkeypatch, books)
+    _held(r, "Z-1-A", "yes", 0.40, 10.0)
+    hist = tmp_path / farm.HISTORY_FILE
+    monkeypatch.setattr(runner, "_append_line", lambda path, line: open(path, "a").write(line + chr(10)))
+
+    async def go():
+        r.report(CFG)
+        await asyncio.sleep(0.05)
+        r.meta["Z-1-A"]["yes_bid_dollars"] = "0.38"
+        r.report(CFG)
+        await asyncio.sleep(0.05)
+    asyncio.run(go())
+    lines = open(hist).read().splitlines()
+    assert len(lines) == 1 and json.loads(lines[0])["fill_pnl_usd"] == pytest.approx(-0.2)
