@@ -104,3 +104,24 @@ def test_update_file_validates_before_write(tmp_path):
     with pytest.raises(ConfigError):
         update_file(Top, p, "S", {"inner.size": -1})
     assert load(Top, p, "S").inner.size == 4.0
+
+
+@section
+class WithDict:
+    by_coin: dict[str, float] | None = param("per-coin")
+    enabled: bool = param("on")
+
+
+def test_store_applies_a_dict_param_as_one_field(tmp_path):
+    p = str(tmp_path / "config.json")
+    _write(p, {"S": {"by_coin": None, "enabled": True}})
+    store = ConfigStore(WithDict, p, key="S")
+    _write(p, {"S": {"by_coin": {"XRP": 4.0}, "enabled": True}})
+    assert store.poll() == ["by_coin None -> {'XRP': 4.0}"]
+    assert store.config.by_coin == {"XRP": 4.0}
+    _write(p, {"S": {"by_coin": {"XRP": 5.0, "SOL": 3.0}, "enabled": True}})
+    store.poll()
+    assert store.config.by_coin == {"XRP": 5.0, "SOL": 3.0}
+    _write(p, {"S": {"by_coin": None, "enabled": True}})
+    store.poll()
+    assert store.config.by_coin is None

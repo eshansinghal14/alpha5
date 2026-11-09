@@ -199,6 +199,19 @@ def set_dotted(cfg, dotted: str, value):
     setattr(obj, parts[-1], value)
 
 
+def _field_of(cls, dotted: str) -> str:
+    """The config field a flattened key belongs to: its dotted path up to the
+    first part that isn't a section (dataclass)."""
+    parts = dotted.split(".")
+    tp = cls
+    for i, part in enumerate(parts[:-1]):
+        sub = _unwrap_optional(_hints(tp)[part])[0]
+        if not _is_section(sub):
+            return ".".join(parts[:i + 1])
+        tp = sub
+    return dotted
+
+
 def field_meta(cls, dotted: str) -> dict:
     parts = dotted.split(".")
     tp = cls
@@ -321,8 +334,11 @@ class ConfigStore:
         old_flat, new_flat = _flatten(to_dict(self.config)), _flatten(to_dict(new))
         changes = []
         self.pending = {}
-        for name, v in new_flat.items():
-            cur = old_flat.get(name)
+        # A dict-valued param flattens to one key per entry ("x.by_coin.XRP");
+        # diff and apply it as the one field it is.
+        names = dict.fromkeys(_field_of(self.cls, n) for n in [*new_flat, *old_flat])
+        for name in names:
+            v, cur = get_dotted(new, name), get_dotted(self.config, name)
             if v == cur:
                 continue
             if field_meta(self.cls, name)["apply"] == APPLY_NEXT_EVENT:
