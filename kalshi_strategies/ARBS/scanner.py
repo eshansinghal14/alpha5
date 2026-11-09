@@ -370,11 +370,13 @@ if __name__ == "__main__":
 
     from kalshi_infra.runtime.persist import LIVE_ROOT
 
-    # The scan peaks ~1 GB and isn't trading: it gives up the -900 inherited
-    # from alpha5-arbs so the OOM killer takes it before any trading process.
+    # The scan peaks ~1 GB: it gives up the -900 inherited from alpha5-arbs so the OOM
+    # killer takes it before a trading process, but stays under the dashboard, perf
+    # worker and recorders (900-1000), which must die first. At 1000 it tied them and,
+    # being the largest, was the one killed.
     try:
         with open("/proc/self/oom_score_adj", "w") as fh:
-            fh.write("1000")
+            fh.write("500")
     except OSError:
         pass
     root = sys.argv[1] if len(sys.argv) > 1 else os.path.join(LIVE_ROOT, "ARBS")
