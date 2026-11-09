@@ -1874,3 +1874,28 @@ def test_a_lip_leg_rests_where_its_completable_size_earns_the_most_lip(arbs):
     plan, size = r.lip_plan(b, vs, 0, need, 1000.0, plan0)
     assert size > R.pricing.depth_size(vs, 0, b.payout, need, 1000.0) and plan.price < plan0.price
     assert plan.edge >= need - 1e-9
+
+
+def test_a_lip_leg_is_sized_through_the_basket_that_completes_it(arbs):
+    r, b = arbs
+    from kalshi_infra.trading import lip
+    from kalshi_backtest.book import L2Book
+    # b completes X-A through X-B, which can't (asks 0.75); c completes it through X-C (asks 0.55, deep).
+    c = Basket(basket_id="t:c", relationship_id="t2", type="complete_set", cluster="t2",
+               legs=(Leg("X-A", "yes"), Leg("X-C", "yes")), payout=1.0, quote_until=None, resume_quoting=None)
+    r.all_baskets.append(c); r.baskets[c.basket_id] = c; r.tickers.append("X-C")
+    r.by_ticker["X-A"].append(c.basket_id); r.by_ticker["X-C"] = [c.basket_id]
+    r.feed._books["X-C"] = L2Book("X-C")
+    r.meta["X-C"] = R.Meta(ticker="X-C", event="X2", status="active", shard=0, taker_rate=0.07, maker_rate=0.0)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=1000, max_bundles_per_basket=5000)
+    book(r, "X-A", [(0.30, 150), (0.25, 3000)], [(0.60, 3000)])
+    book(r, "X-B", [(0.20, 10)], [(0.25, 2000)])
+    book(r, "X-C", [(0.40, 10)], [(0.45, 2000)])
+    prog = {"id": "p1", "start_date": "2026-01-01T00:00:00Z", "end_date": "2099-01-01T00:00:00Z",
+            "period_reward": 10_000_000, "target_size_fp": "1000", "discount_factor_bps": 5000}
+    r.lip_programs = {"X-A": ("p1", 0.0, 4e9, lip.params_from_program(prog))}
+    vs = r.views(b)
+    need = R.edge_dollars(b.payout, r.cfg.trading.min_edge + r.cfg.trading.quote_edge_add)
+    plan0 = R.pricing.QuotePlan(leg=0, price=0.31, max_price=0.31, edge=0.1, others_cost=0.0)
+    plan, size = r.lip_plan(b, vs, 0, need, 1000.0, plan0)
+    assert size > 500 and plan.price == pytest.approx(0.31) and r.via[(b.basket_id, 0)] == c.basket_id   # max_dollars caps it

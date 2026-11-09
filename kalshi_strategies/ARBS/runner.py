@@ -2004,7 +2004,8 @@ class ArbsRunner:
 
     def lip_plan(self, b: Basket, vs, j: int, need: float, room: float, plan):
         """(plan, size) for leg j of a LIP market: of the prices from `plan`'s down
-        LIP_SCAN_TICKS ticks, the one whose largest size that still completes for `need`
+        LIP_SCAN_TICKS ticks, the one whose largest size that still completes for the edge,
+        through b or any basket a fill could be booked into instead (as best_plan prices),
         earns the most LIP, scored on the book with our other bids as they rest (our own
         size can lift the reference price over a crowd below it). Ties go to the higher
         price. None when the leg's market pays no LIP now or `plan` is None."""
@@ -2016,31 +2017,46 @@ class ArbsRunner:
         bk = self.feed.ladder(leg.ticker)
         if bk is None or not start <= time.time() < end:
             return None
+        t, now_ts = self.cfg.trading, _utc()
+        paths = [(None, j, vs, b.payout, need, float(int(room + _EPS)))]
+        for y, k in self.alternatives(b, j):
+            vy = self.views(y)
+            if vy is None:
+                continue
+            live = self.live_now(y, now_ts)
+            ny = self.lip_need(edge_dollars(y.payout, t.min_edge + t.quote_edge_add) +
+                               (t.live_edge_add if live else 0.0), leg.ticker, live)
+            ry = min(room, self.room_bundles(y), float(self.quote_size_by_dollars(y)))
+            paths.append((y, k, vy, y.payout, ny, float(int(ry + _EPS))))
         opp = "no" if leg.side == "yes" else "yes"
         side_own = list(self._own(leg.ticker, leg.side).items())
         opp_own = list(self._own(leg.ticker, opp).items())
         others = lip.others_ladder(dict(bk.yes_bids if leg.side == "yes" else bk.no_bids), side_own)
         opp_lv = lip.levels_with_ours(lip.others_ladder(dict(bk.yes_bids if opp == "yes" else bk.no_bids), opp_own),
                                       opp_own)
-        lv, cap = vs[j], float(int(room + _EPS))
+        lv = vs[j]
         best, p = None, plan.price
         for _ in range(LIP_SCAN_TICKS):
             if p < lv.ticks.lo - _EPS:
                 break
-            n = pricing.depth_size(vs, j, b.payout, need, cap, at=p)
+            n, path = max(((pricing.depth_size(pv, k, pay, nd, cap, at=p), i)
+                           for i, (_, k, pv, pay, nd, cap) in enumerate(paths)), key=lambda x: x[0])
             if n >= 1:
                 mine = lip.levels_with_ours(others, [(p, n)])
                 r = lip.reward_rate(*((mine, opp_lv) if leg.side == "yes" else (opp_lv, mine)), P)
                 if best is None or r > best[0] + 1e-12:
-                    best = (r, p, n)
+                    best = (r, p, n, path)
             p = lv.ticks.down(p)
         if best is None or best[0] <= 0:
             return None
-        _, p, n = best
-        q = pricing.quote_leg(vs, j, b.payout, need, n)
+        _, p, n, i = best
+        y, k, pv, pay, nd, _ = paths[i]
+        q = pricing.quote_leg(pv, k, pay, nd, n)
         if q is None or q.max_price < p - _EPS:
             return None
-        return dataclasses.replace(q, price=p, edge=b.payout - q.others_cost - pricing.maker_cost(p, lv.maker_rate)), n
+        self.set_via(b.basket_id, j, y)
+        return dataclasses.replace(q, leg=j, price=p,
+                                   edge=pay - q.others_cost - pricing.maker_cost(p, pv[k].maker_rate)), n
 
     def lip_offers(self) -> dict:
         """Baskets touching LIPFARM's markets: quotes resting there ("live") and the
