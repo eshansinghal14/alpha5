@@ -3,5 +3,6 @@
 only a dashboard page."""
 SERIES: dict = {}
 DASHBOARD_GROUP = "LIP"
+DASHBOARD_HIDDEN = True   # turned off 2026-11-09
 EXTRA_PAGES = {"LIPFARM": "kalshi_viz.lipfarm_page:render"}
 DASHBOARD_LABELS = {"LIPFARM": "LIP farm"}

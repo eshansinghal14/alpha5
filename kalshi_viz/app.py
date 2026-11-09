@@ -61,9 +61,12 @@ def _groups() -> dict[str, list[str]]:
     """Sidebar heading -> its pages. A folder's DASHBOARD_GROUP names its
     heading (folders sharing one are listed by DASHBOARD_RANK, lower first);
     a folder without one goes under Other. A folder's EXTRA_PAGES (page id ->
-    "module:render") add pages that are not series (a backtest view)."""
+    "module:render") add pages that are not series (a backtest view).
+    DASHBOARD_HIDDEN drops a folder's pages (a strategy turned off)."""
     out: dict[str, list[str]] = {}
     for mod in sorted(folders().values(), key=lambda m: getattr(m, "DASHBOARD_RANK", 0)):
+        if getattr(mod, "DASHBOARD_HIDDEN", False):
+            continue
         g = getattr(mod, "DASHBOARD_GROUP", None) or OTHER_GROUP
         out.setdefault(g, []).extend(mod.SERIES)
         out[g].extend(getattr(mod, "EXTRA_PAGES", {}))

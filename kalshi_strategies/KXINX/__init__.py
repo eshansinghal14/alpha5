@@ -26,6 +26,7 @@ WRITE_GROUP = "spx-daily"
 WRITE_PRIORITY = {"KXINXDUD": 0, "KXINXU": 1}
 # Sidebar heading (kalshi_viz.app._groups).
 DASHBOARD_GROUP = "S&P"
+DASHBOARD_HIDDEN = True   # turned off 2026-11-09
 
 
 def _pick_event(events, cfg):
