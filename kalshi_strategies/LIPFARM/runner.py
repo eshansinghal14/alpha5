@@ -70,6 +70,7 @@ ORPHAN_S = 10.0
 SYNC_GRACE_S = 10.0
 MARKS_S = 60.0
 QUOTED_KEEP_DAYS = 30
+BALANCE_S = 30.0
 # As ARBS's completion.max_exit_misses: an informed sell that comes back short
 # (the socket book still showed bids the sweep had taken) is retried on the
 # market's next book update, at most this many times in a row.
@@ -203,6 +204,7 @@ class Runner:
         self.cfg_adverse_frac = 1.0           # cfg.adverse_frac, likewise
         self.n_refused, self.last_refused_log = 0, 0.0
         self.marks_at = 0.0
+        self.cash: dict[int, float] = {}         # shard -> available balance, read every BALANCE_S
         self.categories: dict[str, str] = {}  # series -> category
         self.series_titles: dict[str, str] = {}
         self.flow_pool = cf.ThreadPoolExecutor(1, thread_name_prefix="lipfarm-flow")
@@ -360,7 +362,7 @@ class Runner:
         return self.state.setdefault("period_accrued", {}).get(self.programs[t]["id"], 0.0)
 
     def choose(self, cfg: Cfg) -> dict[str, farm.Plan]:
-        """The markets to quote, within max_capital and num_markets, by what a slot is
+        """The markets to quote, within shard cash and num_markets, by what a slot is
         worth per day: LIP net of expected loss, plus, for a market under $1 this period
         that can still reach it, its accrual over the days still needed (quoting it that
         long unlocks it; dropping it forfeits it). Markets quoted now get INCUMBENT_EDGE
@@ -388,11 +390,12 @@ class Runner:
             if 0 < a < farm.LIP_MIN_PAYOUT_USD:
                 v += a / max((farm.LIP_MIN_PAYOUT_USD - a) / max(p.rate, 1e-12), 1.0)
             return v * (INCUMBENT_EDGE if p.ticker in quoted else 1.0)
-        out, exp = {}, self.exposure()
+        out = {}
         for p in sorted(cands, key=lambda p: -worth(p)):
             if len(out) >= cfg.num_markets:
                 break
-            if exp + p.lots * max(px for _, px in p.legs) <= cfg.max_capital + 1e-9:
+            room = self.room(p.ticker, cfg)
+            if (p.ticker in quoted if room is None else p.lots * max(px for _, px in p.legs) <= room + 1e-9):
                 out[p.ticker] = p
         return out
 
@@ -776,6 +779,10 @@ class Runner:
         new = self.book_fills(fills)
         sizes = self.state.get("lip_oid_size", {})
         for f in fills:
+            s = self.shard(f.get("ticker") or "")
+            if f.get("ticker") in new and s in self.cash:
+                # The next balance read is up to BALANCE_S away; the bids this fill now makes unaffordable go now.
+                self.cash[s] -= f["size"] * f["price"] + (f.get("fee") or 0.0)
             if f.get("ticker") in new:
                 self.seen_at[f["ticker"]] = (now, f.get("time"))
                 if f.get("order_id") in sizes:
@@ -1408,11 +1415,29 @@ class Runner:
             self.wanted.update(ws)
             self.spawn(self.place_side(t, s, ws, 0.0), t)
 
+    def room(self, t: str, cfg: Cfg) -> float | None:
+        """Dollars a fill on t may spend: its shard's cash less cash_reserve; unlimited
+        when not live, None while that shard's balance is unread."""
+        if not self.live:
+            return math.inf
+        cash = self.cash.get(self.shard(t))
+        return None if cash is None else cash - cfg.cash_reserve
+
+    async def balance_loop(self):
+        while True:
+            if self.live and self.gw.clients:
+                try:
+                    for s, c in list(self.gw.clients.items()):
+                        self.cash[s] = await self.run_io(c.balance, s)
+                except Exception as e:
+                    print(f"balance read failed: {e!r}")
+            await asyncio.sleep(BALANCE_S)
+
     def capital_check(self):
-        exp = self.exposure()
         for k, o in list(self.state["orders"].items()):
-            if not is_hedge(k) and exp + o["price"] * o["remaining"] > self.cfg.max_capital + 1e-9:
-                print(f"capital: pull {k} (exposure ${exp:.0f})")
+            room = self.room(unkey(k)[0], self.cfg)
+            if not is_hedge(k) and room is not None and o["price"] * o["remaining"] > room + 1e-9:
+                print(f"capital: pull {k} (shard cash ${room + self.cfg.cash_reserve:.0f})")
                 self.cancel(k, reason="lipfarm:capital")
 
     def params(self, t: str) -> lip.LipParams:
@@ -1959,7 +1984,7 @@ class Runner:
                    "lip_locked_usd": locked, "lip_pending_usd": tot_lip - locked,
                    "fills": len(self.state["fills"]), "fill_lots": sum(p["lots"] for p in pos),
                    "fill_pnl_usd": fill_pnl, "net_usd": tot_lip + fill_pnl, "resting_cost_usd": at_risk,
-                   "max_capital_usd": cfg.max_capital, "exposure_usd": self.exposure(),
+                   "cash_usd": sum(self.cash.values()), "exposure_usd": self.exposure(),
                    "locked_bundles": len(self.state.get("locked", {})),
                    "write_tps_10m": self.bucket.rate_10m(), "write_tps_cap": cfg.write_tokens_per_s,
                    "ws_up": bool(self.feed and self.feed.up), "ws_updates": self.n_evals,
@@ -1988,7 +2013,7 @@ class Runner:
               f"| {hrs:.2f}h | quoting {len(rows)} | now ${summary['our_usd_day_now']:.0f}/day "
               f"| exp LIP ${tot_lip:.2f} | fills {summary['fills']} pnl ${fill_pnl:+.2f} "
               f"| net ${summary['net_usd']:+.2f} | resting ${at_risk:.0f} | exposure "
-              f"${summary['exposure_usd']:.0f} of ${cfg.max_capital:.0f} | loop lag max "
+              f"${summary['exposure_usd']:.0f} | cash ${summary['cash_usd']:.0f} | loop lag max "
               f"{1000 * self.lag_max:.0f} ms | evals {self.n_evals}", flush=True)
         self.lag_max = 0.0
         for r in rows:
@@ -2018,7 +2043,7 @@ class Runner:
         self.ensure_feed(held or set(list(self.programs)[:1]))
         coros = [self.control_loop(arm, stop_ev), self.eval_loop(), self.cycle_loop(), self.guard_loop(),
                  self.refresh_loop(), self.status_loop(), self.keepalive_loop(), self.flush_loop(),
-                 self.lag_loop(), self.ghost_loop(), self.levels_loop(), self.holds_loop(), self.recovery_loop()]
+                 self.lag_loop(), self.balance_loop(), self.ghost_loop(), self.levels_loop(), self.holds_loop(), self.recovery_loop()]
         tasks = [loop.create_task(c) for c in coros]
         try:
             await stop_ev.wait()

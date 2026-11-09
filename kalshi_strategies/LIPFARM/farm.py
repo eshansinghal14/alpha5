@@ -26,9 +26,10 @@ Each quoted side takes one of two layouts, whichever the LIP scorer prefers:
 Every side must reach Kalshi's Target size, ours included where we quote and
 from others alone where we don't, or the snapshot pays nobody. Markets are
 ranked by LIP per day net of expected loss. Kalshi holds no cash for resting
-orders (11-04: $9.6k resting on a $16.3k balance, balance unchanged), so
-`max_capital` caps what fills have left us holding: a bid that could fill us
-past it isn't placed, and one is pulled as soon as a fill makes that true.
+orders (11-04: $9.6k resting on a $16.3k balance, balance unchanged), so a bid
+is placed only if filling it fits its shard's available cash less
+`cash_reserve`, and is pulled as soon as a fill makes that untrue. ARBS sizes
+against the same cash.
 
 On a fill we first look for a way to lock the position by taking: the same
 market's other side, or the other legs of any ARBS basket holding our leg
@@ -179,9 +180,10 @@ DEFAULT_TAKER_RATE = 0.07
 @section
 class Cfg:
     # ---- pricing: which markets, how much ----
-    max_capital: float = param("Most dollars our fills may leave us holding (unexited positions at cost). A bid "
-                               "that could take us past it isn't placed; after a fill, bids that could are "
-                               "pulled. Resting bids hold no cash at Kalshi.", min=0.0, step=500.0, group="pricing")
+    cash_reserve: float = param("Dollars of each shard's available cash left free: a bid is placed only if filling "
+                                "it fits the cash less this, and pulled when a fill makes that untrue. Resting bids "
+                                "hold no cash at Kalshi, and ARBS spends the same cash.", min=0.0, step=100.0,
+                                group="pricing")
     num_markets: int = param("Most markets quoted.", min=0, step=1, group="pricing")
     sentinel_keep: float = param("Use the sentinel layout on a side when it keeps at least this share of the "
                                  "touch layout's LIP. 11-04, 366 sides: thin touches (<200 ahead) keep ~97%, "

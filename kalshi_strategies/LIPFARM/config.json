@@ -1,6 +1,6 @@
 {
   "farm": {
-    "max_capital": 7000.0,
+    "cash_reserve": 500.0,
     "num_markets": 30,
     "sentinel_keep": 0.8,
     "dump_slip_ticks": 2,

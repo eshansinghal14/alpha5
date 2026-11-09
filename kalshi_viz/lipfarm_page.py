@@ -160,7 +160,8 @@ def render(page: str, stale_fn):
                "Wide markets (spread >= `wide_spread`): a bid of the market's Target (where LIP stops counting) at both touches. Decided markets "
                "(expensive bid >= `decided_min`, below the market's top price): a bid on the expensive side only. "
                "Other markets: both touches, sized by exit liquidity (`exit_depth_frac`). Every "
-               "side must reach Target, so the snapshot pays. Best LIP per dollar first, up to `max_capital`. "
+               "side must reach Target, so the snapshot pays. Best LIP per dollar first, while a fill fits the "
+               "shard's cash less `cash_reserve`. "
                "Expected LIP is our modelled share over time, not Kalshi's payout (nothing under $1 per "
                "market-period). Skips events ARBS holds; when live, ARBS stays off our claimed markets.")
 
@@ -199,10 +200,10 @@ def render(page: str, stale_fn):
         c[4].metric("Net", f"${locked + s['fill_pnl_usd']:+,.2f}", f"${s['net_usd']:+,.2f} incl. LIP under $1",
                     delta_color="off", help="Locked LIP + fill P&L.")
         c[5].metric("Exposure", f"${s.get('exposure_usd', 0):,.0f}",
-                    f"of ${s.get('max_capital_usd', 0):,.0f} cap · ${s['resting_cost_usd']:,.0f} bids resting",
+                    f"${s.get('cash_usd', 0):,.0f} cash · ${s['resting_cost_usd']:,.0f} bids resting",
                     delta_color="off", help="What fills have left us holding, unexited, at cost. Resting bids "
-                                            "hold no cash at Kalshi; a bid that could fill us past the cap "
-                                            "isn't placed.")
+                                            "hold no cash at Kalshi; a bid whose fill wouldn't fit the shard's "
+                                            "cash less cash_reserve isn't placed.")
         ws = ("websocket up" if s.get("ws_up") else "websocket down (REST fallback)") if s.get("live_trading") else "REST"
         st.caption(f"writes {s.get('write_tps_10m', 0):.2f} of {s.get('write_tps_cap', 0):.0f} tokens/s (10 min) · "
                    f"{ws} · {s['mode']} · this mode's journal covers {s['hours']:.2f} h · "

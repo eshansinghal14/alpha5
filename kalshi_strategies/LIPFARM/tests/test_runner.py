@@ -41,6 +41,9 @@ class FakeClient:
     def can_afford(self, kind, reserve=0.0):
         return True
 
+    def balance(self, exchange_index=None):
+        return 1e9
+
     def tokens_now(self):
         return 300.0
 
@@ -99,6 +102,7 @@ def make(tmp_path, monkeypatch, books, live=True):
         r._open_mode(True)
     c = FakeClient()
     r.gw.clients = {0: c}
+    r.cash = {0: 1e9}
     r.gw.shard_of = {t: 0 for t in books}
     r.feed = FakeFeed(books)
     r.meta = {t: {"event_ticker": farm.event_of(t), "exchange_index": 0, "status": "active"} for t in books}
@@ -350,15 +354,20 @@ def _held(r, t, side, price, size, oid="f1"):
                              "trade_id": "x" + oid, "time": "2026-11-05T00:00:00", "liquidity": "maker"})
 
 
-def test_choose_ranks_by_net_lip_per_day_and_caps_by_exposure(tmp_path, monkeypatch):
+def test_choose_ranks_by_net_lip_per_day_and_caps_by_shard_cash(tmp_path, monkeypatch):
     books = {t: {"yes": {}, "no": {}} for t in ("A-1-X", "B-1-X", "C-1-X")}
     r, _ = make(tmp_path, monkeypatch, books)
     r.plans = {"A-1-X": _plan("A-1-X", rate=2e-3), "C-1-X": _plan("C-1-X", legs=(("no", 0.98),), rate=5e-4, capital=980.0),
                "B-1-X": _plan("B-1-X", "wide", (("yes", 0.1), ("no", 0.4)), capital=500.0)}
     r.plans["A-1-X"].loss_rate = 1.7e-3                                   # A pays most, but nets least
-    assert list(r.choose(dataclasses.replace(CFG, max_capital=1000))) == ["B-1-X", "C-1-X", "A-1-X"]
-    monkeypatch.setattr(r, "exposure", lambda: 500.0)
-    assert list(r.choose(dataclasses.replace(CFG, max_capital=1000))) == ["B-1-X"]
+    r.cash = {0: 1100.0}
+    cfg = dataclasses.replace(CFG, cash_reserve=100.0)
+    assert list(r.choose(cfg)) == ["B-1-X", "C-1-X", "A-1-X"]
+    r.cash = {0: 600.0}
+    assert list(r.choose(cfg)) == ["B-1-X"]
+    r.cash = {}                                                       # unread: only what's quoted stays
+    r.state["orders"] = {"C-1-X|no": _order("no", 0.98)}
+    assert list(r.choose(cfg)) == ["C-1-X"]
 
 
 def test_a_market_near_one_dollar_outranks_one_past_it(tmp_path, monkeypatch):
@@ -510,18 +519,19 @@ def test_fill_locked_through_an_arbs_basket(tmp_path, monkeypatch):
     assert r.state["locked"] == {"Z-1-A": 100.0, "Z-1-B": 100.0} and not r.free_positions().get("Z-1-A")
 
 
-def test_a_fill_pulls_bids_that_could_take_us_past_max_capital(tmp_path, monkeypatch):
+def test_a_fill_pulls_bids_its_shard_cash_can_no_longer_cover(tmp_path, monkeypatch):
     books = {"Z-1-A": {"yes": {0.96: 300.0}, "no": {0.02: 5000.0}},
              "Z-1-B": {"yes": {0.40: 900.0}, "no": {0.50: 900.0}}}
     r, c = make(tmp_path, monkeypatch, books)
-    r.cfg = dataclasses.replace(CFG, max_capital=500.0)
+    r.cfg = dataclasses.replace(CFG, cash_reserve=100.0)
+    r.cash = {0: 600.0}
     r.state["orders"] = {"Z-1-A|yes": _order("yes", 0.97, oid="o1", group=None),
                          "Z-1-B|yes": _order("yes", 0.40, oid="o2", group=None)}
     r.state.update(lip_oid_size={"o1": 1000, "o2": 1000}, hedged_oids=["o1", "o2"], all_oids=["o1", "o2"])
 
     async def go():
         await boot(r)
-        r._on_fill(_fill("Z-1-A", "yes", 0.97, 200.0, "o1", "t1"))         # $194 held: a 0.40 x1000 bid passes $500
+        r._on_fill(_fill("Z-1-A", "yes", 0.97, 200.0, "o1", "t1"))         # $194 spent: $306 left, under a 0.40 x1000 bid
         await settle(r)
     asyncio.run(go())
     assert "Z-1-B|yes" not in r.state["orders"]
