@@ -1911,3 +1911,22 @@ def test_arbs_locked_lip_counts_lipfarm_lip_in_the_same_period(arbs):
         json.dump({"period": {"p1": 0.7}}, fh)
     r.poll_farm_periods()
     assert r.lip_summary()["locked_usd"] == pytest.approx(0.4)
+
+
+def test_a_side_that_earns_no_lip_quotes_as_a_plain_arb_leg_whatever_the_other_side_earns(arbs):
+    r, b = arbs
+    from kalshi_infra.trading import lip
+    # X-A yes: 3000 at the touch fill Target, so nothing we rest below it scores; our no bid earns.
+    book(r, "X-A", [(0.30, 3000)], [(0.60, 3000)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 5), (0.33, 500)])
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=1000, max_bundles_per_basket=5000)
+    prog = {"id": "p1", "start_date": "2026-01-01T00:00:00Z", "end_date": "2099-01-01T00:00:00Z",
+            "period_reward": 10_000_000, "target_size_fp": "1000", "discount_factor_bps": 5000}
+    r.lip_programs = {"X-A": ("p1", 0.0, 4e9, lip.params_from_program(prog))}
+    q = R.Quote(basket_id="other", leg=0, ticker="X-A", side="no", price=0.61, size=500.0, cid="c",
+                edge=0.05, max_price=0.61, pending=False)
+    r.quotes[q.key] = q
+    vs = r.views(b)
+    need = R.edge_dollars(b.payout, r.cfg.trading.min_edge + r.cfg.trading.quote_edge_add)
+    plan0 = R.pricing.QuotePlan(leg=0, price=0.29, max_price=0.29, edge=0.05, others_cost=0.0)
+    assert r.lip_plan(b, vs, 0, need, 1000.0, plan0) is None

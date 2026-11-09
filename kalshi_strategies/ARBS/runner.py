@@ -2072,6 +2072,9 @@ class ArbsRunner:
         opp_lv = lip.levels_with_ours(lip.others_ladder(dict(bk.yes_bids if opp == "yes" else bk.no_bids), opp_own),
                                       opp_own)
         lv = vs[j]
+        # What this side's quote adds: our other side's bids earn whatever we rest here.
+        side_lv = lip.levels_with_ours(others, [])
+        base = lip.reward_rate(*((side_lv, opp_lv) if leg.side == "yes" else (opp_lv, side_lv)), P)
         best, p = None, plan.price
         for _ in range(LIP_SCAN_TICKS):
             if p < lv.ticks.lo - _EPS:
@@ -2080,11 +2083,12 @@ class ArbsRunner:
                            for i, (_, k, pv, pay, nd, cap) in enumerate(paths)), key=lambda x: x[0])
             if n >= 1:
                 mine = lip.levels_with_ours(others, [(p, n)])
-                r = lip.reward_rate(*((mine, opp_lv) if leg.side == "yes" else (opp_lv, mine)), P)
+                r = lip.reward_rate(*((mine, opp_lv) if leg.side == "yes" else (opp_lv, mine)), P) - base
                 if best is None or r > best[0] + 1e-12:
                     best = (r, p, n, path)
             p = lv.ticks.down(p)
-        if best is None or best[0] <= 0:
+        if best is None or best[0] <= 1e-12:
+            # No price earns this side anything: it quotes as a plain arb leg.
             self.lip_plans[(b.basket_id, j)] = (time.time(), None, 0.0, None)
             return None
         _, p, n, i = best
