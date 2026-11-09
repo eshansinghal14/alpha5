@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import os
 import time
 
 from kalshi_strategies.KXCRYPTOLEAD15M.cf_index import CfIndex
@@ -59,6 +60,17 @@ def venue_plan(coins=COINS) -> dict[str, list[str]]:
     for v in LEADING_VENUES:
         plan[v] = [c for c in COINS if c in coins]
     return plan
+
+
+def _write_touch(rows: list[tuple]):
+    """One part per flush under data/kalshi_crypto/touch_rec/{day}/."""
+    import pandas as pd
+    from kalshi_infra import DATA_ROOT
+    df = pd.DataFrame(rows, columns=["recv_ts", "venue", "coin", "bid", "ask", "bid_sz", "ask_sz", "our_mid"])
+    day = pd.Timestamp(df.recv_ts.iloc[0], unit="s", tz="UTC").strftime("%Y-%m-%d")
+    d = os.path.join(DATA_ROOT, "kalshi_crypto", "touch_rec", day)
+    os.makedirs(d, exist_ok=True)
+    df.to_parquet(os.path.join(d, f"{int(time.time() * 1000)}.parquet"), compression="zstd", index=False)
 
 
 class SpotFeed:
@@ -123,6 +135,11 @@ class SpotFeed:
         self._calib_seeded = not persist        # tests: nothing on disk to seed from
         self._calib_tasks: list[asyncio.Task] = []
         self._persist = persist
+        # Every spot-venue touch change with our receipt time and the pricing
+        # mid it produced: tests whether the settlement-index books lead our
+        # quote fills (the 1 Hz book recorder is too coarse for that).
+        self._touch_rows: list[tuple] = []
+        self._last_touch: dict[tuple[str, str], tuple] = {}
         self._drain_now: asyncio.Event | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._sent_thr: dict | None = None
@@ -393,6 +410,13 @@ class SpotFeed:
         before = self.bus.mid_nowcast(vb.coin)
         self.bus.observe(vb)
         after = self.bus.mid_nowcast(vb.coin)
+        if self._persist and not vb.is_resyncing and vb.bids and vb.asks:
+            k = (vb.venue, vb.coin)
+            touch = (vb.bids[0].price, vb.asks[0].price)
+            if self._last_touch.get(k) != touch:
+                self._last_touch[k] = touch
+                self._touch_rows.append((time.time() - (time.monotonic() - vb.receive_ts), vb.venue, vb.coin,
+                                         touch[0], touch[1], vb.bids[0].size, vb.asks[0].size, after))
         if after != before:
             self.perp_nowcast.on_spot(vb.coin, after)
             self._perp_woke[vb.coin] = 0.0          # increment resets on a spot move
@@ -452,6 +476,12 @@ class SpotFeed:
                 await asyncio.get_running_loop().run_in_executor(None, self.trips.write, self.trips.drain())
             except Exception as e:
                 print(f"[KXCRYPTOLEAD15M] burst trip flush failed: {e!r}")
+            touch, self._touch_rows = self._touch_rows, []
+            if touch:
+                try:
+                    await asyncio.get_running_loop().run_in_executor(None, _write_touch, touch)
+                except Exception as e:
+                    print(f"[KXCRYPTOLEAD15M] touch flush failed: {e!r}")
             rows = self.cf.drain()
             try:
                 await asyncio.get_running_loop().run_in_executor(None, self.cf.write, rows)
