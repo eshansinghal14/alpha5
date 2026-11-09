@@ -104,10 +104,11 @@ def _metrics(s: dict):
     unrealized = (p.get("locked") or 0.0) + broken
     lip_locked = lp.get("locked_usd") or 0.0
     c[0].metric("Total PnL", _usd(settled + unrealized + lip_locked),
-                f"(incl. {_usd(lip_locked)} LIP past $1)" if lp else None, delta_color="off",
+                f"(LIP {_usd(lp.get('exp_usd') or 0.0)} · {_usd(lip_locked)} payable)" if lp else None,
+                delta_color="off",
                 help="Settled (payouts and unwound contracts, minus everything paid incl. fees) plus expected "
-                     "unrealized, plus the LIP our resting quotes earned in program periods past Kalshi's $1 "
-                     f"minimum ({_usd(lp.get('exp_usd') or 0.0)} incl. periods still under it).")
+                     "unrealized, plus payable LIP. LIP: what our resting quotes have earned in all; payable: "
+                     "the part in program periods past Kalshi's $1 minimum, the only part counted in the total.")
     upside = p.get("upside") or 0.0
     note = [f"{_usd(upside)} upside"] if upside >= 0.005 else []
     if n_broken:
