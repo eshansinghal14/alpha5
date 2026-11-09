@@ -96,14 +96,18 @@ def _alerts(series: str, s: dict):
 
 def _metrics(s: dict):
     p = s.get("pnl") or {}
+    lp = s.get("lip") or {}
     c = st.columns(5)
     broken = p.get("broken") or 0.0
     n_broken = sum(1 for h in s.get("holdings") or [] if h.get("unhedged"))
     settled = p.get("settled") or 0.0
     unrealized = (p.get("locked") or 0.0) + broken
-    c[0].metric("Total PnL", _usd(settled + unrealized),
+    lip_locked = lp.get("locked_usd") or 0.0
+    c[0].metric("Total PnL", _usd(settled + unrealized + lip_locked),
+                f"incl. {_usd(lip_locked)} LIP" if lp else None, delta_color="off",
                 help="Settled (payouts and unwound contracts, minus everything paid incl. fees) plus expected "
-                     "unrealized.")
+                     "unrealized, plus the LIP our resting quotes earned in program periods past Kalshi's $1 "
+                     f"minimum ({_usd(lp.get('exp_usd') or 0.0)} incl. periods still under it).")
     upside = p.get("upside") or 0.0
     note = [f"{_usd(upside)} upside"] if upside >= 0.005 else []
     if n_broken:

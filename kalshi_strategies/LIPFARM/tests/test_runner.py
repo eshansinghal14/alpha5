@@ -1028,4 +1028,5 @@ def test_claims_file_lists_the_lip_markets_beside_it(tmp_path, monkeypatch):
     r, _ = make(tmp_path, monkeypatch, books)
     r.write_claims({})
     with open(tmp_path / "live" / farm.LIP_MARKETS_FILE) as f:
-        assert json.load(f)["tickers"] == ["Z-1-A"]
+        doc = json.load(f)
+    assert doc["tickers"] == ["Z-1-A"] and doc["programs"]["Z-1-A"]["id"] == "pZ-1-A"

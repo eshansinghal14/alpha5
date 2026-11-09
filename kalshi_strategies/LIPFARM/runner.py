@@ -358,11 +358,14 @@ class Runner:
         claims = {t: old.get(t, now) for t in set(want) | self.order_tickers() | set(pos)}
         self.state["claims"] = claims
         os.makedirs(os.path.dirname(farm.CLAIMS_PATH), exist_ok=True)
-        lipm = frozenset(self.programs)
+        lipm = frozenset((t, p.get("id")) for t, p in self.programs.items())
         if lipm != self._lipm_written:
             path = os.path.join(os.path.dirname(farm.CLAIMS_PATH), farm.LIP_MARKETS_FILE)
+            keep = ("id", "start_date", "end_date", "period_reward", "target_size_fp", "discount_factor_bps",
+                    "max_reward_per_account")
             with open(path + ".tmp", "w") as f:
-                json.dump({"written_at": now, "tickers": sorted(lipm)}, f)
+                json.dump({"written_at": now, "tickers": sorted(self.programs),
+                           "programs": {t: {k: p.get(k) for k in keep} for t, p in self.programs.items()}}, f)
             os.replace(path + ".tmp", path)
             self._lipm_written = lipm
         tmp = farm.CLAIMS_PATH + ".tmp"

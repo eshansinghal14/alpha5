@@ -1834,3 +1834,22 @@ def test_lip_edge_discount_lifts_the_quote_limit_on_a_lip_market_only(arbs):
     got = limits()
     assert got["X-A"] == pytest.approx(base["X-A"] + 0.02) and got["X-B"] == pytest.approx(base["X-B"])
     assert r.lip_need(0.01, "X-A", live=False) == 0.0 and r.lip_need(0.05, "X-A", live=True) == 0.05
+
+
+def test_live_quotes_on_a_lip_market_accrue_its_lip_per_period(arbs):
+    r, b = arbs
+    from kalshi_infra.trading import lip
+    book(r, "X-A", [(0.30, 3000), (0.31, 100)], [(0.60, 3000)])     # our 100 at 0.31 is in the book
+    prog = {"id": "p1", "start_date": "2026-01-01T00:00:00Z", "end_date": "2099-01-01T00:00:00Z",
+            "period_reward": 10_000_000, "target_size_fp": "1000", "discount_factor_bps": 5000}
+    r.lip_programs = {"X-A": ("p1", 0.0, 4e9, lip.params_from_program(prog))}
+    q = R.Quote(basket_id=b.basket_id, leg=0, ticker="X-A", side="yes", price=0.31, size=100.0, cid="c",
+                edge=0.05, max_price=0.31, pending=False)
+    r.quotes[q.key] = q
+    r.accrue_lip(10.0)
+    assert r.lip_acc["accrued"] == {}                                  # shadow: nothing rests at Kalshi
+    r.live = True
+    r.accrue_lip(10.0)
+    got = r.lip_acc["accrued"]["X-A"]
+    assert got > 0 and r.lip_acc["period"]["p1"] == pytest.approx(got) and r.lip_rate["X-A"] * 10 == pytest.approx(got)
+    assert r.lip_summary()["locked_usd"] == 0.0 and r.lip_summary()["markets_now"] == 1

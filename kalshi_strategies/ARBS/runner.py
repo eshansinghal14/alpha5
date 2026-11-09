@@ -40,6 +40,7 @@ from kalshi_infra.kalshi import fees as kfees
 from kalshi_infra.kalshi.orders import (RealFill, error_code, http_status, is_market_paused, is_order_group_reject,
                                         is_post_only_reject)
 from kalshi_infra.kalshi.orders import KEEPALIVE_S, write_budget_tokens_per_s
+from kalshi_infra.trading import lip
 from kalshi_infra.trading.engine import MARKET_PAUSE_RETRY_S
 from kalshi_infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
 from kalshi_infra.runtime.persist import LIVE_ROOT, day_dir
@@ -67,6 +68,12 @@ SUMMARY_S = 1.0
 LIP_OFFER_S = 5.0
 LIP_RELEASE_S = 5.0
 LIP_OFFERS = "lip_offers.json"
+# Our own LIP: resting quotes on LIP markets scored on the book every LIP_ACCRUE_S (as
+# LIPFARM does), per market and program period, saved to LIP_FILE every LIP_SAVE_S.
+LIP_ACCRUE_S = 5.0
+LIP_SAVE_S = 60.0
+LIP_FILE = "lip_accrued.json"
+LIP_MIN_PAYOUT_USD = 1.0       # Kalshi pays a market-period's LIP only from $1
 MAX_ALERTS = 300
 # A quote whose create got no response may still rest at Kalshi; look for it
 # by client id after this long.
@@ -320,6 +327,9 @@ class ArbsRunner:
         self.lip_markets: set[str] = set()           # markets paying LIP (lip_edge_discount)
         self._lipm_mtime: float | None = None
         self.lip_shadow: dict[str, dict] = {}        # basket_id -> quotes we'd rest on its claimed legs
+        self.lip_programs: dict[str, tuple] = {}     # ticker -> (program id, start, end, LipParams)
+        self.lip_rate: dict[str, float] = {}         # ticker -> our LIP $/s now
+        self.lip_acc = self._load_lip()
         self.set_baskets(merge(self.hand, self.scanned()))
         for led in (self.real_ledger, self.shadow_ledger):
             for bid, pos in led.baskets.items():
@@ -790,12 +800,80 @@ class ArbsRunner:
             return
         try:
             with open(path, encoding="utf-8") as fh:
-                tickers = set(json.load(fh).get("tickers") or [])
+                doc = json.load(fh)
         except (OSError, ValueError):
             return
+        tickers = set(doc.get("tickers") or [])
+        progs = {}
+        for t, p in (doc.get("programs") or {}).items():
+            try:
+                progs[t] = (p["id"], pd.Timestamp(p["start_date"]).timestamp(), pd.Timestamp(p["end_date"]).timestamp(),
+                            lip.params_from_program(p))
+            except (KeyError, TypeError, ValueError):
+                continue
         for t in tickers ^ self.lip_markets:
             self.dirty |= set(self.by_ticker.get(t, ()))
-        self.lip_markets, self._lipm_mtime = tickers, m
+        self.lip_markets, self.lip_programs, self._lipm_mtime = tickers, progs, m
+
+    def _load_lip(self) -> dict:
+        try:
+            with open(os.path.join(self.root, LIP_FILE), encoding="utf-8") as fh:
+                d = json.load(fh)
+        except (OSError, ValueError):
+            d = {}
+        return {"accrued": d.get("accrued", {}), "period": d.get("period", {}), "period_end": d.get("period_end", {})}
+
+    def accrue_lip(self, dt: float):
+        """Add `dt` seconds of the LIP our resting quotes earn: per LIP market in an active
+        program, our bids on both sides scored against the socket's book less our own size.
+        Live only: shadow quotes rest nowhere."""
+        now = time.time()
+        rates = {}
+        if self.live:
+            ours: dict[str, dict[str, list]] = {}
+            for q in list(self.quotes.values()):
+                if q.ticker in self.lip_programs and not q.pending and q.remaining > 0:
+                    ours.setdefault(q.ticker, {"yes": [], "no": []})[q.side].append((round(q.price, 4), q.remaining))
+            for t, sides in ours.items():
+                pid, start, end, P = self.lip_programs[t]
+                bk = self.feed.ladder(t)
+                if bk is None or not start <= now < end:
+                    continue
+                lv = {s: lip.levels_with_ours(lip.others_ladder(dict(bk.yes_bids if s == "yes" else bk.no_bids),
+                                                                sides[s]), sides[s]) for s in ("yes", "no")}
+                rates[t] = r = lip.reward_rate(lv["yes"], lv["no"], P)
+                a = self.lip_acc
+                a["accrued"][t] = a["accrued"].get(t, 0.0) + r * dt
+                a["period"][pid] = a["period"].get(pid, 0.0) + r * dt
+                a["period_end"][pid] = end
+        self.lip_rate = rates
+
+    def lip_summary(self) -> dict:
+        a = self.lip_acc
+        return {"exp_usd": round(sum(a["accrued"].values()), 4),
+                "locked_usd": round(sum(v for v in a["period"].values() if v >= LIP_MIN_PAYOUT_USD), 4),
+                "usd_day_now": round(sum(self.lip_rate.values()) * 86400, 2), "markets_now": len(self.lip_rate)}
+
+    async def lip_accrue_loop(self):
+        last = saved = time.time()
+        while True:
+            await asyncio.sleep(LIP_ACCRUE_S)
+            now = time.time()
+            try:
+                self.accrue_lip(min(now - last, 30.0))
+                if now - saved >= LIP_SAVE_S:
+                    saved = now
+                    # Periods ended a month ago are paid or forfeited; their markets keep their totals.
+                    a = self.lip_acc
+                    for pid in [p for p, e in a["period_end"].items() if e < now - 30 * 86400]:
+                        a["period"].pop(pid, None)
+                        a["period_end"].pop(pid, None)
+                    snap = json.loads(json.dumps(a))
+                    await asyncio.get_running_loop().run_in_executor(
+                        self.pool, lambda: atomic_write_json(os.path.join(self.root, LIP_FILE), snap, indent=None))
+            except Exception:
+                traceback.print_exc()
+            last = now
 
     def horizon(self) -> pd.Timestamp:
         """Latest settlement traded, refreshed once a second: evaluate asks
@@ -2983,6 +3061,7 @@ class ArbsRunner:
                     "committed": round(self.committed(), 4), "max_dollars": self.cfg.trading.max_dollars,
                     "cash": round(sum(self.cash.values()), 2) if self.cash else None,
                     "cash_room": None if (cr := self.cash_room(None)) is None else round(cr, 2)},
+            "lip": self.lip_summary(),
             "holdings": holdings, "quotes": quotes, "hot": self.hot, "ranking": self.ranking[:60],
             "hot_churn": {f"{m}m": sum(e for t, e, _ in self.hot_churn if t >= time.time() - 60 * m)
                           for m in (1, 10, 60)},
@@ -3045,7 +3124,7 @@ class ArbsRunner:
             _log(f"WARN: fill-rate seed failed ({e!r})")
         trading, stopper, stop = TradingModeWatcher(self.S), StopWatcher(), asyncio.Event()
         coros = [self.feed.run(), self.eval_loop(), self.rank_loop(), self.meta_loop(), self.fill_poll_loop(),
-                 self.audit_loop(), self.guard_loop(), self.summary_loop(), self.scan_loop(), self.lip_offer_loop(),
+                 self.audit_loop(), self.guard_loop(), self.summary_loop(), self.scan_loop(), self.lip_offer_loop(), self.lip_accrue_loop(),
                  self.liquidity_loop(), self.prints_loop(), self.exchange_loop(), self.write_share_loop(), self.ledger_flush_loop(),
                  self.keepalive_loop(), self.balance_loop(), self.control_loop(trading, stopper, stop)]
         tasks = [asyncio.create_task(c) for c in coros]
