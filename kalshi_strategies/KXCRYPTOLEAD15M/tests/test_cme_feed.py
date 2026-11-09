@@ -185,3 +185,21 @@ def test_a_wide_cme_touch_is_ignored():
     n._touch.clear()
     n.on_perp("cme", "BTC", 76000.0, 2.0, 75950.0, 76050.0)    # 13bp
     assert ("cme", "BTC") not in n._touch
+
+
+def test_per_coin_horizon_widens_theo_vol_only_through_that_coin():
+    import numpy as np
+    from kalshi_strategies.KXCRYPTOLEAD15M.pricer import CoinRacePricer, N_COINS
+
+    class Cfg:
+        mc_seed, t_nu = 7, None
+    p = CoinRacePricer.__new__(CoinRacePricer)
+    p.config, p._reval_z = Cfg(), None
+    p._argmax_probs = lambda Y: np.eye(N_COINS)[np.argmax(Y, axis=1)].mean(axis=0)
+    rng = np.random.default_rng(0)
+    Y0 = rng.standard_normal((4000, N_COINS)) * 1e-3
+    rate, R = np.full(N_COINS, 1e-8), np.eye(N_COINS)
+    base = p._reval_theo_vol(Y0, rate, R, 2.0, 1.0, 200)
+    slow_xrp = p._reval_theo_vol(Y0, rate, R, np.array([2.0, 2.0, 2.0, 8.0, 2.0]), 1.0, 200)
+    assert slow_xrp[3] > base[3] * 1.5           # XRP's own market
+    assert (slow_xrp > base - 1e-12).all()        # and nothing narrower anywhere

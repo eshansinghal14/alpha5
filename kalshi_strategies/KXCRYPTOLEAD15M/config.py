@@ -32,6 +32,9 @@ class CryptoPricingParams:
     reaction_latency_s: float = param(
         "Horizon for theo_vol: the fair move we charge for is the one over this many seconds.",
         min=0.001, step=0.01)
+    reaction_latency_by_coin: dict[str, float] | None = param(
+        "Per-coin theo_vol horizon (s), e.g. {\"XRP\": 5}: each coin's move is sized over its own horizon, so "
+        "being slow on one coin widens every market that depends on it. Coins left out use reaction_latency_s.")
     theo_vol_reval_draws: int = param(
         "theo_vol by full revaluation: reprice under this many joint coin moves over the horizon and "
         "take E|fair change| (sigma-equivalent). Prices a race flip the slope x 1-sigma estimate misses "

@@ -238,7 +238,8 @@ class CoinRacePricer:
         if compute_delta and E is not None:
             scaled = math.sqrt(te) * E
             delta = self._bump_deltas(mu, scaled, sd, probs)
-            lat = self.config.reaction_latency_s
+            by = getattr(self.config, "reaction_latency_by_coin", None) or {}
+            lat = np.array([float(by.get(c, self.config.reaction_latency_s)) for c in COINS])
             n_reval = int(getattr(self.config, "theo_vol_reval_draws", 0) or 0)
             if n_reval > 0:
                 # dmu/dx: 1 in the window, tau/60 in the last minute (only the
@@ -247,7 +248,7 @@ class CoinRacePricer:
                 g = 1.0 if phase == "in_window" else (tau / L if phase == "last_minute" else 0.0)
                 theo_vol = self._reval_theo_vol(mu + scaled, rate, R, lat, g, n_reval) * (1.0 - lam)
             else:
-                A = R * np.outer(np.sqrt(rate), np.sqrt(rate)) * lat
+                A = R * np.outer(np.sqrt(rate * lat), np.sqrt(rate * lat))
                 theo_vol = np.sqrt(np.maximum(np.einsum("ij,jk,ik->i", delta, A, delta), 0.0))
         elif compute_delta:
             delta, theo_vol = np.zeros((N_COINS, N_COINS)), np.zeros(N_COINS)
@@ -340,7 +341,8 @@ class CoinRacePricer:
         coins' joint per-second covariance x h; each reprices the fixed draws
         Y0 shifted by g * dx. Uses the first REVAL_ROWS rows of Y0 for both p
         and p', so sampling noise cancels except on rows whose winner flips."""
-        if g <= 0 or h <= 0:
+        h = np.broadcast_to(np.asarray(h, dtype=float), (N_COINS,))
+        if g <= 0 or not np.any(h > 0):
             return np.zeros(N_COINS)
         n = max(2, n - n % 2)
         if self._reval_z is None or self._reval_z.shape[0] != n:
@@ -350,8 +352,8 @@ class CoinRacePricer:
             if nu is not None:
                 z = z * np.sqrt(nu / rng.chisquare(nu, n // 2) * (nu - 2.0) / nu)[:, None]
             self._reval_z = np.vstack([z, -z])
-        s = np.sqrt(np.maximum(rate, 0.0))
-        C = R * np.outer(s, s) * h + 1e-30 * np.eye(N_COINS)
+        s = np.sqrt(np.maximum(rate, 0.0) * h)          # h: per-coin horizon (s)
+        C = R * np.outer(s, s) + 1e-30 * np.eye(N_COINS)
         try:
             Lc = np.linalg.cholesky(C)
         except np.linalg.LinAlgError:
