@@ -986,6 +986,13 @@ def test_accrue_counts_market_days_with_lip_bids_up_per_series(tmp_path, monkeyp
     assert sum(qd["KXA"].values()) == pytest.approx(0.1, rel=1e-3) and "KXB" not in qd
 
 
+def _daily_programs(r):
+    """make()'s programs run to 2099 and pay ~$0.01/day; a one-day $180 period instead."""
+    for p in r.programs.values():
+        p["end_date"] = "2026-11-05T00:00:00Z"
+    r.P = {}
+
+
 def _offers(legs, tickers, live=False, age=0.0, live_trading=True):
     return {"written_at": time.time() - age, "live_trading": live_trading,
             "offers": {"arb:b": {"tickers": tickers, "legs": legs, "live": live}}}
@@ -994,8 +1001,9 @@ def _offers(legs, tickers, live=False, age=0.0, live_trading=True):
 def test_a_basket_goes_to_arbs_when_its_quotes_earn_more_lip_than_ours_net(tmp_path, monkeypatch):
     books = {"Z-1-A": {"yes": {0.40: 3000.0}, "no": {0.50: 3000.0}}, "Z-1-B": {"yes": {0.30: 3000.0}, "no": {0.60: 3000.0}}}
     r, _ = make(tmp_path, monkeypatch, books)
+    _daily_programs(r)
     cfg = dataclasses.replace(CFG, arbs_yield_ratio=1.0)
-    plans = {"Z-1-A": _plan("Z-1-A", rate=1e-12), "Z-1-B": _plan("Z-1-B", rate=1.0)}     # the test program pays ~1e-7/s
+    plans = {"Z-1-A": _plan("Z-1-A", rate=1e-6), "Z-1-B": _plan("Z-1-B", rate=1.0)}
     others = {t: {s: dict(v) for s, v in b.items()} for t, b in books.items()}
     offer = _offers([["Z-1-A", "yes", 0.41, 500.0]], ["Z-1-A", "Z-1-C"])
     r.yield_to_arbs(cfg, plans, others, offer)
@@ -1010,7 +1018,8 @@ def test_a_basket_goes_to_arbs_when_its_quotes_earn_more_lip_than_ours_net(tmp_p
 def test_no_yield_on_a_held_market_a_stale_offer_or_with_the_ratio_off(tmp_path, monkeypatch):
     books = {"Z-1-A": {"yes": {0.40: 3000.0}, "no": {0.50: 3000.0}}}
     r, _ = make(tmp_path, monkeypatch, books)
-    plans = {"Z-1-A": _plan("Z-1-A", rate=1e-12)}
+    _daily_programs(r)
+    plans = {"Z-1-A": _plan("Z-1-A", rate=1e-6)}
     others = {t: {s: dict(v) for s, v in b.items()} for t, b in books.items()}
     offer = [["Z-1-A", "yes", 0.41, 500.0]]
     on = dataclasses.replace(CFG, arbs_yield_ratio=1.0)
@@ -1030,3 +1039,15 @@ def test_claims_file_lists_the_lip_markets_beside_it(tmp_path, monkeypatch):
     with open(tmp_path / "live" / farm.LIP_MARKETS_FILE) as f:
         doc = json.load(f)
     assert doc["tickers"] == ["Z-1-A"] and doc["programs"]["Z-1-A"]["id"] == "pZ-1-A"
+
+
+def test_no_yield_on_a_market_we_have_not_priced_or_for_pennies(tmp_path, monkeypatch):
+    books = {"Z-1-A": {"yes": {0.40: 3000.0}, "no": {0.50: 3000.0}}}
+    r, _ = make(tmp_path, monkeypatch, books)
+    r.state["orders"] = {"Z-1-A|yes": _order("yes", 0.40)}
+    others = {t: {s: dict(v) for s, v in b.items()} for t, b in books.items()}
+    on = dataclasses.replace(CFG, arbs_yield_ratio=1.0)
+    r.yield_to_arbs(on, {}, others, _offers([["Z-1-A", "yes", 0.41, 500.0]], ["Z-1-A"]))
+    assert not r.yielded                                       # quoted, but not priced this cycle
+    r.yield_to_arbs(on, {"Z-1-A": _plan("Z-1-A", rate=0.0)}, others, _offers([["Z-1-A", "yes", 0.41, 500.0]], ["Z-1-A"]))
+    assert not r.yielded                                       # the test program pays ~$0.01/day

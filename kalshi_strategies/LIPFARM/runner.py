@@ -75,6 +75,9 @@ BALANCE_S = 30.0
 # offers file older than OFFERS_STALE_S is ignored (ARBS down: we take markets back).
 YIELD_HOLD_S = 600.0
 OFFERS_STALE_S = 30.0
+# Least LIP ARBS's quotes must earn to take a basket: a restart's first cycle priced nothing of
+# ours yet and gave one away on $0.00 vs $0.00 (11-09).
+YIELD_MIN_USD_DAY = 0.10
 # As ARBS's completion.max_exit_misses: an informed sell that comes back short
 # (the socket book still showed bids the sweep had taken) is retried on the
 # market's next book update, at most this many times in a row.
@@ -1575,7 +1578,8 @@ class Runner:
             ours = set(plans) | self.order_tickers() | set(self.yielded)
             for bid, off in (doc.get("offers") or {}).items():
                 mine = [t for t in off.get("tickers") or () if t in ours]
-                if not mine or held & set(mine):
+                # A market of ours we haven't priced this cycle can't be compared.
+                if not mine or held & set(mine) or any(t not in plans and t not in self.yielded for t in mine):
                     continue
                 legs = collections.defaultdict(list)
                 for t, side, price, size in off.get("legs") or ():
@@ -1589,7 +1593,7 @@ class Runner:
                             others[side] = remove_ours(others[side], price, size)
                     arbs += farm.market_rate(others, ls, self.params(t))
                 farm_net = sum(max(plans[t].rate - plans[t].loss_rate, 0.0) for t in mine if t in plans)
-                if arbs > 0 and arbs >= cfg.arbs_yield_ratio * farm_net:
+                if arbs * 86400 >= YIELD_MIN_USD_DAY and arbs >= cfg.arbs_yield_ratio * farm_net:
                     for t in mine:
                         if t not in self.yielded:
                             print(f"yield: {t} to ARBS ({bid}: ${arbs * 86400:.2f}/day vs our "
