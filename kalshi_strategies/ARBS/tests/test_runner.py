@@ -460,6 +460,18 @@ def test_one_quote_per_market_side(arbs):
     assert {q.basket_id for q in r.quotes.values()} == {b.basket_id}
 
 
+def test_rescan_reordering_legs_keeps_quotes_on_their_markets(arbs):
+    r, b = arbs
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    _eval(r, b)
+    before = {q.ticker: q.price for q in r.quotes.values() if not q.deep}
+    r.set_baskets([dataclasses.replace(b, legs=tuple(reversed(b.legs)))])
+    assert r.baskets[b.basket_id].legs == b.legs
+    _eval(r, r.baskets[b.basket_id])
+    assert {q.ticker: q.price for q in r.quotes.values() if not q.deep} == before
+
+
 def test_live_events_quoted_only_when_enabled_and_smaller(arbs):
     r, b = arbs
     live = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))

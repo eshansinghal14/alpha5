@@ -571,6 +571,13 @@ class ArbsRunner:
         basket dropped from the list is kept while it has a position, quote
         or task: completion, settlement and cancels look it up by id."""
         new = {b.basket_id: b for b in baskets}
+        # Quotes are keyed by leg index, and the scan orders a mecnet's legs by
+        # price under an id that doesn't change: a reorder moved one leg's quote
+        # to another leg's price (NCX/TIJ 0.34<->0.65, 11-06), so keep the old order.
+        for bid, b in list(new.items()):
+            old = self.baskets.get(bid)
+            if old is not None and old.legs != b.legs and set(old.legs) == set(b.legs):
+                new[bid] = dataclasses.replace(b, legs=old.legs)
         # Also every basket a tracked quote id belongs to, retired ones included:
         # a fill racing a cancel books after the quote is gone (KeyError, ALGQSC 10-30).
         keep = set(self.real_ledger.baskets) | set(self.shadow_ledger.baskets) | self.busy | \
