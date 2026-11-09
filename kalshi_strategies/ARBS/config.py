@@ -148,6 +148,10 @@ class ScanParams:
     max_markets: int = param("Most scanned markets traded beyond the hand spec's: the scan lists every event, "
                              "and the most traded in the last 24h are taken until this many. Each is one more "
                              "websocket subscription.", min=0, max=20000, step=100)
+    lip_volume_weight: float = param("Dollars of 24h volume one $/day of the markets' LIP rewards counts as when "
+                                     "ranking for max_markets. 30 took 321 of the 359 markets paying >= $40/day "
+                                     "into a 1,500-market budget (187 at 0) for 0.7% less volume covered "
+                                     "(11-09 scan).", min=0.0, max=1000.0, step=5.0)
     shards: list[int] = param("Exchange shards (event exchange_index) the scan takes events from. Kalshi "
                               "holds collateral per shard: an order on one we haven't funded is rejected "
                               "insufficient_shard_balance, and arming refuses a zero-balance shard.",

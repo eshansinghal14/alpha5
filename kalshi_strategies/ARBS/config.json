@@ -44,6 +44,7 @@
   "scan": {
     "enable": true,
     "max_markets": 1000,
+    "lip_volume_weight": 30.0,
     "shards": [0],
     "interval_s": 120.0,
     "mecnet_max_legs": 6,

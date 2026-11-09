@@ -106,6 +106,20 @@ def test_budget_goes_by_volume_per_market():
     assert {b.relationship_id for b in parse_spec(doc)} == {"mecnet:G-1"}
 
 
+def test_lip_reward_counts_toward_the_budget():
+    # LAD trades less per market (200 vs 300) but pays $20/day of LIP on each market.
+    lad = event("LAD-1", "MECNET", [mkt(f"LAD-1-{c}", vol=200) for c in "AB"])
+    game = event("G-1", "MECNET", [mkt("G-1-A", vol=300), mkt("G-1-B", vol=300)])
+    args = dict(now=NOW, mecnet_max_legs=6, ladder_span=3, complete_set_exclude=[], overrides={})
+    doc = scanner.scan([lad, game], lip={"LAD-1-A": 20.0, "LAD-1-B": 20.0}, **args)
+    assert {r["relationship_id"]: r["lip_usd_day"] for r in doc["relationships"]} == {"mecnet:LAD-1": 40.0,
+                                                                                    "mecnet:G-1": 0.0}
+    pick = lambda w: {r["relationship_id"] for r in scanner.select(doc, now=NOW, days=90, max_markets=2,
+                                                                     lip_weight=w)["relationships"]}
+    assert pick(0.0) == {"mecnet:G-1"}
+    assert pick(10.0) == {"mecnet:LAD-1"}
+
+
 def test_scan_lists_everything_and_select_keeps_held():
     far = event("FAR-1", "MECNET", [mkt("FAR-1-A"), mkt("FAR-1-B", expected_expiration_time="2027-06-01T00:00:00Z")])
     big = event("BIG-1", "MECNET", [mkt("BIG-1-A", vol=500), mkt("BIG-1-B", vol=500)])
