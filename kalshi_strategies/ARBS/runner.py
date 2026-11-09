@@ -336,6 +336,7 @@ class ArbsRunner:
         self.lip_programs: dict[str, tuple] = {}     # ticker -> (program id, start, end, LipParams)
         self.lip_rate: dict[str, float] = {}         # ticker -> our LIP $/s now
         self.lip_plans: dict[tuple, tuple] = {}      # (basket_id, leg) -> (at, price, size, via basket or None)
+        self.lip_rate_cache: dict[tuple, tuple] = {}  # (ticker, side, price, size) -> (at, LIP $/s)
         self.farm_period: dict[str, float] = {}      # program id -> LIPFARM's LIP in it (one $1 minimum for both)
         self._farmp_mtime: float | None = None
         self.lip_acc = self._load_lip()
@@ -938,15 +939,22 @@ class ArbsRunner:
 
     def quote_score(self, b: Basket, vs) -> tuple[float, float]:
         """(expected $/h of quoting every leg, shortest leg wait in s): each
-        leg's edge x size over the time trading takes to reach it."""
+        leg's edge x size over the time trading takes to reach it, plus the
+        LIP its quote would add at the price it rests at (lip_need)."""
         t = self.cfg.trading
-        need = edge_dollars(b.payout, t.min_edge + t.quote_edge_add) + \
-            (t.live_edge_add if self.live_now(b, _utc()) else 0.0)
+        live = self.live_now(b, _utc())
+        need = edge_dollars(b.payout, t.min_edge + t.quote_edge_add) + (t.live_edge_add if live else 0.0)
         score, fastest = 0.0, float("inf")
         px = []
         for j, leg in enumerate(b.legs):
             size = max(1.0, pricing.depth_size(vs, j, b.payout, need, float(t.quote_size)))
             plan = pricing.quote_leg(vs, j, b.payout, need, size)
+            ln = self.lip_need(need, leg.ticker, live)
+            if leg.ticker in self.lip_programs:
+                n = max(1.0, pricing.depth_size(vs, j, b.payout, ln, float(t.quote_size))) if ln < need else size
+                lp = pricing.quote_leg(vs, j, b.payout, ln, n) if ln < need else plan
+                if lp is not None:
+                    score += self.lip_rate_at(leg, lp.price, n) * 3600.0
             px.append(None if plan is None else (plan.price, plan.edge, size))
             if plan is None:
                 continue
@@ -2030,6 +2038,40 @@ class ArbsRunner:
         else:
             self.lip_shadow.pop(b.basket_id, None)
 
+    def _lip_earn(self, leg: Leg, bk, P):
+        """f(price, size) -> LIP $/s a bid of ours on `leg` adds, scored on the
+        book with our other bids as they rest: our other side's bids earn
+        whatever we rest here, so only the increase counts."""
+        opp = "no" if leg.side == "yes" else "yes"
+        side_own = list(self._own(leg.ticker, leg.side).items())
+        opp_own = list(self._own(leg.ticker, opp).items())
+        others = lip.others_ladder(dict(bk.yes_bids if leg.side == "yes" else bk.no_bids), side_own)
+        opp_lv = lip.levels_with_ours(lip.others_ladder(dict(bk.yes_bids if opp == "yes" else bk.no_bids), opp_own),
+                                      opp_own)
+
+        def rate(side_lv):
+            return lip.reward_rate(*((side_lv, opp_lv) if leg.side == "yes" else (opp_lv, side_lv)), P)
+        base = rate(lip.levels_with_ours(others, []))
+        return lambda p, n: rate(lip.levels_with_ours(others, [(p, n)])) - base
+
+    def lip_rate_at(self, leg: Leg, price: float, size: float) -> float:
+        """LIP $/s a bid of `size` at `price` on `leg` would add now; 0 off a live program."""
+        prog = self.lip_programs.get(leg.ticker)
+        now = time.time()
+        if prog is None or not prog[1] <= now < prog[2]:
+            return 0.0
+        # Ranked on every book update; held LIP_PLAN_S like lip_plan's choice (7dccd90).
+        key = (leg.ticker, leg.side, round(price, 4), size)
+        hit = self.lip_rate_cache.get(key)
+        if hit is not None and now - hit[0] < LIP_PLAN_S:
+            return hit[1]
+        bk = self.feed.ladder(leg.ticker)
+        r = 0.0 if bk is None else max(0.0, self._lip_earn(leg, bk, prog[3])(price, size))
+        if len(self.lip_rate_cache) > 20000:
+            self.lip_rate_cache = {k: v for k, v in self.lip_rate_cache.items() if now - v[0] < LIP_PLAN_S}
+        self.lip_rate_cache[key] = (now, r)
+        return r
+
     def lip_plan(self, b: Basket, vs, j: int, need: float, room: float, plan):
         """(plan, size) for leg j of a LIP market: of the prices from `plan`'s down
         LIP_SCAN_TICKS ticks, the one whose largest size that still completes for the edge,
@@ -2072,16 +2114,8 @@ class ArbsRunner:
                                (t.live_edge_add if live else 0.0), leg.ticker, live)
             ry = min(room, self.room_bundles(y), float(self.quote_size_by_dollars(y)))
             paths.append((y, k, vy, y.payout, ny, float(int(ry + _EPS))))
-        opp = "no" if leg.side == "yes" else "yes"
-        side_own = list(self._own(leg.ticker, leg.side).items())
-        opp_own = list(self._own(leg.ticker, opp).items())
-        others = lip.others_ladder(dict(bk.yes_bids if leg.side == "yes" else bk.no_bids), side_own)
-        opp_lv = lip.levels_with_ours(lip.others_ladder(dict(bk.yes_bids if opp == "yes" else bk.no_bids), opp_own),
-                                      opp_own)
         lv = vs[j]
-        # What this side's quote adds: our other side's bids earn whatever we rest here.
-        side_lv = lip.levels_with_ours(others, [])
-        base = lip.reward_rate(*((side_lv, opp_lv) if leg.side == "yes" else (opp_lv, side_lv)), P)
+        earn = self._lip_earn(leg, bk, P)
         best, p = None, plan.price
         for _ in range(LIP_SCAN_TICKS):
             if p < lv.ticks.lo - _EPS:
@@ -2089,8 +2123,7 @@ class ArbsRunner:
             n, path = max(((pricing.depth_size(pv, k, pay, nd, cap, at=p), i)
                            for i, (_, k, pv, pay, nd, cap) in enumerate(paths)), key=lambda x: x[0])
             if n >= 1:
-                mine = lip.levels_with_ours(others, [(p, n)])
-                r = lip.reward_rate(*((mine, opp_lv) if leg.side == "yes" else (opp_lv, mine)), P) - base
+                r = earn(p, n)
                 if best is None or r > best[0] + 1e-12:
                     best = (r, p, n, path)
             p = lv.ticks.down(p)

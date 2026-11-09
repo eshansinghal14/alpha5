@@ -1888,6 +1888,21 @@ def test_a_lip_leg_rests_where_its_completable_size_earns_the_most_lip(arbs):
     assert plan.edge >= need - 1e-9
 
 
+def test_hot_ranking_counts_the_lip_a_basket_quotes_would_earn(arbs):
+    r, b = arbs
+    from kalshi_infra.trading import lip
+    book(r, "X-A", [(0.30, 150), (0.25, 3000)], [(0.60, 3000)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 5), (0.33, 500)])
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=1000, max_bundles_per_basket=5000)
+    vs = r.views(b)
+    plain, _ = r.quote_score(b, vs)
+    prog = {"id": "p1", "start_date": "2026-01-01T00:00:00Z", "end_date": "2099-01-01T00:00:00Z",
+            "period_reward": 10_000_000, "target_size_fp": "1000", "discount_factor_bps": 5000}
+    r.lip_programs = {"X-A": ("p1", 0.0, 4e9, lip.params_from_program(prog))}
+    with_lip, _ = r.quote_score(b, vs)
+    assert with_lip > plain + 1e-6
+
+
 def test_a_lip_leg_is_sized_through_the_basket_that_completes_it(arbs):
     r, b = arbs
     from kalshi_infra.trading import lip
