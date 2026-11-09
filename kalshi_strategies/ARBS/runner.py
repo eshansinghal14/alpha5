@@ -73,7 +73,10 @@ LIP_OFFERS = "lip_offers.json"
 LIP_ACCRUE_S = 5.0
 LIP_SAVE_S = 60.0
 LIP_FILE = "lip_accrued.json"
-LIP_MIN_PAYOUT_USD = 1.0       # Kalshi pays a market-period's LIP only from $1
+LIP_MIN_PAYOUT_USD = 1.0
+# A leg in a LIP market rests at whichever price, from its usual one down this many ticks,
+# has the size (the most that still completes for the edge) earning the most LIP.
+LIP_SCAN_TICKS = 8       # Kalshi pays a market-period's LIP only from $1
 MAX_ALERTS = 300
 # A quote whose create got no response may still rest at Kalshi; look for it
 # by client id after this long.
@@ -1759,6 +1762,8 @@ class ArbsRunner:
                 size = pricing.depth_size(vs, j, b.payout, need, float(int(room + _EPS)))
                 plan = pricing.quote_leg(vs, j, b.payout, need, size) if size >= 1 else None
                 plan, size = self.best_plan(b, j, plan, size, room)
+                if not live and (alt := self.lip_plan(b, vs, j, need, room, plan)) is not None:
+                    plan, size = alt
                 if q is not None and q.remaining > size + _EPS:
                     plan = None
             if plan is None:
@@ -1988,12 +1993,54 @@ class ArbsRunner:
             need = self.lip_need(quote_need, leg.ticker, False)
             size = pricing.depth_size(vs, j, b.payout, need, float(int(room + _EPS)))
             plan = pricing.quote_leg(vs, j, b.payout, need, size) if size >= 1 else None
+            if (alt := self.lip_plan(b, vs, j, need, room, plan)) is not None:
+                plan, size = alt
             if plan is not None:
                 legs.append([leg.ticker, leg.side, plan.price, size])
         if legs:
             self.lip_shadow[b.basket_id] = {"tickers": sorted(b.tickers), "legs": legs, "at": now}
         else:
             self.lip_shadow.pop(b.basket_id, None)
+
+    def lip_plan(self, b: Basket, vs, j: int, need: float, room: float, plan):
+        """(plan, size) for leg j of a LIP market: of the prices from `plan`'s down
+        LIP_SCAN_TICKS ticks, the one whose largest size that still completes for `need`
+        earns the most LIP, scored on the book with our other bids as they rest (our own
+        size can lift the reference price over a crowd below it). Ties go to the higher
+        price. None when the leg's market pays no LIP now or `plan` is None."""
+        leg = b.legs[j]
+        prog = self.lip_programs.get(leg.ticker)
+        if plan is None or prog is None:
+            return None
+        pid, start, end, P = prog
+        bk = self.feed.ladder(leg.ticker)
+        if bk is None or not start <= time.time() < end:
+            return None
+        opp = "no" if leg.side == "yes" else "yes"
+        side_own = list(self._own(leg.ticker, leg.side).items())
+        opp_own = list(self._own(leg.ticker, opp).items())
+        others = lip.others_ladder(dict(bk.yes_bids if leg.side == "yes" else bk.no_bids), side_own)
+        opp_lv = lip.levels_with_ours(lip.others_ladder(dict(bk.yes_bids if opp == "yes" else bk.no_bids), opp_own),
+                                      opp_own)
+        lv, cap = vs[j], float(int(room + _EPS))
+        best, p = None, plan.price
+        for _ in range(LIP_SCAN_TICKS):
+            if p < lv.ticks.lo - _EPS:
+                break
+            n = pricing.depth_size(vs, j, b.payout, need, cap, at=p)
+            if n >= 1:
+                mine = lip.levels_with_ours(others, [(p, n)])
+                r = lip.reward_rate(*((mine, opp_lv) if leg.side == "yes" else (opp_lv, mine)), P)
+                if best is None or r > best[0] + 1e-12:
+                    best = (r, p, n)
+            p = lv.ticks.down(p)
+        if best is None or best[0] <= 0:
+            return None
+        _, p, n = best
+        q = pricing.quote_leg(vs, j, b.payout, need, n)
+        if q is None or q.max_price < p - _EPS:
+            return None
+        return dataclasses.replace(q, price=p, edge=b.payout - q.others_cost - pricing.maker_cost(p, lv.maker_rate)), n
 
     def lip_offers(self) -> dict:
         """Baskets touching LIPFARM's markets: quotes resting there ("live") and the

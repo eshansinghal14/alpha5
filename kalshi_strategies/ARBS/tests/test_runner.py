@@ -1853,3 +1853,24 @@ def test_live_quotes_on_a_lip_market_accrue_its_lip_per_period(arbs):
     got = r.lip_acc["accrued"]["X-A"]
     assert got > 0 and r.lip_acc["period"]["p1"] == pytest.approx(got) and r.lip_rate["X-A"] * 10 == pytest.approx(got)
     assert r.lip_summary()["locked_usd"] == 0.0 and r.lip_summary()["markets_now"] == 1
+
+
+def test_a_lip_leg_rests_where_its_completable_size_earns_the_most_lip(arbs):
+    r, b = arbs
+    from kalshi_infra.trading import lip
+    # X-A yes: 150 rest at 0.30, the crowd at 0.25 (our usual quote would join one over 0.30). X-B
+    # (the leg a fill is completed with) offers yes at 0.55 x5, then 0.67 x500: at 0.31 only 5 bundles
+    # complete for the edge; at 0.28, 505 do, which lifts the reference price over the crowd.
+    book(r, "X-A", [(0.30, 150), (0.25, 3000)], [(0.60, 3000)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 5), (0.33, 500)])
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=1000, max_bundles_per_basket=5000)
+    prog = {"id": "p1", "start_date": "2026-01-01T00:00:00Z", "end_date": "2099-01-01T00:00:00Z",
+            "period_reward": 10_000_000, "target_size_fp": "1000", "discount_factor_bps": 5000}
+    vs = r.views(b)
+    need = R.edge_dollars(b.payout, r.cfg.trading.min_edge + r.cfg.trading.quote_edge_add)
+    plan0 = R.pricing.quote_leg(vs, 0, b.payout, need, R.pricing.depth_size(vs, 0, b.payout, need, 1000.0))
+    assert r.lip_plan(b, vs, 0, need, 1000.0, plan0) is None              # not a LIP market
+    r.lip_programs = {"X-A": ("p1", 0.0, 4e9, lip.params_from_program(prog))}
+    plan, size = r.lip_plan(b, vs, 0, need, 1000.0, plan0)
+    assert size > R.pricing.depth_size(vs, 0, b.payout, need, 1000.0) and plan.price < plan0.price
+    assert plan.edge >= need - 1e-9
