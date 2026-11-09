@@ -66,8 +66,11 @@ CLAUDE_CODE_OAUTH_TOKEN=$(tr -d '\r\n ' < /etc/alpha5/claude-token) timeout "$LI
     < "$OUT/digest.txt" > "$OUT/reply.txt" 2> "$OUT/claude.err"
 rc=$?
 
-STATUS=$(sed -n '1s/^STATUS: *//p' "$OUT/reply.txt" | tr -d '\r ')
-SUBJECT=$(sed -n '2s/^SUBJECT: *//p' "$OUT/reply.txt" | tr -d '\r')
+# Searched for, not read off line 1: Claude sometimes writes a sentence first (11-09).
+SL=$(grep -n -m1 '^STATUS:' "$OUT/reply.txt" | cut -d: -f1)
+SL=${SL:-1}
+STATUS=$(sed -n "${SL}s/^STATUS: *//p" "$OUT/reply.txt" | tr -d '\r ')
+SUBJECT=$(sed -n "$((SL + 1))s/^SUBJECT: *//p" "$OUT/reply.txt" | tr -d '\r')
 DAY=$(TZ=America/New_York date +%m-%d)
 NOW=$(TZ=America/New_York date '+%m-%d %H:%M ET')
 
@@ -84,7 +87,7 @@ if [ $rc -ne 0 ] || [ -z "$STATUS" ]; then
   exit 1
 fi
 echo 0 > "$OUT/fails"
-tail -n +4 "$OUT/reply.txt" > "$OUT/body.txt"
+tail -n +$((SL + 3)) "$OUT/reply.txt" > "$OUT/body.txt"
 cp "$OUT/reply.txt" "$OUT/reply-$(date -u +%Y%m%dT%H%M).txt"
 find "$OUT" -name 'reply-*.txt' -mtime +14 -delete
 
