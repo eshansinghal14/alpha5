@@ -292,18 +292,6 @@ def select(doc: dict, *, now: pd.Timestamp, days: float, max_markets: int, known
     return {**doc, "relationships": out}
 
 
-def lipfarm_claimed(root: str) -> set[str]:
-    """Events LIPFARM (live) claims, from its claimed.json beside our root.
-    Its scan of us waits for a selection written after its claim, so this has
-    to be read at select time, not at scan start."""
-    path = os.path.join(os.path.dirname(root), "LIPFARM", "live", "claimed.json")
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return {t.rsplit("-", 1)[0] for t in json.load(fh).get("tickers") or []}
-    except (OSError, ValueError):
-        return set()
-
-
 def other_series() -> set[str]:
     from kalshi_strategies.run import registry
     return {t for t, s in registry().items() if t != "ARBS"}
@@ -360,7 +348,7 @@ def scan_and_select(root: str) -> dict:
     doc = run(cfg, hand, os.path.join(root, "scanned_spec.json"), held)
     sel = select(doc, now=pd.Timestamp.now(tz="UTC"), days=cfg.trading.days_till_expiry,
                  max_markets=cfg.scan.max_markets, known_tickers={t for b in load_spec(SPEC_PATH) for t in b.tickers},
-                 held=held, exclude=set(cfg.watch.exclude), yield_events=lipfarm_claimed(root))
+                 held=held, exclude=set(cfg.watch.exclude))
     atomic_write_json(os.path.join(root, SELECTED), sel, indent=None)
     return {"listed_markets": doc["n_markets"], "selected_relationships": len(sel["relationships"])}
 

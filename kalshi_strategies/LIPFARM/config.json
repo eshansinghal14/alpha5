@@ -38,6 +38,7 @@
     "flow_long_days": 60.0,
     "adverse_frac": 0.9,
     "realized_loss_days": 7.0,
-    "realized_loss_prior": 5.0
+    "realized_loss_prior": 5.0,
+    "arbs_yield_ratio": 1.0
   }
 }

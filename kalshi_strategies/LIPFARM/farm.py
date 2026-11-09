@@ -67,7 +67,10 @@ our positions). ARBS reads it every second: it neither takes nor quotes a
 claimed ticker and pulls its quotes there, its sweep skips our orders, and its
 position audit takes our positions off Kalshi's. We quote CLAIM_SETTLE_S after
 claiming. Events where ARBS holds a basket are never claimed: it may have to
-take there to complete one.
+take there to complete one. ARBS still prices the baskets our claims hold off
+and publishes what it would rest there (lip_offers.json); when that would earn
+arbs_yield_ratio x our net LIP on the basket's markets, we stop claiming them
+and ARBS quotes them instead.
 """
 from __future__ import annotations
 
@@ -105,6 +108,10 @@ ROOT = os.path.join(LIVE_ROOT, NAME)
 ARBS_ROOT = os.path.join(LIVE_ROOT, "ARBS")
 # Read by ARBS's scanner (ARBS.scanner.lipfarm_claimed): it selects no event here.
 CLAIMS_PATH = os.path.join(ROOT, "live", "claimed.json")
+# Beside the claims: every market paying LIP, for ARBS's lip_edge_discount.
+LIP_MARKETS_FILE = "lip_markets.json"
+# ARBS's quotes (live) and would-be quotes (on baskets our claims hold off) on our markets.
+ARBS_OFFERS_PATH = os.path.join(ARBS_ROOT, "lip_offers.json")
 SERIES_LOSS_PATH = os.path.join(ROOT, "series_loss.json")      # series_loss.py's table, built off the box
 # One summary point per logged report (~every 2 min), for the dashboard's P&L chart.
 HISTORY_FILE = "pnl_history.jsonl"
@@ -248,6 +255,11 @@ class Cfg:
                                    "loss. Above 1 because the replay model understated our real fills' losses "
                                    "~1.5x (11-04/05).", min=0.0, step=0.25, group="pricing",
                                    sub="low flow (all markets)")
+    arbs_yield_ratio: float = param("Give a basket's markets to ARBS while its quotes there (ARBS's lip_offers.json) "
+                                    "would earn at least this many times our LIP net of expected loss on them; held "
+                                    "YIELD_HOLD_S after that stops. Its fills complete an arb, so they're charged no "
+                                    "loss. Never a market we hold. 0 = off.", min=0.0, step=0.25, group="pricing",
+                                    sub="low flow (all markets)")
     realized_loss_days: float = param("Each series is also charged at least the fill loss it actually cost us per "
                                       "market-day quoted over this many days (positions marked at the bid, dated by "
                                       "their first fill). The tape model put House races at ~$0.10/day a market; our "

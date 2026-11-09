@@ -1680,7 +1680,9 @@ def test_lipfarm_claim_excludes_basket_and_audit_nets_its_position(arbs):
     assert asyncio.run(r.audit()) and r.audit_diff is None
     R.os.remove(R.os.path.join(path, "claimed.json"))
     r.poll_lip_claims()
-    assert not r.excluded(b) and not r.lip_positions
+    assert r.excluded(b) and not r.lip_positions        # held off while LIPFARM's cancels land
+    r.lip_released["X-A"] -= R.LIP_RELEASE_S
+    assert not r.excluded(b)
 
 
 def test_sweep_leaves_lipfarm_orders(arbs, monkeypatch):
@@ -1791,3 +1793,44 @@ def test_fill_booked_into_the_best_subset_at_todays_books_even_if_unlisted(arbs)
     assert ac.basket_id in {b.basket_id for b in r.all_baskets} and ac.basket_id in r.by_ticker["E-C"]
     r.set_baskets([ab, abd, full])                 # a rescan keeps it while it holds the position
     assert ac.basket_id in r.baskets
+
+
+def test_a_claimed_basket_is_priced_for_the_lip_offer_not_quoted(arbs):
+    r, b = arbs
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    r.lip_claims = {"X-A"}
+    r.evaluate(b)
+    assert not r.basket_quotes(b.basket_id)
+    off = r.lip_offers()[b.basket_id]
+    assert not off["live"] and off["tickers"] == ["X-A", "X-B"] and {l[0] for l in off["legs"]} == {"X-A", "X-B"}
+    r.lip_claims = set()
+    r.lip_released = {}
+
+    async def go():
+        r.evaluate(b)
+        await drain(r)
+    asyncio.run(go())
+    assert b.basket_id not in r.lip_shadow and r.basket_quotes(b.basket_id)
+
+
+def test_lip_edge_discount_lifts_the_quote_limit_on_a_lip_market_only(arbs):
+    r, b = arbs
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+
+    def limits():
+        async def go():
+            r.evaluate(b)
+            await drain(r)
+        asyncio.run(go())
+        return {q.ticker: q.max_price for q in r.basket_quotes(b.basket_id)}
+    base = limits()
+    r.lip_markets = {"X-A"}
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, lip_edge_discount=0.02)
+    r.dirty = set()
+    for q in list(r.basket_quotes(b.basket_id)):
+        r.quotes.pop((q.basket_id, q.leg), None)
+    got = limits()
+    assert got["X-A"] == pytest.approx(base["X-A"] + 0.02) and got["X-B"] == pytest.approx(base["X-B"])
+    assert r.lip_need(0.01, "X-A", live=False) == 0.0 and r.lip_need(0.05, "X-A", live=True) == 0.05

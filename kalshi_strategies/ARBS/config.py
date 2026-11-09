@@ -40,6 +40,10 @@ class TradingParams:
                                     "expiration). The scan skips events past it. Open positions past it are still "
                                     "completed and settled.", min=0.0, max=2000.0, step=1.0)
     quote_size: int = param("Bundles per resting quote.", min=1, max=10000, step=1)
+    lip_edge_discount: float = param("Edge ($ per bundle) taken off a quote's requirement on a leg in a market "
+                                     "paying LIP (LIPFARM's lip_markets.json), never below 0: a bid resting "
+                                     "there also earns LIP. Not on live events. 0 = off.", min=0.0, max=0.5,
+                                     step=0.0025)
     quote_live_events: bool = param("Quote events that have started (a game after kickoff). A live score change "
                                     "sweeps every leg at once, so a fill there is usually already a loss; "
                                     "exits on live events are taken at once.")

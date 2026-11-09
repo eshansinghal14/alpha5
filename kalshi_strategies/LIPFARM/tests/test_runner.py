@@ -984,3 +984,48 @@ def test_accrue_counts_market_days_with_lip_bids_up_per_series(tmp_path, monkeyp
     r.accrue()
     qd = r.state["quoted_days"]
     assert sum(qd["KXA"].values()) == pytest.approx(0.1, rel=1e-3) and "KXB" not in qd
+
+
+def _offers(legs, tickers, live=False, age=0.0, live_trading=True):
+    return {"written_at": time.time() - age, "live_trading": live_trading,
+            "offers": {"arb:b": {"tickers": tickers, "legs": legs, "live": live}}}
+
+
+def test_a_basket_goes_to_arbs_when_its_quotes_earn_more_lip_than_ours_net(tmp_path, monkeypatch):
+    books = {"Z-1-A": {"yes": {0.40: 3000.0}, "no": {0.50: 3000.0}}, "Z-1-B": {"yes": {0.30: 3000.0}, "no": {0.60: 3000.0}}}
+    r, _ = make(tmp_path, monkeypatch, books)
+    cfg = dataclasses.replace(CFG, arbs_yield_ratio=1.0)
+    plans = {"Z-1-A": _plan("Z-1-A", rate=1e-12), "Z-1-B": _plan("Z-1-B", rate=1.0)}     # the test program pays ~1e-7/s
+    others = {t: {s: dict(v) for s, v in b.items()} for t, b in books.items()}
+    offer = _offers([["Z-1-A", "yes", 0.41, 500.0]], ["Z-1-A", "Z-1-C"])
+    r.yield_to_arbs(cfg, plans, others, offer)
+    assert set(r.yielded) == {"Z-1-A"}                        # Z-1-C isn't ours to give
+    r.plans = plans
+    assert "Z-1-A" not in r.choose(cfg)
+    # Z-1-B pays us more than ARBS's quote would earn there: kept.
+    r.yield_to_arbs(cfg, plans, others, _offers([["Z-1-B", "yes", 0.31, 10.0]], ["Z-1-B"]))
+    assert "Z-1-B" not in r.yielded and "Z-1-A" in r.yielded  # A held YIELD_HOLD_S
+
+
+def test_no_yield_on_a_held_market_a_stale_offer_or_with_the_ratio_off(tmp_path, monkeypatch):
+    books = {"Z-1-A": {"yes": {0.40: 3000.0}, "no": {0.50: 3000.0}}}
+    r, _ = make(tmp_path, monkeypatch, books)
+    plans = {"Z-1-A": _plan("Z-1-A", rate=1e-12)}
+    others = {t: {s: dict(v) for s, v in b.items()} for t, b in books.items()}
+    offer = [["Z-1-A", "yes", 0.41, 500.0]]
+    on = dataclasses.replace(CFG, arbs_yield_ratio=1.0)
+    r.yield_to_arbs(dataclasses.replace(CFG, arbs_yield_ratio=0.0), plans, others, _offers(offer, ["Z-1-A"]))
+    r.yield_to_arbs(on, plans, others, _offers(offer, ["Z-1-A"], age=600.0))
+    r.yield_to_arbs(on, plans, others, _offers(offer, ["Z-1-A"], live_trading=False))
+    assert not r.yielded
+    _held(r, "Z-1-A", "yes", 0.40, 10.0)
+    r.yield_to_arbs(on, plans, others, _offers(offer, ["Z-1-A"]))
+    assert not r.yielded
+
+
+def test_claims_file_lists_the_lip_markets_beside_it(tmp_path, monkeypatch):
+    books = {"Z-1-A": {"yes": {}, "no": {}}}
+    r, _ = make(tmp_path, monkeypatch, books)
+    r.write_claims({})
+    with open(tmp_path / "live" / farm.LIP_MARKETS_FILE) as f:
+        assert json.load(f)["tickers"] == ["Z-1-A"]

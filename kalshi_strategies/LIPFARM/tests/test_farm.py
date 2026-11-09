@@ -15,7 +15,7 @@ CFG = farm.Cfg(cash_reserve=0.0, num_markets=5, min_lots_frac=0.0, sentinel_keep
                programs_refresh_s=600, flow_days=4.0, max_trades_day=50.0, loss_per_trade=3.0, loss_cap=30.0,
                min_lip_to_loss=2.0,
                skip_categories="Sports,Mentions", skip_series="KXRT", min_close_h=48.0, max_pool_share=1.0, loss_min_trades=0.0, wide_exit_frac=0.0, wide_exit_slip=0.10, flow_long_days=0.0, adverse_frac=1.0,
-               realized_loss_days=0.0, realized_loss_prior=5.0)
+               realized_loss_days=0.0, realized_loss_prior=5.0, arbs_yield_ratio=0.0)
 
 
 @pytest.fixture(autouse=True)

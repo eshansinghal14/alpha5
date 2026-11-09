@@ -8,6 +8,7 @@
     "exit_ref_days": 30.0,
     "days_till_expiry": 90.0,
     "quote_size": 5,
+    "lip_edge_discount": 0.0,
     "quote_live_events": false,
     "take_live_events": false,
     "live_edge_add": 0.01,

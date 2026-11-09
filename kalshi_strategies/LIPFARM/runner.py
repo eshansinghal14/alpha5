@@ -71,6 +71,10 @@ SYNC_GRACE_S = 10.0
 MARKS_S = 60.0
 QUOTED_KEEP_DAYS = 30
 BALANCE_S = 30.0
+# A basket given to ARBS stays its this long after its offer stops beating ours, and an
+# offers file older than OFFERS_STALE_S is ignored (ARBS down: we take markets back).
+YIELD_HOLD_S = 600.0
+OFFERS_STALE_S = 30.0
 # As ARBS's completion.max_exit_misses: an informed sell that comes back short
 # (the socket book still showed bids the sweep had taken) is retried on the
 # market's next book update, at most this many times in a row.
@@ -205,6 +209,8 @@ class Runner:
         self.n_refused, self.last_refused_log = 0, 0.0
         self.marks_at = 0.0
         self.cash: dict[int, float] = {}         # shard -> available balance, read every BALANCE_S
+        self.yielded: dict[str, float] = {}      # ticker -> until when ARBS quotes it instead of us
+        self._lipm_written: frozenset = frozenset()
         self.categories: dict[str, str] = {}  # series -> category
         self.series_titles: dict[str, str] = {}
         self.flow_pool = cf.ThreadPoolExecutor(1, thread_name_prefix="lipfarm-flow")
@@ -352,6 +358,13 @@ class Runner:
         claims = {t: old.get(t, now) for t in set(want) | self.order_tickers() | set(pos)}
         self.state["claims"] = claims
         os.makedirs(os.path.dirname(farm.CLAIMS_PATH), exist_ok=True)
+        lipm = frozenset(self.programs)
+        if lipm != self._lipm_written:
+            path = os.path.join(os.path.dirname(farm.CLAIMS_PATH), farm.LIP_MARKETS_FILE)
+            with open(path + ".tmp", "w") as f:
+                json.dump({"written_at": now, "tickers": sorted(lipm)}, f)
+            os.replace(path + ".tmp", path)
+            self._lipm_written = lipm
         tmp = farm.CLAIMS_PATH + ".tmp"
         with open(tmp, "w") as f:
             json.dump({"written_at": now, "tickers": sorted(claims), "positions": pos}, f)
@@ -379,6 +392,7 @@ class Runner:
         def need(p):
             return farm.LIP_MIN_PAYOUT_USD * (1.0 if self.period_accrued(p.ticker) > 0 else farm.START_PAYOUT_MARGIN)
         cands = [p for p in self.plans.values() if p.ticker in self.programs and cool.get(p.ticker, 0.0) <= now
+                 and p.ticker not in self.yielded
                  and (self.period_accrued(p.ticker) >= farm.LIP_MIN_PAYOUT_USD
                       or self.period_accrued(p.ticker) + p.rate * left(p.ticker) >= need(p))]
 
@@ -1392,6 +1406,8 @@ class Runner:
 
     def reprice(self, t: str, pl: farm.Plan, others: dict, P):
         """Re-place a side now when its resting bids earn under REPRICE_FRAC of its plan's."""
+        if t in self.yielded:
+            return
         want, now = desired_orders(pl), time.time()
         for s in {s for s, _ in pl.legs}:
             mine = [(k, o) for k, o in self.state["orders"].items()
@@ -1534,10 +1550,53 @@ class Runner:
             if self.ws_others(t) is None:
                 self.books[t] = others
         self.plans, self.rates = plans, {**self.rates, **rates}
+        self.yield_to_arbs(cfg, plans, books, await self.run_io(farm._json, farm.ARBS_OFFERS_PATH))
         await self.reconcile(cfg)
         await self.tidy_groups()
         self.report(cfg)
         await self.save()
+
+    def yield_to_arbs(self, cfg: Cfg, plans: dict[str, farm.Plan], books: dict, doc: dict | None):
+        """Give ARBS the markets of each basket whose quotes (live or would-be, from its
+        lip_offers.json) earn at least arbs_yield_ratio x our net LIP on them, scored on
+        our books with our bids (and its live ones) taken out. Held YIELD_HOLD_S after it
+        last won; never a market we hold or have exits on."""
+        now = time.time()
+        old = set(self.yielded)
+        self.yielded = {t: u for t, u in self.yielded.items() if u > now}
+        fresh = (doc and doc.get("live_trading") and now - float(doc.get("written_at") or 0) <= OFFERS_STALE_S)
+        if cfg.arbs_yield_ratio <= 0 or not self.live or not fresh:
+            self.yielded = {}
+        else:
+            held = set(self.signed_positions()) | {unkey(k)[0] for k in self.state["orders"] if is_hedge(k)}
+            ours = set(plans) | self.order_tickers() | set(self.yielded)
+            for bid, off in (doc.get("offers") or {}).items():
+                mine = [t for t in off.get("tickers") or () if t in ours]
+                if not mine or held & set(mine):
+                    continue
+                legs = collections.defaultdict(list)
+                for t, side, price, size in off.get("legs") or ():
+                    if t in books and t in self.programs:
+                        legs[t].append((side, float(price), float(size)))
+                arbs = 0.0
+                for t, ls in legs.items():
+                    others = {s: dict(v) for s, v in books[t].items()}
+                    if off.get("live"):
+                        for side, price, size in ls:
+                            others[side] = remove_ours(others[side], price, size)
+                    arbs += farm.market_rate(others, ls, self.params(t))
+                farm_net = sum(max(plans[t].rate - plans[t].loss_rate, 0.0) for t in mine if t in plans)
+                if arbs > 0 and arbs >= cfg.arbs_yield_ratio * farm_net:
+                    for t in mine:
+                        if t not in self.yielded:
+                            print(f"yield: {t} to ARBS ({bid}: ${arbs * 86400:.2f}/day vs our "
+                                  f"${farm_net * 86400:.2f}/day net)")
+                            self.journal({"kind": "yield", "ticker": t, "basket_id": bid, "live": off.get("live"),
+                                          "arbs_usd_day": arbs * 86400, "ours_usd_day": farm_net * 86400})
+                        self.yielded[t] = now + YIELD_HOLD_S
+        for t in old - set(self.yielded):
+            print(f"yield: {t} back from ARBS")
+            self.journal({"kind": "yield_end", "ticker": t})
 
     async def reconcile(self, cfg: Cfg):
         want = self.choose(cfg)
@@ -1988,6 +2047,7 @@ class Runner:
                    "fills": len(self.state["fills"]), "fill_lots": sum(p["lots"] for p in pos),
                    "fill_pnl_usd": fill_pnl, "net_usd": tot_lip + fill_pnl, "resting_cost_usd": at_risk,
                    "cash_usd": sum(self.cash.values()), "exposure_usd": self.exposure(),
+                   "yielded_to_arbs": sorted(self.yielded),
                    "locked_bundles": len(self.state.get("locked", {})),
                    "write_tps_10m": self.bucket.rate_10m(), "write_tps_cap": cfg.write_tokens_per_s,
                    "ws_up": bool(self.feed and self.feed.up), "ws_updates": self.n_evals,
