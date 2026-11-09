@@ -203,13 +203,17 @@ def quote_leg(legs: list[LegView], j: int, payout: float, required_edge: float, 
                      edge=payout - others - maker_cost(price, lv.maker_rate), others_cost=others)
 
 
-def depth_size(legs: list[LegView], j: int, payout: float, required_edge: float, cap: float) -> float:
-    """Largest whole size, up to `cap`, that leg j can rest at its smallest
-    quote's price and still have a fill completed through the other legs'
-    books (each taken at the worst level that size reaches) for
-    `required_edge`. 0 if not even 1 works."""
+def depth_size(legs: list[LegView], j: int, payout: float, required_edge: float, cap: float,
+               at: float | None = None) -> float:
+    """Largest whole size, up to `cap`, that leg j can rest at price `at`
+    (default: its smallest quote's price) and still have a fill completed
+    through the other legs' books (each taken at the worst level that size
+    reaches) for `required_edge`. 0 if not even 1 works."""
     first = quote_leg(legs, j, payout, required_edge, 1.0)
     if first is None or cap < 1:
+        return 0.0
+    price = first.price if at is None else at
+    if first.max_price < price - _EPS:
         return 0.0
     # Sizes where some other leg's worst level changes, then the cap.
     marks = {float(cap)}
@@ -225,7 +229,7 @@ def depth_size(legs: list[LegView], j: int, payout: float, required_edge: float,
     best = 1.0
     for n in sorted(m for m in marks if m >= 1):
         plan = quote_leg(legs, j, payout, required_edge, n)
-        if plan is None or plan.max_price < first.price - _EPS:
+        if plan is None or plan.max_price < price - _EPS:
             break
         best = n
     return best

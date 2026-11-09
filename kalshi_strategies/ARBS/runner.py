@@ -1662,17 +1662,18 @@ class ArbsRunner:
                 acts.append(self.move_quote(q, plan, size if grow else None))
             else:
                 q.edge, q.max_price = plan.edge, plan.max_price
-        acts += self.manage_deep(b, vs, mains, quote_need, now, live and want, pulled)
+        acts += self.manage_deep(b, vs, mains, quote_need, now, want, live, pulled)
         if acts:
             async def run(acts=acts):
                 await asyncio.gather(*acts)
             self.spawn(run(), b.basket_id)
 
-    def deep_plan(self, b: Basket, vs, j: int, main: pricing.QuotePlan, need: float) -> tuple:
+    def deep_plan(self, b: Basket, vs, j: int, main: pricing.QuotePlan, need: float, cap: float) -> tuple:
         """(plan, size) for a second quote one tick over the next other bid
-        behind the arb quote on leg j, or (None, 0) when that gap is under
+        behind the arb quote on leg j, sized up to `cap` by what the other legs
+        can complete at that price, or (None, 0) when that gap is under
         deep_min_gap_ticks or the price can't complete even 1 bundle at `need`."""
-        t, leg, lv = self.cfg.trading, b.legs[j], vs[j]
+        leg, lv = b.legs[j], vs[j]
         bk = self.feed.ladder(leg.ticker)
         if bk is None:
             return None, 0
@@ -1683,13 +1684,23 @@ class ArbsRunner:
         price = lv.ticks.up(max(behind)) if behind else lv.ticks.lo
         if not self.deep_gap(price, main.price):
             return None, 0
-        for n in range(int(t.deep_quote_size), 0, -1):
-            p = pricing.quote_leg(vs, j, b.payout, need, float(n))
-            if p is not None and price <= p.max_price + _EPS:
-                edge = b.payout - p.others_cost - pricing.maker_cost(price, lv.maker_rate)
-                return pricing.QuotePlan(leg=j, price=price, max_price=p.max_price, edge=edge,
-                                         others_cost=p.others_cost), float(n)
-        return None, 0
+        n = pricing.depth_size(vs, j, b.payout, need, float(int(cap + _EPS)), at=price)
+        p = pricing.quote_leg(vs, j, b.payout, need, n) if n >= 1 else None
+        if p is None or price > p.max_price + _EPS:
+            return None, 0
+        edge = b.payout - p.others_cost - pricing.maker_cost(price, lv.maker_rate)
+        return pricing.QuotePlan(leg=j, price=price, max_price=p.max_price, edge=edge,
+                                 others_cost=p.others_cost), n
+
+    def deep_cap(self, b: Basket, j: int, live: bool) -> float:
+        """Most bundles a deep quote on leg j may rest: deep_quote_size, held to
+        the arb quote's own size cap and to the bundle and dollar room left
+        after the arb quote on that leg (a sweep can fill both)."""
+        t = self.cfg.trading
+        main = self.quotes.get((b.basket_id, j))
+        dollars = self.quote_size_by_dollars(b) - (main.remaining if main is not None else 0.0)
+        return max(0.0, min(float(t.deep_quote_size), float(t.live_quote_size if live else t.quote_size),
+                            self.room_bundles(b, j), dollars))
 
     def deep_gap(self, deep: float, main: float) -> bool:
         """Is `deep` at least deep_min_gap_ticks cents under `main`? Cents, not
@@ -1698,12 +1709,14 @@ class ArbsRunner:
         golf longshot's deep quote 89 times in 4 min (10-31 00:03)."""
         return main - deep >= self.cfg.trading.deep_min_gap_ticks * 0.01 - _EPS
 
-    def manage_deep(self, b: Basket, vs, mains: dict, need: float, now: float, on: bool,
+    def manage_deep(self, b: Basket, vs, mains: dict, need: float, now: float, on: bool, live: bool,
                     pulled: frozenset | set = frozenset()) -> list:
-        """Deep quotes behind the arb quotes in `mains`, while `on` (a live
-        basket being quoted). Live sweeps ran past our arb quote 90% of the
-        time and 37% by 30c+ (trades 10-28..30); on slow markets 1% did, so
-        there a fill that deep is mostly news."""
+        """Deep quotes behind the arb quotes in `mains`, while `on` (the basket
+        is being quoted). Live sweeps ran past our arb quote 90% of the time and
+        37% by 30c+ (trades 10-28..30). Non-live ones rarely do, but when they
+        do it's a dump the other legs still complete: replayed on prints
+        11-07..08, 16 non-live deep fills at up to 400 made +$284, completing
+        0.1 s or 1 s after the print."""
         t, reserve, acts = self.cfg.trading, self.cfg.runtime.write_reserve_tokens, []
         on = on and t.deep_quote_size >= 1
         for j, leg in enumerate(b.legs):
@@ -1714,7 +1727,8 @@ class ArbsRunner:
                 if dq is not None:
                     acts.append(self.cancel_quote(dq, "pull"))
                 continue
-            plan, size = self.deep_plan(b, vs, j, mains[j], need) if on and j in mains else (None, 0)
+            plan, size = self.deep_plan(b, vs, j, mains[j], need, self.deep_cap(b, j, live)) \
+                if on and j in mains else (None, 0)
             if plan is None:
                 if dq is None:
                     continue

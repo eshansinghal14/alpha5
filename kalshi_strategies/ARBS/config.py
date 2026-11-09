@@ -63,9 +63,11 @@ class TradingParams:
                                     "contracts match in 15 s, Kalshi cancels the rest inside the matching "
                                     "engine, before the rest of a sweep lands, and exits go out without "
                                     "waiting on our own cancels.")
-    deep_quote_size: int = param("Bundles in the second quote a live (or same-day) basket rests one tick over "
-                                 "the next bid behind each arb quote, where a sweep through the arb quote "
-                                 "lands. 0 = off.", min=0, max=1000, step=1)
+    deep_quote_size: int = param("Most bundles in the second quote a basket rests one tick over the next bid "
+                                 "behind each arb quote, where a sweep through the arb quote lands. Also held "
+                                 "to the arb quote's own cap (live_quote_size / quote_size) and the room left "
+                                 "after it, so at or over quote_size it is the regular size. 0 = off.",
+                                 min=0, max=10000, step=1)
     # Scored on fill_context 11-02..04: sports, others' depth -50% in 2 s with a
     # 2 s hold skipped $60 of losing fills for $30 of winners, 1.7% of quote
     # time; live elections about even (most losses there gave no warning).

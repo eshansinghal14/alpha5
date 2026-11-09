@@ -1109,18 +1109,40 @@ def test_deep_quote_rests_one_tick_over_the_next_bid_behind(arbs):
     live = _live_gap(r, b, [(0.45, 10), (0.20, 5)])
     main, deep = r.quotes[(live.basket_id, 0)], r.quotes[(live.basket_id, 0, "deep")]
     assert main.price == pytest.approx(0.40) and not main.deep
-    assert deep.price == pytest.approx(0.21) and deep.size == 5 and deep.edge > main.edge
+    # deep_quote_size 5, held to the arb quote's live_quote_size of 2.
+    assert deep.price == pytest.approx(0.21) and deep.size == 2 and deep.edge > main.edge
 
 
-def test_no_deep_quote_on_a_small_gap_or_a_slow_market(arbs):
+def test_no_deep_quote_on_a_small_gap(arbs):
     r, b = arbs
     live = _live_gap(r, b, [(0.45, 10), (0.37, 5)])        # 0.38 is 2 ticks behind 0.40
     assert (live.basket_id, 0) in r.quotes and (live.basket_id, 0, "deep") not in r.quotes
-    r.set_baskets([b])
-    r.hot = [b.basket_id]
+
+
+def _slow_gap(r, b, deep_quote_size):
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, deep_quote_size=deep_quote_size, deep_min_gap_ticks=5,
+                                        requote_cooldown_s=0.0)
     book(r, "X-A", [(0.45, 10), (0.20, 5)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
     _eval(r, b)
-    assert (b.basket_id, 0) in r.quotes and not any(q.deep for q in r.quotes.values())
+    for q in list(r.quotes.values()):
+        q.placed_at -= R.DEEP_REQUOTE_S
+    _eval(r, b)
+
+
+def test_non_live_basket_gets_a_deep_quote_at_its_quote_size(arbs):
+    r, b = arbs
+    _slow_gap(r, b, deep_quote_size=10000)
+    deep = r.quotes[(b.basket_id, 0, "deep")]
+    assert deep.price == pytest.approx(0.21) and deep.size == r.cfg.trading.quote_size
+
+
+def test_deep_quote_sized_to_what_the_other_legs_complete(arbs):
+    r, b = arbs
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=50)
+    _slow_gap(r, b, deep_quote_size=10000)
+    # B's NO bids hold 10 at 0.45 (its YES ask 0.55): past that nothing completes.
+    assert r.quotes[(b.basket_id, 0, "deep")].size == 10
 
 
 def test_deep_fill_is_journaled_as_deep_and_completed(arbs, tmp_path):
