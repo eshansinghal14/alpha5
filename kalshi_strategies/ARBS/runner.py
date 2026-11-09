@@ -76,7 +76,10 @@ LIP_FILE = "lip_accrued.json"
 LIP_MIN_PAYOUT_USD = 1.0
 # A leg in a LIP market rests at whichever price, from its usual one down this many ticks,
 # has the size (the most that still completes for the edge) earning the most LIP.
-LIP_SCAN_TICKS = 8       # Kalshi pays a market-period's LIP only from $1
+LIP_SCAN_TICKS = 8
+# The scan (prices x baskets x depth_size) took ARBS from ~61% to ~91% of a core when run on
+# every book update (11-09): a leg's choice is reused this long, re-checked at its size.
+LIP_PLAN_S = 5.0       # Kalshi pays a market-period's LIP only from $1
 MAX_ALERTS = 300
 # A quote whose create got no response may still rest at Kalshi; look for it
 # by client id after this long.
@@ -332,6 +335,7 @@ class ArbsRunner:
         self.lip_shadow: dict[str, dict] = {}        # basket_id -> quotes we'd rest on its claimed legs
         self.lip_programs: dict[str, tuple] = {}     # ticker -> (program id, start, end, LipParams)
         self.lip_rate: dict[str, float] = {}         # ticker -> our LIP $/s now
+        self.lip_plans: dict[tuple, tuple] = {}      # (basket_id, leg) -> (at, price, size, via basket or None)
         self.lip_acc = self._load_lip()
         self.set_baskets(merge(self.hand, self.scanned()))
         for led in (self.real_ledger, self.shadow_ledger):
@@ -2018,6 +2022,22 @@ class ArbsRunner:
         if bk is None or not start <= time.time() < end:
             return None
         t, now_ts = self.cfg.trading, _utc()
+        hit = self.lip_plans.get((b.basket_id, j))
+        if hit is not None and time.time() - hit[0] < LIP_PLAN_S:
+            _, p, n, y = hit
+            if p is None:
+                return None                           # no LIP price beat the usual one lately
+            k = j if y is None else next((i for i, l in enumerate(y.legs) if l.ticker == leg.ticker
+                                          and l.side == leg.side), None)
+            pv = vs if y is None else self.views(y)
+            if k is not None and pv is not None and n <= room + _EPS:
+                pay = b.payout if y is None else y.payout
+                nd = need if y is None else self.lip_need(edge_dollars(y.payout, t.min_edge + t.quote_edge_add),
+                                                          leg.ticker, False)
+                q = pricing.quote_leg(pv, k, pay, nd, n)
+                if q is not None and q.max_price >= p - _EPS:
+                    return dataclasses.replace(q, leg=j, price=p,
+                                               edge=pay - q.others_cost - pricing.maker_cost(p, pv[k].maker_rate)), n
         paths = [(None, j, vs, b.payout, need, float(int(room + _EPS)))]
         for y, k in self.alternatives(b, j):
             vy = self.views(y)
@@ -2048,12 +2068,16 @@ class ArbsRunner:
                     best = (r, p, n, path)
             p = lv.ticks.down(p)
         if best is None or best[0] <= 0:
+            self.lip_plans[(b.basket_id, j)] = (time.time(), None, 0.0, None)
             return None
         _, p, n, i = best
         y, k, pv, pay, nd, _ = paths[i]
         q = pricing.quote_leg(pv, k, pay, nd, n)
         if q is None or q.max_price < p - _EPS:
             return None
+        self.lip_plans[(b.basket_id, j)] = (time.time(), p, n, y)
+        if len(self.lip_plans) > 20000:
+            self.lip_plans = {key: v for key, v in self.lip_plans.items() if time.time() - v[0] < LIP_PLAN_S}
         self.set_via(b.basket_id, j, y)
         return dataclasses.replace(q, leg=j, price=p,
                                    edge=pay - q.others_cost - pricing.maker_cost(p, pv[k].maker_rate)), n
