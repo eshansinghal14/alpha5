@@ -336,6 +336,8 @@ class ArbsRunner:
         self.lip_programs: dict[str, tuple] = {}     # ticker -> (program id, start, end, LipParams)
         self.lip_rate: dict[str, float] = {}         # ticker -> our LIP $/s now
         self.lip_plans: dict[tuple, tuple] = {}      # (basket_id, leg) -> (at, price, size, via basket or None)
+        self.farm_period: dict[str, float] = {}      # program id -> LIPFARM's LIP in it (one $1 minimum for both)
+        self._farmp_mtime: float | None = None
         self.lip_acc = self._load_lip()
         self.set_baskets(merge(self.hand, self.scanned()))
         for led in (self.real_ledger, self.shadow_ledger):
@@ -855,10 +857,24 @@ class ArbsRunner:
                 a["period_end"][pid] = end
         self.lip_rate = rates
 
+    def poll_farm_periods(self):
+        """LIPFARM's per-period LIP (lip_periods.json): Kalshi's $1 minimum is the account's."""
+        path = os.path.join(LIVE_ROOT, "LIPFARM", "live", "lip_periods.json")
+        try:
+            m = os.path.getmtime(path)
+            if m == self._farmp_mtime:
+                return
+            with open(path, encoding="utf-8") as fh:
+                self.farm_period = json.load(fh).get("period") or {}
+            self._farmp_mtime = m
+        except (OSError, ValueError):
+            return
+
     def lip_summary(self) -> dict:
-        a = self.lip_acc
+        a, farm = self.lip_acc, self.farm_period
         return {"exp_usd": round(sum(a["accrued"].values()), 4),
-                "locked_usd": round(sum(v for v in a["period"].values() if v >= LIP_MIN_PAYOUT_USD), 4),
+                "locked_usd": round(sum(v for pid, v in a["period"].items()
+                                        if v + farm.get(pid, 0.0) >= LIP_MIN_PAYOUT_USD), 4),
                 "usd_day_now": round(sum(self.lip_rate.values()) * 86400, 2), "markets_now": len(self.lip_rate)}
 
     async def lip_accrue_loop(self):
@@ -868,6 +884,7 @@ class ArbsRunner:
             now = time.time()
             try:
                 self.accrue_lip(min(now - last, 30.0))
+                self.poll_farm_periods()
                 if now - saved >= LIP_SAVE_S:
                     saved = now
                     # Periods ended a month ago are paid or forfeited; their markets keep their totals.

@@ -112,6 +112,11 @@ CLAIMS_PATH = os.path.join(ROOT, "live", "claimed.json")
 LIP_MARKETS_FILE = "lip_markets.json"
 # ARBS's quotes (live) and would-be quotes (on baskets our claims hold off) on our markets.
 ARBS_OFFERS_PATH = os.path.join(ARBS_ROOT, "lip_offers.json")
+# Kalshi's $1 minimum is per account and market-period, and ARBS rests in the same account:
+# each side publishes its per-period accrual (ours beside the claims, ARBS's in its root)
+# and both judge a period on the sum.
+LIP_PERIODS_FILE = "lip_periods.json"
+ARBS_LIP_PATH = os.path.join(ARBS_ROOT, "lip_accrued.json")
 SERIES_LOSS_PATH = os.path.join(ROOT, "series_loss.json")      # series_loss.py's table, built off the box
 # One summary point per logged report (~every 2 min), for the dashboard's P&L chart.
 HISTORY_FILE = "pnl_history.jsonl"

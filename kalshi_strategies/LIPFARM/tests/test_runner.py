@@ -1051,3 +1051,12 @@ def test_no_yield_on_a_market_we_have_not_priced_or_for_pennies(tmp_path, monkey
     assert not r.yielded                                       # quoted, but not priced this cycle
     r.yield_to_arbs(on, {"Z-1-A": _plan("Z-1-A", rate=0.0)}, others, _offers([["Z-1-A", "yes", 0.41, 500.0]], ["Z-1-A"]))
     assert not r.yielded                                       # the test program pays ~$0.01/day
+
+
+def test_the_dollar_minimum_counts_arbs_lip_in_the_same_period(tmp_path, monkeypatch):
+    books = {"Z-1-A": {"yes": {}, "no": {}}, "Z-1-B": {"yes": {}, "no": {}}}
+    r, _ = make(tmp_path, monkeypatch, books)
+    r.state["period_accrued"] = {"pZ-1-A": 0.6, "pZ-1-B": 0.6}
+    assert r.lip_locked() == 0.0
+    r.arbs_period = {"pZ-1-A": 0.5}                  # ARBS quoted Z-1-A earlier in the period
+    assert r.lip_locked() == pytest.approx(0.6) and r.period_accrued("Z-1-A") == pytest.approx(1.1)

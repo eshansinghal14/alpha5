@@ -1899,3 +1899,15 @@ def test_a_lip_leg_is_sized_through_the_basket_that_completes_it(arbs):
     plan0 = R.pricing.QuotePlan(leg=0, price=0.31, max_price=0.31, edge=0.1, others_cost=0.0)
     plan, size = r.lip_plan(b, vs, 0, need, 1000.0, plan0)
     assert size > 500 and plan.price == pytest.approx(0.31) and r.via[(b.basket_id, 0)] == c.basket_id   # max_dollars caps it
+
+
+def test_arbs_locked_lip_counts_lipfarm_lip_in_the_same_period(arbs):
+    r, b = arbs
+    r.lip_acc = {"accrued": {"X-A": 0.4, "X-B": 0.4}, "period": {"p1": 0.4, "p2": 0.4}, "period_end": {}}
+    assert r.lip_summary()["locked_usd"] == 0.0
+    path = R.os.path.join(R.LIVE_ROOT, "LIPFARM", "live")
+    R.os.makedirs(path)
+    with open(R.os.path.join(path, "lip_periods.json"), "w") as fh:
+        json.dump({"period": {"p1": 0.7}}, fh)
+    r.poll_farm_periods()
+    assert r.lip_summary()["locked_usd"] == pytest.approx(0.4)

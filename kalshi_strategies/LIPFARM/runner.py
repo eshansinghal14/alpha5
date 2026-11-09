@@ -214,6 +214,7 @@ class Runner:
         self.cash: dict[int, float] = {}         # shard -> available balance, read every BALANCE_S
         self.yielded: dict[str, float] = {}      # ticker -> until when ARBS quotes it instead of us
         self._lipm_written: frozenset = frozenset()
+        self.arbs_period: dict[str, float] = {}  # program id -> ARBS's LIP in that period (lip_accrued.json)
         self.categories: dict[str, str] = {}  # series -> category
         self.series_titles: dict[str, str] = {}
         self.flow_pool = cf.ThreadPoolExecutor(1, thread_name_prefix="lipfarm-flow")
@@ -378,7 +379,15 @@ class Runner:
         return any(t not in old for t in claims)
 
     def period_accrued(self, t: str) -> float:
-        return self.state.setdefault("period_accrued", {}).get(self.programs[t]["id"], 0.0)
+        """The account's LIP in t's current period: ours plus ARBS's (one $1 minimum for both)."""
+        pid = self.programs[t]["id"]
+        return self.state.setdefault("period_accrued", {}).get(pid, 0.0) + self.arbs_period.get(pid, 0.0)
+
+    def lip_locked(self) -> float:
+        """Our LIP in periods the account (we plus ARBS) has taken past Kalshi's $1 minimum."""
+        arbs = self.arbs_period
+        return sum(v for pid, v in self.state.get("period_accrued", {}).items()
+                   if v + arbs.get(pid, 0.0) >= farm.LIP_MIN_PAYOUT_USD)
 
     def choose(self, cfg: Cfg) -> dict[str, farm.Plan]:
         """The markets to quote, within shard cash and num_markets, by what a slot is
@@ -643,6 +652,12 @@ class Runner:
     async def save(self):
         data = json.dumps(self.state)
         await asyncio.get_running_loop().run_in_executor(self.io_pool, _atomic_write, self.state_path, data)
+        if self.live:
+            per = json.dumps({"written_at": time.time(), "period": self.state.get("period_accrued", {})})
+            await asyncio.get_running_loop().run_in_executor(
+                self.io_pool, _atomic_write, os.path.join(os.path.dirname(farm.CLAIMS_PATH), farm.LIP_PERIODS_FILE), per)
+        doc = await self.run_io(farm._json, farm.ARBS_LIP_PATH)
+        self.arbs_period = (doc or {}).get("period") or {}
 
     async def run_io(self, fn, *a):
         return await asyncio.get_running_loop().run_in_executor(self.pool, fn, *a)
@@ -2043,7 +2058,7 @@ class Runner:
                                    if unkey(k)[0] == t and not is_hedge(k) and not is_sentinel(k)}})
         pos = self.positions()
         tot_lip = sum(self.state["accrued"].values())
-        locked = sum(v for v in self.state.get("period_accrued", {}).values() if v >= farm.LIP_MIN_PAYOUT_USD)
+        locked = self.lip_locked()
         fill_pnl = sum(p["pnl"] for p in pos)
         at_risk = sum(r["capital_usd"] for r in rows)
         hrs = (time.time() - self.state["t0"]) / 3600
