@@ -3,6 +3,8 @@ config.json (validated as a whole before anything touches disk); the running
 session hot-reloads it."""
 from __future__ import annotations
 
+import json
+
 import streamlit as st
 
 from kalshi_infra.config import (APPLY_NEXT_EVENT, ConfigError, describe, get_dotted, load,
@@ -32,6 +34,23 @@ def _nullable_number(d: dict, value, label: str, key: str, help_: str):
     return v
 
 
+def _json_dict(d: dict, value, label: str, key: str, help_: str):
+    """JSON text box for a dict field, e.g. {"XRP": 4.0}; empty = null when nullable."""
+    raw = st.text_input(label, value="" if value is None else json.dumps(value), key=key,
+                        help=help_ + ("\n\nJSON object; leave empty for none." if d["nullable"] else "\n\nJSON object."),
+                        placeholder="none" if d["nullable"] else "")
+    raw = raw.strip()
+    if not raw and d["nullable"]:
+        return None
+    try:
+        v = json.loads(raw)
+    except ValueError:
+        raise _BadInput(f"{d['name']}: {raw!r} is not valid JSON")
+    if not isinstance(v, dict):
+        raise _BadInput(f"{d['name']}: expected a JSON object like {{\"XRP\": 4.0}}")
+    return v
+
+
 def _market_checkboxes(d: dict, value, key: str, label: str, help_: str, markets: list[str]):
     """One checkbox per market for a list-of-market-names field. All ticked
     is saved as null (= every market, including any added later)."""
@@ -51,6 +70,8 @@ def _widget(d: dict, value, key: str, markets: list[str] | None = None):
     help_ = d["help"] + ("\n\n⏭ applies at the next event." if d["apply"] == APPLY_NEXT_EVENT else "")
     if d["type"] == "list" and name.endswith("_markets") and markets:
         return _market_checkboxes(d, value, key, label, help_, markets)
+    if d["type"] == "dict":
+        return _json_dict(d, value, label, key, help_)
     if d["type"] == "bool":
         return st.checkbox(label, value=bool(value), key=key, help=help_)
     if d["type"] == "str":
