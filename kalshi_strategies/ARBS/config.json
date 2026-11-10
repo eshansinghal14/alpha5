@@ -18,6 +18,7 @@
     "live_order_groups": false,
     "deep_quote_size": 5,
     "deep_min_gap_ticks": 5,
+    "depth_age_s": 5.0,
     "pull_drop": 0.5,
     "pull_window_s": 2.0,
     "pull_hold_s": 2.0,

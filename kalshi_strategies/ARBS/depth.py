@@ -102,6 +102,21 @@ class TopHistory:
                 return s[1:]
         return None
 
+    def held_depth(self, ticker: str, side: str, now: float, age: float) -> float | None:
+        """Others' depth at the best price to buy `side`, at its lowest over the
+        last `age` s (<= HIST_S): what has rested at least that long. None with
+        no history."""
+        d = self.h.get(ticker)
+        if not d:
+            return None
+        col = 4 if side == "yes" else 2
+        lo = None
+        for s in reversed(d):
+            lo = s[col] if lo is None else min(lo, s[col])
+            if s[0] <= now - age:
+                break
+        return lo
+
     def pull_ratio(self, ticker: str, side: str, now: float, window: float) -> float | None:
         """Others' depth at the side's best bid now over its peak at that same
         price within `window` (the pull rule's measure, depth.PullWatch), for

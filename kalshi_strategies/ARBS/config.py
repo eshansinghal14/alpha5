@@ -85,6 +85,10 @@ class TradingParams:
                                     "quote and the deep quote's price; a smaller "
                                     "gap gains too little over the arb quote to be worth the order.",
                                     min=1, max=99, step=1)
+    depth_age_s: float = param("New and grown quotes are held to the other legs' touch depth that has rested "
+                               "this long (an existing quote keeps its size); 0 = off. Live fills 11-02..10 "
+                               "over 50 lots made +2.1c/lot when that depth (5 s) covered them, -3.0c/lot "
+                               "(-$322, 87 arbs) when it didn't.", min=0.0, max=10.0, step=0.5)
     max_bundles_per_basket: int = param("Most bundles held in one basket (complete or not).", min=0, max=100000,
                                         step=1)
     max_dollars: float = param("Most dollars in the strategy: cost paid on held baskets, plus per quoted "

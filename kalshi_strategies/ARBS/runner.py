@@ -1794,6 +1794,7 @@ class ArbsRunner:
                     plan = pricing.quote_leg(vs, j, b.payout, need, size)
             elif want:
                 room = min(cap, self.room_bundles(b, j), float(self.quote_size_by_dollars(b)))
+                room = min(room, max(self.aged_room(b, j), q.remaining if q is not None else 0.0))
                 need = self.lip_need(quote_need, leg.ticker, live)
                 size = pricing.depth_size(vs, j, b.payout, need, float(int(room + _EPS)))
                 plan = pricing.quote_leg(vs, j, b.payout, need, size) if size >= 1 else None
@@ -1876,6 +1877,17 @@ class ArbsRunner:
         return max(0.0, min(float(t.deep_quote_size), float(t.live_quote_size if live else t.quote_size),
                             self.room_bundles(b, j), dollars))
 
+    def aged_room(self, b: Basket, j: int) -> float:
+        """Bundles the other legs' touch has offered for trading.depth_age_s:
+        new and grown quotes on leg j are held to it (an existing one keeps its
+        size). Others' top-of-book depth only; inf when off or unrecorded."""
+        age = self.cfg.trading.depth_age_s
+        if age <= 0:
+            return math.inf
+        now = time.time()
+        got = [self.top_hist.held_depth(l.ticker, l.side, now, age) for i, l in enumerate(b.legs) if i != j]
+        return min((g for g in got if g is not None), default=math.inf)
+
     def deep_gap(self, deep: float, main: float) -> bool:
         """Is `deep` at least deep_min_gap_ticks cents under `main`? Cents, not
         the market's ticks: on a tapered market's 0.1c tails 5 ticks is half a
@@ -1901,8 +1913,14 @@ class ArbsRunner:
                 if dq is not None:
                     acts.append(self.cancel_quote(dq, "pull"))
                 continue
-            plan, size = self.deep_plan(b, vs, j, mains[j], need, self.deep_cap(b, j, live)) \
-                if on and j in mains else (None, 0)
+            if on and j in mains:
+                # A sweep fills both quotes: the deep one gets what the aged depth leaves.
+                main = self.quotes.get((b.basket_id, j))
+                aged = self.aged_room(b, j) - (main.remaining if main is not None else 0.0)
+                cap = min(self.deep_cap(b, j, live), max(aged, dq.remaining if dq is not None else 0.0))
+                plan, size = self.deep_plan(b, vs, j, mains[j], need, cap)
+            else:
+                plan, size = None, 0
             if plan is None:
                 if dq is None:
                     continue

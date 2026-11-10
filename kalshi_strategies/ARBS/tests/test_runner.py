@@ -1100,6 +1100,25 @@ def test_resting_quote_grows_when_the_room_does(arbs):
     assert r.quotes[(b.basket_id, 0)].size == 5     # quote_size in the fixture
 
 
+def test_quote_grows_only_into_depth_that_has_rested(arbs):
+    r, b = arbs
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, requote_cooldown_s=0.0, depth_age_s=5.0)
+    now = time.time()
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 40)])      # B's YES ask 0.55, 40 deep...
+    r.top_hist.on_book("X-B", now - 8, 0.40, 10, 0.55, 1)
+    r.top_hist.on_book("X-B", now - 0.5, 0.40, 10, 0.55, 40)   # ...of which 39 arrived just now
+    _eval(r, b)
+    assert r.quotes[(b.basket_id, 0)].size == 1
+    r.top_hist.h["X-B"].clear()
+    r.top_hist.on_book("X-B", now - 8, 0.40, 10, 0.55, 40)
+    _eval(r, b)
+    assert r.quotes[(b.basket_id, 0)].size == 5     # rested 8 s: grows to quote_size
+    r.top_hist.on_book("X-B", time.time(), 0.40, 10, 0.55, 2)
+    _eval(r, b)
+    assert r.quotes[(b.basket_id, 0)].remaining == 5     # aged depth fell, but the book still completes 5
+
+
 def _live_gap(r, b, a_yes_bids):
     """b as a live basket; A's arb quote sits at its 0.40 limit under bids at 0.45."""
     live = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
