@@ -210,6 +210,19 @@ def test_daily_rule_skips_events_with_a_kickoff():
 
 
 
+def test_live_before_settlement_unless_a_kickoff():
+    lead = pd.Timedelta(hours=6)
+    news = event("KXPEAK-26NOV08", "DIRECNET", [mkt("KXPEAK-26NOV08-T6", strike_type="greater", floor_strike=6),
+                                                mkt("KXPEAK-26NOV08-T7", strike_type="greater", floor_strike=7)])
+    b = next(iter(baskets(run([news], settle_lead=lead)).values()))
+    assert not b.is_live(pd.Timestamp("2026-11-14T17:59:00Z"))
+    assert b.is_live(pd.Timestamp("2026-11-14T18:00:00Z"))          # 6h before 11-15 00:00
+    assert not next(iter(baskets(run([news])).values())).is_live(pd.Timestamp("2026-11-14T23:00:00Z"))
+    game = event("GM-1", "MECNET", [mkt("GM-1-A"), mkt("GM-1-B")])
+    b = next(iter(baskets(run([game], settle_lead=lead, starts={"GM-1": "2026-11-14T20:00:00Z"})).values()))
+    assert not b.is_live(pd.Timestamp("2026-11-14T19:00:00Z"))      # kickoff decides, not settlement
+
+
 def test_live_window_by_category():
     win = {"Elections": ["2026-11-03T22:00:00Z", "2026-11-06T00:00:00Z"]}
     vote = event("SENATEX-26", "MECNET", buckets("SENATEX-26")) | {"category": "Elections"}

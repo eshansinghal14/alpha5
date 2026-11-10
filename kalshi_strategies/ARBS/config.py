@@ -167,6 +167,10 @@ class ScanParams:
     live_windows: dict[str, list[str]] = param("Kalshi category -> [from, until] UTC: its events are live "
                                                "(live size, edge and exits) from `from`, for scans before "
                                                "`until` (election results night).", editable=False)
+    live_before_settle_h: float = param("Hours before expected settlement an event without a kickoff turns live "
+                                        "(live size, edge, no LIP discount, exits). Non-sports arbs started within "
+                                        "6h of settlement netted -$3 over 10-28..11-09, then -$179 on 11-10; "
+                                        "0 = off.", min=0.0, max=72.0, step=1.0)
 
 
 @section
