@@ -802,9 +802,10 @@ class CmeFuturesAdapter(_PerpSignal):
 # (10-19), and it only pulled HYPE. Bybit is no longer run either (10-20):
 # slowest perp to us (p50 113-145ms vs Binance ~75, OKX ~80-120), second
 # heaviest feed, and OKX alone covers the nowcast check and the move trigger.
-# CME (Databento) joined 2026-11-01 as a signal: its match engine leads the
-# perps for BTC/ETH/SOL/XRP and reaches this box ~5 ms after capture.
-LEADING_VENUES = ("binance_perp", "okx_perp", "cme")
+# CME (Databento) ran 2026-11-01 to 11-11 as a signal (the adapter stays):
+# race fills 11-02..11 were worth the same with CME open or shut (+0.86 vs
+# +0.83c/lot at 60s), so the subscription was dropped.
+LEADING_VENUES = ("binance_perp", "okx_perp")
 
 ADAPTERS = {a.venue: a for a in (KrakenAdapter, BitstampAdapter, GeminiAdapter, CryptoComAdapter, BullishAdapter,
                                  HyperliquidAdapter, BinancePerpAdapter, BybitPerpAdapter, OkxPerpAdapter,

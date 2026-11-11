@@ -34,7 +34,7 @@ HL_BURST_USD_1S = {"BTC": 200_700, "ETH": 625_400, "SOL": 13_100, "XRP": 5_000, 
 # Offshore perps. No static fallback: each stays record-only until its own
 # BurstCalibrator has MIN_CALIB_S of live samples. These trade 10-50x Coinbase
 # volume, so borrowing Coinbase's or Hyperliquid's numbers would trip constantly.
-PERP_SOURCES = ("binance_perp", "okx_perp", "cme")   # Bybit dropped 10-20 (spot_feed.venues.LEADING_VENUES)
+PERP_SOURCES = ("binance_perp", "okx_perp")   # Bybit dropped 10-20, CME 11-11 (spot_feed.venues.LEADING_VENUES)
 # The perp_move trigger needs MOVE_AGREE of these. CME is kept out of that
 # vote and trips on its own move instead ("cme_move"): it leads them.
 MOVE_VENUES = ("binance_perp", "okx_perp")
