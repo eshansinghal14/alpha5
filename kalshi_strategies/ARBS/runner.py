@@ -43,6 +43,7 @@ from kalshi_infra.kalshi.orders import KEEPALIVE_S, write_budget_tokens_per_s
 from kalshi_infra.trading.engine import MARKET_PAUSE_RETRY_S
 from kalshi_infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
 from kalshi_infra.runtime.persist import LIVE_ROOT, day_dir
+from kalshi_strategies.ARBS import exit_cost
 from kalshi_strategies.ARBS import live_params as lparams, pricing, replay, scanner
 from kalshi_strategies.ARBS.config import SPEC_PATH
 from kalshi_strategies.ARBS.execution import Gateway
@@ -197,6 +198,20 @@ MAX_ALTS = 8
 ALT_SEARCH_S = 0.5
 # Rested depth (aged_room) is re-read after a book change or this long.
 HELD_CACHE_S = 0.25
+# Live quotes in trading.model_series: edge and size from the exit-cost model,
+# picked over this grid (sizes within the model's 11-08..10 training range).
+MODEL_EDGES = (0.02, 0.03, 0.04, 0.05, 0.075, 0.10, 0.15, 0.20)
+MODEL_SIZES = (5.0, 20.0, 50.0, 100.0)
+MODEL_EVAL_S = 0.5            # a leg's pick is reused this long between book changes
+MODEL_AGE_S = 0.25            # the depth age the model's training rows measured
+# Sticky by design: the pick flipped edge on 49% of consecutive prints a minute
+# apart (11-05..10), and every price move or size increase costs queue place.
+# Risk-reducing moves (wider, smaller) go at once; narrowing and growing wait
+# for the pick to hold, and move one step.
+MODEL_MIN_NET_C = 0.5         # widen at once when the current edge nets less than this a lot
+MODEL_WIDEN_GAIN = 1.5        # ... or a wider edge is worth this many times more
+MODEL_NARROW_HOLD_S = 30.0
+MODEL_GROW_HOLD_S = 60.0
 
 
 class _Rate:
@@ -360,6 +375,10 @@ class ArbsRunner:
         self._lv_cache: dict[tuple[str, str], tuple] = {}
         self._alt_pick: dict[tuple[str, int], tuple[float, str | None]] = {}   # (basket, leg) -> (searched at, via)
         self._held_cache: dict[tuple, tuple] = {}
+        self.exit_model: exit_cost.Model | None = None
+        self._model_mtime: float | None = None
+        self.model_state: dict[tuple[str, int], dict] = {}
+        self._model_cache: dict[tuple[str, int], tuple[float, tuple]] = {}
         # event -> {id, ticker, tripped_at, resetting, fills, used}: one order
         # group per live event its quotes share; group id -> event.
         self.groups: dict[str, dict] = {}
@@ -1658,6 +1677,104 @@ class ArbsRunner:
         self._held_cache[key] = (seq, now, v)
         return v
 
+    def model_on(self, b: Basket) -> bool:
+        ms = self.cfg.trading.model_series
+        if not ms or self.exit_model is None:
+            return False
+        t = b.legs[0].ticker
+        m = self.meta.get(t)
+        series = (m.series if m else None) or t.split("-", 1)[0]
+        return series in ms or self.series_group.get(series) in ms
+
+    def poll_model(self):
+        """Reload exit_cost.MODEL_FILE when the daily shadow check rewrites it."""
+        path = os.path.join(LIVE_ROOT, "ARBS", exit_cost.MODEL_FILE)
+        try:
+            m = os.path.getmtime(path)
+            if m == self._model_mtime:
+                return
+            with open(path, encoding="utf-8") as fh:
+                model = exit_cost.Model.from_json(json.load(fh))
+        except (OSError, ValueError):
+            return
+        self._model_mtime = m
+        if model is None:
+            self.alert("warn", None, "exit model file doesn't match this code's inputs; model quoting off")
+        self.exit_model = model
+
+    def model_pick(self, b: Basket, j: int, vs, now_ts: pd.Timestamp):
+        """(edge $/bundle, size cap) for live leg j from the exit-cost model,
+        (None, 0) for no quote, or None to fall back to the config. Sticky: see
+        MODEL_* constants."""
+        key, now = (b.basket_id, j), time.time()
+        hit = self._model_cache.get(key)
+        if hit is not None and now - hit[0] < MODEL_EVAL_S:
+            return hit[1]
+        m = self.exit_model
+        leg = b.legs[j]
+        aged = [self._held_depth(l.ticker, l.side, now, MODEL_AGE_S) for i, l in enumerate(b.legs) if i != j]
+        uw = self.leg_view(leg.ticker, OTHER[leg.side])
+        unwind_top = uw.asks[0][1] if uw is not None and uw.asks else None
+        tte = None if b.settles is None else (b.settles - now_ts).total_seconds() / 3600.0
+        cands: dict[tuple[float, float], tuple[float, float]] = {}
+        for n in MODEL_SIZES:
+            f = exit_cost.live_features(vs, j, b.payout, n, aged, unwind_top, True, tte)
+            if f is None:
+                break
+            for e in MODEL_EDGES:
+                plan = pricing.quote_leg(vs, j, b.payout, e, n)
+                if plan is not None:
+                    cands[(e, n)] = m.value(f, plan.price, True, n, vs[j].maker_rate)
+        if not cands:
+            return None
+        (pe, pn), (pv, _) = max(cands.items(), key=lambda kv: kv[1][0])
+        st = self.model_state.get(key)
+        why = None
+        if pv <= 0:
+            res, why = (None, 0.0), "no positive value"
+        elif st is None or st["edge"] is None or (st["edge"], st["size"]) not in cands:
+            res, why = (pe, pn), "start"
+        else:
+            e, n = st["edge"], st["size"]
+            cur_v, cur_net = cands[(e, n)]
+            if pe > e:
+                st["narrow"] = None
+                wider = cands.get((pe, n), (pv, 0.0))[0]
+                if cur_net < MODEL_MIN_NET_C or wider >= MODEL_WIDEN_GAIN * max(cur_v, 1e-9):
+                    e, why = pe, "widen"
+            elif pe < e:
+                since = st.get("narrow") or now
+                st["narrow"] = since
+                if now - since >= MODEL_NARROW_HOLD_S:
+                    e, why, st["narrow"] = MODEL_EDGES[MODEL_EDGES.index(e) - 1], "narrow", None
+            else:
+                st["narrow"] = None
+            if pn < n:
+                n, why, st["grow"] = pn, why or "shrink", None
+            elif pn > n:
+                since = st.get("grow") or now
+                st["grow"] = since
+                if now - since >= MODEL_GROW_HOLD_S:
+                    n, why, st["grow"] = MODEL_SIZES[MODEL_SIZES.index(n) + 1], why or "grow", None
+            else:
+                st["grow"] = None
+            res = (e, n)
+        prev = (st or {}).get("edge"), (st or {}).get("size")
+        if res != prev:
+            self.n["model_changes"] = self.n.get("model_changes", 0) + 1
+            v, net = cands.get(res, (pv, None)) if res[0] is not None else (pv, None)
+            self.journal({"kind": "model_quote", "basket_id": b.basket_id, "leg": j, "ticker": leg.ticker,
+                          "edge": res[0], "size": res[1], "prev_edge": prev[0], "prev_size": prev[1], "why": why,
+                          "value": round(v, 3), "net_c": None if net is None else round(net, 2),
+                          "pick": [pe, pn]})
+        nst = st if st is not None else {"narrow": None, "grow": None}
+        nst["edge"], nst["size"] = res
+        self.model_state[key] = nst
+        if len(self._model_cache) > 20000:
+            self._model_cache.clear()
+        self._model_cache[key] = (now, res)
+        return res
+
     def basket_shard(self, b: Basket) -> int | None:
         m = self.meta.get(b.legs[0].ticker)
         return None if m is None else m.shard
@@ -1823,11 +1940,20 @@ class ArbsRunner:
                 if size >= 1 and (q is None or q.remaining <= size + _EPS):
                     plan = pricing.quote_leg(vs, j, b.payout, need, size)
             elif want:
-                room = min(cap, self.room_bundles(b, j), float(self.quote_size_by_dollars(b)))
-                room = min(room, max(self.aged_room(b, j), q.remaining if q is not None else 0.0))
-                size = pricing.depth_size(vs, j, b.payout, quote_need, float(int(room + _EPS)))
-                plan = pricing.quote_leg(vs, j, b.payout, quote_need, size) if size >= 1 else None
-                plan, size = self.best_plan(b, j, plan, size, room)
+                need_j, cap_j = quote_need, cap
+                if live and self.model_on(b):
+                    mp = self.model_pick(b, j, vs, now_ts)
+                    if mp is not None:
+                        need_j, cap_j = mp
+                if need_j is None:
+                    room = 0.0                        # the model values no quote here now
+                else:
+                    room = min(cap_j, self.room_bundles(b, j), float(self.quote_size_by_dollars(b)))
+                    room = min(room, max(self.aged_room(b, j), q.remaining if q is not None else 0.0))
+                size = pricing.depth_size(vs, j, b.payout, need_j, float(int(room + _EPS))) if room >= 1 else 0.0
+                plan = pricing.quote_leg(vs, j, b.payout, need_j, size) if size >= 1 else None
+                if room >= 1:
+                    plan, size = self.best_plan(b, j, plan, size, room)
                 if q is not None and q.remaining > size + _EPS:
                     plan = None
             if plan is None:
@@ -2805,6 +2931,7 @@ class ArbsRunner:
                 for s, bids in by_shard.items():
                     picked |= set(self.pick_hot(bids, self.write_budget(), cost))
                 hot = [bid for bid in quotable if bid in picked]
+                self.poll_model()
                 self.hot_cost = round(sum(cost[bid] for bid in hot), 1)
                 self.hot_cost_by_shard = {str(s): round(sum(cost[b] for b in bids if b in picked), 1)
                                           for s, bids in by_shard.items()}

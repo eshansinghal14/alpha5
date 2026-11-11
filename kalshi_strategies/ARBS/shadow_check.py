@@ -162,6 +162,7 @@ def run(day: str, root: str | None = None, groups: dict | None = None) -> dict:
                 if f is not None:
                     stats.add(f, exit_cost.loss(r, f))
                     stats.add_reach(bool(live), f["reach_c"])
+                    stats.add_vol(bool(live), sum(q for _, _, q in r["prints"]))
         q = r.get("quote")
         if q is None or (q.get("tripped") and (q.get("tripped_s") or 0.0) > QUOTE_GONE_S):
             continue
@@ -302,7 +303,7 @@ def rules(root: str, day: str, rows: list) -> dict:
             x = exit_cost.quote_price(f, e)
             net = 100 * e - exit_cost.predict(w, exit_cost.at_price(f, x))
             nets.append(net)
-            evs.append(prev.fill_prob(live, 100 * (f["touch"] - x)) * net)
+            evs.append(prev.fill_prob(live, 100 * (f["touch"] - x)) * prev.expected_fill(live, POLICY_SIZE) * net)
         k = next((k for k, v in enumerate(nets) if v >= RULE_MARGIN_C), None)
         narrow += pnl[k] if k is not None else 0.0
         k = int(np.argmax(evs))
@@ -315,7 +316,8 @@ def rules(root: str, day: str, rows: list) -> dict:
             at_n = None
             for k, e in enumerate(EDGES):
                 x = exit_cost.quote_price(fn, e)
-                v = prev.fill_prob(live, 100 * (fn["touch"] - x)) * n * \
+                # Expected lots, not the size: a big quote fills only the print's volume.
+                v = prev.fill_prob(live, 100 * (fn["touch"] - x)) * prev.expected_fill(live, n) * \
                     (100 * e - exit_cost.predict(w, exit_cost.at_price(fn, x)))
                 if best is None or v > best[0]:
                     best = (v, n, k, pn[k])
@@ -355,6 +357,17 @@ def main():
         os.makedirs(os.path.join(root, OUT_DIR), exist_ok=True)
         atomic_write_json(os.path.join(root, OUT_DIR, f"{day}.json"), doc, indent=None)
         print(json.dumps({"series": s, "day": day, "coverage": doc["coverage"], "groups": len(doc["calibration"])}))
+    write_model(os.path.join(LIVE_ROOT, "ARBS"), (pd.Timestamp(day) + pd.Timedelta(days=1)).strftime("%Y-%m-%d"))
+
+
+def write_model(root: str, before: str):
+    """The model ARBS processes quote with (exit_cost.MODEL_FILE in `root`),
+    fitted on every saved day before `before`."""
+    prev, used = training_stats(root, before)
+    if not used:
+        return
+    m = exit_cost.Model(prev.fit(), prev, sorted(used))
+    atomic_write_json(os.path.join(root, exit_cost.MODEL_FILE), m.to_json(), indent=None)
 
 
 if __name__ == "__main__":

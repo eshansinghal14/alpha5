@@ -1977,3 +1977,72 @@ def test_an_excluded_event_covers_its_baskets(arbs):
     assert not r.excluded(b)
     r.cfg.watch = dataclasses.replace(r.cfg.watch, exclude=["EV1"])
     assert r.excluded(b)
+
+
+def test_model_pick_is_quick_to_cut_risk_and_slow_to_add_it(arbs, monkeypatch):
+    import types
+    r, b = arbs
+    table = {}
+
+    class Stub:
+        def value(self, f, x, live, n, maker_rate=0.0):          # x is the edge (quote_leg stubbed below)
+            return table.get((x, n), (-1.0, -1.0))
+
+    r.exit_model = Stub()
+    monkeypatch.setattr(R.exit_cost, "live_features", lambda *a, **k: {})
+    monkeypatch.setattr(R.pricing, "quote_leg", lambda vs, j, payout, e, n: types.SimpleNamespace(price=e))
+    now_ts = pd.Timestamp.now(tz="UTC")
+    vs = [types.SimpleNamespace(maker_rate=0.0)] * 2
+
+    def pick(best):
+        table.clear()
+        for e in R.MODEL_EDGES:
+            for n in R.MODEL_SIZES:
+                table[(e, n)] = (1.0, 2.0)                        # every option worth a little
+        table.update(best)
+        r._model_cache.clear()
+        return r.model_pick(b, 0, vs, now_ts)
+
+    assert pick({(0.05, 50.0): (5.0, 2.0)}) == (0.05, 50.0)                 # start at the pick
+    assert pick({(0.10, 50.0): (9.0, 3.0)}) == (0.10, 50.0)                 # wider and worth 1.5x: at once
+    assert pick({(0.05, 50.0): (12.0, 2.0)}) == (0.10, 50.0)                # narrower: waits
+    r.model_state[(b.basket_id, 0)]["narrow"] -= R.MODEL_NARROW_HOLD_S
+    assert pick({(0.05, 50.0): (12.0, 2.0)}) == (0.075, 50.0)               # then one step
+    assert pick({(0.075, 20.0): (12.0, 2.0)}) == (0.075, 20.0)              # smaller: at once
+    assert pick({(0.075, 100.0): (12.0, 2.0)}) == (0.075, 20.0)             # bigger: waits
+    r.model_state[(b.basket_id, 0)]["grow"] -= R.MODEL_GROW_HOLD_S
+    assert pick({(0.075, 100.0): (12.0, 2.0)}) == (0.075, 50.0)             # then one step
+    table_none = {(e, n): (-1.0, -1.0) for e in R.MODEL_EDGES for n in R.MODEL_SIZES}
+    table.clear(); table.update(table_none); r._model_cache.clear()
+    assert r.model_pick(b, 0, vs, now_ts) == (None, 0.0)          # nothing worth quoting
+
+
+def test_live_features_match_the_training_inputs():
+    from kalshi_strategies.ARBS.pricing import LegView
+    vs = [LegView(asks=[(0.55, 100)], bid=0.40, taker_rate=0.07, maker_rate=0.0),
+          LegView(asks=[(0.50, 40), (0.51, 60)], bid=0.45, taker_rate=0.07, maker_rate=0.0)]
+    f = R.exit_cost.live_features(vs, 0, 1.0, 20.0, [30.0], 80.0, True, 2.5)
+    assert f["top_r_min"] == pytest.approx(2.0) and f["depth2_r"] == pytest.approx(5.0)
+    assert f["aged_frac"] == pytest.approx(0.75) and f["unwind_top_r"] == pytest.approx(4.0)
+    assert f["touch"] == 0.40 and f["c0"] == pytest.approx(0.50) and f["live"] == 1.0 and f["tte_h"] == 2.5
+    assert R.exit_cost.row({**f}).shape == (R.exit_cost.WIDTH,)
+
+
+def test_a_model_series_live_quote_takes_the_models_edge_and_size(arbs, monkeypatch):
+    r, b = arbs
+    live = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
+    r.set_baskets([live])
+    r.hot = [live.basket_id]
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_live_events=True, live_quote_size=50, live_edge_add=0.0,
+                                        requote_cooldown_s=0.0, depth_age_s=0.0, model_series=["X"])
+    book(r, "X-A", [(0.20, 100)], [(0.55, 100)])
+    book(r, "X-B", [(0.20, 100)], [(0.45, 100)])          # B's YES ask 0.55
+    r.exit_model = object()                                 # model_pick is stubbed: only its presence counts
+    monkeypatch.setattr(r, "model_pick", lambda b, j, vs, now_ts: (0.10, 3.0))
+    _eval(r, live)
+    q = r.quotes[(live.basket_id, 0)]
+    limit = 1.0 - R.pricing.taker_cost(0.55, 0.07) - 0.10                # the model's 10c, not config's
+    assert q.size == 3 and limit - 0.01 - 1e-9 <= q.max_price <= limit + 1e-9
+    monkeypatch.setattr(r, "model_pick", lambda b, j, vs, now_ts: (None, 0.0))
+    _eval(r, live)
+    assert (live.basket_id, 0) not in r.quotes or r.quotes[(live.basket_id, 0)].pending   # pulled

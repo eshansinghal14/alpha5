@@ -45,6 +45,8 @@ WIDTH = 1 + sum(len(e) - 2 for e in BINS.values())
 RIDGE = 50.0
 CLIP_C = (-10.0, 50.0)
 MAX_REACH = 30                      # ticks a sweep's depth is counted to, for fill odds
+# Print volume bins (contracts), for the lots a filled quote of a given size can expect.
+VOL_EDGES = (0.0, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, math.inf)
 
 
 def _fee(p: float) -> float:
@@ -136,14 +138,16 @@ def row(f: dict) -> np.ndarray:
 
 
 class Stats:
-    """A day's sufficient statistics: X'X, X'y and how far prints swept below
-    the touch (ticks, by live), which fit() and fill_prob() sum over days."""
+    """A day's sufficient statistics: X'X, X'y, how far prints swept below the
+    touch (ticks) and their volume, by live, which fit(), fill_prob() and
+    expected_fill() sum over days."""
 
     def __init__(self):
         self.xtx = np.zeros((WIDTH, WIDTH))
         self.xty = np.zeros(WIDTH)
         self.n = 0
         self.reach = {"live": np.zeros(MAX_REACH + 1), "not_live": np.zeros(MAX_REACH + 1)}
+        self.vol = {"live": np.zeros(len(VOL_EDGES) - 1), "not_live": np.zeros(len(VOL_EDGES) - 1)}
 
     def add(self, f: dict, y: float):
         x = row(f)
@@ -154,16 +158,22 @@ class Stats:
     def add_reach(self, live: bool, ticks: float):
         self.reach["live" if live else "not_live"][int(min(MAX_REACH, max(0, round(ticks))))] += 1
 
+    def add_vol(self, live: bool, contracts: float):
+        i = next(i for i in range(len(VOL_EDGES) - 1) if contracts < VOL_EDGES[i + 1])
+        self.vol["live" if live else "not_live"][i] += 1
+
     def merge(self, o: Stats):
         self.xtx += o.xtx
         self.xty += o.xty
         self.n += o.n
         for k in self.reach:
             self.reach[k] += o.reach[k]
+            self.vol[k] += o.vol[k]
 
     def to_json(self) -> dict:
         return {"xtx": self.xtx.round(3).tolist(), "xty": self.xty.round(3).tolist(), "n": self.n,
-                "reach": {k: v.tolist() for k, v in self.reach.items()}}
+                "reach": {k: v.tolist() for k, v in self.reach.items()},
+                "vol": {k: v.tolist() for k, v in self.vol.items()}}
 
     @classmethod
     def from_json(cls, d: dict) -> Stats:
@@ -173,6 +183,9 @@ class Stats:
         for k, v in (d.get("reach") or {}).items():
             if k in s.reach and len(v) == MAX_REACH + 1:
                 s.reach[k] = np.array(v)
+        for k, v in (d.get("vol") or {}).items():
+            if k in s.vol and len(v) == len(VOL_EDGES) - 1:
+                s.vol[k] = np.array(v)
         return s
 
     def fit(self) -> np.ndarray:
@@ -187,6 +200,74 @@ class Stats:
         if tot <= 0:
             return 0.0
         return float(h[int(min(MAX_REACH, max(0, math.ceil(ticks - 1e-9)))):].sum() / tot)
+
+    def expected_fill(self, live: bool, size: float) -> float:
+        """Contracts a filled quote of `size` can expect: min(size, the print's
+        volume), each bin at its lower edge (1 for the first). `size` itself
+        with no volumes recorded, as the replay scored before this existed."""
+        h = self.vol["live" if live else "not_live"]
+        tot = h.sum()
+        if tot <= 0:
+            return size
+        lo = [max(1.0, VOL_EDGES[i]) for i in range(len(h))]
+        return float(sum(c * min(size, v) for c, v in zip(h, lo)) / tot)
+
+
+class Model:
+    """The fitted model as the runner uses it: weights plus fill odds and fill
+    sizes, written by the daily shadow check (MODEL_FILE)."""
+
+    def __init__(self, w: np.ndarray, stats: Stats, trained_on: list[str]):
+        self.w, self.stats, self.trained_on = w, stats, trained_on
+
+    def to_json(self) -> dict:
+        return {"w": [round(float(x), 6) for x in self.w], "width": WIDTH, "trained_on": self.trained_on,
+                "reach": {k: v.tolist() for k, v in self.stats.reach.items()},
+                "vol": {k: v.tolist() for k, v in self.stats.vol.items()}}
+
+    @classmethod
+    def from_json(cls, d: dict) -> Model | None:
+        if d.get("width") != WIDTH or len(d.get("w") or []) != WIDTH:
+            return None
+        st = Stats.from_json({"reach": d.get("reach"), "vol": d.get("vol")})
+        return cls(np.array(d["w"]), st, d.get("trained_on") or [])
+
+    def loss(self, f: dict) -> float:
+        return predict(self.w, f)
+
+    def value(self, f: dict, x: float, live: bool, size: float, maker_rate: float = 0.0) -> tuple[float, float]:
+        """(expected $-cents of a quote at x for `size`: fill odds x expected
+        lots x net, net c per lot after the predicted exit loss)."""
+        g = at_price(f, x)
+        net = 100 * (f["payout"] - x - f["plan"] - maker_rate * x * (1 - x)) - predict(self.w, g)
+        return self.stats.fill_prob(live, g["reach_c"]) * self.stats.expected_fill(live, size) * net, net
+
+
+MODEL_FILE = "exit_model.json"
+
+
+def live_features(views, j: int, payout: float, n: float, aged: list, unwind_top: float | None,
+                  live: bool, tte_h: float | None) -> dict | None:
+    """features() from the runner's books instead of a print row: `views` the
+    basket's LegViews (our own orders out), `aged` the depth each other leg's
+    top has held over the last 0.25 s (None unknown), `unwind_top` the size to
+    buy leg j's other side at its top."""
+    others = [i for i in range(len(views)) if i != j]
+    if not others or any(not views[i].asks for i in others) or views[j].bid is None:
+        return None
+    tops = [views[i].asks[0] for i in others]
+    top = [q / n for _, q in tops]
+    k = int(np.argmin(top))
+    ag = [min(a, q) / n if a is not None else 0.0 for a, (_, q) in zip(aged, tops)]
+    p0k = tops[k][0]
+    depth2 = sum(q for p, q in views[others[k]].asks if p <= p0k + 0.02 + 1e-9) / n
+    c0 = sum(p for p, _ in tops)
+    return {"top_r_min": min(top), "aged_frac": min(ag) / min(top) if min(top) > 0 else 0.0, "depth2_r": depth2,
+            "reach_c": 0.0, "edge_c": 0.0, "spread_c": 0.0, "n": n,
+            "unwind_top_r": (unwind_top / n) if unwind_top else 0.0, "n_other": len(others),
+            "stable": 1.0 if all(a is not None and a > 0 for a in aged) else 0.0,
+            "live": 1.0 if live else 0.0, "tte_h": -1.0 if tte_h is None else float(tte_h),
+            "touch": views[j].bid, "c0": c0, "plan": sum(p + _fee(p) for p, _ in tops), "payout": payout}
 
 
 def predict(w: np.ndarray, f: dict) -> float:

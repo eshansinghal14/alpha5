@@ -58,6 +58,11 @@ class TradingParams:
                                    "take first: 6 of 7 live takes filled unevenly (10-29). Exits of broken "
                                    "baskets are taken regardless.")
     live_quote_size: int = param("Bundles per resting quote on a live event.", min=1, max=10000, step=1)
+    model_series: list[str] = param("Series or groups (S:Esports) whose live quotes take their edge and size "
+                                    "from the exit-cost model (exit_model.json, refitted nightly by the shadow "
+                                    "check) instead of min_edge + live_edge_add and live_quote_size. Widening "
+                                    "and shrinking act at once; narrowing and growing wait (MODEL_*_HOLD_S). "
+                                    "Empty = off.")
     live_take_size: int = param("Most bundles per take (or flip) on a live event, when take_live_events is on.",
                                 min=1, max=10000, step=1)
     live_order_groups: bool = param("Put a live event's quotes in one Kalshi order group (limit 1): once 2 "

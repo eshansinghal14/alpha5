@@ -15,6 +15,7 @@
       "S:Soccer": 75.0
     },
     "live_quote_size": 5,
+    "model_series": [],
     "live_take_size": 1,
     "live_order_groups": false,
     "deep_quote_size": 5,
