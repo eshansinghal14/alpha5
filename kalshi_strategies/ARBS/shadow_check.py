@@ -13,6 +13,10 @@ Writes data/live/ARBS/shadow_check/<day>.json, shown on the ARBS dashboard.
 - markout: every recorded print, ours or not: how far the cost of the other
   legs moved 0.1 s and 1 s after it, by group, time to settlement, live and
   basket shape. A maker quote there pays this move whenever it is filled.
+- rules: the exit-cost model (exit_cost.py) fitted on the earlier days' saved
+  statistics only, scored on this day's prints our quote met against the
+  fixed edges: the narrowest edge whose predicted net clears RULE_MARGIN_C, and
+  the edge with the best fill odds x predicted net (none if it isn't positive).
 """
 from __future__ import annotations
 
@@ -27,12 +31,14 @@ import numpy as np
 import pandas as pd
 
 from kalshi_infra.config import atomic_write_json
-from kalshi_strategies.ARBS import live_params, replay
+from kalshi_strategies.ARBS import exit_cost, live_params, replay
 from kalshi_strategies.ARBS.runner import LIVE_ROOT, QUOTE_GONE_S, SHADOW_LAG_S, series_groups
 
 EDGES = (*live_params.EDGES, 0.15, 0.20)
 POLICY_SIZE = 5.0
 OUT_DIR = "shadow_check"
+RULE_MARGIN_C = 1.0
+TRAIN_DAYS = 14
 
 
 def rates(ticker: str) -> tuple[float, float]:
@@ -74,8 +80,8 @@ def _pre_cost(pre: dict, legs) -> float | None:
 
 
 def markout(row: dict):
-    """(basket_id, edge at the print, move at 0.1 s, move at 1 s) in $ per
-    bundle for the row's best basket, or None."""
+    """(basket_id, edge at the print, move at 0.1 s, move at 1 s, payout) in $
+    per bundle for the row's best basket, or None."""
     best = None
     pmin = min(p for _, p, _ in row["prints"])
     for bid, payout, _ in row["baskets"]:
@@ -88,13 +94,13 @@ def markout(row: dict):
             continue
         g0 = payout - pmin - c0
         if best is None or g0 > best[1]:
-            best = (bid, g0, others, c0)
+            best = (bid, g0, others, c0, payout)
     if best is None:
         return None
-    bid, g0, others, c0 = best
+    bid, g0, others, c0, payout = best
     after = row.get("after") or {}
     m = [None if (c := _top_cost(after.get(k) or {}, others)) is None else c - c0 for k in ("0.1", "1.0")]
-    return bid, g0, m[0], m[1]
+    return bid, g0, m[0], m[1], payout
 
 
 def _rows(path: str):
@@ -132,15 +138,22 @@ def run(day: str, root: str | None = None, groups: dict | None = None) -> dict:
     policy = collections.defaultdict(lambda: {"prints": 0, "edges": [0.0] * len(EDGES), "shadow_usd": 0.0,
                                               "shadow_prints": 0})
     marks = collections.defaultdict(list)
+    stats, rule_rows = exit_cost.Stats(), []
     path = os.path.join(root, "prints", f"{day}.jsonl.gz")
     for r in _rows(path) if os.path.exists(path) else ():
         g = grp(r["ticker"])
         mk = markout(r)
         if mk is not None:
-            bid, g0, m01, m1 = mk
+            bid, g0, m01, m1, payout = mk
             live = next((lv for b, _, lv in r["baskets"] if b == bid), False)
             key = (g, tte_bucket((r.get("tte_h") or {}).get(bid)), bool(live), shape(bid))
             marks[key].append((g0, m01, m1))
+            if g0 >= -0.01:
+                n = max(1.0, min(sum(q for _, _, q in r["prints"]), 100.0))
+                f = exit_cost.features(r, bid, payout, n)
+                if f is not None:
+                    stats.add(f, exit_cost.loss(r, f))
+                    stats.add_reach(bool(live), f["reach_c"])
         q = r.get("quote")
         if q is None or (q.get("tripped") and (q.get("tripped_s") or 0.0) > QUOTE_GONE_S):
             continue
@@ -157,6 +170,10 @@ def run(day: str, root: str | None = None, groups: dict | None = None) -> dict:
             continue
         ratio = (r.get("pull") or {}).get("ratio")
         pnl = [0.0] * len(EDGES) if ratio is not None and ratio < 0.5 else s["pnl"]
+        if any(s["fills"]):
+            f5 = exit_cost.features(r, bk[0][0], bk[0][1], POLICY_SIZE)
+            if f5 is not None:
+                rule_rows.append((f5, bool(bk[0][2]), pnl))
         p = policy[(g, bool(bk[0][2]))]
         p["prints"] += 1
         p["edges"] = [a + b for a, b in zip(p["edges"], pnl)]
@@ -201,7 +218,8 @@ def run(day: str, root: str | None = None, groups: dict | None = None) -> dict:
                         "move_1_c": _r(100 * np.nanmean(x[:, 2])),
                         "move_1_p90_c": _r(100 * np.nanpercentile(x[:, 2], 90)) if np.isfinite(x[:, 2]).any() else None})
     mk_rows.sort(key=lambda r: -r["n"])
-    return {"day": day, "generated_at": pd.Timestamp.now(tz="UTC").isoformat(), "edges": list(EDGES),
+    return {"exit_stats": stats.to_json(), "rules": rules(root, day, rule_rows),
+            "day": day, "generated_at": pd.Timestamp.now(tz="UTC").isoformat(), "edges": list(EDGES),
             "policy_size": POLICY_SIZE,
             "coverage": {"arbs": len(arbs), "matched": len(match)},
             "calibration": cal_rows,
@@ -209,6 +227,50 @@ def run(day: str, root: str | None = None, groups: dict | None = None) -> dict:
                                                     for k, v in p.items()}}
                        for (g, lv), p in sorted(policy.items(), key=lambda kv: -kv[1]["prints"])],
             "markout": mk_rows}
+
+
+def rules(root: str, day: str, rows: list) -> dict:
+    """The exit-cost rules on this day's filled prints, fitted on the saved
+    statistics of up to TRAIN_DAYS earlier days."""
+    prev, used = exit_cost.Stats(), []
+    d = os.path.join(root, OUT_DIR)
+    for f in sorted(os.listdir(d))[::-1] if os.path.isdir(d) else ():
+        if f.endswith(".json") and f[:-5] < day and len(used) < TRAIN_DAYS:
+            try:
+                with open(os.path.join(d, f), encoding="utf-8") as fh:
+                    st = json.load(fh).get("exit_stats")
+            except (OSError, ValueError):
+                continue
+            if st and st.get("n"):
+                prev.merge(exit_cost.Stats.from_json(st))
+                used.append(f[:-5])
+    out = {"trained_on": sorted(used), "prints": len(rows), "fixed": [0.0] * len(EDGES), "narrowest": None,
+           "best_ev": None, "best_ev_quoted": None, "best_ev_edges": None}
+    for _, _, pnl in rows:
+        out["fixed"] = [a + b for a, b in zip(out["fixed"], pnl)]
+    out["fixed"] = [round(v, 2) for v in out["fixed"]]
+    if not used or not rows:
+        return out
+    w = prev.fit()
+    narrow = ev = 0.0
+    quoted, picked = 0, [0] * len(EDGES)
+    for f, live, pnl in rows:
+        nets, evs = [], []
+        for e in EDGES:
+            x = exit_cost.quote_price(f, e)
+            net = 100 * e - exit_cost.predict(w, exit_cost.at_price(f, x))
+            nets.append(net)
+            evs.append(prev.fill_prob(live, 100 * (f["touch"] - x)) * net)
+        k = next((k for k, v in enumerate(nets) if v >= RULE_MARGIN_C), None)
+        narrow += pnl[k] if k is not None else 0.0
+        k = int(np.argmax(evs))
+        if evs[k] > 0:
+            ev += pnl[k]
+            quoted += 1
+            picked[k] += 1
+    out.update(narrowest=round(narrow, 2), best_ev=round(ev, 2), best_ev_quoted=round(quoted / len(rows), 3),
+               best_ev_edges=picked)
+    return out
 
 
 def _c(usd: float, lots: float) -> float | None:

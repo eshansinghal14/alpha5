@@ -15,7 +15,7 @@ def _print_row(t, b_no_after):
     return {"t": t, "ticker": "X-A", "side": "yes", "prints": [[0.0, 0.40, 50]],
             "baskets": [["complete_set:X:buy_all_yes", 1.0, True]], "books": books,
             "after": {"0.03": after, "0.1": after, "1.0": after},
-            "pre": {"X-B": [[0.02, 0.45, 100, 0.50, 100]]}, "tte_h": {"complete_set:X:buy_all_yes": 3.0},
+            "pre": {"X-A": [[0.02, 0.45, 100, 0.55, 100]], "X-B": [[0.02, 0.45, 100, 0.50, 100]]}, "tte_h": {"complete_set:X:buy_all_yes": 3.0},
             "quote": {"basket_id": "complete_set:X:buy_all_yes", "price": 0.45, "left": 10, "edge": 0.05,
                       "tripped": False}, "pull": {"ratio": 1.0}}
 
@@ -42,3 +42,19 @@ def test_daily_check_compares_the_replay_with_a_real_fill(tmp_path):
     m = doc["markout"][0]
     assert (m["tte"], m["live"], m["shape"]) == ("<6h", True, "complete_set")
     assert m["edge_c"] == pytest.approx(10.0) and m["move_01_c"] == pytest.approx(3.0)
+
+
+def test_rules_train_on_earlier_days_only(tmp_path):
+    import os
+    (tmp_path / "journal").mkdir()
+    (tmp_path / "prints").mkdir()
+    (tmp_path / sc.OUT_DIR).mkdir()
+    for day in ("2026-11-12", "2026-11-13"):
+        (tmp_path / "journal" / f"{day}.jsonl").write_text("")
+        with gzip.open(tmp_path / "prints" / f"{day}.jsonl.gz", "wt") as fh:
+            fh.write(json.dumps(_print_row(1000.0, 0.47)) + chr(10))
+        doc = sc.run(day, str(tmp_path), groups={"X": "S:Test"})
+        json.dump(doc, open(os.path.join(tmp_path, sc.OUT_DIR, f"{day}.json"), "w"))
+        assert doc["exit_stats"]["n"] == 1
+    assert doc["rules"]["trained_on"] == ["2026-11-12"] and doc["rules"]["prints"] == 1
+    assert doc["rules"]["best_ev"] is not None and doc["rules"]["narrowest"] is not None

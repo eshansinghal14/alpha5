@@ -307,6 +307,23 @@ def _shadow_check(series: str, days: int = 7):
                                     **{f"{100 * e:g}c": v for e, v in zip(x["edges"], p["edges"])},
                                     "shadow": round(p["shadow_usd"], 2), "shadow prints": p["shadow_prints"]}
                                    for p in x["policy"]]), hide_index=True)
+        ru = [y for y in docs if (y.get("rules") or {}).get("narrowest") is not None]
+        if ru:
+            st.caption("Exit-cost rules vs fixed edges, $ for a 5-lot quote on each print our quote met, the model "
+                       "fitted on earlier days only. Narrowest: least edge whose predicted net clears 1c. Best EV: "
+                       "edge with the best fill odds x predicted net, no quote when none is positive.")
+            tab = []
+            for y in ru:
+                rr, ed = y["rules"], y["edges"]
+                k = int(max(range(len(ed)), key=lambda i: rr["fixed"][i]))
+                tab.append({"day": y["day"], "trained days": len(rr["trained_on"]), "filled prints": rr["prints"],
+                            "fixed 5c": rr["fixed"][ed.index(0.05)], "fixed 10c": rr["fixed"][ed.index(0.1)],
+                            "best fixed (hindsight)": f"{rr['fixed'][k]:.2f} @ {100 * ed[k]:g}c",
+                            "narrowest": rr["narrowest"], "best EV": rr["best_ev"],
+                            "best EV quoted %": round(100 * rr["best_ev_quoted"])})
+            t = pd.DataFrame(tab)
+            tot = {c: t[c].sum() for c in ("filled prints", "fixed 5c", "fixed 10c", "narrowest", "best EV")}
+            st.dataframe(pd.concat([t, pd.DataFrame([{"day": "total", **tot}])], ignore_index=True), hide_index=True)
         st.caption("Every recorded print (ours or not): edge at the print and how far the other legs' cost "
                    "moved after it, cents per bundle. A filled maker quote pays the move.")
         st.dataframe(pd.DataFrame(x["markout"][:40]), hide_index=True)
