@@ -60,7 +60,7 @@ _EPS = 1e-9
 OTHER = {"yes": "no", "no": "yes"}
 TRADEABLE = ("active", "open")
 SETTLED = ("determined", "settled", "finalized")
-SUMMARY_S = 1.0
+SUMMARY_S = 2.0
 # A market LIPFARM stops claiming stays off for LIP_RELEASE_S while its cancels land
 # (our completions would otherwise take against its resting bids).
 LIP_RELEASE_S = 5.0
@@ -77,8 +77,16 @@ def _log(msg: str):
     print(f"[ARBS] {msg}", flush=True)
 
 
+_UTC_AT: list = [0.0, None]
+
+
 def _utc() -> pd.Timestamp:
-    return pd.Timestamp.now(tz="UTC")
+    # One Timestamp per ms: an evaluate asked for it ~10 times and building
+    # it was 5% of ARBS's CPU (py-spy 11-11).
+    now = time.time()
+    if _UTC_AT[1] is None or abs(now - _UTC_AT[0]) > 0.001:
+        _UTC_AT[0], _UTC_AT[1] = now, pd.Timestamp(now, unit="s", tz="UTC")
+    return _UTC_AT[1]
 
 
 @dataclasses.dataclass
@@ -183,6 +191,12 @@ PULL_BATCH = 20
 # Most other baskets sharing a quote's market side priced per leg per pass:
 # MECNET subsets put one market in dozens of baskets.
 MAX_ALTS = 8
+# A leg's best alternative basket (best_plan) is searched for at most this
+# often; between searches only the chosen one is re-priced, on fresh books.
+# The search was 22% of ARBS's CPU on every book change (py-spy 11-11).
+ALT_SEARCH_S = 0.5
+# Rested depth (aged_room) is re-read after a book change or this long.
+HELD_CACHE_S = 0.25
 
 
 class _Rate:
@@ -343,6 +357,8 @@ class ArbsRunner:
         # delta goes through _on_quote), our own quotes and in-flight IOCs on
         # the market are unchanged.
         self._lv_cache: dict[tuple[str, str], tuple] = {}
+        self._alt_pick: dict[tuple[str, int], tuple[float, str | None]] = {}   # (basket, leg) -> (searched at, via)
+        self._held_cache: dict[tuple, tuple] = {}
         # event -> {id, ticker, tripped_at, resetting, fills, used}: one order
         # group per live event its quotes share; group id -> event.
         self.groups: dict[str, dict] = {}
@@ -1621,6 +1637,21 @@ class ArbsRunner:
         # Kalshi checks collateral per shard: a basket sizes on its own shard's cash.
         return self.cash.get(self.basket_shard(b), 0.0) + own - t.cash_reserve
 
+    def _held_depth(self, ticker: str, side: str, now: float, age: float) -> float | None:
+        """TopHistory.held_depth, reused until the market's book changes or
+        HELD_CACHE_S passes. Without a book change it can only rise as old
+        samples leave the window, so a reused value is never too high."""
+        key = (ticker, side, age)
+        seq = self.book_seq.get(ticker)
+        hit = self._held_cache.get(key)
+        if hit is not None and hit[0] == seq and now - hit[1] < HELD_CACHE_S:
+            return hit[2]
+        v = self.top_hist.held_depth(ticker, side, now, age)
+        if len(self._held_cache) > 50000:
+            self._held_cache.clear()
+        self._held_cache[key] = (seq, now, v)
+        return v
+
     def basket_shard(self, b: Basket) -> int | None:
         m = self.meta.get(b.legs[0].ticker)
         return None if m is None else m.shard
@@ -1873,7 +1904,7 @@ class ArbsRunner:
         if age <= 0:
             return math.inf
         now = time.time()
-        got = [self.top_hist.held_depth(l.ticker, l.side, now, age) for i, l in enumerate(b.legs) if i != j]
+        got = [self._held_depth(l.ticker, l.side, now, age) for i, l in enumerate(b.legs) if i != j]
         return min((g for g in got if g is not None), default=math.inf)
 
     def deep_gap(self, deep: float, main: float) -> bool:
@@ -2026,7 +2057,20 @@ class ArbsRunner:
         rest as high as the best of them clears its edge."""
         t, now_ts = self.cfg.trading, _utc()
         best, via = (plan, size), None
-        for y, k in self.alternatives(b, j):
+        cands = None
+        hit = self._alt_pick.get((b.basket_id, j))
+        if hit is not None and time.time() - hit[0] < ALT_SEARCH_S:
+            y = self.baskets.get(hit[1]) if hit[1] is not None else None
+            if hit[1] is None:
+                cands = []
+            elif y is not None and self.can_book(y, now_ts):
+                leg = b.legs[j]
+                k = next((i for i, l in enumerate(y.legs) if l.ticker == leg.ticker and l.side == leg.side), None)
+                cands = None if k is None else [(y, k)]
+        searched = cands is None
+        if searched:
+            cands = self.alternatives(b, j)
+        for y, k in cands:
             vy = self.views(y)
             if vy is None:
                 continue
@@ -2037,6 +2081,10 @@ class ArbsRunner:
             p = pricing.quote_leg(vy, k, y.payout, need, n) if n >= 1 else None
             if p is not None and (best[0] is None or p.max_price > best[0].max_price + _EPS):
                 best, via = (dataclasses.replace(p, leg=j), n), y
+        if searched:
+            if len(self._alt_pick) > 50000:
+                self._alt_pick.clear()
+            self._alt_pick[(b.basket_id, j)] = (time.time(), via.basket_id if via is not None else None)
         self.set_via(b.basket_id, j, via)
         return best
 

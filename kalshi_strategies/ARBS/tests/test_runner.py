@@ -769,6 +769,22 @@ def test_fill_booked_into_the_basket_that_completes_it_cheapest(arbs):
     assert L.baskets[c.basket_id].bundles(c.tickers) == 5      # completed by buying C, not B
 
 
+def test_a_kept_alternative_is_priced_on_fresh_books_and_dropped_when_unbookable(arbs):
+    r, b = arbs
+    c = _cheaper_through_c(r, b)
+    t = r.cfg.trading
+    need = R.edge_dollars(1.0, t.min_edge + t.quote_edge_add)
+    plan = lambda: R.pricing.quote_leg(r.views(b), 0, 1.0, need, 5)
+    p1, _ = r.best_plan(b, 0, plan(), 5, 5.0)
+    assert r.via[(b.basket_id, 0)] == c.basket_id
+    book(r, "X-C", [(0.40, 10)], [(0.50, 10)])     # C's ask falls 0.55 -> 0.50 within ALT_SEARCH_S
+    p2, _ = r.best_plan(b, 0, plan(), 5, 5.0)
+    assert r.via[(b.basket_id, 0)] == c.basket_id and p2.max_price >= p1.max_price + 0.04 - 1e-9   # re-priced
+    r.cfg.watch = dataclasses.replace(r.cfg.watch, exclude=[c.basket_id])
+    r.best_plan(b, 0, plan(), 5, 5.0)
+    assert (b.basket_id, 0) not in r.via                                    # searched again, none left
+
+
 def test_excluded_basket_is_no_alternative(arbs):
     r, b = arbs
     c = _cheaper_through_c(r, b)
@@ -1112,9 +1128,11 @@ def test_quote_grows_only_into_depth_that_has_rested(arbs):
     assert r.quotes[(b.basket_id, 0)].size == 1
     r.top_hist.h["X-B"].clear()
     r.top_hist.on_book("X-B", now - 8, 0.40, 10, 0.55, 40)
+    r.book_seq["X-B"] = r.book_seq.get("X-B", 0) + 1   # as the book update that writes the history does
     _eval(r, b)
     assert r.quotes[(b.basket_id, 0)].size == 5     # rested 8 s: grows to quote_size
     r.top_hist.on_book("X-B", time.time(), 0.40, 10, 0.55, 2)
+    r.book_seq["X-B"] = r.book_seq.get("X-B", 0) + 1
     _eval(r, b)
     assert r.quotes[(b.basket_id, 0)].remaining == 5     # aged depth fell, but the book still completes 5
 
