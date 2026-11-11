@@ -26,6 +26,7 @@ from kalshi_strategies.KXCRYPTOLEAD15M.shared import get_spot
 # Sidebar heading (kalshi_viz.app._groups), listed after the Coin Race.
 DASHBOARD_GROUP = "Crypto"
 DASHBOARD_RANK = 1
+DASHBOARD_HIDDEN = True   # turned off 2026-11-11
 COIN_OF = {"KXBTC15M": "BTC", "KXETH15M": "ETH", "KXSOL15M": "SOL", "KXXRP15M": "XRP", "KXHYPE15M": "HYPE"}
 CRYPTO_GROUP = "crypto-shard2"
 GROUP_OF = {"KXBTC15M": "crypto15m-btc", **{t: CRYPTO_GROUP for t in COIN_OF if t != "KXBTC15M"}}
