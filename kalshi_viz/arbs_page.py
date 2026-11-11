@@ -267,3 +267,43 @@ def render(series: str, stale_fn):
         _tables(series, s)
 
     body()
+    _shadow_check(series)
+
+
+def _shadow_check(series: str, days: int = 7):
+    """The daily shadow check (kalshi_strategies/ARBS/shadow_check.py)."""
+    d = os.path.join(LIVE_ROOT, series, "shadow_check")
+    files = sorted(f for f in os.listdir(d) if f.endswith(".json"))[-days:] if os.path.isdir(d) else []
+    with st.expander("Shadow check: replay vs real fills, edge policy, print markouts", expanded=False):
+        if not files:
+            st.caption("No daily shadow check yet (alpha5-arbs-shadow-check.timer, 00:40 UTC).")
+            return
+        docs = []
+        for f in files:
+            try:
+                with open(os.path.join(d, f), encoding="utf-8") as fh:
+                    docs.append(json.load(fh))
+            except (OSError, ValueError):
+                continue
+        def tot(doc, k):
+            return sum(r.get(k) or 0.0 for r in doc["calibration"])
+        st.dataframe(pd.DataFrame([{
+            "day": x["day"], "quote arbs": x["coverage"]["arbs"],
+            "with print %": round(100 * x["coverage"]["matched"] / max(x["coverage"]["arbs"], 1)),
+            "real c/lot": round(100 * tot(x, "f_real_usd") / tot(x, "f_lots"), 2) if tot(x, "f_lots") else None,
+            "replay c/lot": round(100 * tot(x, "f_shadow_usd") / tot(x, "f_shadow_lots"), 2)
+            if tot(x, "f_shadow_lots") else None} for x in reversed(docs)]), hide_index=True)
+        x = docs[-1]
+        st.caption(f"{x['day']}. Replay of each quote-started arb at its real edge and size vs what it made "
+                   "(on the arbs the replay fills):")
+        st.dataframe(pd.DataFrame(x["calibration"])[["group", "arbs", "matched", "filled", "lots", "real_usd",
+                                                    "real_c", "shadow_c"]], hide_index=True)
+        st.caption(f"Every print our quote met, $ for a {x['policy_size']:g}-lot quote at each edge, and at the "
+                   "shadow's choice (live events it had seen):")
+        st.dataframe(pd.DataFrame([{"group": p["group"], "live": p["live"], "prints": p["prints"],
+                                    **{f"{100 * e:g}c": v for e, v in zip(x["edges"], p["edges"])},
+                                    "shadow": round(p["shadow_usd"], 2), "shadow prints": p["shadow_prints"]}
+                                   for p in x["policy"]]), hide_index=True)
+        st.caption("Every recorded print (ours or not): edge at the print and how far the other legs' cost "
+                   "moved after it, cents per bundle. A filled maker quote pays the move.")
+        st.dataframe(pd.DataFrame(x["markout"][:40]), hide_index=True)

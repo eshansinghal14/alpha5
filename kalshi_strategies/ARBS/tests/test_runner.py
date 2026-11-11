@@ -1879,6 +1879,7 @@ def test_a_finished_near_arb_teaches_the_shadow_sizer(arbs):
     got = [x for x in rows if x["kind"] == "size_shadow"]
     assert len(got) == 1 and got[0]["pnl"] == pytest.approx(-1.0) and got[0]["lots"] == 10
     assert got[0]["bucket"] == "<6h" and got[0]["live"]
+    assert got[0]["entry"] == ["quote", "X-A", "yes"] and got[0]["t0"] > 0
     assert r.lsizer.mult(path) < start                          # -10c a lot cut it
     assert got[0]["size"] == max(1.0, round(100 * 0.25 * r.lsizer.mult(path)))
     assert not r.cycles

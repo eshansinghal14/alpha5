@@ -1114,6 +1114,10 @@ class ArbsRunner:
             row = self.prints.start(now, ticker, side, trade.price, trade.size, qual, self._snap(tickers), own)
             if row is not None:
                 row.update(self._print_state(ticker, side, tickers, now))
+                now_ts = _utc()
+                # Hours to each basket's settlement: the scan drops an event once it settles.
+                row["tte_h"] = {q[0]: round((st - now_ts).total_seconds() / 3600.0, 2)
+                                for q in qual if (st := self.baskets[q[0]].settles) is not None}
                 loop = asyncio.get_running_loop()
                 for d in AFTER_S:
                     loop.call_later(d, lambda d=d: row["after"].__setitem__(str(d), self._snap(tickers)))
@@ -1273,7 +1277,7 @@ class ArbsRunner:
             return
         pos = self.ledger.pos(basket_id)
         pos.spec = basket_to_dict(b)
-        self._cycle_open(b, pos)
+        self._cycle_open(b, pos, ticker, side, kind)
         self.ledger.record(basket_id, b.tickers, ticker, side, size, cost, time.time())
         self._cycle_add(b, ticker, size, cost)
         self.journal({"kind": "fill", "fill_kind": kind, "basket_id": basket_id, "ticker": ticker, "side": side,
@@ -1300,7 +1304,7 @@ class ArbsRunner:
         self._cycle_add(b, None, 0.0, cost - size)
         self.dirty.add(b.basket_id)
 
-    def _cycle_open(self, b: Basket, pos):
+    def _cycle_open(self, b: Basket, pos, ticker: str, side: str, kind: str):
         """A fill on an even basket starts an arb for the shadow sizer."""
         if (self.cfg.runtime.live_params_shadow and b.basket_id not in self.cycles
                 and not pos.unhedged(b.tickers)):
@@ -1308,7 +1312,7 @@ class ArbsRunner:
             self.cycles[b.basket_id] = {
                 "t": time.time(), "b0": pos.bundles(b.tickers), "cash": 0.0, "lots": {},
                 "tte_h": None if b.settles is None else (b.settles - now).total_seconds() / 3600.0,
-                "live": self.live_now(b, now)}
+                "live": self.live_now(b, now), "entry": [kind, ticker, side]}
 
     def _cycle_add(self, b: Basket, ticker: str | None, size: float, cash: float):
         """Count a fill's cash (an unwind's net of the $1 a pair) and close the
@@ -1342,7 +1346,7 @@ class ArbsRunner:
                       "tte_h": None if c["tte_h"] is None else round(c["tte_h"], 2), "bucket": bucket,
                       "live": c["live"], "lots": lots, "pnl": round(pnl, 4), "factor": factor,
                       "mult_before": round(before, 4), "mult": round(mult, 4),
-                      "size": max(1.0, round(base * factor * mult))})
+                      "size": max(1.0, round(base * factor * mult)), "t0": round(c["t"], 3), "entry": c["entry"]})
 
     def _lp_state_path(self) -> str:
         return os.path.join(self.root, "live_params_state.json")

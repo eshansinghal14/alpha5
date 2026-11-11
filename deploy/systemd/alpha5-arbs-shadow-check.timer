@@ -1,0 +1,9 @@
+[Unit]
+Description=alpha5: ARBS shadow check of the previous UTC day
+
+[Timer]
+OnCalendar=*-*-* 00:40:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

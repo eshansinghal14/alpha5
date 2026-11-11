@@ -1,0 +1,11 @@
+[Unit]
+Description=alpha5 ARBS daily shadow check: replay vs real fills, edge policy, print markouts (ARBS/shadow_check.py)
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/opt/alpha5
+Nice=19
+# Not trading: first for the OOM killer.
+OOMScoreAdjust=1000
+ExecStart=/opt/alpha5/.venv/bin/python -W ignore -m kalshi_strategies.ARBS.shadow_check
