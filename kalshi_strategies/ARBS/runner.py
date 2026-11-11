@@ -421,6 +421,7 @@ class ArbsRunner:
         self.last_top: dict[str, tuple] = {}
         self.hot_churn: collections.deque = collections.deque()   # (time, entered, left) per hot-list change
         self.hot_cost = 0.0                       # estimated write tokens/s of quoting the hot list
+        self.hot_cost_by_shard: dict[str, float] = {}
         # Quote ids are saved by ledger_flush_loop, not per placement: a
         # synchronous write per quote held the loop ~200 ms each and queued a
         # live exit 7 s behind a burst of placements (FURIABB-2 10-29). Dirty
@@ -1614,8 +1615,15 @@ class ArbsRunner:
         # Kalshi's balance already holds back what our resting orders could
         # cost; the basket's own are added back or its quotes would size
         # against cash net of themselves and shrink every pass.
-        own = sum(q.price * q.remaining for q in self.basket_quotes(b.basket_id)) if b else 0.0
-        return sum(self.cash.values()) + own - t.cash_reserve
+        if b is None:
+            return sum(self.cash.values()) - t.cash_reserve * len(self.cash)
+        own = sum(q.price * q.remaining for q in self.basket_quotes(b.basket_id))
+        # Kalshi checks collateral per shard: a basket sizes on its own shard's cash.
+        return self.cash.get(self.basket_shard(b), 0.0) + own - t.cash_reserve
+
+    def basket_shard(self, b: Basket) -> int | None:
+        m = self.meta.get(b.legs[0].ticker)
+        return None if m is None else m.shard
 
     def room_dollars(self, b: Basket | None = None) -> float:
         cash = self.cash_room(b)
@@ -2733,8 +2741,17 @@ class ArbsRunner:
                 cost = {bid: self.write_cost(self.baskets[bid], now) for bid in quotable}
                 for r in rows:
                     r["write_tps"] = round(cost.get(r["basket_id"], 0.0), 2)
-                hot = self.pick_hot(quotable, self.write_budget(), cost)
+                # Kalshi bills each shard's writes to that shard's own bucket.
+                by_shard: dict = collections.defaultdict(list)
+                for bid in quotable:
+                    by_shard[self.basket_shard(self.baskets[bid])].append(bid)
+                picked = set()
+                for s, bids in by_shard.items():
+                    picked |= set(self.pick_hot(bids, self.write_budget(), cost))
+                hot = [bid for bid in quotable if bid in picked]
                 self.hot_cost = round(sum(cost[bid] for bid in hot), 1)
+                self.hot_cost_by_shard = {str(s): round(sum(cost[b] for b in bids if b in picked), 1)
+                                          for s, bids in by_shard.items()}
                 if _utc() - self.started > pd.Timedelta(minutes=2):
                     self.hot_ready = True
                 if hot != self.hot:
@@ -3055,7 +3072,8 @@ class ArbsRunner:
             "holdings": holdings, "quotes": quotes, "hot": self.hot, "ranking": self.ranking[:60],
             "hot_churn": {f"{m}m": sum(e for t, e, _ in self.hot_churn if t >= time.time() - 60 * m)
                           for m in (1, 10, 60)},
-            "hot_cost_tps": self.hot_cost, "write_budget_tps": self.write_budget(),
+            "hot_cost_tps": self.hot_cost, "hot_cost_by_shard": self.hot_cost_by_shard,
+            "write_budget_tps": self.write_budget(),
             "order_groups": {e: {"id": g["id"], "tripped": g["tripped_at"] is not None}
                              for e, g in self.groups.items()},
             "flagged_live": {t: datetime_iso(ts) for t, ts in self.flagged.items()},

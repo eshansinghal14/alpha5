@@ -1656,6 +1656,19 @@ def test_top_history_keeps_price_moves_in_a_busy_book(tmp_path):
     assert rows[-1][3] == 0.52 and abs(rows[-1][0] - 0.030) < 1e-9
 
 
+def test_dollar_room_is_the_baskets_own_shard_cash(arbs):
+    r, b = arbs
+    t = r.cfg.trading
+    t.max_dollars_auto, t.cash_reserve = True, 100.0
+    r.live = True
+    r.cash, r.cash_at = {0: 900.0, 3: 150.0}, time.time()
+    for tk in ("X-A", "X-B"):
+        r.meta[tk] = dataclasses.replace(r.meta[tk], shard=3)
+    assert abs(r.room_dollars(b) - (150.0 - 100.0)) < 1e-9          # shard 0's cash can't back it
+    assert abs(r.room_dollars() - (1050.0 - 200.0)) < 1e-9          # each shard keeps its reserve
+    r.live = False
+
+
 def test_dollar_room_follows_shard_cash_when_live(arbs):
     r, b = arbs
     t = r.cfg.trading
