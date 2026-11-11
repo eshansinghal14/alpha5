@@ -138,7 +138,7 @@ class WatchParams:
                                   "sold into its bids.", min=300.0, step=300.0, editable=False)
     rank_interval_s: float = param("Seconds between re-rankings, and least time between pricing one basket "
                                    "for the ranking.", min=0.5, step=0.5, editable=False)
-    exclude: list[str] = param("basket_id, relationship_id or cluster names never traded. Open positions "
+    exclude: list[str] = param("basket_id, relationship_id, event or cluster names never traded. Open positions "
                                "in them are still completed and settled.", editable=False)
 
 

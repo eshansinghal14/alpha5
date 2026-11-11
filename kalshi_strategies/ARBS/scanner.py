@@ -290,7 +290,7 @@ def select(doc: dict, *, now: pd.Timestamp, days: float, max_markets: int, known
             used |= ts
             continue
         s = r.get("expected_settlement_utc")
-        if (s and pd.Timestamp(s) > horizon) or r.get("cluster") in exclude:
+        if (s and pd.Timestamp(s) > horizon) or r.get("cluster") in exclude                 or r["relationship_id"].split(":", 1)[-1] in exclude:
             continue
         if yield_events and any(t.rsplit("-", 1)[0] in yield_events for t in ts):
             continue

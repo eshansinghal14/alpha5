@@ -231,3 +231,11 @@ def test_select_yields_lipfarm_events_unless_held():
     got = scanner.select(doc, now=NOW, days=90, max_markets=1000, yield_events={"A-1"},
                          held={"mecnet:A-1:no:X+Y"})
     assert {r["relationship_id"] for r in got["relationships"]} == {"mecnet:A-1", "mecnet:B-1"}
+
+
+def test_select_skips_an_excluded_event():
+    a = event("A-1", "MECNET", [mkt("A-1-X"), mkt("A-1-Y")])
+    b = event("B-1", "MECNET", [mkt("B-1-X"), mkt("B-1-Y")])
+    doc = scanner.scan([a, b], now=NOW, mecnet_max_legs=6, ladder_span=3, complete_set_exclude=[], overrides={})
+    got = scanner.select(doc, now=NOW, days=90, max_markets=1000, exclude={"A-1"})
+    assert [r["relationship_id"] for r in got["relationships"]] == ["mecnet:B-1"]

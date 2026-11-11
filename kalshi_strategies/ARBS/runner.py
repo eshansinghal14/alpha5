@@ -757,7 +757,8 @@ class ArbsRunner:
         ignores them, so a claimed basket is still ranked), or settling past
         the horizon."""
         ex = self.cfg.watch.exclude
-        if ex and (b.basket_id in ex or b.relationship_id in ex or b.cluster in ex):
+        if ex and (b.basket_id in ex or b.relationship_id in ex or b.cluster in ex
+                   or b.relationship_id.split(":", 1)[-1] in ex):
             return True
         # A scanned basket on a shard this process no longer scans (another
         # process's, ARBS3) stays only to finish its position, not to quote.
@@ -1672,7 +1673,9 @@ class ArbsRunner:
                 continue
             try:
                 cash, value = await self.gw.call(self.gw.any_client().shard_balances)
-                self.cash = {s: cash.get(s, 0.0) for s in self.gw.clients}
+                # Only shards this process scans: one kept for a held basket on
+                # another's shard would count that shard's cash twice.
+                self.cash = {s: cash.get(s, 0.0) for s in self.gw.clients if s in self.cfg.scan.shards}
                 self.pos_value = {"all": value}
                 self.cash_at = time.time()
                 if self.cash_at - self.balance_logged >= BALANCE_LOG_S:

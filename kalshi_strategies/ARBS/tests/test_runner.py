@@ -1969,3 +1969,11 @@ def test_feed_with_no_markets_yet_waits_for_its_first_scan():
         assert not task.done()                             # waiting, not raised
         task.cancel()
     asyncio.run(go())
+
+
+def test_an_excluded_event_covers_its_baskets(arbs):
+    r, b = arbs
+    b = dataclasses.replace(b, basket_id="mecnet:EV1:no:A+B", relationship_id="mecnet:EV1", cluster="SER")
+    assert not r.excluded(b)
+    r.cfg.watch = dataclasses.replace(r.cfg.watch, exclude=["EV1"])
+    assert r.excluded(b)
