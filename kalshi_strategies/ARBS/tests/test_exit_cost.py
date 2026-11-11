@@ -8,7 +8,7 @@ from kalshi_strategies.ARBS import exit_cost as ec
 
 def _f(edge_c, top=20.0):
     return {"top_r_min": top, "aged_frac": 1.0, "depth2_r": 30.0, "reach_c": 0.0, "edge_c": edge_c, "spread_c": 1.0,
-            "n": 5.0, "unwind_top_r": 5.0, "n_other": 1, "stable": 1.0}
+            "n": 5.0, "unwind_top_r": 5.0, "n_other": 1, "stable": 1.0, "live": 0.0, "tte_h": 30.0}
 
 
 def test_fit_learns_an_additive_cost_and_days_add_up():
@@ -38,3 +38,13 @@ def test_quote_price_matches_the_replay():
     assert ec.quote_price(f, 0.05) == pytest.approx(0.43)
     g = ec.at_price(f, 0.43)
     assert g["edge_c"] == pytest.approx(7.0) and g["reach_c"] == pytest.approx(2.0)
+
+
+def test_in_play_and_time_to_settlement_are_inputs():
+    s = ec.Stats()
+    for _ in range(5000):
+        s.add({**_f(1.0), "live": 0.0, "tte_h": 48.0}, 0.0)
+        s.add({**_f(1.0), "live": 1.0, "tte_h": 2.0}, 4.0)      # same book, in play near settlement: costs more
+    w = s.fit()
+    assert ec.predict(w, {**_f(1.0), "live": 1.0, "tte_h": 2.0}) - ec.predict(w, {**_f(1.0), "live": 0.0, "tte_h": 48.0}) \
+        == pytest.approx(4.0, abs=0.5)

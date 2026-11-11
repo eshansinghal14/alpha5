@@ -36,6 +36,10 @@ BINS = {
     "unwind_top_r": [-0.01, 0.5, 1, 3, math.inf],
     "n_other": [0, 1, 2, math.inf],
     "stable": [-0.01, 0.5, 1.0],
+    # In play and hours to settlement (-1 when unknown, its own bin): the
+    # factor study's two strongest, here beside the book (11-11).
+    "live": [-0.01, 0.5, 1.0],
+    "tte_h": [-math.inf, -0.5, 1, 6, 24, math.inf],
 }
 WIDTH = 1 + sum(len(e) - 2 for e in BINS.values())
 RIDGE = 50.0
@@ -96,10 +100,13 @@ def features(r: dict, bid: str, payout: float, n: float) -> dict | None:
     pmin = min(p for _, p, _ in r["prints"])
     uw = ask_at(pre.get(r["ticker"]), OTHER[r["side"]], LAG)
     c0 = sum(p for p, _ in tops)
+    live = next((bool(x[2]) for x in r.get("baskets") or () if x[0] == bid), False)
+    tte = (r.get("tte_h") or {}).get(bid)
     return {"top_r_min": min(top), "aged_frac": min(aged) / min(top) if min(top) > 0 else 0.0,
             "depth2_r": depth2[j], "reach_c": 100 * (tb - pmin), "edge_c": 100 * (payout - pmin - c0),
             "spread_c": spread[j], "n": n, "unwind_top_r": (uw[1] / n) if uw else 0.0, "n_other": len(others),
-            "stable": min(stable), "touch": tb, "c0": c0, "plan": sum(p + _fee(p) for p, _ in tops),
+            "stable": min(stable), "live": 1.0 if live else 0.0, "tte_h": -1.0 if tte is None else float(tte),
+            "touch": tb, "c0": c0, "plan": sum(p + _fee(p) for p, _ in tops),
             "payout": payout, "pmin": pmin, "others": others}
 
 

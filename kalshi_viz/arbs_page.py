@@ -371,10 +371,18 @@ def render(series: str, stale_fn):
 
 
 def _shadow_check(series: str, days: int = 7):
-    """The daily shadow check (kalshi_strategies/ARBS/shadow_check.py)."""
+    """The daily shadow check (kalshi_strategies/ARBS/shadow_check.py), per process."""
+    with st.expander("Shadow check: replay vs real fills, edge and size rules, print markouts", expanded=False):
+        ps = parts(series)
+        for p, tab in zip(ps, st.tabs([SHARD_OF.get(x, x) for x in ps]) if len(ps) > 1 else [st.container()]):
+            with tab:
+                _shadow_check_one(p, days)
+
+
+def _shadow_check_one(series: str, days: int):
     d = os.path.join(LIVE_ROOT, series, "shadow_check")
     files = sorted(f for f in os.listdir(d) if f.endswith(".json"))[-days:] if os.path.isdir(d) else []
-    with st.expander("Shadow check: replay vs real fills, edge policy, print markouts", expanded=False):
+    with st.container():
         if not files:
             st.caption("No daily shadow check yet (alpha5-arbs-shadow-check.timer, 00:40 UTC).")
             return
@@ -409,20 +417,29 @@ def _shadow_check(series: str, days: int = 7):
                                    for p in x["policy"]]), hide_index=True)
         ru = [y for y in docs if (y.get("rules") or {}).get("narrowest") is not None]
         if ru:
-            st.caption("Exit-cost rules vs fixed edges, $ for a 5-lot quote on each print our quote met, the model "
-                       "fitted on earlier days only. Narrowest: least edge whose predicted net clears 1c. Best EV: "
-                       "edge with the best fill odds x predicted net, no quote when none is positive.")
+            st.caption("Exit-cost rules vs fixed edges on each print our quote met, the model fitted on earlier "
+                       "days only. $ for a 5-lot quote, except the edge+size rule. Narrowest: least edge whose "
+                       "predicted net clears 1c. Best EV: edge with the best fill odds x predicted net. Edge+size: "
+                       "the edge and size (5/20/50/100) with the best fill odds x size x predicted net; compare it "
+                       "with the fixed sizes.")
             tab = []
             for y in ru:
                 rr, ed = y["rules"], y["edges"]
                 k = int(max(range(len(ed)), key=lambda i: rr["fixed"][i]))
-                tab.append({"day": y["day"], "trained days": len(rr["trained_on"]), "filled prints": rr["prints"],
-                            "fixed 5c": rr["fixed"][ed.index(0.05)], "fixed 10c": rr["fixed"][ed.index(0.1)],
-                            "best fixed (hindsight)": f"{rr['fixed'][k]:.2f} @ {100 * ed[k]:g}c",
-                            "narrowest": rr["narrowest"], "best EV": rr["best_ev"],
-                            "best EV quoted %": round(100 * rr["best_ev_quoted"])})
+                fs = rr.get("fixed_by_size") or {}
+                row = {"day": y["day"], "trained days": len(rr["trained_on"]), "filled prints": rr["prints"],
+                       "fixed 5c": rr["fixed"][ed.index(0.05)], "fixed 10c": rr["fixed"][ed.index(0.1)],
+                       "best fixed (hindsight)": f"{rr['fixed'][k]:.2f} @ {100 * ed[k]:g}c",
+                       "narrowest": rr["narrowest"], "best EV": rr["best_ev"],
+                       "best EV quoted %": round(100 * rr["best_ev_quoted"])}
+                if rr.get("best_ev_size") is not None:
+                    row.update({"edge+size": rr["best_ev_size"], "edge+size lots": rr.get("best_ev_size_lots"),
+                                **{f"10c x{n}": fs[n][ed.index(0.1)] for n in ("20", "50", "100") if n in fs}})
+                tab.append(row)
             t = pd.DataFrame(tab)
-            tot = {c: t[c].sum() for c in ("filled prints", "fixed 5c", "fixed 10c", "narrowest", "best EV")}
+            tot = {c: t[c].sum() for c in ("filled prints", "fixed 5c", "fixed 10c", "narrowest", "best EV",
+                                           "edge+size", "edge+size lots", "10c x20", "10c x50", "10c x100")
+                   if c in t}
             st.dataframe(pd.concat([t, pd.DataFrame([{"day": "total", **tot}])], ignore_index=True), hide_index=True)
         st.caption("Every recorded print (ours or not): edge at the print and how far the other legs' cost "
                    "moved after it, cents per bundle. A filled maker quote pays the move.")

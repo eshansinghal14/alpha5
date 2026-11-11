@@ -56,5 +56,7 @@ def test_rules_train_on_earlier_days_only(tmp_path):
         doc = sc.run(day, str(tmp_path), groups={"X": "S:Test"})
         json.dump(doc, open(os.path.join(tmp_path, sc.OUT_DIR, f"{day}.json"), "w"))
         assert doc["exit_stats"]["n"] == 1
-    assert doc["rules"]["trained_on"] == ["2026-11-12"] and doc["rules"]["prints"] == 1
-    assert doc["rules"]["best_ev"] is not None and doc["rules"]["narrowest"] is not None
+    ru = doc["rules"]
+    assert [t.split(":")[-1] for t in ru["trained_on"]] == ["2026-11-12"] and ru["prints"] == 1
+    assert ru["best_ev"] is not None and ru["narrowest"] is not None and ru["best_ev_size"] is not None
+    assert set(ru["fixed_by_size"]) == {"5", "20", "50", "100"}
