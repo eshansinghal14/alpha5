@@ -735,8 +735,9 @@ class ArbsRunner:
         return True
 
     def excluded(self, b: Basket, lip: bool = True) -> bool:
-        """Not traded; with lip=False, ignoring LIPFARM's claims (a claimed basket is
-        still ranked and priced, for the handoff offer)."""
+        """Not traded: in watch.exclude, held off by LIPFARM's claims (lip=False
+        ignores them, so a claimed basket is still ranked), or settling past
+        the horizon."""
         ex = self.cfg.watch.exclude
         if ex and (b.basket_id in ex or b.relationship_id in ex or b.cluster in ex):
             return True

@@ -50,8 +50,7 @@
     "ladder_span": 3,
     "complete_set_exclude": [],
     "live_before_settle_h": 6.0,
-    "live_windows": {"Elections": ["2026-11-03T22:00:00Z", "2026-11-06T00:00:00Z"],
-                     "Politics": ["2026-11-03T22:00:00Z", "2026-11-06T00:00:00Z"]}
+    "live_windows": {}
   },
   "runtime": {
     "control_poll_s": 1.0,
