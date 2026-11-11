@@ -1531,6 +1531,43 @@ def test_print_recorded_only_where_a_quote_could_make_edge(arbs):
     assert row["quote"] is None and row["pull"] == {"on": False, "ratio": None}
 
 
+def test_print_that_fills_our_quote_is_recorded_after_the_other_legs_moved(arbs):
+    r, b = arbs
+    from kalshi_backtest.core import Trade
+    book(r, "X-A", [(0.40, 10)], [(0.55, 10)])
+    book(r, "X-B", [(0.20, 10)], [(0.30, 10)])           # YES B ask 0.70: 0.45 + 0.70 is no arb now
+    q = R.Quote(basket_id=b.basket_id, leg=0, ticker="X-A", side="yes", price=0.45, size=5, cid="c", edge=0.04,
+                max_price=0.45, pending=False, placed_at=time.time() - 2.0)
+    r.quotes[q.key] = q
+
+    async def go():
+        r._on_trade("X-A", Trade("X-A", pd.Timestamp.now(tz="UTC"), 0.45, 5, "no"))
+        await asyncio.sleep(1.1)
+    asyncio.run(go())
+    rows = r.prints.take(time.time() + 1.0)
+    assert len(rows) == 1 and rows[0]["baskets"] == [[b.basket_id, 1.0, False]]
+    assert rows[0]["quote"]["price"] == 0.45
+
+
+def test_print_recorded_when_an_arb_stood_just_before_it(arbs):
+    r, b = arbs
+    from kalshi_backtest.core import Trade
+    from kalshi_strategies.ARBS.depth import TopHistory
+    r.top_hist = TopHistory(str(r.root))
+    book(r, "X-A", [(0.40, 10)], [(0.55, 10)])
+    book(r, "X-B", [(0.20, 10)], [(0.30, 10)])           # YES B ask 0.70 now
+    now = time.time()
+    r.top_hist.on_book("X-B", now - 1.0, 0.45, 50, 0.50, 40)        # 0.50 until 10 ms ago
+    r.top_hist.on_book("X-B", now - 0.01, 0.20, 50, 0.70, 40)
+
+    async def go():
+        r._on_trade("X-A", Trade("X-A", pd.Timestamp.now(tz="UTC"), 0.45, 5, "no"))
+        await asyncio.sleep(1.1)
+    asyncio.run(go())
+    rows = r.prints.take(time.time() + 1.0)
+    assert len(rows) == 1 and rows[0]["quote"] is None
+
+
 def test_print_row_keeps_the_book_a_resting_quote_saw(arbs):
     r, b = arbs
     from kalshi_strategies.ARBS.depth import TopHistory

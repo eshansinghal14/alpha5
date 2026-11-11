@@ -1,6 +1,7 @@
 """Score a recorded print (prints.py row) as a maker quote at each edge would
-have met it: filled by the prints at or through its price, completed on the
-other legs' books when our completion would land. Shared by the runner's
+have met it: filled by the prints at or through its price, then exited as our
+completion would when it lands: the cheaper of buying the other legs or
+unwinding (buying the filled leg's other side, $1 a pair). Shared by the runner's
 shadow estimator (live_params.py) and offline studies.
 
 With `lag`, the quote is priced on the books `lag` seconds before the print
@@ -58,6 +59,21 @@ def lagged_ask(pre: dict, ticker: str, side: str, lag: float) -> tuple[float, fl
                 return None if ask is None else (ask, ask_q)
             return None if bid is None else (round(1.0 - bid, 4), bid_q)
     return None
+
+
+_OTHER = {"yes": "no", "no": "yes"}
+
+
+def _take(end: dict, late: dict, ticker: str, side: str, n: float, rate: float) -> float:
+    """Cost to buy n of `side` on `end`'s book, else `late`'s, the rest at its
+    worst level plus SHORT_PENALTY."""
+    cc, got = _walk(asks(end, ticker, side) or [], n, rate)
+    if got < n - 1e-9:
+        lv1 = asks(late, ticker, side) or []
+        cc, got = _walk(lv1, n, rate)
+        if got < n - 1e-9:
+            cc += (n - got) * min(0.99, (lv1[-1][0] if lv1 else 0.99) + SHORT_PENALTY)
+    return cc
 
 
 def _walk(lv, n: float, rate: float) -> tuple[float, float]:
@@ -136,15 +152,10 @@ def score(row: dict, rates, edges, size: float, lag: float | None = None, done: 
             pnl.append(0.0)
             continue
         c = n * x + _fee(x, n, mrate)
-        for ot, os_ in others:
-            rate = rates(ot)[0]
-            cc, got = _walk(asks(end, ot, os_) or [], n, rate)
-            if got < n - 1e-9:
-                lv1 = asks(late, ot, os_) or []
-                cc, got = _walk(lv1, n, rate)
-                if got < n - 1e-9:
-                    cc += (n - got) * min(0.99, (lv1[-1][0] if lv1 else 0.99) + SHORT_PENALTY)
-            c += cc
+        complete = n * payout - c - sum(_take(end, late, ot, os_, n, rates(ot)[0]) for ot, os_ in others)
+        # Our live exits took this path for 568 of 2,834 breaks (11-04..10); completing
+        # only scored our real fills 1.3c/lot worse than they did.
+        unwind = n - c - _take(end, late, tk, _OTHER[side], n, rates(tk)[0])
         fills.append(n)
-        pnl.append(n * payout - c)
+        pnl.append(max(complete, unwind))
     return {"basket_id": bid, "live": live, "g0": g0, "fills": fills, "pnl": pnl}

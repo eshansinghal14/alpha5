@@ -163,7 +163,8 @@ EVAL_SLICE_S = 0.001
 # complete sets and exact identities pay the same in every outcome.
 UPSIDE_TYPES = ("mutually_exclusive_no", "implication", "mutual_exclusion")
 # A print is recorded when a quote at its price, completed at the other legs'
-# asks, comes within this of the payout: fees aside, some edge setting fills.
+# asks (now or PRINT_LAGS_S before), comes within this of the payout: fees
+# aside, some edge setting fills.
 PRINT_SLACK = 0.01
 PRINT_MAX_BASKETS = 10
 PRINT_MAX_TICKERS = 20
@@ -1228,23 +1229,20 @@ class ArbsRunner:
         if self.prints.merge(now, ticker, side, trade.price, trade.size):
             return
         qual = []
+        mq, _ = self._print_quote(ticker, side, now)
+        if mq is not None and (b := self.baskets.get(mq.basket_id)) is not None:
+            # Kept even with the other legs already past an arb: that is how a
+            # picked-off fill looks (11-08..10: 43 fills at -7c/lot had no row).
+            qual.append([b.basket_id, b.payout, self.live_now(b, _utc())])
         for bid in self.by_ticker.get(ticker, ()):
+            if len(qual) >= PRINT_MAX_BASKETS:
+                break
             b = self.baskets.get(bid)
-            if b is None or not any(l.ticker == ticker and l.side == side for l in b.legs):
+            if (b is None or (mq is not None and bid == mq.basket_id)
+                    or not any(l.ticker == ticker and l.side == side for l in b.legs)):
                 continue
-            others = 0.0
-            for l in b.legs:
-                if l.ticker == ticker:
-                    continue
-                a = self._best_ask(l.ticker, l.side)
-                if a is None:
-                    break
-                others += a
-            else:
-                if trade.price + others <= b.payout + PRINT_SLACK:
-                    qual.append([bid, b.payout, self.live_now(b, _utc())])
-                    if len(qual) >= PRINT_MAX_BASKETS:
-                        break
+            if self._print_qualifies(b, ticker, trade.price, now):
+                qual.append([bid, b.payout, self.live_now(b, _utc())])
         if qual:
             tickers = list(dict.fromkeys(t for q in qual for t in self.baskets[q[0]].tickers))[:PRINT_MAX_TICKERS]
             own = {t: o for t in tickers if (o := {s: self._own(t, s) for s in ("yes", "no") if self._own(t, s)})}
@@ -1255,6 +1253,45 @@ class ArbsRunner:
                 for d in AFTER_S:
                     loop.call_later(d, lambda d=d: row["after"].__setitem__(str(d), self._snap(tickers)))
         self.n["print_record_ms"] = self.n.get("print_record_ms", 0.0) + (time.perf_counter() - start) * 1000
+
+    def _print_qualifies(self, b: Basket, ticker: str, price: float, now: float) -> bool:
+        """A quote at `price` completed at the other legs' asks comes within
+        PRINT_SLACK of the payout, on today's books or those PRINT_LAGS_S ago:
+        a quote priced before the other legs moved is the one the print fills."""
+        others = [l for l in b.legs if l.ticker != ticker]
+        for lag in (0.0, *PRINT_LAGS_S):
+            cost = price
+            for l in others:
+                a = self._best_ask(l.ticker, l.side) if lag == 0.0 else self._ask_then(l.ticker, l.side, now - lag)
+                if a is None:
+                    break
+                cost += a
+            else:
+                if cost <= b.payout + PRINT_SLACK:
+                    return True
+        return False
+
+    def _ask_then(self, ticker: str, side: str, t: float) -> float | None:
+        s = self.top_hist.at(ticker, t)
+        if s is None:
+            return None
+        bid, _, ask, _ = s
+        if side == "yes":
+            return ask
+        return None if bid is None else round(1.0 - bid, 4)
+
+    def _print_quote(self, ticker: str, side: str, now: float):
+        """(our arb quote on this side, s since it went or None)."""
+        live = [q for q in self.quotes.on(ticker, side) if q.kind == "arb" and not q.deep]
+        if live:
+            return live[0], None
+        g0 = self.quotes.gone.get((ticker, side))
+        if (g0 is not None and now - g0[0] <= QUOTE_GONE_S and g0[1].kind == "arb" and not g0[1].deep
+                and g0[1].filled > 0):
+            # The fill often lands before its print: half the live quote fills of 11-05..06
+            # found their quote already removed (or the group tripped) when the print row was made.
+            return g0[1], round(now - g0[0], 3)
+        return None, None
 
     def _print_state(self, ticker: str, side: str, tickers, now: float) -> dict:
         """What a replay needs to judge the print as our quote would have met
@@ -1267,15 +1304,9 @@ class ArbsRunner:
             if rows:
                 pre[t] = rows
         c = self.cfg.trading
-        live = [q for q in self.quotes.on(ticker, side) if q.kind == "arb" and not q.deep]
-        gone_s = None
-        if not live and (g0 := self.quotes.gone.get((ticker, side))) is not None and now - g0[0] <= QUOTE_GONE_S \
-                and g0[1].kind == "arb" and not g0[1].deep and g0[1].filled > 0:
-            # The fill often lands before its print: half the live quote fills of 11-05..06
-            # found their quote already removed (or the group tripped) when the print row was made.
-            live, gone_s = [g0[1]], round(now - g0[0], 3)
+        q, gone_s = self._print_quote(ticker, side, now)
         mine = None
-        for q in live[:1]:
+        if q is not None:
             g = self.groups.get(self.meta[ticker].event) if q.group and ticker in self.meta else None
             tripped_at = g["tripped_at"] if g else None
             mine = {"basket_id": q.basket_id, "price": q.price, "left": q.remaining, "edge": round(q.edge, 4),

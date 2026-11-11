@@ -49,3 +49,9 @@ def test_live_only_skips_non_live_baskets():
     r = row([[0.50, 100]])
     r["baskets"][0][2] = False
     assert replay.score(r, NO_FEES, [0.02], 10, live_only=True) is None
+
+
+def test_exit_unwinds_when_that_is_cheaper_than_completing():
+    s = replay.score(row([[0.30, 100]]), NO_FEES, [0.02], 10)     # B's ask jumps to 0.70
+    # Completing loses 10 * 0.18; buying A's NO at 0.60 ($1 a pair) loses 10 * 0.08.
+    assert s["pnl"][0] == pytest.approx(10 * (1 - 0.48 - 0.60))
