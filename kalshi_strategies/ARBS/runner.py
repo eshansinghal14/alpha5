@@ -458,6 +458,7 @@ class ArbsRunner:
         self.flagged: dict[str, float] = {}
         self.unpriced_alert_at: dict[str, float | None] = {}
         self._horizon: tuple[float, pd.Timestamp] | None = None
+        self._lip_cut: tuple[float, pd.Timestamp] | None = None
         # Live order round trips, flushed with the liquidity log (orders_*.jsonl.gz).
         self.order_times: list[dict] = []
 
@@ -774,9 +775,19 @@ class ArbsRunner:
         now = time.time()
         return any(t in self.lip_claims or now - self.lip_released.get(t, -1e18) < LIP_RELEASE_S for t in b.tickers)
 
-    def lip_need(self, need: float, ticker: str, live: bool) -> float:
-        d = self.cfg.trading.lip_edge_discount
-        return max(need - d, 0.0) if d > 0 and not live and ticker in self.lip_markets else need
+    def lip_need(self, need: float, ticker: str, live: bool, settles: pd.Timestamp | None) -> float:
+        t = self.cfg.trading
+        if (t.lip_edge_discount <= 0 or live or ticker not in self.lip_markets or settles is None
+                or settles < self.lip_cutoff()):
+            return need
+        return max(need - t.lip_edge_discount, 0.0)
+
+    def lip_cutoff(self) -> pd.Timestamp:
+        """Earliest settlement lip_edge_discount applies to, refreshed once a second."""
+        now = time.monotonic()
+        if self._lip_cut is None or now - self._lip_cut[0] > 1.0:
+            self._lip_cut = (now, _utc() + pd.Timedelta(hours=self.cfg.trading.lip_discount_min_settle_h))
+        return self._lip_cut[1]
 
     def poll_lip_claims(self):
         """Reload LIPFARM's claimed.json when it changes; baskets on tickers
@@ -957,7 +968,7 @@ class ArbsRunner:
         for j, leg in enumerate(b.legs):
             size = max(1.0, pricing.depth_size(vs, j, b.payout, need, float(t.quote_size)))
             plan = pricing.quote_leg(vs, j, b.payout, need, size)
-            ln = self.lip_need(need, leg.ticker, live)
+            ln = self.lip_need(need, leg.ticker, live, b.settles)
             if leg.ticker in self.lip_programs:
                 n = max(1.0, pricing.depth_size(vs, j, b.payout, ln, float(t.quote_size))) if ln < need else size
                 lp = pricing.quote_leg(vs, j, b.payout, ln, n) if ln < need else plan
@@ -1916,7 +1927,7 @@ class ArbsRunner:
             elif want:
                 room = min(cap, self.room_bundles(b, j), float(self.quote_size_by_dollars(b)))
                 room = min(room, max(self.aged_room(b, j), q.remaining if q is not None else 0.0))
-                need = self.lip_need(quote_need, leg.ticker, live)
+                need = self.lip_need(quote_need, leg.ticker, live, b.settles)
                 size = pricing.depth_size(vs, j, b.payout, need, float(int(room + _EPS)))
                 plan = pricing.quote_leg(vs, j, b.payout, need, size) if size >= 1 else None
                 plan, size = self.best_plan(b, j, plan, size, room)
@@ -2165,7 +2176,7 @@ class ArbsRunner:
         legs = []
         for j, leg in enumerate(b.legs):
             room = min(float(t.quote_size), self.room_bundles(b, j), float(self.quote_size_by_dollars(b)))
-            need = self.lip_need(quote_need, leg.ticker, False)
+            need = self.lip_need(quote_need, leg.ticker, False, b.settles)
             size = pricing.depth_size(vs, j, b.payout, need, float(int(room + _EPS)))
             plan = pricing.quote_leg(vs, j, b.payout, need, size) if size >= 1 else None
             if (alt := self.lip_plan(b, vs, j, need, room, plan)) is not None:
@@ -2238,7 +2249,7 @@ class ArbsRunner:
             if k is not None and pv is not None and n <= room + _EPS:
                 pay = b.payout if y is None else y.payout
                 nd = need if y is None else self.lip_need(edge_dollars(y.payout, t.min_edge + t.quote_edge_add),
-                                                          leg.ticker, False)
+                                                          leg.ticker, False, y.settles)
                 q = pricing.quote_leg(pv, k, pay, nd, n)
                 if q is not None and q.max_price >= p - _EPS:
                     return dataclasses.replace(q, leg=j, price=p,
@@ -2250,7 +2261,7 @@ class ArbsRunner:
                 continue
             live = self.live_now(y, now_ts)
             ny = self.lip_need(edge_dollars(y.payout, t.min_edge + t.quote_edge_add) +
-                               (t.live_edge_add if live else 0.0), leg.ticker, live)
+                               (t.live_edge_add if live else 0.0), leg.ticker, live, y.settles)
             ry = min(room, self.room_bundles(y), float(self.quote_size_by_dollars(y)))
             paths.append((y, k, vy, y.payout, ny, float(int(ry + _EPS))))
         lv = vs[j]
@@ -2320,7 +2331,7 @@ class ArbsRunner:
                 continue
             live = self.live_now(y, now_ts)
             need = self.lip_need(edge_dollars(y.payout, t.min_edge + t.quote_edge_add) +
-                                 (t.live_edge_add if live else 0.0), b.legs[j].ticker, live)
+                                 (t.live_edge_add if live else 0.0), b.legs[j].ticker, live, y.settles)
             r = min(room, self.room_bundles(y), float(self.quote_size_by_dollars(y)))
             n = pricing.depth_size(vy, k, y.payout, need, float(int(r + _EPS)))
             p = pricing.quote_leg(vy, k, y.payout, need, n) if n >= 1 else None

@@ -1884,6 +1884,8 @@ def test_a_claimed_basket_is_priced_for_the_lip_offer_not_quoted(arbs):
 
 def test_lip_edge_discount_lifts_the_quote_limit_on_a_lip_market_only(arbs):
     r, b = arbs
+    b = dataclasses.replace(b, settles=pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=3))
+    r.set_baskets([b])
     book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
     book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
 
@@ -1901,7 +1903,17 @@ def test_lip_edge_discount_lifts_the_quote_limit_on_a_lip_market_only(arbs):
         r.quotes.pop((q.basket_id, q.leg), None)
     got = limits()
     assert got["X-A"] == pytest.approx(base["X-A"] + 0.02) and got["X-B"] == pytest.approx(base["X-B"])
-    assert r.lip_need(0.01, "X-A", live=False) == 0.0 and r.lip_need(0.05, "X-A", live=True) == 0.05
+    assert r.lip_need(0.01, "X-A", False, b.settles) == 0.0 and r.lip_need(0.05, "X-A", True, b.settles) == 0.05
+
+
+def test_lip_edge_discount_stops_a_day_before_settlement(arbs):
+    r, _ = arbs
+    r.lip_markets = {"X-A"}
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, lip_edge_discount=0.02, lip_discount_min_settle_h=24.0)
+    now = pd.Timestamp.now(tz="UTC")
+    assert r.lip_need(0.05, "X-A", False, now + pd.Timedelta(hours=30)) == pytest.approx(0.03)
+    assert r.lip_need(0.05, "X-A", False, now + pd.Timedelta(hours=2)) == 0.05
+    assert r.lip_need(0.05, "X-A", False, None) == 0.05
 
 
 def test_live_quotes_on_a_lip_market_accrue_its_lip_per_period(arbs):

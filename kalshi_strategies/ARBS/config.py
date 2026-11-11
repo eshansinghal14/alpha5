@@ -44,6 +44,10 @@ class TradingParams:
                                      "paying LIP (LIPFARM's lip_markets.json), never below 0: a bid resting "
                                      "there also earns LIP. Not on live events. 0 = off.", min=0.0, max=0.5,
                                      step=0.0025)
+    # 11-04..10: two discounted fills 1.7 h before settlement lost $108 (Hormuz, Bab el-Mandeb,
+    # 11-10) against $19 of LIP earned by every quote in all.
+    lip_discount_min_settle_h: float = param("lip_edge_discount only on baskets settling at least this many hours "
+                                             "out (none with no settlement date).", min=0.0, max=720.0, step=1.0)
     quote_live_events: bool = param("Quote events that have started (a game after kickoff). A live score change "
                                     "sweeps every leg at once, so a fill there is usually already a loss; "
                                     "exits on live events are taken at once.")
