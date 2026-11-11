@@ -40,14 +40,6 @@ class TradingParams:
                                     "expiration). The scan skips events past it. Open positions past it are still "
                                     "completed and settled.", min=0.0, max=2000.0, step=1.0)
     quote_size: int = param("Bundles per resting quote.", min=1, max=10000, step=1)
-    lip_edge_discount: float = param("Edge ($ per bundle) taken off a quote's requirement on a leg in a market "
-                                     "paying LIP (LIPFARM's lip_markets.json), never below 0: a bid resting "
-                                     "there also earns LIP. Not on live events. 0 = off.", min=0.0, max=0.5,
-                                     step=0.0025)
-    # 11-04..10: two discounted fills 1.7 h before settlement lost $108 (Hormuz, Bab el-Mandeb,
-    # 11-10) against $19 of LIP earned by every quote in all.
-    lip_discount_min_settle_h: float = param("lip_edge_discount only on baskets settling at least this many hours "
-                                             "out (none with no settlement date).", min=0.0, max=720.0, step=1.0)
     quote_live_events: bool = param("Quote events that have started (a game after kickoff). A live score change "
                                     "sweeps every leg at once, so a fill there is usually already a loss; "
                                     "exits on live events are taken at once.")
@@ -156,10 +148,6 @@ class ScanParams:
     max_markets: int = param("Most scanned markets traded beyond the hand spec's: the scan lists every event, "
                              "and the most traded in the last 24h are taken until this many. Each is one more "
                              "websocket subscription.", min=0, max=20000, step=100)
-    lip_volume_weight: float = param("Dollars of 24h volume one $/day of the markets' LIP rewards counts as when "
-                                     "ranking for max_markets. 30 took 321 of the 359 markets paying >= $40/day "
-                                     "into a 1,500-market budget (187 at 0) for 0.7% less volume covered "
-                                     "(11-09 scan).", min=0.0, max=1000.0, step=5.0)
     shards: list[int] = param("Exchange shards (event exchange_index) the scan takes events from. Kalshi "
                               "holds collateral per shard: an order on one we haven't funded is rejected "
                               "insufficient_shard_balance, and arming refuses a zero-balance shard.",
@@ -176,7 +164,7 @@ class ScanParams:
                                                "(live size, edge and exits) from `from`, for scans before "
                                                "`until` (election results night).", editable=False)
     live_before_settle_h: float = param("Hours before expected settlement an event without a kickoff turns live "
-                                        "(live size, edge, no LIP discount, exits). Non-sports arbs started within "
+                                        "(live size, edge, exits). Non-sports arbs started within "
                                         "6h of settlement netted -$3 over 10-28..11-09, then -$179 on 11-10; "
                                         "0 = off.", min=0.0, max=72.0, step=1.0)
 

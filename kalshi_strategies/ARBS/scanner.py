@@ -99,27 +99,6 @@ def fetch_frequencies() -> dict[str, str]:
             return out
 
 
-def fetch_lip() -> dict[str, float]:
-    """Blocking (paged, ~5 calls). market ticker -> active LIP reward in $/day;
-    {} if the read fails, so a scan never stops on it."""
-    out, cursor = {}, None
-    try:
-        while True:
-            d = kalshi_get("/trade-api/v2/incentive_programs",
-                           params={"status": "active", "limit": 1000, **({"cursor": cursor} if cursor else {})})
-            batch = d.get("incentive_programs") or []
-            for p in batch:
-                days = (pd.Timestamp(p["end_date"]) - pd.Timestamp(p["start_date"])).total_seconds() / 86400.0
-                if p.get("incentive_type") == "liquidity" and days > 0:
-                    out[p["market_ticker"]] = out.get(p["market_ticker"], 0.0) + \
-                        _f(p.get("period_reward")) / 10_000.0 / days
-            cursor = d.get("next_cursor") or d.get("cursor")
-            if not cursor or not batch:
-                return out
-    except Exception:
-        return {}
-
-
 def _f(v) -> float:
     try:
         return float(v)
@@ -232,9 +211,9 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
          complete_set_exclude: list[str], overrides: dict[str, str], shards=(0,),
          skip_series: set[str] = frozenset(), starts: dict[str, str] | None = None,
          freqs: dict[str, str] | None = None, live_windows: dict[str, list[str]] | None = None,
-         lip: dict[str, float] | None = None, settle_lead: pd.Timedelta | None = None) -> dict:
+         settle_lead: pd.Timedelta | None = None) -> dict:
     """Every relationship found, each with its event's expected settlement,
-    24h volume and LIP $/day (`lip`: ticker -> $/day) for `select`. `starts`: event -> when it goes live
+    24h volume for `select`. `starts`: event -> when it goes live
     (fetch_starts); `freqs`: series -> frequency (fetch_frequencies);
     `live_windows`: Kalshi category -> [from, until], its events live from
     `from` while the scan runs before `until`; `settle_lead`: an event
@@ -280,7 +259,6 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
             r.update(expected_settlement_utc=s.isoformat(), quote_until_utc=None, resume_quoting_utc=None,
                      live_from_utc=min(live).isoformat() if live else None, volume_24h=vol)
             ts = {l["ticker"] for b in r["baskets"] for l in b["legs"]}
-            r["lip_usd_day"] = round(sum((lip or {}).get(t, 0.0) for t in ts), 2)
             tickers |= ts
         rels += got
     return {"generated_at_utc": now.isoformat(), "source": "kalshi_strategies.ARBS.scanner",
@@ -290,9 +268,9 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
 
 def select(doc: dict, *, now: pd.Timestamp, days: float, max_markets: int, known_tickers: set[str] = frozenset(),
            held: set[str] = frozenset(), exclude: set[str] = frozenset(),
-           yield_events: set[str] = frozenset(), lip_weight: float = 0.0) -> dict:
+           yield_events: set[str] = frozenset()) -> dict:
     """The part of a scan to trade: relationships settling within `days`, the
-    most traded per market first (24h volume plus lip_weight x LIP $/day),
+    most traded per market first (24h volume),
     until max_markets markets beyond `known_tickers`. Relationships holding a
     basket in `held` are always kept; otherwise one with a leg in
     `yield_events` (another strategy's) is skipped."""
@@ -301,7 +279,7 @@ def select(doc: dict, *, now: pd.Timestamp, days: float, max_markets: int, known
     # $40-110k a day, and only 10 games within 36 h made the budget (32 per market).
     def per_market(r):
         n = len({l["ticker"] for b in r["baskets"] for l in b["legs"]})
-        return ((r.get("volume_24h") or 0.0) + lip_weight * (r.get("lip_usd_day") or 0.0)) / max(n, 1)
+        return (r.get("volume_24h") or 0.0) / max(n, 1)
 
     horizon = now + pd.Timedelta(days=days)
     out, used = [], set()
@@ -335,7 +313,7 @@ def run(cfg, hand_doc: dict, spec_path: str, held: set[str] = frozenset()) -> di
     doc = scan(fetch_events(), now=now, mecnet_max_legs=cfg.scan.mecnet_max_legs,
                ladder_span=cfg.scan.ladder_span, complete_set_exclude=cfg.scan.complete_set_exclude,
                shards=set(cfg.scan.shards), skip_series=other_series(), starts=fetch_starts(now),
-               freqs=fetch_frequencies(), live_windows=cfg.scan.live_windows, lip=fetch_lip(),
+               freqs=fetch_frequencies(), live_windows=cfg.scan.live_windows,
                settle_lead=pd.Timedelta(hours=cfg.scan.live_before_settle_h) if cfg.scan.live_before_settle_h > 0 else None,
                overrides={s: v["expected_settlement_month"]
                           for s, v in (hand_doc.get("settlement_basis_by_series") or {}).items()})
@@ -379,7 +357,7 @@ def scan_and_select(root: str) -> dict:
     doc = run(cfg, hand, os.path.join(root, "scanned_spec.json"), held)
     sel = select(doc, now=pd.Timestamp.now(tz="UTC"), days=cfg.trading.days_till_expiry,
                  max_markets=cfg.scan.max_markets, known_tickers={t for b in load_spec(SPEC_PATH) for t in b.tickers},
-                 held=held, exclude=set(cfg.watch.exclude), lip_weight=cfg.scan.lip_volume_weight)
+                 held=held, exclude=set(cfg.watch.exclude))
     atomic_write_json(os.path.join(root, SELECTED), sel, indent=None)
     return {"listed_markets": doc["n_markets"], "selected_relationships": len(sel["relationships"])}
 

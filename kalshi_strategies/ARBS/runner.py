@@ -40,7 +40,6 @@ from kalshi_infra.kalshi import fees as kfees
 from kalshi_infra.kalshi.orders import (RealFill, error_code, http_status, is_market_paused, is_order_group_reject,
                                         is_post_only_reject)
 from kalshi_infra.kalshi.orders import KEEPALIVE_S, write_budget_tokens_per_s
-from kalshi_infra.trading import lip
 from kalshi_infra.trading.engine import MARKET_PAUSE_RETRY_S
 from kalshi_infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
 from kalshi_infra.runtime.persist import LIVE_ROOT, day_dir
@@ -62,24 +61,9 @@ OTHER = {"yes": "no", "no": "yes"}
 TRADEABLE = ("active", "open")
 SETTLED = ("determined", "settled", "finalized")
 SUMMARY_S = 1.0
-# LIPFARM handoff: we publish what we quote, or would quote, on its markets every LIP_OFFER_S;
-# a market it stops claiming stays off for LIP_RELEASE_S while its cancels land (our
-# completions would otherwise take against its resting bids).
-LIP_OFFER_S = 5.0
+# A market LIPFARM stops claiming stays off for LIP_RELEASE_S while its cancels land
+# (our completions would otherwise take against its resting bids).
 LIP_RELEASE_S = 5.0
-LIP_OFFERS = "lip_offers.json"
-# Our own LIP: resting quotes on LIP markets scored on the book every LIP_ACCRUE_S (as
-# LIPFARM does), per market and program period, saved to LIP_FILE every LIP_SAVE_S.
-LIP_ACCRUE_S = 5.0
-LIP_SAVE_S = 60.0
-LIP_FILE = "lip_accrued.json"
-LIP_MIN_PAYOUT_USD = 1.0
-# A leg in a LIP market rests at whichever price, from its usual one down this many ticks,
-# has the size (the most that still completes for the edge) earning the most LIP.
-LIP_SCAN_TICKS = 8
-# The scan (prices x baskets x depth_size) took ARBS from ~61% to ~91% of a core when run on
-# every book update (11-09): a leg's choice is reused this long, re-checked at its size.
-LIP_PLAN_S = 5.0       # Kalshi pays a market-period's LIP only from $1
 MAX_ALERTS = 300
 # A quote whose create got no response may still rest at Kalshi; look for it
 # by client id after this long.
@@ -332,16 +316,6 @@ class ArbsRunner:
         self.lip_positions: dict[str, float] = {}
         self._lip_mtime: float | None = None
         self.lip_released: dict[str, float] = {}     # ticker -> when LIPFARM stopped claiming it
-        self.lip_markets: set[str] = set()           # markets paying LIP (lip_edge_discount)
-        self._lipm_mtime: float | None = None
-        self.lip_shadow: dict[str, dict] = {}        # basket_id -> quotes we'd rest on its claimed legs
-        self.lip_programs: dict[str, tuple] = {}     # ticker -> (program id, start, end, LipParams)
-        self.lip_rate: dict[str, float] = {}         # ticker -> our LIP $/s now
-        self.lip_plans: dict[tuple, tuple] = {}      # (basket_id, leg) -> (at, price, size, via basket or None)
-        self.lip_rate_cache: dict[tuple, tuple] = {}  # (ticker, side, price, size) -> (at, LIP $/s)
-        self.farm_period: dict[str, float] = {}      # program id -> LIPFARM's LIP in it (one $1 minimum for both)
-        self._farmp_mtime: float | None = None
-        self.lip_acc = self._load_lip()
         self.set_baskets(merge(self.hand, self.scanned()))
         for led in (self.real_ledger, self.shadow_ledger):
             for bid, pos in led.baskets.items():
@@ -458,7 +432,6 @@ class ArbsRunner:
         self.flagged: dict[str, float] = {}
         self.unpriced_alert_at: dict[str, float | None] = {}
         self._horizon: tuple[float, pd.Timestamp] | None = None
-        self._lip_cut: tuple[float, pd.Timestamp] | None = None
         # Live order round trips, flushed with the liquidity log (orders_*.jsonl.gz).
         self.order_times: list[dict] = []
 
@@ -775,20 +748,6 @@ class ArbsRunner:
         now = time.time()
         return any(t in self.lip_claims or now - self.lip_released.get(t, -1e18) < LIP_RELEASE_S for t in b.tickers)
 
-    def lip_need(self, need: float, ticker: str, live: bool, settles: pd.Timestamp | None) -> float:
-        t = self.cfg.trading
-        if (t.lip_edge_discount <= 0 or live or ticker not in self.lip_markets or settles is None
-                or settles < self.lip_cutoff()):
-            return need
-        return max(need - t.lip_edge_discount, 0.0)
-
-    def lip_cutoff(self) -> pd.Timestamp:
-        """Earliest settlement lip_edge_discount applies to, refreshed once a second."""
-        now = time.monotonic()
-        if self._lip_cut is None or now - self._lip_cut[0] > 1.0:
-            self._lip_cut = (now, _utc() + pd.Timedelta(hours=self.cfg.trading.lip_discount_min_settle_h))
-        return self._lip_cut[1]
-
     def poll_lip_claims(self):
         """Reload LIPFARM's claimed.json when it changes; baskets on tickers
         that changed are re-evaluated, which pulls our quotes on a new claim.
@@ -825,107 +784,6 @@ class ArbsRunner:
         self.lip_claims, self.lip_positions, self._lip_mtime = tickers, pos, m
         self.lip_released = {t: at for t, at in self.lip_released.items() if now - at < LIP_RELEASE_S}
 
-    def poll_lip_markets(self):
-        """LIPFARM's lip_markets.json: the markets paying LIP, for lip_edge_discount."""
-        path = os.path.join(LIVE_ROOT, "LIPFARM", "live", "lip_markets.json")
-        try:
-            m = os.path.getmtime(path)
-        except OSError:
-            return
-        if m == self._lipm_mtime:
-            return
-        try:
-            with open(path, encoding="utf-8") as fh:
-                doc = json.load(fh)
-        except (OSError, ValueError):
-            return
-        tickers = set(doc.get("tickers") or [])
-        progs = {}
-        for t, p in (doc.get("programs") or {}).items():
-            try:
-                progs[t] = (p["id"], pd.Timestamp(p["start_date"]).timestamp(), pd.Timestamp(p["end_date"]).timestamp(),
-                            lip.params_from_program(p))
-            except (KeyError, TypeError, ValueError):
-                continue
-        for t in tickers ^ self.lip_markets:
-            self.dirty |= set(self.by_ticker.get(t, ()))
-        self.lip_markets, self.lip_programs, self._lipm_mtime = tickers, progs, m
-
-    def _load_lip(self) -> dict:
-        try:
-            with open(os.path.join(self.root, LIP_FILE), encoding="utf-8") as fh:
-                d = json.load(fh)
-        except (OSError, ValueError):
-            d = {}
-        return {"accrued": d.get("accrued", {}), "period": d.get("period", {}), "period_end": d.get("period_end", {})}
-
-    def accrue_lip(self, dt: float):
-        """Add `dt` seconds of the LIP our resting quotes earn: per LIP market in an active
-        program, our bids on both sides scored against the socket's book less our own size.
-        Live only: shadow quotes rest nowhere."""
-        now = time.time()
-        rates = {}
-        if self.live:
-            ours: dict[str, dict[str, list]] = {}
-            for q in list(self.quotes.values()):
-                if q.ticker in self.lip_programs and not q.pending and q.remaining > 0:
-                    ours.setdefault(q.ticker, {"yes": [], "no": []})[q.side].append((round(q.price, 4), q.remaining))
-            for t, sides in ours.items():
-                pid, start, end, P = self.lip_programs[t]
-                bk = self.feed.ladder(t)
-                if bk is None or not start <= now < end:
-                    continue
-                lv = {s: lip.levels_with_ours(lip.others_ladder(dict(bk.yes_bids if s == "yes" else bk.no_bids),
-                                                                sides[s]), sides[s]) for s in ("yes", "no")}
-                rates[t] = r = lip.reward_rate(lv["yes"], lv["no"], P)
-                a = self.lip_acc
-                a["accrued"][t] = a["accrued"].get(t, 0.0) + r * dt
-                a["period"][pid] = a["period"].get(pid, 0.0) + r * dt
-                a["period_end"][pid] = end
-        self.lip_rate = rates
-
-    def poll_farm_periods(self):
-        """LIPFARM's per-period LIP (lip_periods.json): Kalshi's $1 minimum is the account's."""
-        path = os.path.join(LIVE_ROOT, "LIPFARM", "live", "lip_periods.json")
-        try:
-            m = os.path.getmtime(path)
-            if m == self._farmp_mtime:
-                return
-            with open(path, encoding="utf-8") as fh:
-                self.farm_period = json.load(fh).get("period") or {}
-            self._farmp_mtime = m
-        except (OSError, ValueError):
-            return
-
-    def lip_summary(self) -> dict:
-        a, farm = self.lip_acc, self.farm_period
-        return {"exp_usd": round(sum(a["accrued"].values()), 4),
-                "locked_usd": round(sum(v for pid, v in a["period"].items()
-                                        if v + farm.get(pid, 0.0) >= LIP_MIN_PAYOUT_USD), 4),
-                "usd_day_now": round(sum(self.lip_rate.values()) * 86400, 2), "markets_now": len(self.lip_rate)}
-
-    async def lip_accrue_loop(self):
-        last = saved = time.time()
-        while True:
-            await asyncio.sleep(LIP_ACCRUE_S)
-            now = time.time()
-            try:
-                self.accrue_lip(min(now - last, 30.0))
-                self.poll_farm_periods()
-                if now - saved >= LIP_SAVE_S:
-                    saved = now
-                    # Periods ended a month ago are paid or forfeited; their markets keep their totals.
-                    a = self.lip_acc
-                    for pid in [p for p, e in a["period_end"].items() if e < now - 30 * 86400]:
-                        a["period"].pop(pid, None)
-                        a["period_end"].pop(pid, None)
-                    snap = json.loads(json.dumps(a))
-                    await asyncio.get_running_loop().run_in_executor(
-                        self.pool, lambda: atomic_write_json(os.path.join(self.root, LIP_FILE), snap, indent=None))
-            except Exception:
-                traceback.print_exc()
-            last = now
-
     def horizon(self) -> pd.Timestamp:
         """Latest settlement traded, refreshed once a second: evaluate asks
         for every basket and pd.Timestamp.now() was a tenth of the loop."""
@@ -958,8 +816,7 @@ class ArbsRunner:
 
     def quote_score(self, b: Basket, vs) -> tuple[float, float]:
         """(expected $/h of quoting every leg, shortest leg wait in s): each
-        leg's edge x size over the time trading takes to reach it, plus the
-        LIP its quote would add at the price it rests at (lip_need)."""
+        leg's edge x size over the time trading takes to reach it."""
         t = self.cfg.trading
         live = self.live_now(b, _utc())
         need = edge_dollars(b.payout, t.min_edge + t.quote_edge_add) + (t.live_edge_add if live else 0.0)
@@ -968,12 +825,6 @@ class ArbsRunner:
         for j, leg in enumerate(b.legs):
             size = max(1.0, pricing.depth_size(vs, j, b.payout, need, float(t.quote_size)))
             plan = pricing.quote_leg(vs, j, b.payout, need, size)
-            ln = self.lip_need(need, leg.ticker, live, b.settles)
-            if leg.ticker in self.lip_programs:
-                n = max(1.0, pricing.depth_size(vs, j, b.payout, ln, float(t.quote_size))) if ln < need else size
-                lp = pricing.quote_leg(vs, j, b.payout, ln, n) if ln < need else plan
-                if lp is not None:
-                    score += self.lip_rate_at(leg, lp.price, n) * 3600.0
             px.append(None if plan is None else (plan.price, plan.edge, size))
             if plan is None:
                 continue
@@ -1849,12 +1700,7 @@ class ArbsRunner:
             if live_qs:
                 self.spawn(self.cancel_quotes(live_qs, blocked or ("excluded" if self.excluded(b) else "untradeable")),
                            b.basket_id)
-            if vs is not None and not blocked and not self.excluded(b, lip=False):
-                self.shadow_lip(b, vs, now)
-            else:
-                self.lip_shadow.pop(b.basket_id, None)
             return
-        self.lip_shadow.pop(b.basket_id, None)
         t = self.cfg.trading
         if (t.enable_takes and (t.take_live_events or not self.live_now(b, _utc()))
                 and now - self.last_take.get(b.basket_id, 0.0) >= t.take_cooldown_s):
@@ -1927,12 +1773,9 @@ class ArbsRunner:
             elif want:
                 room = min(cap, self.room_bundles(b, j), float(self.quote_size_by_dollars(b)))
                 room = min(room, max(self.aged_room(b, j), q.remaining if q is not None else 0.0))
-                need = self.lip_need(quote_need, leg.ticker, live, b.settles)
-                size = pricing.depth_size(vs, j, b.payout, need, float(int(room + _EPS)))
-                plan = pricing.quote_leg(vs, j, b.payout, need, size) if size >= 1 else None
+                size = pricing.depth_size(vs, j, b.payout, quote_need, float(int(room + _EPS)))
+                plan = pricing.quote_leg(vs, j, b.payout, quote_need, size) if size >= 1 else None
                 plan, size = self.best_plan(b, j, plan, size, room)
-                if not live and (alt := self.lip_plan(b, vs, j, need, room, plan)) is not None:
-                    plan, size = alt
                 if q is not None and q.remaining > size + _EPS:
                     plan = None
             if plan is None:
@@ -2163,161 +2006,6 @@ class ArbsRunner:
         for t in y.tickers:
             self.by_ticker.setdefault(t, []).append(y.basket_id)
 
-    def shadow_lip(self, b: Basket, vs, now: float):
-        """What manage_quotes would rest on a basket held off only by LIPFARM's claims,
-        kept for the handoff offer (lip_offers.json): LIPFARM gives the basket's
-        markets up when these quotes would earn more LIP than its own net there."""
-        t, now_ts = self.cfg.trading, _utc()
-        if not (t.enable_quoting and b.basket_id in self.hot and self.may_quote(b, now_ts)) \
-                or self.live_now(b, now_ts):
-            self.lip_shadow.pop(b.basket_id, None)
-            return
-        quote_need = edge_dollars(b.payout, t.min_edge + t.quote_edge_add)
-        legs = []
-        for j, leg in enumerate(b.legs):
-            room = min(float(t.quote_size), self.room_bundles(b, j), float(self.quote_size_by_dollars(b)))
-            need = self.lip_need(quote_need, leg.ticker, False, b.settles)
-            size = pricing.depth_size(vs, j, b.payout, need, float(int(room + _EPS)))
-            plan = pricing.quote_leg(vs, j, b.payout, need, size) if size >= 1 else None
-            if (alt := self.lip_plan(b, vs, j, need, room, plan)) is not None:
-                plan, size = alt
-            if plan is not None:
-                legs.append([leg.ticker, leg.side, plan.price, size])
-        if legs:
-            self.lip_shadow[b.basket_id] = {"tickers": sorted(b.tickers), "legs": legs, "at": now}
-        else:
-            self.lip_shadow.pop(b.basket_id, None)
-
-    def _lip_earn(self, leg: Leg, bk, P):
-        """f(price, size) -> LIP $/s a bid of ours on `leg` adds, scored on the
-        book with our other bids as they rest: our other side's bids earn
-        whatever we rest here, so only the increase counts."""
-        opp = "no" if leg.side == "yes" else "yes"
-        side_own = list(self._own(leg.ticker, leg.side).items())
-        opp_own = list(self._own(leg.ticker, opp).items())
-        others = lip.others_ladder(dict(bk.yes_bids if leg.side == "yes" else bk.no_bids), side_own)
-        opp_lv = lip.levels_with_ours(lip.others_ladder(dict(bk.yes_bids if opp == "yes" else bk.no_bids), opp_own),
-                                      opp_own)
-
-        def rate(side_lv):
-            return lip.reward_rate(*((side_lv, opp_lv) if leg.side == "yes" else (opp_lv, side_lv)), P)
-        base = rate(lip.levels_with_ours(others, []))
-        return lambda p, n: rate(lip.levels_with_ours(others, [(p, n)])) - base
-
-    def lip_rate_at(self, leg: Leg, price: float, size: float) -> float:
-        """LIP $/s a bid of `size` at `price` on `leg` would add now; 0 off a live program."""
-        prog = self.lip_programs.get(leg.ticker)
-        now = time.time()
-        if prog is None or not prog[1] <= now < prog[2]:
-            return 0.0
-        # Ranked on every book update; held LIP_PLAN_S like lip_plan's choice (7dccd90).
-        key = (leg.ticker, leg.side, round(price, 4), size)
-        hit = self.lip_rate_cache.get(key)
-        if hit is not None and now - hit[0] < LIP_PLAN_S:
-            return hit[1]
-        bk = self.feed.ladder(leg.ticker)
-        r = 0.0 if bk is None else max(0.0, self._lip_earn(leg, bk, prog[3])(price, size))
-        if len(self.lip_rate_cache) > 20000:
-            self.lip_rate_cache = {k: v for k, v in self.lip_rate_cache.items() if now - v[0] < LIP_PLAN_S}
-        self.lip_rate_cache[key] = (now, r)
-        return r
-
-    def lip_plan(self, b: Basket, vs, j: int, need: float, room: float, plan):
-        """(plan, size) for leg j of a LIP market: of the prices from `plan`'s down
-        LIP_SCAN_TICKS ticks, the one whose largest size that still completes for the edge,
-        through b or any basket a fill could be booked into instead (as best_plan prices),
-        earns the most LIP, scored on the book with our other bids as they rest (our own
-        size can lift the reference price over a crowd below it). Ties go to the higher
-        price. None when the leg's market pays no LIP now or `plan` is None."""
-        leg = b.legs[j]
-        prog = self.lip_programs.get(leg.ticker)
-        if plan is None or prog is None:
-            return None
-        pid, start, end, P = prog
-        bk = self.feed.ladder(leg.ticker)
-        if bk is None or not start <= time.time() < end:
-            return None
-        t, now_ts = self.cfg.trading, _utc()
-        hit = self.lip_plans.get((b.basket_id, j))
-        if hit is not None and time.time() - hit[0] < LIP_PLAN_S:
-            _, p, n, y = hit
-            if p is None:
-                return None                           # no LIP price beat the usual one lately
-            k = j if y is None else next((i for i, l in enumerate(y.legs) if l.ticker == leg.ticker
-                                          and l.side == leg.side), None)
-            pv = vs if y is None else self.views(y)
-            if k is not None and pv is not None and n <= room + _EPS:
-                pay = b.payout if y is None else y.payout
-                nd = need if y is None else self.lip_need(edge_dollars(y.payout, t.min_edge + t.quote_edge_add),
-                                                          leg.ticker, False, y.settles)
-                q = pricing.quote_leg(pv, k, pay, nd, n)
-                if q is not None and q.max_price >= p - _EPS:
-                    return dataclasses.replace(q, leg=j, price=p,
-                                               edge=pay - q.others_cost - pricing.maker_cost(p, pv[k].maker_rate)), n
-        paths = [(None, j, vs, b.payout, need, float(int(room + _EPS)))]
-        for y, k in self.alternatives(b, j):
-            vy = self.views(y)
-            if vy is None:
-                continue
-            live = self.live_now(y, now_ts)
-            ny = self.lip_need(edge_dollars(y.payout, t.min_edge + t.quote_edge_add) +
-                               (t.live_edge_add if live else 0.0), leg.ticker, live, y.settles)
-            ry = min(room, self.room_bundles(y), float(self.quote_size_by_dollars(y)))
-            paths.append((y, k, vy, y.payout, ny, float(int(ry + _EPS))))
-        lv = vs[j]
-        earn = self._lip_earn(leg, bk, P)
-        best, p = None, plan.price
-        for _ in range(LIP_SCAN_TICKS):
-            if p < lv.ticks.lo - _EPS:
-                break
-            n, path = max(((pricing.depth_size(pv, k, pay, nd, cap, at=p), i)
-                           for i, (_, k, pv, pay, nd, cap) in enumerate(paths)), key=lambda x: x[0])
-            if n >= 1:
-                r = earn(p, n)
-                if best is None or r > best[0] + 1e-12:
-                    best = (r, p, n, path)
-            p = lv.ticks.down(p)
-        if best is None or best[0] <= 1e-12:
-            # No price earns this side anything: it quotes as a plain arb leg.
-            self.lip_plans[(b.basket_id, j)] = (time.time(), None, 0.0, None)
-            return None
-        _, p, n, i = best
-        y, k, pv, pay, nd, _ = paths[i]
-        q = pricing.quote_leg(pv, k, pay, nd, n)
-        if q is None or q.max_price < p - _EPS:
-            return None
-        self.lip_plans[(b.basket_id, j)] = (time.time(), p, n, y)
-        if len(self.lip_plans) > 20000:
-            self.lip_plans = {key: v for key, v in self.lip_plans.items() if time.time() - v[0] < LIP_PLAN_S}
-        self.set_via(b.basket_id, j, y)
-        return dataclasses.replace(q, leg=j, price=p,
-                                   edge=pay - q.others_cost - pricing.maker_cost(p, pv[k].maker_rate)), n
-
-    def lip_offers(self) -> dict:
-        """Baskets touching LIPFARM's markets: quotes resting there ("live") and the
-        ones we'd rest on baskets its claims hold off ("shadow")."""
-        now = time.time()
-        out = {bid: {**o, "live": False} for bid, o in self.lip_shadow.items() if now - o["at"] < 60.0}
-        mine = self.lip_markets | self.lip_claims
-        for q in list(self.quotes.values()):
-            b = self.baskets.get(q.basket_id)
-            if b is None or q.kind != "arb" or q.deep or q.remaining <= 0 or not mine & set(b.tickers):
-                continue
-            o = out.setdefault(q.basket_id, {"tickers": sorted(b.tickers), "legs": [], "at": now, "live": True})
-            o["legs"].append([q.ticker, q.side, q.price, q.remaining])
-        return out
-
-    async def lip_offer_loop(self):
-        while True:
-            await asyncio.sleep(LIP_OFFER_S)
-            try:
-                self.poll_lip_markets()
-                atomic_write_json(os.path.join(self.root, LIP_OFFERS),
-                                  {"written_at": time.time(), "live_trading": self.live, "offers": self.lip_offers()},
-                                  indent=None)
-            except Exception:
-                traceback.print_exc()
-
     def best_plan(self, b: Basket, j: int, plan, size: float, room: float):
         """(plan, size) for b's quote on leg j, priced through whichever basket
         with that market side allows the highest price: a fill is booked into
@@ -2330,8 +2018,7 @@ class ArbsRunner:
             if vy is None:
                 continue
             live = self.live_now(y, now_ts)
-            need = self.lip_need(edge_dollars(y.payout, t.min_edge + t.quote_edge_add) +
-                                 (t.live_edge_add if live else 0.0), b.legs[j].ticker, live, y.settles)
+            need = edge_dollars(y.payout, t.min_edge + t.quote_edge_add) + (t.live_edge_add if live else 0.0)
             r = min(room, self.room_bundles(y), float(self.quote_size_by_dollars(y)))
             n = pricing.depth_size(vy, k, y.payout, need, float(int(r + _EPS)))
             p = pricing.quote_leg(vy, k, y.payout, need, n) if n >= 1 else None
@@ -3360,7 +3047,6 @@ class ArbsRunner:
                     "cash": round(sum(self.cash.values()), 2) if self.cash else None,
                     "positions_value": round(sum(self.pos_value.values()), 2) if self.pos_value else None,
                     "cash_room": None if (cr := self.cash_room(None)) is None else round(cr, 2)},
-            "lip": self.lip_summary(),
             "holdings": holdings, "quotes": quotes, "hot": self.hot, "ranking": self.ranking[:60],
             "hot_churn": {f"{m}m": sum(e for t, e, _ in self.hot_churn if t >= time.time() - 60 * m)
                           for m in (1, 10, 60)},
@@ -3423,7 +3109,7 @@ class ArbsRunner:
             _log(f"WARN: fill-rate seed failed ({e!r})")
         trading, stopper, stop = TradingModeWatcher(self.S), StopWatcher(), asyncio.Event()
         coros = [self.feed.run(), self.eval_loop(), self.rank_loop(), self.meta_loop(), self.fill_poll_loop(),
-                 self.audit_loop(), self.guard_loop(), self.summary_loop(), self.scan_loop(), self.lip_offer_loop(), self.lip_accrue_loop(),
+                 self.audit_loop(), self.guard_loop(), self.summary_loop(), self.scan_loop(),
                  self.liquidity_loop(), self.prints_loop(), self.exchange_loop(), self.write_share_loop(), self.ledger_flush_loop(),
                  self.keepalive_loop(), self.balance_loop(), self.control_loop(trading, stopper, stop)]
         tasks = [asyncio.create_task(c) for c in coros]
