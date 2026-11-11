@@ -149,3 +149,76 @@ class LiveParams:
             cur = best[0]
         self.choice[leaf] = cur
         return cur
+
+    def state(self) -> dict:
+        """JSON-able: the learned sums and choices, so a restart keeps them."""
+        return {"nodes": [[list(k), n.w, n.f, n.p, n.x2, n.xf, n.f2, n.t] for k, n in self.nodes.items()],
+                "choice": [[list(k), v] for k, v in self.choice.items()]}
+
+    def load(self, st: dict):
+        k = len(self.edges)
+        for key, w, f, p, x2, xf, f2, t in st.get("nodes", []):
+            if len(f) != k:
+                continue                      # saved under another edge grid
+            n = self.nodes[tuple(key)] = _Node(k)
+            n.w, n.f, n.p, n.x2, n.xf, n.f2, n.t = w, f, p, x2, xf, f2, t
+        for key, v in st.get("choice", []):
+            self.choice[tuple(key)] = v
+
+
+# Live size multipliers. Replay of 2,119 in-play arbs 10-28..11-10 (actual +$131,
+# 11-10 -$325): start 0.10, up 0.01 / down 0.10 per cent of a lot's result made
+# +$270 with no day under -$3; starting at full size made +$434 but kept 11-10 at -$25.
+SIZE_START = 0.10
+SIZE_UP = 0.01
+SIZE_DOWN = 0.10
+SIZE_FLOOR = 0.01
+SIZE_CLIP_C = 30.0
+
+
+class LiveSizer:
+    """A multiplier on live_quote_size per group, series and event, learned from
+    our own finished live arbs: m *= exp(rate * cents per lot), the rate SIZE_DOWN
+    on a loss and SIZE_UP on a gain, so a group earns size slowly and a bad
+    fill cuts it at once. Real fills, not replayed prints: replay at the
+    quote's lag scored live table tennis positive while it lost ~20c a lot
+    (11-10). A group or series never seen starts at SIZE_START; an event
+    starts at 1 (its group and series already carry the prior)."""
+
+    def __init__(self, start=SIZE_START, up=SIZE_UP, down=SIZE_DOWN, floor=SIZE_FLOOR, clip_c=SIZE_CLIP_C):
+        self.start, self.up, self.down, self.floor, self.clip_c = start, up, down, floor, clip_c
+        self.m: dict[tuple, float] = {}
+        self.seen: dict[tuple, float] = {}
+
+    @staticmethod
+    def _keys(path: tuple) -> list[tuple]:
+        return [tuple(path[:1]), tuple(path[:2]), tuple(path[:3])]
+
+    def _get(self, k: tuple) -> float:
+        return self.m.get(k, 1.0 if len(k) == 3 else self.start)
+
+    def mult(self, path: tuple) -> float:
+        g, s, e = (self._get(k) for k in self._keys(path))
+        return min(g, s) * e
+
+    def update(self, path: tuple, cents_per_lot: float, t: float):
+        x = max(-self.clip_c, min(self.clip_c, cents_per_lot))
+        rate = self.down if x < 0 else self.up
+        for k in self._keys(path):
+            self.m[k] = max(self.floor, min(1.0, self._get(k) * math.exp(rate * x)))
+            self.seen[k] = t
+
+    def prune(self, t: float, max_age: float):
+        """Events (not groups or series) idle for max_age go."""
+        for k in [k for k, s in self.seen.items() if len(k) == 3 and t - s > max_age]:
+            self.m.pop(k, None)
+            self.seen.pop(k, None)
+
+    def state(self) -> dict:
+        return {"m": [[list(k), v, self.seen.get(k)] for k, v in self.m.items()]}
+
+    def load(self, st: dict):
+        for k, v, s in st.get("m", []):
+            self.m[tuple(k)] = v
+            if s is not None:
+                self.seen[tuple(k)] = s

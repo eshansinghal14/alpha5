@@ -71,3 +71,31 @@ def test_prune_drops_idle_events_and_their_choices():
     assert p.prune(5000.0, 3600.0) == 1
     assert ("soccer", "old") not in p.nodes and ("soccer",) in p.nodes and ("soccer", "new") in p.nodes
     assert set(p.choice) == {("soccer", "new")}
+
+
+def test_sizer_starts_small_grows_slowly_and_cuts_on_a_loss():
+    from kalshi_strategies.ARBS.live_params import LiveSizer
+    s = LiveSizer(start=0.1, up=0.01, down=0.1)
+    path = ("S:Table Tennis", "KXLIGAPROMATCH", "ev1")
+    assert s.mult(path) == pytest.approx(0.1)                   # unseen sport: a tenth of size
+    for _ in range(10):
+        s.update(path, 3.0, 0.0)                                # ten +3c/lot wins
+    grown = s.mult(path)
+    assert 0.13 < grown < 0.14                                  # x exp(0.3)
+    s.update(path, -20.0, 0.0)                                  # one -20c/lot fill
+    assert s.mult(path) < grown * 0.2 * 0.2                      # group/series and event both cut x exp(-2)
+    assert s.mult(("S:Table Tennis", "KXLIGAPROMATCH", "ev2")) == pytest.approx(grown * 0.135, rel=0.01)
+
+
+def test_live_state_survives_a_restart():
+    from kalshi_strategies.ARBS.live_params import LiveSizer
+    p = lp(z=0.0)
+    feed(p, ("hockey", "ev"), 300, [10, 5], [-0.3, -0.1])
+    q = lp(z=0.0)
+    q.load(p.state())
+    assert q.estimate(("hockey", "ev"), 0.0) == p.estimate(("hockey", "ev"), 0.0)
+    s = LiveSizer()
+    s.update(("g", "s", "e"), -10.0, 5.0)
+    t = LiveSizer()
+    t.load(s.state())
+    assert t.mult(("g", "s", "e")) == s.mult(("g", "s", "e"))

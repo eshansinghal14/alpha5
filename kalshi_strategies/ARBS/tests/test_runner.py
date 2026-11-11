@@ -1976,3 +1976,33 @@ def test_a_side_that_earns_no_lip_quotes_as_a_plain_arb_leg_whatever_the_other_s
     need = R.edge_dollars(b.payout, r.cfg.trading.min_edge + r.cfg.trading.quote_edge_add)
     plan0 = R.pricing.QuotePlan(leg=0, price=0.29, max_price=0.29, edge=0.05, others_cost=0.0)
     assert r.lip_plan(b, vs, 0, need, 1000.0, plan0) is None
+
+
+def test_a_finished_live_arb_teaches_the_shadow_sizer(arbs):
+    r, b = arbs
+    live = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
+    r.set_baskets([live])
+    rows = []
+    r.journal = rows.append
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, live_quote_size=100)
+    path = r._lp_path("X-A")
+    start = r.lsizer.mult(path)
+    r._book(live.basket_id, "X-A", "yes", 10, 4.0, "quote")      # quote fill, then the other leg
+    r._book(live.basket_id, "X-B", "yes", 10, 7.0, "complete")   # moved: 1.10 for a $1 bundle
+    got = [x for x in rows if x["kind"] == "live_size"]
+    assert len(got) == 1 and got[0]["pnl"] == pytest.approx(-1.0) and got[0]["lots"] == 10
+    assert r.lsizer.mult(path) < start                          # -10c a lot cut it
+    assert got[0]["size"] == max(1.0, round(100 * r.lsizer.mult(path)))
+    assert not r.cycles
+
+
+def test_an_unwound_live_arb_counts_its_loss(arbs):
+    r, b = arbs
+    live = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
+    r.set_baskets([live])
+    rows = []
+    r.journal = rows.append
+    r._book(live.basket_id, "X-A", "yes", 100, 41.0, "quote")
+    r._book(live.basket_id, "X-A", "no", 100, 68.54, "unwind")   # VORSLE 11-10: -$9.54
+    got = [x for x in rows if x["kind"] == "live_size"]
+    assert len(got) == 1 and got[0]["pnl"] == pytest.approx(-9.54)

@@ -423,6 +423,11 @@ class ArbsRunner:
         self.lp_seen: dict[str, tuple] = {}            # event -> (last print t, its edge, path)
         self.lp_view: dict = {"groups": {}, "events": {}}
         self.lp_logged = 0.0
+        # Shadow live sizes, learned from our finished live arbs (loop thread only).
+        self.lsizer = lparams.LiveSizer()
+        self.cycles: dict[str, dict] = {}              # basket_id -> live arb in progress
+        self.lp_paths: dict[str, tuple] = {}
+        self._load_lp_state()
         self.series_group: dict[str, str] = {}
         self.series_group_at = 0.0
         self.flow = _Flow()
@@ -1331,7 +1336,8 @@ class ArbsRunner:
         for g in {v[2][0] for v in self.lp_seen.values()}:
             e, val, lcb = self.lp.best((g,), now)
             groups[g] = {"edge": e, "value": round(val, 4), "lcb": round(lcb, 4)}
-        return {"groups": groups, "events": {ev: v[1] for ev, v in self.lp_seen.items()}}, errs
+        return {"groups": groups, "events": {ev: v[1] for ev, v in self.lp_seen.items()},
+                "paths": {ev: v[2] for ev, v in self.lp_seen.items()}}, errs
 
     async def prints_loop(self):
         loop = asyncio.get_running_loop()
@@ -1341,11 +1347,21 @@ class ArbsRunner:
                 rows = self.prints.take(time.time())
                 self.n["prints_recorded"], self.n["prints_dropped"] = self.prints.rows, self.prints.dropped
                 if rows and self.cfg.runtime.live_params_shadow:
-                    self.lp_view, errs = await loop.run_in_executor(self.pool, self._shadow_live, rows)
+                    view, errs = await loop.run_in_executor(self.pool, self._shadow_live, rows)
+                    self.lp_paths = view.pop("paths")
+                    self.lp_view = view
                     self.n["shadow_errors"] = self.n.get("shadow_errors", 0) + errs
                     if time.time() - self.lp_logged >= SHADOW_LOG_S:
                         self.lp_logged = time.time()
-                        self.journal({"kind": "live_params", **self.lp_view})
+                        self.lsizer.prune(time.time(), SHADOW_PRUNE_S)
+                        # An arb left uneven until settlement never closes.
+                        for k in [k for k, c in self.cycles.items() if time.time() - c["t"] > SHADOW_PRUNE_S]:
+                            del self.cycles[k]
+                        sizes = {ev: self.shadow_size(p) for ev, p in self.lp_paths.items()}
+                        self.journal({"kind": "live_params", **self.lp_view, "sizes": sizes})
+                        # lp is only touched by the one _shadow_live call at a time, awaited above.
+                        edges = await loop.run_in_executor(self.pool, self.lp.state)
+                        await loop.run_in_executor(self.write_pool, self._save_lp_state, edges, self.lsizer.state())
                 # The no-fill base rate: one resting quote's basket per flush.
                 resting = [q for q in self.quotes.values() if not q.pending and q.remaining > 0]
                 if resting and self.cfg.runtime.record_prints:
@@ -1363,8 +1379,11 @@ class ArbsRunner:
         if any(l.ticker == ticker and l.side != side for l in b.legs):
             self._book_unwind(b, ticker, side, size, cost, kind, **kw)
             return
-        self.ledger.pos(basket_id).spec = basket_to_dict(b)
+        pos = self.ledger.pos(basket_id)
+        pos.spec = basket_to_dict(b)
+        self._cycle_open(b, pos)
         self.ledger.record(basket_id, b.tickers, ticker, side, size, cost, time.time())
+        self._cycle_add(b, ticker, size, cost)
         self.journal({"kind": "fill", "fill_kind": kind, "basket_id": basket_id, "ticker": ticker, "side": side,
                       "size": size, "cost": round(cost, 4), "price": round((cost / size) if size else 0, 4),
                       "settles": None if b.settles is None else b.settles.isoformat(), **kw})
@@ -1386,7 +1405,66 @@ class ArbsRunner:
                       "size": size, "cost": round(cost, 4), "price": round(cost / size if size else 0, 4),
                       "settles": None if b.settles is None else b.settles.isoformat(), **kw})
         self.journal({"kind": "settled", **row})
+        self._cycle_add(b, None, 0.0, cost - size)
         self.dirty.add(b.basket_id)
+
+    def _cycle_open(self, b: Basket, pos):
+        """A fill on an even basket while live starts an arb for the sizer."""
+        if (self.cfg.runtime.live_params_shadow and b.basket_id not in self.cycles
+                and not pos.unhedged(b.tickers) and self.live_now(b, _utc())):
+            self.cycles[b.basket_id] = {"t": time.time(), "b0": pos.bundles(b.tickers), "cash": 0.0, "lots": {}}
+
+    def _cycle_add(self, b: Basket, ticker: str | None, size: float, cash: float):
+        """Count a fill's cash (an unwind's net of the $1 a pair) and close the
+        arb once the basket is even again: P&L = payout of the bundles gained
+        less the cash, per lot of the most-bought leg."""
+        c = self.cycles.get(b.basket_id)
+        if c is None:
+            return
+        c["cash"] += cash
+        if ticker is not None:
+            c["lots"][ticker] = c["lots"].get(ticker, 0.0) + size
+        pos = self.ledger.baskets.get(b.basket_id)
+        if pos is not None and pos.unhedged(b.tickers):
+            return
+        del self.cycles[b.basket_id]
+        lots = max(c["lots"].values(), default=0.0)
+        if lots <= _EPS:
+            return
+        bundles = pos.bundles(b.tickers) if pos is not None else 0.0
+        pnl = b.payout * (bundles - c["b0"]) - c["cash"]
+        path = self._lp_path(b.legs[0].ticker)
+        before = self.lsizer.mult(path)
+        self.lsizer.update(path, 100.0 * pnl / lots, time.time())
+        self.journal({"kind": "live_size", "basket_id": b.basket_id, "path": list(path), "lots": lots,
+                      "pnl": round(pnl, 4), "mult_before": round(before, 4),
+                      "mult": round(self.lsizer.mult(path), 4),
+                      "size": self.shadow_size(path)})
+
+    def shadow_size(self, path: tuple) -> float:
+        """What the sizer would quote live: live_quote_size scaled, at least 1."""
+        return max(1.0, round(self.cfg.trading.live_quote_size * self.lsizer.mult(path)))
+
+    def _lp_state_path(self) -> str:
+        return os.path.join(self.root, "live_params_state.json")
+
+    def _load_lp_state(self):
+        try:
+            with open(self._lp_state_path(), encoding="utf-8") as fh:
+                st = json.load(fh)
+            self.lp.load(st.get("edges") or {})
+            self.lsizer.load(st.get("sizes") or {})
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            _log(f"WARN: live params state not loaded ({e!r})")
+
+    def _save_lp_state(self, edges: dict, sizes: dict):
+        path = self._lp_state_path()
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"t": time.time(), "edges": edges, "sizes": sizes}, fh, separators=(",", ":"))
+        os.replace(tmp, path)
 
     def seed_exit(self, basket_id: str, planned: float):
         """Start a basket's chase history at the exit cost it was priced
