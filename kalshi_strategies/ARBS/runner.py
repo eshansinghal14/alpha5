@@ -86,6 +86,7 @@ MAX_ALERTS = 300
 LOST_LOOKUP_S = 1.0
 ORPHAN_FILL_S = 30.0
 CASH_STALE_POLLS = 6       # balance reads missed before max_dollars_auto falls back to max_dollars
+BALANCE_LOG_S = 60.0       # journal interval for the shards' cash and positions' value (dashboard capital)
 
 
 def _log(msg: str):
@@ -377,6 +378,8 @@ class ArbsRunner:
         self.book_wall: dict[str, float] = {}     # the same on the wall clock, for the order log
         self.cash: dict[int, float] = {}          # shard -> available balance, for max_dollars_auto
         self.cash_at = 0.0
+        self.pos_value: dict[int, float] = {}     # shard -> Kalshi's value of our positions
+        self.balance_logged = 0.0
         self.paused_until: dict[str, float] = {}  # ticker -> monotonic time Kalshi's pause is next retried
         self.exchange_paused = False              # Kalshi's exchange-wide trading_active is off
         self.priority_trading: list[str] = []     # write_priority_series in session now
@@ -1757,8 +1760,14 @@ class ArbsRunner:
             if not (self.live and self.cfg.trading.max_dollars_auto):
                 continue
             try:
-                self.cash = {s: await self.gw.call(c.balance, s) for s, c in self.gw.clients.items()}
+                got = {s: await self.gw.call(c.balance_and_positions, s) for s, c in self.gw.clients.items()}
+                self.cash = {s: v[0] for s, v in got.items()}
+                self.pos_value = {s: v[1] for s, v in got.items()}
                 self.cash_at = time.time()
+                if self.cash_at - self.balance_logged >= BALANCE_LOG_S:
+                    self.balance_logged = self.cash_at
+                    self.journal({"kind": "balance", "cash": {str(s): round(v, 2) for s, v in self.cash.items()},
+                                  "positions": {str(s): round(v, 2) for s, v in self.pos_value.items()}})
             except Exception as e:
                 _log(f"WARN: balance read failed ({e!r})")
 
@@ -3338,6 +3347,7 @@ class ArbsRunner:
                     "held_cost": round(sum(h["cost"] for h in holdings), 4),
                     "committed": round(self.committed(), 4), "max_dollars": self.cfg.trading.max_dollars,
                     "cash": round(sum(self.cash.values()), 2) if self.cash else None,
+                    "positions_value": round(sum(self.pos_value.values()), 2) if self.pos_value else None,
                     "cash_room": None if (cr := self.cash_room(None)) is None else round(cr, 2)},
             "lip": self.lip_summary(),
             "holdings": holdings, "quotes": quotes, "hot": self.hot, "ranking": self.ranking[:60],

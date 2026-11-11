@@ -897,12 +897,19 @@ class KalshiOrderClient:
         trading shard is empty -- every order then 404s
         `insufficient_shard_balance` (2026-10-08: $165 on shard 0, $0 on
         crypto's shard 2)."""
+        return self.balance_and_positions(exchange_index)[0]
+
+    def balance_and_positions(self, exchange_index: int | None = None) -> tuple[float, float]:
+        """(available balance, positions' value) in dollars, from the one
+        balance read. The positions' value only comes as integer cents
+        (portfolio_value; no _dollars field, 2026-11-11)."""
         params = {"exchange_index": exchange_index} if exchange_index is not None else None
         resp = self._session.get(BASE_URL + BALANCE_PATH,
                                  headers=self._headers("GET", BALANCE_PATH),
                                  params=params, timeout=self.timeout_s)
         resp.raise_for_status()
-        return _dollars(resp.json(), "balance") or 0.0
+        data = resp.json()
+        return _dollars(data, "balance") or 0.0, float(data.get("portfolio_value") or 0) / 100.0
 
     def target_allocation(self) -> dict:
         """Kalshi's auto-rebalance target: {"allocations": {shard: percent},

@@ -121,8 +121,8 @@ def _metrics(s: dict):
     if p.get("cash_room") is not None:
         c[2].metric("Shard cash", f"${p['cash']:,.2f}", f"${p['cash_room']:,.0f} free to size on", delta_color="off",
                     help="Kalshi's available balance on the traded shards (net of resting orders); quotes are "
-                         "sized against it less cash_reserve (trading.max_dollars_auto). Held basket cost: "
-                         f"${p.get('committed', 0):,.0f}.")
+                         "sized against it less cash_reserve (trading.max_dollars_auto). Positions on the shard "
+                         f"(Kalshi's value): ${p.get('positions_value') or 0:,.0f}.")
     else:
         c[2].metric("Capital used", f"${p.get('committed', 0):,.2f}", f"of ${p.get('max_dollars', 0):,.0f}",
                     delta_color="off", help="Cost of held baskets (resting quotes aren't counted; each is sized to fit what's left).")
@@ -199,13 +199,15 @@ def _pnl_chart(series: str):
     journal (settled plus what complete bundles lock in); the last point adds
     unfinished baskets at what their extra legs would sell for now, so it
     matches the header. Starts at 0 at the window's start. Capital used
-    (right axis) is a level, not rebased to the window."""
+    (right axis): Kalshi's value of our positions on the traded shards,
+    logged each minute from 11-11; a level, not rebased to the window."""
     df = _pnl_frame(series)
     s = read_summary(series)
     if len(df) and s and s.get("ledger") == "real":
         df = pd.concat([df, pd.DataFrame({"time": [pd.Timestamp.now(tz="UTC")], "settled": [df.settled.iloc[-1]],
                                           "total": [df.total.iloc[-1] + ((s.get("pnl") or {}).get("broken") or 0.0)],
-                                          "capital": [df.capital.iloc[-1]]})],
+                                          "capital": [(s.get("pnl") or {}).get("positions_value")
+                                                      or df.capital.iloc[-1]]})],
                        ignore_index=True)
     if df.empty:
         st.caption("No live fills yet.")
@@ -227,7 +229,7 @@ def _pnl_chart(series: str):
                  alt.Tooltip("capital:Q", title="capital used", format=",.0f")])
     zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#888", strokeWidth=0.7).encode(y="y:Q")
     capital = alt.Chart(c).mark_line(interpolate="step-after", strokeWidth=1.5, color="#fb8c00", opacity=0.8).encode(
-        x=x, y=alt.Y("capital:Q", title="Capital used $",
+        x=x, y=alt.Y("capital:Q", title="Capital used $ (shard positions)",
                      axis=alt.Axis(orient="right", titleColor="#fb8c00", format=",.0f")),
         tooltip=[alt.Tooltip("time:T", format="%m-%d %H:%M:%S"),
                  alt.Tooltip("capital:Q", title="capital used", format=",.0f")])

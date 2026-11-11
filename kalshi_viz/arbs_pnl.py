@@ -147,16 +147,34 @@ def replay(rows: list[dict], info: dict[str, tuple[float, int]]) -> pd.DataFrame
 
 def load(series: str) -> pd.DataFrame:
     root = os.path.join(LIVE_ROOT, series)
-    rows = []
+    rows, bal = [], []
     for f in sorted(glob.glob(os.path.join(root, "journal", "*.jsonl"))):
         with open(f, encoding="utf-8") as fh:
             for line in fh:
-                if '"fill"' in line or '"settled"' in line:
+                if '"fill"' in line or '"settled"' in line or '"balance"' in line:
                     try:
-                        rows.append(json.loads(line))
+                        r = json.loads(line)
                     except ValueError:
                         continue
-    return replay(rows, basket_info(root))
+                    if r.get("kind") == "balance":
+                        bal.append((pd.Timestamp(r["t"], unit="s", tz="UTC"), sum((r.get("positions") or {}).values())))
+                    else:
+                        rows.append(r)
+    return with_positions(replay(rows, basket_info(root)), bal)
+
+
+def with_positions(df: pd.DataFrame, bal: list[tuple]) -> pd.DataFrame:
+    """Capital is Kalshi's value of the positions on our traded shards, from
+    the runner's balance rows (none before 11-11): the replayed cost of what
+    we hold ran far above it ($35k vs $5.2k on shard 0, 11-11). NaN before
+    the first row."""
+    if not bal:
+        return df.assign(capital=float("nan"))
+    b = pd.DataFrame(bal, columns=["time", "capital"])
+    out = pd.concat([df.drop(columns="capital"), b], ignore_index=True).sort_values("time", kind="stable")
+    out[["settled", "total"]] = out[["settled", "total"]].ffill().fillna(0.0)
+    out["capital"] = out.capital.ffill()
+    return out.reset_index(drop=True)[["time", "settled", "total", "capital"]]
 
 
 def _net(legs: dict, meta) -> tuple[float, float, float | None]:

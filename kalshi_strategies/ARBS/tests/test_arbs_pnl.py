@@ -77,3 +77,21 @@ def test_bundle_log_counts_bundles_and_unwound_pairs_in_one_arb(tmp_path, monkey
     (j / "2026-10-29.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
     log = arbs_pnl.bundle_log("ARBS")
     assert log.bundles.iloc[0] == 1 and log.pnl.iloc[0] == pytest.approx(2 - 1.94)
+
+
+def test_capital_is_the_shards_positions_from_balance_rows(tmp_path, monkeypatch):
+    import json
+    from kalshi_viz import arbs_pnl
+    monkeypatch.setattr(arbs_pnl, "LIVE_ROOT", str(tmp_path))
+    monkeypatch.setattr(arbs_pnl, "basket_info", lambda root: {"b": (1.0, 2)})
+    j = tmp_path / "ARBS" / "journal"
+    j.mkdir(parents=True)
+    rows = [fill(100, "b", "S-A", "yes", 5, 2.0),
+            {"t": 150, "kind": "balance", "cash": {"0": 900.0}, "positions": {"0": 40.0, "2": 2.0}},
+            fill(200, "b", "S-B", "yes", 5, 2.5),
+            {"t": 250, "kind": "balance", "cash": {"0": 895.0}, "positions": {"0": 45.0}}]
+    (j / "2026-11-11.jsonl").write_text("".join(json.dumps(r) + chr(10) for r in rows))
+    df = arbs_pnl.load("ARBS")
+    assert list(df.time.astype("int64") // 10**9) == [100, 150, 200, 250]
+    assert pd.isna(df.capital.iloc[0]) and list(df.capital.iloc[1:]) == [42.0, 42.0, 45.0]
+    assert df.total.iloc[-1] == pytest.approx(df.total.iloc[2])
