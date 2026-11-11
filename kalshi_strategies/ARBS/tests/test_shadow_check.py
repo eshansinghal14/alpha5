@@ -59,4 +59,5 @@ def test_rules_train_on_earlier_days_only(tmp_path):
     ru = doc["rules"]
     assert [t.split(":")[-1] for t in ru["trained_on"]] == ["2026-11-12"] and ru["prints"] == 1
     assert ru["best_ev"] is not None and ru["narrowest"] is not None and ru["best_ev_size"] is not None
-    assert set(ru["fixed_by_size"]) == {"5", "20", "50", "100"}
+    assert set(ru["fixed_by_size"]) == {"5", "20", "50", "100", "200", "500"}
+    assert set(ru["best_ev_by_size"]) <= set(ru["fixed_by_size"])

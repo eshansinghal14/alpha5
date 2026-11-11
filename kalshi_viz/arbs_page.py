@@ -433,12 +433,15 @@ def _shadow_check_one(series: str, days: int):
                        "narrowest": rr["narrowest"], "best EV": rr["best_ev"],
                        "best EV quoted %": round(100 * rr["best_ev_quoted"])}
                 if rr.get("best_ev_size") is not None:
+                    be = rr.get("best_ev_by_size") or {}
                     row.update({"edge+size": rr["best_ev_size"], "edge+size lots": rr.get("best_ev_size_lots"),
-                                **{f"10c x{n}": fs[n][ed.index(0.1)] for n in ("20", "50", "100") if n in fs}})
+                                **{f"best EV x{n}": be[n] for n in ("100", "500") if n in be},
+                                **{f"10c x{n}": fs[n][ed.index(0.1)] for n in ("20", "50", "100", "500") if n in fs}})
                 tab.append(row)
             t = pd.DataFrame(tab)
             tot = {c: t[c].sum() for c in ("filled prints", "fixed 5c", "fixed 10c", "narrowest", "best EV",
-                                           "edge+size", "edge+size lots", "10c x20", "10c x50", "10c x100")
+                                           "edge+size", "edge+size lots", "best EV x100", "best EV x500",
+                                           "10c x20", "10c x50", "10c x100", "10c x500")
                    if c in t}
             st.dataframe(pd.concat([t, pd.DataFrame([{"day": "total", **tot}])], ignore_index=True), hide_index=True)
         st.caption("Every recorded print (ours or not): edge at the print and how far the other legs' cost "

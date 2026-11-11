@@ -19,7 +19,9 @@ Writes data/live/ARBS/shadow_check/<day>.json, shown on the ARBS dashboard.
   the narrowest edge whose predicted net clears RULE_MARGIN_C; the edge with
   the best fill odds x predicted net for a POLICY_SIZE quote; and the edge and
   size (RULE_SIZES) with the best fill odds x size x predicted net, where the
-  predicted exit cost grows as the size outgrows the exit legs' depth.
+  predicted exit cost grows as the size outgrows the exit legs' depth; and,
+  to tell the size choice from the edge choice, the best edge at each fixed
+  size.
 
 Run for each ARBS process (ARBS, ARBS3), each into its own folder.
 """
@@ -44,7 +46,7 @@ POLICY_SIZE = 5.0
 OUT_DIR = "shadow_check"
 RULE_MARGIN_C = 1.0
 TRAIN_DAYS = 14
-RULE_SIZES = (5.0, 20.0, 50.0, 100.0)
+RULE_SIZES = (5.0, 20.0, 50.0, 100.0, 200.0, 500.0)
 
 
 def rates(ticker: str) -> tuple[float, float]:
@@ -278,7 +280,7 @@ def rules(root: str, day: str, rows: list) -> dict:
     out = {"trained_on": sorted(used), "prints": len(rows), "fixed": [0.0] * len(EDGES), "narrowest": None,
            "best_ev": None, "best_ev_quoted": None, "best_ev_edges": None,
            "fixed_by_size": {str(int(n)): [0.0] * len(EDGES) for n in sizes}, "sizes": [int(n) for n in sizes],
-           "best_ev_size": None, "best_ev_size_picks": None, "best_ev_size_lots": None}
+           "best_ev_size": None, "best_ev_size_picks": None, "best_ev_size_lots": None, "best_ev_by_size": None}
     for _, by in rows:
         out["fixed"] = [a + b for a, b in zip(out["fixed"], by[POLICY_SIZE][1])]
         for n, (_, pnl) in by.items():
@@ -292,6 +294,7 @@ def rules(root: str, day: str, rows: list) -> dict:
     narrow = ev = ev_size = lots = 0.0
     quoted, picked = 0, [0] * len(EDGES)
     size_picks = collections.Counter()
+    by_size_ev = collections.Counter()
     for live, by in rows:
         f, pnl = by[POLICY_SIZE]
         nets, evs = [], []
@@ -309,19 +312,24 @@ def rules(root: str, day: str, rows: list) -> dict:
             picked[k] += 1
         best = None
         for n, (fn, pn) in by.items():
+            at_n = None
             for k, e in enumerate(EDGES):
                 x = exit_cost.quote_price(fn, e)
                 v = prev.fill_prob(live, 100 * (fn["touch"] - x)) * n * \
                     (100 * e - exit_cost.predict(w, exit_cost.at_price(fn, x)))
                 if best is None or v > best[0]:
                     best = (v, n, k, pn[k])
+                if at_n is None or v > at_n[0]:
+                    at_n = (v, pn[k])
+            if at_n[0] > 0:
+                by_size_ev[str(int(n))] += at_n[1]
         if best is not None and best[0] > 0:
             ev_size += best[3]
             lots += best[1]
             size_picks[str(int(best[1]))] += 1
     out.update(narrowest=round(narrow, 2), best_ev=round(ev, 2), best_ev_quoted=round(quoted / len(rows), 3),
                best_ev_edges=picked, best_ev_size=round(ev_size, 2), best_ev_size_picks=dict(size_picks),
-               best_ev_size_lots=lots)
+               best_ev_size_lots=lots, best_ev_by_size={k: round(v, 2) for k, v in by_size_ev.items()})
     return out
 
 
