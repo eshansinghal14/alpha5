@@ -68,7 +68,7 @@ def _groups() -> dict[str, list[str]]:
         if getattr(mod, "DASHBOARD_HIDDEN", False):
             continue
         g = getattr(mod, "DASHBOARD_GROUP", None) or OTHER_GROUP
-        out.setdefault(g, []).extend(mod.SERIES)
+        out.setdefault(g, []).extend(s for s in mod.SERIES if s not in getattr(mod, "DASHBOARD_MERGED", ()))
         out[g].extend(getattr(mod, "EXTRA_PAGES", {}))
     return dict(sorted(out.items(), key=lambda kv: (kv[0] == OTHER_GROUP, kv[0])))
 

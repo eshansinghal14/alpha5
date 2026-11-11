@@ -95,3 +95,30 @@ def test_capital_is_the_shards_positions_from_balance_rows(tmp_path, monkeypatch
     assert list(df.time.astype("int64") // 10**9) == [100, 150, 200, 250]
     assert pd.isna(df.capital.iloc[0]) and list(df.capital.iloc[1:]) == [42.0, 42.0, 45.0]
     assert df.total.iloc[-1] == pytest.approx(df.total.iloc[2])
+
+
+def test_dashboard_merges_both_arbs_processes():
+    from kalshi_viz import arbs_page as ap
+    a = {"live_trading": True, "pnl": {"settled": 10.0, "locked": 2.0, "cash": 900.0, "cash_room": 800.0,
+                                       "positions_value": 500.0}, "counts": {"quote_fills": 3},
+         "quotes": [{"basket_id": "x"}], "feed": {"up": True}, "n_baskets": 10, "blocked_reason": None}
+    b = {"live_trading": False, "pnl": {"settled": -1.0, "locked": 0.5, "cash": 300.0, "cash_room": 200.0,
+                                        "positions_value": 500.0}, "counts": {"quote_fills": 1},
+         "quotes": [{"basket_id": "y"}], "feed": {"up": False}, "n_baskets": 4, "blocked_reason": "feed_down"}
+    m = ap.merge({"ARBS": a, "ARBS3": b})
+    assert m["pnl"]["settled"] == 9.0 and m["pnl"]["cash"] == 1200.0
+    assert m["pnl"]["positions_value"] == 500.0                    # the account's, not summed
+    assert m["counts"]["quote_fills"] == 4 and m["n_baskets"] == 14
+    assert [q["shard"] for q in m["quotes"]] == ["shard 0", "shard 3"]
+    assert m["blocked_reason"] == "shard 3: feed_down" and not m["feed"]["up"]
+
+
+def test_dashboard_pnl_history_adds_the_processes():
+    from kalshi_viz import arbs_page as ap
+    t = lambda s: pd.Timestamp(s, tz="UTC")
+    a = pd.DataFrame({"time": [t("2026-11-11 10:00"), t("2026-11-11 12:00")], "settled": [1.0, 2.0],
+                      "total": [1.5, 2.5], "capital": [100.0, 110.0]})
+    b = pd.DataFrame({"time": [t("2026-11-11 11:00")], "settled": [5.0], "total": [6.0], "capital": [float("nan")]})
+    c = ap.combine([a, b])
+    assert list(c.settled) == [1.0, 6.0, 7.0] and list(c.total) == [1.5, 7.5, 8.5]
+    assert list(c.capital) == [100.0, 100.0, 110.0]

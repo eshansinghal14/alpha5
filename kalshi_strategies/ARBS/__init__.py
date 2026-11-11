@@ -13,7 +13,9 @@ from kalshi_strategies.ARBS.config import CONFIG3_PATH, CONFIG_PATH, ArbsConfig
 
 DASHBOARD_GROUP = "Arbitrage"
 DASHBOARD_PAGE = "kalshi_viz.arbs_page:render"
-DASHBOARD_LABELS = {"ARBS": "risk-free", "ARBS3": "shard 3"}
+DASHBOARD_LABELS = {"ARBS": "risk-free"}
+# Shown inside the ARBS page (the same strategy, another process), not as a page of its own.
+DASHBOARD_MERGED = {"ARBS3"}
 
 
 async def _runner(series, **kw):

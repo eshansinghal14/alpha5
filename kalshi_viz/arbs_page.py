@@ -1,6 +1,8 @@
 """ARBS dashboard page: arm switch, guards and alerts, PnL (settled, locked
 in on held bundles), bundles held, resting quotes, the opportunity ranking
-and the settled history. Reads only data/live/ARBS/<date>/summary.json."""
+and the settled history. The ARBS page shows every ARBS process together
+(ARBS on shard 0, ARBS3 on shard 3: one strategy split for CPU), each with
+its own arm switch. Reads only data/live/<series>/<date>/summary.json."""
 from __future__ import annotations
 
 import json
@@ -17,6 +19,65 @@ from kalshi_viz.perf_panel import time_axis
 from kalshi_viz.data import latest_summary, read_summary, summary_age_s
 
 STALE_S = 15.0
+SHARD_OF = {"ARBS": "shard 0", "ARBS3": "shard 3"}
+
+
+def parts(series: str) -> list[str]:
+    """The processes one page shows."""
+    from kalshi_strategies.ARBS import SERIES
+    return list(SERIES) if series == "ARBS" else [series]
+
+
+def _num_sum(vals):
+    vals = [v for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    return sum(vals) if vals else None
+
+
+def merge(ss: dict[str, dict]) -> dict:
+    """Summaries of several processes as one. Positions' value is Kalshi's
+    for the whole account, so it is taken once, not summed."""
+    xs = list(ss.values())
+    if len(xs) == 1:
+        return xs[0]
+    pn = [x.get("pnl") or {} for x in xs]
+    pnl = {k: _num_sum(p.get(k) for p in pn)
+           for k in ("settled", "locked", "broken", "upside", "held_cost", "committed", "cash", "cash_room")}
+    pnl["positions_value"] = next((p["positions_value"] for p in pn if p.get("positions_value") is not None), None)
+    pnl["max_dollars"] = next((p["max_dollars"] for p in pn if p.get("max_dollars") is not None), None)
+
+    def tagged(key):
+        return [{**r, "shard": SHARD_OF.get(n, n)} for n, x in ss.items() for r in (x.get(key) or [])]
+
+    def why(key):
+        return "; ".join(f"{SHARD_OF.get(n, n)}: {x[key]}" for n, x in ss.items() if x.get(key)) or None
+
+    counts: dict = {}
+    for x in xs:
+        for k, v in (x.get("counts") or {}).items():
+            if isinstance(v, (int, float)):
+                counts[k] = counts.get(k, 0) + v
+    feeds = [x.get("feed") or {} for x in xs]
+    cfg_err = "; ".join(f"{SHARD_OF.get(n, n)}: {(x.get('config_status') or {}).get('error')}"
+                        for n, x in ss.items() if (x.get("config_status") or {}).get("error"))
+    return {
+        "live_trading": any(x.get("live_trading") for x in xs), "ledger": xs[0].get("ledger"),
+        "halt_reason": why("halt_reason"), "blocked_reason": why("blocked_reason"),
+        "config_status": {"error": cfg_err or None},
+        "audit_diff": {k: v for x in xs for k, v in (x.get("audit_diff") or {}).items()} or None,
+        "feed": {"up": all(f.get("up") for f in feeds), "by_process": dict(zip(ss, feeds))},
+        "pnl": pnl, "counts": counts,
+        "n_tradeable": _num_sum(x.get("n_tradeable") for x in xs),
+        "n_baskets": _num_sum(x.get("n_baskets") for x in xs),
+        "n_tickers": _num_sum(x.get("n_tickers") for x in xs),
+        "holdings": tagged("holdings"), "quotes": tagged("quotes"),
+        "alerts": sorted(tagged("alerts"), key=lambda a: a.get("time") or ""),
+        "settled": sorted(tagged("settled"), key=lambda a: a.get("settled_at") or ""),
+        "ranking": sorted(tagged("ranking"), key=lambda r: -(r.get("quote_usd_h") or 0.0)),
+        "missed": tagged("missed"), "hot": [h for x in xs for h in (x.get("hot") or [])],
+        "write_usage": {k: v for x in xs for k, v in (x.get("write_usage") or {}).items()},
+        "market_status": {n: x.get("market_status") for n, x in ss.items()},
+        "order_errors": {n: x.get("order_errors") for n, x in ss.items()},
+    }
 LOCAL_TZ = "America/New_York"
 TIME_COL = st.column_config.DatetimeColumn(format="MM-DD HH:mm:ss")
 
@@ -82,15 +143,18 @@ def _alerts(series: str, s: dict):
     if not f.get("up"):
         st.error("📡 Kalshi websocket down (quotes are pulled after runtime.feed_down_pull_s).")
     # Times are all UTC isoformat from the runner, so they compare as strings.
-    cut = _cleared(series)
-    al = [a for a in (s.get("alerts") or []) if a["level"] in ("error", "warn") and a["time"] > cut]
+    cuts = {SHARD_OF.get(p, p): _cleared(p) for p in parts(series)}
+    al = [a for a in (s.get("alerts") or []) if a["level"] in ("error", "warn")
+          and a["time"] > cuts.get(a.get("shard"), _cleared(series))]
     if al:
         with st.expander(f"Alerts ({len(al)} new)", expanded=any(a["level"] == "error" for a in al[-10:])):
-            st.dataframe(_local(pd.DataFrame(al[::-1]), "time")[["time", "level", "basket_id", "msg", "live"]],
+            df = _local(pd.DataFrame(al[::-1]), "time")
+            st.dataframe(df[[c for c in ("time", "shard", "level", "basket_id", "msg", "live") if c in df]],
                          use_container_width=True, hide_index=True, column_config={"time": TIME_COL})
             if st.button("Clear (handled)", key="arbs_clear_alerts"):
-                with open(_cleared_path(series), "w", encoding="utf-8") as fh:
-                    json.dump({"before": al[-1]["time"]}, fh)
+                for p in parts(series):
+                    with open(_cleared_path(p), "w", encoding="utf-8") as fh:
+                        json.dump({"before": al[-1]["time"]}, fh)
                 st.rerun(scope="fragment")
 
 
@@ -130,7 +194,10 @@ def _metrics(s: dict):
 
 @st.cache_data(ttl=5, show_spinner=False)
 def _bundle_log(series: str) -> pd.DataFrame:
-    return arbs_pnl.bundle_log(series)
+    logs = [x for x in (arbs_pnl.bundle_log(p) for p in parts(series)) if len(x)]
+    if not logs:
+        return pd.DataFrame()
+    return pd.concat(logs, ignore_index=True).sort_values("time", ascending=False, kind="stable")
 
 
 def _tables(series: str, s: dict):
@@ -153,8 +220,8 @@ def _tables(series: str, s: dict):
         df = pd.DataFrame(q)
         if "ret" in df:
             df["return"] = df["ret"].map(lambda v: f"{v:.2%}")
-        cols = ["basket_id", "ticker", "side", "price", "max_price", "size", "filled", "edge", "return", "age_s",
-                "pending"]
+        cols = ["shard", "basket_id", "ticker", "side", "price", "max_price", "size", "filled", "edge", "return",
+                "age_s", "pending"]
         st.dataframe(df[[c for c in cols if c in df]], use_container_width=True, hide_index=True)
     else:
         st.caption("None.")
@@ -185,7 +252,26 @@ def _tables(series: str, s: dict):
 
 @st.cache_data(ttl=15, show_spinner=False)
 def _pnl_frame(series: str) -> pd.DataFrame:
-    return arbs_pnl.load(series)
+    return combine([arbs_pnl.load(p) for p in parts(series)])
+
+
+def combine(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    """Several processes' PnL histories as one: settled and total summed at
+    every time any of them changed; capital is the account's, from the
+    first frame that has it."""
+    frames = [f.drop_duplicates("time", keep="last").set_index("time") for f in frames if len(f)]
+    if not frames:
+        return pd.DataFrame(columns=["time", "settled", "total", "capital"])
+    if len(frames) == 1:
+        return frames[0].reset_index()
+    times = sorted(set().union(*(set(f.index) for f in frames)))
+    out = pd.DataFrame({"time": times, "settled": 0.0, "total": 0.0})
+    for f in frames:
+        for c in ("settled", "total"):
+            out[c] += f[c].reindex(times, method="ffill").fillna(0.0).values
+    cap = next((f for f in frames if f.capital.notna().any()), frames[0])
+    out["capital"] = cap.capital.reindex(times, method="ffill").values
+    return out
 
 
 PNL_WINDOWS = {"6h": pd.Timedelta(hours=6), "24h": pd.Timedelta(hours=24), "7d": pd.Timedelta(days=7), "All": None}
@@ -197,7 +283,8 @@ def _pnl_chart(series: str):
     (right axis): Kalshi's value of our positions on the traded shards,
     logged each minute from 11-11; a level, not rebased to the window."""
     df = _pnl_frame(series)
-    s = read_summary(series)
+    found = {p: x for p in parts(series) if (x := read_summary(p)) is not None}
+    s = merge(found) if found else None
     if len(df) and s and s.get("ledger") == "real":
         df = pd.concat([df, pd.DataFrame({"time": [pd.Timestamp.now(tz="UTC")], "settled": [df.settled.iloc[-1]],
                                           "total": [df.total.iloc[-1] + ((s.get("pnl") or {}).get("broken") or 0.0)],
@@ -249,19 +336,32 @@ def render(series: str, stale_fn):
     def body():
         if stale_fn(series):
             return
-        s = read_summary(series)
-        if s is None:
-            prev = latest_summary(series)
-            s = prev[1] if prev else None
-        if s is None:
-            st.caption(f"No {series} run has written yet: `python -m kalshi_strategies.run --series {series}`.")
+        ss, idles = {}, {}
+        for p in parts(series):
+            x = read_summary(p)
+            if x is None:
+                prev = latest_summary(p)
+                x = prev[1] if prev else None
+            if x is not None:
+                ss[p] = x
+                age = summary_age_s(x)
+                idles[p] = age is None or age > STALE_S
+        if not ss:
+            st.caption("No ARBS run has written yet: `python -m kalshi_strategies.run --series ARBS`.")
             _toggle(series, {}, idle=True)
             return
-        age = summary_age_s(s)
-        idle = age is None or age > STALE_S
-        if idle:
-            st.warning(f"Process not running (last summary {age or 0:.0f}s ago). Figures are as of then.")
-        _toggle(series, s, idle)
+        cols = st.columns(len(parts(series)))
+        for col, p in zip(cols, parts(series)):
+            with col:
+                if len(cols) > 1:
+                    st.markdown(f"**{SHARD_OF.get(p, p)}** ({p})")
+                if p not in ss:
+                    st.caption("Not running yet.")
+                    continue
+                if idles[p]:
+                    st.warning(f"{p} not running (last summary {summary_age_s(ss[p]) or 0:.0f}s ago).")
+                _toggle(p, ss[p], idles[p])
+        s = merge(ss)
         _alerts(series, s)
         _metrics(s)
         _tables(series, s)
