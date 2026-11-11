@@ -423,10 +423,9 @@ class ArbsRunner:
         self.lp_seen: dict[str, tuple] = {}            # event -> (last print t, its edge, path)
         self.lp_view: dict = {"groups": {}, "events": {}}
         self.lp_logged = 0.0
-        # Shadow live sizes, learned from our finished live arbs (loop thread only).
+        # Shadow sizes: tte factor x a multiplier learned from our finished arbs (loop thread only).
         self.lsizer = lparams.LiveSizer()
-        self.cycles: dict[str, dict] = {}              # basket_id -> live arb in progress
-        self.lp_paths: dict[str, tuple] = {}
+        self.cycles: dict[str, dict] = {}              # basket_id -> arb in progress
         self._load_lp_state()
         self.series_group: dict[str, str] = {}
         self.series_group_at = 0.0
@@ -1336,8 +1335,7 @@ class ArbsRunner:
         for g in {v[2][0] for v in self.lp_seen.values()}:
             e, val, lcb = self.lp.best((g,), now)
             groups[g] = {"edge": e, "value": round(val, 4), "lcb": round(lcb, 4)}
-        return {"groups": groups, "events": {ev: v[1] for ev, v in self.lp_seen.items()},
-                "paths": {ev: v[2] for ev, v in self.lp_seen.items()}}, errs
+        return {"groups": groups, "events": {ev: v[1] for ev, v in self.lp_seen.items()}}, errs
 
     async def prints_loop(self):
         loop = asyncio.get_running_loop()
@@ -1347,9 +1345,7 @@ class ArbsRunner:
                 rows = self.prints.take(time.time())
                 self.n["prints_recorded"], self.n["prints_dropped"] = self.prints.rows, self.prints.dropped
                 if rows and self.cfg.runtime.live_params_shadow:
-                    view, errs = await loop.run_in_executor(self.pool, self._shadow_live, rows)
-                    self.lp_paths = view.pop("paths")
-                    self.lp_view = view
+                    self.lp_view, errs = await loop.run_in_executor(self.pool, self._shadow_live, rows)
                     self.n["shadow_errors"] = self.n.get("shadow_errors", 0) + errs
                     if time.time() - self.lp_logged >= SHADOW_LOG_S:
                         self.lp_logged = time.time()
@@ -1357,8 +1353,8 @@ class ArbsRunner:
                         # An arb left uneven until settlement never closes.
                         for k in [k for k, c in self.cycles.items() if time.time() - c["t"] > SHADOW_PRUNE_S]:
                             del self.cycles[k]
-                        sizes = {ev: self.shadow_size(p) for ev, p in self.lp_paths.items()}
-                        self.journal({"kind": "live_params", **self.lp_view, "sizes": sizes})
+                        mults = {k[0]: round(v, 4) for k, v in self.lsizer.m.items() if len(k) == 1}
+                        self.journal({"kind": "live_params", **self.lp_view, "size_mults": mults})
                         # lp is only touched by the one _shadow_live call at a time, awaited above.
                         edges = await loop.run_in_executor(self.pool, self.lp.state)
                         await loop.run_in_executor(self.write_pool, self._save_lp_state, edges, self.lsizer.state())
@@ -1409,10 +1405,14 @@ class ArbsRunner:
         self.dirty.add(b.basket_id)
 
     def _cycle_open(self, b: Basket, pos):
-        """A fill on an even basket while live starts an arb for the sizer."""
+        """A fill on an even basket starts an arb for the shadow sizer."""
         if (self.cfg.runtime.live_params_shadow and b.basket_id not in self.cycles
-                and not pos.unhedged(b.tickers) and self.live_now(b, _utc())):
-            self.cycles[b.basket_id] = {"t": time.time(), "b0": pos.bundles(b.tickers), "cash": 0.0, "lots": {}}
+                and not pos.unhedged(b.tickers)):
+            now = _utc()
+            self.cycles[b.basket_id] = {
+                "t": time.time(), "b0": pos.bundles(b.tickers), "cash": 0.0, "lots": {},
+                "tte_h": None if b.settles is None else (b.settles - now).total_seconds() / 3600.0,
+                "live": self.live_now(b, now)}
 
     def _cycle_add(self, b: Basket, ticker: str | None, size: float, cash: float):
         """Count a fill's cash (an unwind's net of the $1 a pair) and close the
@@ -1433,17 +1433,20 @@ class ArbsRunner:
             return
         bundles = pos.bundles(b.tickers) if pos is not None else 0.0
         pnl = b.payout * (bundles - c["b0"]) - c["cash"]
-        path = self._lp_path(b.legs[0].ticker)
-        before = self.lsizer.mult(path)
-        self.lsizer.update(path, 100.0 * pnl / lots, time.time())
-        self.journal({"kind": "live_size", "basket_id": b.basket_id, "path": list(path), "lots": lots,
-                      "pnl": round(pnl, 4), "mult_before": round(before, 4),
-                      "mult": round(self.lsizer.mult(path), 4),
-                      "size": self.shadow_size(path)})
-
-    def shadow_size(self, path: tuple) -> float:
-        """What the sizer would quote live: live_quote_size scaled, at least 1."""
-        return max(1.0, round(self.cfg.trading.live_quote_size * self.lsizer.mult(path)))
+        bucket, factor = lparams.tte_bucket(c["tte_h"])
+        g, s, e = self._lp_path(b.legs[0].ticker)
+        path = None if bucket == lparams.FAR else (f"{g}|{bucket}", s, e)
+        before = mult = 1.0
+        if path is not None:
+            before = self.lsizer.mult(path)
+            self.lsizer.update(path, 100.0 * pnl / lots, time.time())
+            mult = self.lsizer.mult(path)
+        base = self.cfg.trading.live_quote_size if c["live"] else self.cfg.trading.quote_size
+        self.journal({"kind": "size_shadow", "basket_id": b.basket_id, "group": g, "series": s, "event": e,
+                      "tte_h": None if c["tte_h"] is None else round(c["tte_h"], 2), "bucket": bucket,
+                      "live": c["live"], "lots": lots, "pnl": round(pnl, 4), "factor": factor,
+                      "mult_before": round(before, 4), "mult": round(mult, 4),
+                      "size": max(1.0, round(base * factor * mult))})
 
     def _lp_state_path(self) -> str:
         return os.path.join(self.root, "live_params_state.json")

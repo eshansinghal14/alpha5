@@ -166,24 +166,39 @@ class LiveParams:
             self.choice[tuple(key)] = v
 
 
-# Live size multipliers. Replay of 2,119 in-play arbs 10-28..11-10 (actual +$131,
-# 11-10 -$325): start 0.10, up 0.01 / down 0.10 per cent of a lot's result made
-# +$270 with no day under -$3; starting at full size made +$434 but kept 11-10 at -$25.
-SIZE_START = 0.10
+# Size by hours to settlement, relative to arbs settling over a day out. Mean/variance
+# per lot over 4,410 arbs 10-28..11-10: >24h 0.139, 6-24h 0.046, under 6h below zero
+# (kept at a quarter so those arbs still teach the sizer). Those fills scaled by this
+# table made +$1,501 vs +$1,479 actual, with no losing day (11-10 had been -$138).
+TTE_SIZE = ((6.0, "<6h", 0.25), (24.0, "6-24h", 0.5))
+FAR = ">24h"
+
+
+def tte_bucket(hours: float | None) -> tuple[str, float]:
+    """(bucket, size factor) for an arb settling in `hours`; unknown counts as near."""
+    for top, name, f in TTE_SIZE:
+        if hours is None or hours < top:
+            return name, f
+    return FAR, 1.0
+
+
+# Learned multipliers, same replay, keyed by (group|bucket, series, event) and learned
+# only under 24h: start 1, up 0.01 / down 0.05 made +$1,535 and live table tennis +$5
+# (-$53 without). Learning past 24h too cut far arbs after one loss: -$311.
+SIZE_START = 1.0
 SIZE_UP = 0.01
-SIZE_DOWN = 0.10
+SIZE_DOWN = 0.05
 SIZE_FLOOR = 0.01
 SIZE_CLIP_C = 30.0
 
 
 class LiveSizer:
-    """A multiplier on live_quote_size per group, series and event, learned from
-    our own finished live arbs: m *= exp(rate * cents per lot), the rate SIZE_DOWN
-    on a loss and SIZE_UP on a gain, so a group earns size slowly and a bad
-    fill cuts it at once. Real fills, not replayed prints: replay at the
-    quote's lag scored live table tennis positive while it lost ~20c a lot
-    (11-10). A group or series never seen starts at SIZE_START; an event
-    starts at 1 (its group and series already carry the prior)."""
+    """A size multiplier per group, series and event, learned from our own
+    finished arbs: m *= exp(rate * cents per lot), the rate SIZE_DOWN on a loss
+    and SIZE_UP on a gain, so a bad fill cuts size at once and wins earn it
+    back slowly. Real fills, not replayed prints: replay at the quote's lag
+    scored live table tennis positive while it lost ~20c a lot (11-10). A group
+    or series never seen starts at SIZE_START; an event starts at 1."""
 
     def __init__(self, start=SIZE_START, up=SIZE_UP, down=SIZE_DOWN, floor=SIZE_FLOOR, clip_c=SIZE_CLIP_C):
         self.start, self.up, self.down, self.floor, self.clip_c = start, up, down, floor, clip_c

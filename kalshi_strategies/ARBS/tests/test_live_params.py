@@ -99,3 +99,11 @@ def test_live_state_survives_a_restart():
     t = LiveSizer()
     t.load(s.state())
     assert t.mult(("g", "s", "e")) == s.mult(("g", "s", "e"))
+
+
+def test_tte_buckets_size_near_arbs_down():
+    from kalshi_strategies.ARBS.live_params import tte_bucket
+    assert tte_bucket(2.0) == ("<6h", 0.25)
+    assert tte_bucket(12.0) == ("6-24h", 0.5)
+    assert tte_bucket(48.0) == (">24h", 1.0)
+    assert tte_bucket(None) == ("<6h", 0.25)
