@@ -1666,9 +1666,9 @@ class ArbsRunner:
             if not (self.live and self.cfg.trading.max_dollars_auto):
                 continue
             try:
-                got = {s: await self.gw.call(c.balance_and_positions, s) for s, c in self.gw.clients.items()}
-                self.cash = {s: v[0] for s, v in got.items()}
-                self.pos_value = {s: v[1] for s, v in got.items()}
+                cash, value = await self.gw.call(self.gw.any_client().shard_balances)
+                self.cash = {s: cash.get(s, 0.0) for s in self.gw.clients}
+                self.pos_value = {"all": value}
                 self.cash_at = time.time()
                 if self.cash_at - self.balance_logged >= BALANCE_LOG_S:
                     self.balance_logged = self.cash_at
@@ -2971,7 +2971,8 @@ class ArbsRunner:
             self.alert("error", None, "arm refused: no order clients")
             return False
         try:
-            bal = {s: await self.gw.call(c.balance, s) for s, c in self.gw.clients.items()}
+            cash, _ = await self.gw.call(self.gw.any_client().shard_balances)
+            bal = {s: cash.get(s, 0.0) for s in self.gw.clients}
         except Exception as e:
             self.alert("error", None, f"arm refused: balance read failed ({e!r})")
             return False

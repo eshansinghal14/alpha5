@@ -911,6 +911,17 @@ class KalshiOrderClient:
         data = resp.json()
         return _dollars(data, "balance") or 0.0, float(data.get("portfolio_value") or 0) / 100.0
 
+    def shard_balances(self) -> tuple[dict[int, float], float]:
+        """({shard: available balance}, the account's positions' value), in
+        dollars, from one unscoped read: reading each shard's balance back to
+        back drew 429s on the second every poll (2026-11-11)."""
+        resp = self._session.get(BASE_URL + BALANCE_PATH, headers=self._headers("GET", BALANCE_PATH),
+                                 timeout=self.timeout_s)
+        resp.raise_for_status()
+        data = resp.json()
+        cash = {int(r["exchange_index"]): float(r["balance"]) for r in data.get("balance_breakdown") or []}
+        return cash, float(data.get("portfolio_value") or 0) / 100.0
+
     def target_allocation(self) -> dict:
         """Kalshi's auto-rebalance target: {"allocations": {shard: percent},
         "resting_margin_reservation": ...}. Empty allocations = rebalancing off."""
