@@ -296,8 +296,11 @@ def _shadow_check(series: str, days: int = 7):
         x = docs[-1]
         st.caption(f"{x['day']}. Replay of each quote-started arb at its real edge and size vs what it made "
                    "(on the arbs the replay fills):")
-        st.dataframe(pd.DataFrame(x["calibration"])[["group", "arbs", "matched", "filled", "lots", "real_usd",
-                                                    "real_c", "shadow_c"]], hide_index=True)
+        if x["calibration"]:
+            st.dataframe(pd.DataFrame(x["calibration"])[["group", "arbs", "matched", "filled", "lots", "real_usd",
+                                                        "real_c", "shadow_c"]], hide_index=True)
+        else:
+            st.caption("No finished quote-started arbs that day.")
         st.caption(f"Every print our quote met, $ for a {x['policy_size']:g}-lot quote at each edge, and at the "
                    "shadow's choice (live events it had seen):")
         st.dataframe(pd.DataFrame([{"group": p["group"], "live": p["live"], "prints": p["prints"],
