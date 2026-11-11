@@ -1949,3 +1949,23 @@ def test_shard3_process_trades_only_its_scan(tmp_path, monkeypatch):
     assert r.cfg.scan.shards == [3] and not r.cfg.scan.hand_spec
     assert r.hand == [] and r.root.endswith("ARBS3")
     assert R.ArbsRunner(SERIES["ARBS"], live_trading=False).hand            # the first keeps the hand spec
+
+
+def test_a_scanned_basket_on_another_processes_shard_is_not_traded(arbs):
+    r, b = arbs
+    assert not r.excluded(b)
+    for tk in ("X-A", "X-B"):
+        r.meta[tk] = dataclasses.replace(r.meta[tk], shard=3)
+    assert r.excluded(b)                                   # ARBS scans shard 0; ARBS3 trades this one
+
+
+def test_feed_with_no_markets_yet_waits_for_its_first_scan():
+    from kalshi_strategies.ARBS.feed import MultiFeed
+
+    async def go():
+        f = MultiFeed([], lambda *a: None, lambda *a: None, label="t")
+        task = asyncio.create_task(f.run())
+        await asyncio.sleep(0.2)
+        assert not task.done()                             # waiting, not raised
+        task.cancel()
+    asyncio.run(go())

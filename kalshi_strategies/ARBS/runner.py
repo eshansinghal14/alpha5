@@ -322,6 +322,7 @@ class ArbsRunner:
         with open(SPEC_PATH, encoding="utf-8") as fh:
             self.hand_doc = json.load(fh)
         self.hand = load_spec(SPEC_PATH) if self.cfg.scan.hand_spec else []
+        self.hand_ids = {b.basket_id for b in self.hand}
         self.scan_path = os.path.join(self.root, scanner.SELECTED)
         self.scan_status: dict = {}
         # LIPFARM's claims (live): tickers we neither take nor quote, and its
@@ -757,6 +758,10 @@ class ArbsRunner:
         the horizon."""
         ex = self.cfg.watch.exclude
         if ex and (b.basket_id in ex or b.relationship_id in ex or b.cluster in ex):
+            return True
+        # A scanned basket on a shard this process no longer scans (another
+        # process's, ARBS3) stays only to finish its position, not to quote.
+        if b.basket_id not in self.hand_ids and (s := self.basket_shard(b)) is not None                 and s not in self.cfg.scan.shards:
             return True
         if lip and self.lip_blocked(b):
             return True

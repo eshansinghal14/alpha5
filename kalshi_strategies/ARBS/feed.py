@@ -71,8 +71,10 @@ class MultiFeed(LiveKalshiFeed):
         self.up = up
 
     async def run(self):
-        if not self._tickers:
-            raise ValueError(f"[{self.label}] no Kalshi markets to subscribe to")
+        # A new process (ARBS3 11-11) starts with none until its first scan
+        # lands; raising here left its feed down for good.
+        while not self._tickers:
+            await asyncio.sleep(1.0)
         sub_id = 1
         while True:
             try:
