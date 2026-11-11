@@ -333,7 +333,7 @@ def run(cfg, hand_doc: dict, spec_path: str, held: set[str] = frozenset()) -> di
 SELECTED = "scanned_selected.json"
 
 
-def scan_and_select(root: str) -> dict:
+def scan_and_select(root: str, config_path: str | None = None) -> dict:
     """Blocking, and meant for a child process: a scan holds ~1 GB of
     temporary objects that Python keeps after freeing them, so scanning in
     the trading process grew it ~430 MB a scan until the OOM killer took it
@@ -344,9 +344,10 @@ def scan_and_select(root: str) -> dict:
     from kalshi_strategies.ARBS.config import CONFIG_PATH, SPEC_PATH, ArbsConfig
     from kalshi_strategies.ARBS.spec import load_spec
 
-    cfg = ConfigStore(ArbsConfig, CONFIG_PATH, None).config
+    cfg = ConfigStore(ArbsConfig, config_path or CONFIG_PATH, None).config
     with open(SPEC_PATH, encoding="utf-8") as fh:
         hand = json.load(fh)
+    known = {t for b in load_spec(SPEC_PATH) for t in b.tickers} if cfg.scan.hand_spec else set()
     held = set()
     for name in ("ledger.json", "ledger_shadow.json"):
         try:
@@ -356,7 +357,7 @@ def scan_and_select(root: str) -> dict:
             pass
     doc = run(cfg, hand, os.path.join(root, "scanned_spec.json"), held)
     sel = select(doc, now=pd.Timestamp.now(tz="UTC"), days=cfg.trading.days_till_expiry,
-                 max_markets=cfg.scan.max_markets, known_tickers={t for b in load_spec(SPEC_PATH) for t in b.tickers},
+                 max_markets=cfg.scan.max_markets, known_tickers=known,
                  held=held, exclude=set(cfg.watch.exclude))
     atomic_write_json(os.path.join(root, SELECTED), sel, indent=None)
     return {"listed_markets": doc["n_markets"], "selected_relationships": len(sel["relationships"])}
@@ -378,4 +379,4 @@ if __name__ == "__main__":
         pass
     root = sys.argv[1] if len(sys.argv) > 1 else os.path.join(LIVE_ROOT, "ARBS")
     os.makedirs(root, exist_ok=True)
-    print(json.dumps(scan_and_select(root)))
+    print(json.dumps(scan_and_select(root, sys.argv[2] if len(sys.argv) > 2 else None)))

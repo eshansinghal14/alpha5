@@ -1940,3 +1940,12 @@ def test_an_unwound_live_arb_counts_its_loss(arbs):
     r._book(live.basket_id, "X-A", "no", 100, 68.54, "unwind")   # VORSLE 11-10: -$9.54
     got = [x for x in rows if x["kind"] == "size_shadow"]
     assert len(got) == 1 and got[0]["pnl"] == pytest.approx(-9.54)
+
+
+def test_shard3_process_trades_only_its_scan(tmp_path, monkeypatch):
+    monkeypatch.setattr(R, "LIVE_ROOT", str(tmp_path))
+    from kalshi_strategies.ARBS import SERIES
+    r = R.ArbsRunner(SERIES["ARBS3"], live_trading=False)
+    assert r.cfg.scan.shards == [3] and not r.cfg.scan.hand_spec
+    assert r.hand == [] and r.root.endswith("ARBS3")
+    assert R.ArbsRunner(SERIES["ARBS"], live_trading=False).hand            # the first keeps the hand spec

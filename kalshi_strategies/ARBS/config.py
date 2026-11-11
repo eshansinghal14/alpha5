@@ -9,6 +9,7 @@ import os
 from kalshi_infra.config import param, section
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
+CONFIG3_PATH = os.path.join(os.path.dirname(__file__), "config_shard3.json")
 SPEC_PATH = os.path.join(os.path.dirname(__file__), "Kalshi arb baskets spec.json")
 
 
@@ -163,6 +164,9 @@ class ScanParams:
     live_windows: dict[str, list[str]] = param("Kalshi category -> [from, until] UTC: its events are live "
                                                "(live size, edge and exits) from `from`, for scans before "
                                                "`until` (election results night).", editable=False)
+    hand_spec: bool = param("Trade the hand spec's baskets besides the scan's. Off for a second process "
+                            "scanning other shards (ARBS3): the hand spec's markets belong to the first.",
+                            editable=False)
     live_before_settle_h: float = param("Hours before expected settlement an event without a kickoff turns live "
                                         "(live size, edge, exits). Non-sports arbs started within "
                                         "6h of settlement netted -$3 over 10-28..11-09, then -$179 on 11-10; "

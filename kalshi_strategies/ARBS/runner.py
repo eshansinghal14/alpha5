@@ -321,7 +321,7 @@ class ArbsRunner:
         self.ranking: list[dict] = []
         with open(SPEC_PATH, encoding="utf-8") as fh:
             self.hand_doc = json.load(fh)
-        self.hand = load_spec(SPEC_PATH)
+        self.hand = load_spec(SPEC_PATH) if self.cfg.scan.hand_spec else []
         self.scan_path = os.path.join(self.root, scanner.SELECTED)
         self.scan_status: dict = {}
         # LIPFARM's claims (live): tickers we neither take nor quote, and its
@@ -656,7 +656,7 @@ class ArbsRunner:
                     t0 = time.monotonic()
                     # A child process: the scan's memory goes back when it exits.
                     proc = await asyncio.create_subprocess_exec(
-                        sys.executable, "-m", "kalshi_strategies.ARBS.scanner", self.root,
+                        sys.executable, "-m", "kalshi_strategies.ARBS.scanner", self.root, self.store.path,
                         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
                     out, err = await asyncio.wait_for(proc.communicate(), timeout=600)
                     if proc.returncode != 0:

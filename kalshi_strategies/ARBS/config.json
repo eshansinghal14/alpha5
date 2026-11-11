@@ -49,6 +49,7 @@
     "mecnet_max_legs": 6,
     "ladder_span": 3,
     "complete_set_exclude": [],
+    "hand_spec": true,
     "live_before_settle_h": 6.0,
     "live_windows": {}
   },
