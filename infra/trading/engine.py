@@ -148,6 +148,16 @@ def _post(loop, fn, fut):
 SWEEP_PASS_S = 0.5
 SWEEP_MAX_S = 15.0
 
+# Kalshi 429s /portfolio/balance far below the general read limit while ARBS
+# polls it, and the arm's one read failed up to 13 times in a row at 30 s
+# retries (11-04..11). A 429 retries a few times at 1 s, then falls back to the
+# last balance this process read on the shard, if it's from the last 20 min
+# (the previous event's arm); the arm only needs that shard to hold funds.
+ARM_BALANCE_TRIES = 3
+ARM_BALANCE_RETRY_S = 1.0
+ARM_BALANCE_MAX_AGE_S = 20 * 60.0
+_LAST_BALANCE: dict[int, tuple[float, float]] = {}    # shard -> (balance, time.time() read)
+
 
 @dataclasses.dataclass
 class LiveContext:
@@ -755,11 +765,33 @@ class LiveEngine:
         """Worker-thread safe: REST only, touches no engine state. Raises on
         any failed read. (shard, balance, positions, fills)."""
         shard = self.order_client.exchange_index(self.event_ticker)
-        balance = self.order_client.balance(exchange_index=shard)
+        balance = self._arm_balance(shard)
         real_positions = self.order_client.positions(self.event_ticker)
         past_fills = self.order_client.fills(self.event_ticker)
         self._og_open_blocking()
         return shard, balance, real_positions, past_fills
+
+    def _arm_balance(self, shard: int) -> float:
+        """The shard's balance, or on repeated 429s a recent one read earlier
+        (ARM_BALANCE_MAX_AGE_S). Any other error, or no recent read, raises."""
+        for attempt in range(ARM_BALANCE_TRIES):
+            try:
+                balance = self.order_client.balance(exchange_index=shard)
+            except Exception as exc:
+                if http_status(exc) != 429:
+                    raise
+                last_exc = exc
+                if attempt + 1 < ARM_BALANCE_TRIES:
+                    time.sleep(ARM_BALANCE_RETRY_S)
+                continue
+            _LAST_BALANCE[shard] = (balance, time.time())
+            return balance
+        cached = _LAST_BALANCE.get(shard)
+        if cached is not None and time.time() - cached[1] <= ARM_BALANCE_MAX_AGE_S:
+            print(f"[live] balance read 429'd {ARM_BALANCE_TRIES}x; using shard {shard}'s "
+                  f"${cached[0]:.2f} from {time.time() - cached[1]:.0f}s ago")
+            return cached[0]
+        raise last_exc
 
     # -----------------------------------------------------------------
     # Order group: Kalshi-side sweep stop

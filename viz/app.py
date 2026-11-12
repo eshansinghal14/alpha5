@@ -427,7 +427,9 @@ def main():
     if st.session_state.get(SERIES_KEY) not in every:
         st.session_state[SERIES_KEY] = every[0]
     series = st.session_state[SERIES_KEY]
-    live = {s for s in reg if read_summary(s) is not None}
+    # Today's summary alone kept a stopped process dotted until midnight UTC.
+    live = {s for s in reg if (x := read_summary(s)) is not None
+            and (summary_age_s(x) or 0.0) <= STALE_SUMMARY_S}
     labels = _labels()
     with st.sidebar:
         # One button per series under its heading: one radio can't carry headings,
