@@ -1095,6 +1095,27 @@ def test_bad_exit_flags_markets_live_until_a_clean_fill(arbs):
     assert not r.live_now(b, now) and not r.flagged
 
 
+def test_an_unwind_that_does_not_lose_leaves_the_markets_pre_game(arbs):
+    r, b = arbs
+    # 5 YES A bought at 0.20 with others bidding 0.45: netting out at A's 0.55 NO ask makes money,
+    # and beats completing at B's 0.80 YES ask.
+    book(r, "X-A", [(0.45, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.10, 10)], [(0.20, 10)])
+    r.shadow_ledger.record(b.basket_id, b.tickers, "X-A", "yes", 5, 5 * 0.20, time.time())
+    _eval(r, b)
+    assert b.basket_id not in r.shadow_ledger.baskets and r.shadow_ledger.settled[-1]["pnl"] > 0
+    assert not r.flagged
+
+
+def test_an_unwind_on_a_fast_move_flags_the_markets_live(arbs):
+    r, b = arbs
+    _broken(r, b)
+    _eval(r, b)
+    book(r, "X-A", [(0.25, 10)], [(0.35, 10)])      # the unwind runs 0.25 away
+    _eval(r, b)
+    assert b.basket_id not in r.shadow_ledger.baskets and set(r.flagged) == {"X-A", "X-B"}
+
+
 def test_live_edge_add_raises_the_quote_edge(arbs):
     r, b = arbs
     book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
@@ -1322,6 +1343,95 @@ def test_no_deep_quote_behind_a_fresh_arb_quote(arbs):
     book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
     _eval(r, live)
     assert (live.basket_id, 0) in r.quotes and not any(q.deep for q in r.quotes.values())
+
+
+def _near(r, b, second_level, **cfg):
+    """b pre-game. A's arb quote rests at its 0.40 limit, sized to the 10 at
+    B's 0.55 ask; B's next ask, 0.56, completes a quote at 0.39."""
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, **{
+        "quote_size": 100, "near_quote_size": 5000, "near_min_size": 100, "deep_quote_size": 0,
+        "max_bundles_per_basket": 10000, "max_dollars": 1e6, "requote_cooldown_s": 0.0, "depth_age_s": 0.0, **cfg})
+    book(r, "X-A", [(0.45, 100)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10), (0.44, second_level)])
+    _eval(r, b)
+    for q in list(r.quotes.values()):               # like a deep quote, it waits for an arb quote that has rested
+        q.placed_at -= R.DEEP_REQUOTE_S
+    _eval(r, b)
+
+
+def _b_depth(r, b, second_level):
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10), (0.44, second_level)])
+    _eval(r, b)
+
+
+def test_near_quote_rests_a_tick_under_a_pre_game_arb_quote_with_the_size_that_tick_adds(arbs):
+    r, b = arbs
+    rows = []
+    r.journal = rows.append
+    _near(r, b, 500)
+    main, near = r.quotes[(b.basket_id, 0)], r.quotes[(b.basket_id, 0, "deep")]
+    assert main.price == pytest.approx(0.40) and main.size == 10        # one level of B clears the edge at 0.40
+    assert near.near and near.price == pytest.approx(0.39) and near.size == 500 and near.edge > main.edge
+    assert (b.basket_id, 1, "deep") not in r.quotes                     # A has no second level for B's quote
+    assert [x for x in rows if x["kind"] == "quote" and x.get("near")][0]["deep"] is True
+
+
+def test_no_near_quote_when_off_too_small_or_live(arbs):
+    r, b = arbs
+    _near(r, b, 500, near_quote_size=0)
+    assert (b.basket_id, 0, "deep") not in r.quotes
+    _near(r, b, 500, near_min_size=1000)
+    assert (b.basket_id, 0, "deep") not in r.quotes
+    live = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
+    r.set_baskets([live])
+    r.hot = [live.basket_id]
+    _near(r, live, 500, quote_live_events=True, live_quote_size=100, live_edge_add=0.0)
+    assert (live.basket_id, 0) in r.quotes and (live.basket_id, 0, "deep") not in r.quotes
+
+
+def test_near_quote_is_cut_at_once_and_grown_only_after_a_while(arbs):
+    r, b = arbs
+    _near(r, b, 500)
+    near = r.quotes[(b.basket_id, 0, "deep")]
+    _b_depth(r, b, 420)
+    assert near.remaining == 500                    # within NEAR_SHRINK of it: left alone
+    _b_depth(r, b, 300)
+    assert near.remaining == 300                    # the exits take 300: cut now
+    _b_depth(r, b, 2000)
+    assert near.remaining == 300                    # more room, but it has just moved
+    near.moved_at -= R.DEEP_REQUOTE_S
+    near.placed_at -= R.DEEP_REQUOTE_S
+    _b_depth(r, b, 2000)
+    assert near.remaining == 2000
+
+
+def test_resting_near_quote_stays_down_to_half_its_minimum_then_goes(arbs):
+    r, b = arbs
+    _near(r, b, 500, near_min_size=400)
+    _b_depth(r, b, 250)
+    assert r.quotes[(b.basket_id, 0, "deep")].remaining == 250
+    _b_depth(r, b, 150)
+    assert (b.basket_id, 0, "deep") not in r.quotes
+    _b_depth(r, b, 250)                             # not enough to place a new one
+    assert (b.basket_id, 0, "deep") not in r.quotes
+
+
+def test_near_quote_is_sized_through_the_basket_the_arb_quote_is_priced_through(arbs):
+    r, b = arbs
+    c = _second_basket(r, b, (Leg("X-A", "yes"), Leg("X-C", "yes")))
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=100, near_quote_size=5000, near_min_size=100,
+                                        deep_quote_size=0, max_bundles_per_basket=10000, max_dollars=1e6,
+                                        requote_cooldown_s=0.0, depth_age_s=0.0)
+    book(r, "X-A", [(0.43, 100)], [(0.55, 10)])                 # A ask 0.45
+    book(r, "X-B", [(0.30, 10)], [(0.35, 10)])                  # B ask 0.65: b alone clears at 0.30
+    book(r, "X-C", [(0.40, 10)], [(0.45, 10), (0.44, 500)])     # C asks 0.55 x 10, 0.56 x 500
+    _eval(r, b)
+    for q in list(r.quotes.values()):
+        q.placed_at -= R.DEEP_REQUOTE_S
+    _eval(r, b)
+    main, near = r.quotes[(b.basket_id, 0)], r.quotes[(b.basket_id, 0, "deep")]
+    assert r.via[(b.basket_id, 0)] == c.basket_id and main.price == pytest.approx(0.40) and main.size == 10
+    assert near.near and near.price == pytest.approx(0.39) and near.size == 500
 
 
 def test_deep_gap_is_in_cents_not_ticks(arbs):

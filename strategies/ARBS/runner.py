@@ -119,6 +119,7 @@ class Quote:
     pending: bool = True        # create in flight
     kind: str = "arb"           # or "complete" / "unwind": resting on a broken basket's exit
     deep: bool = False          # the small second quote in the gap behind a live leg's arb quote
+    near: bool = False          # a deep quote resting one tick under a pre-game arb quote (near_plan)
     group: str | None = None    # Kalshi order group it rests in (live events, live_order_groups)
     booked_to: str | None = None  # basket its last fill was booked into (see book_target)
 
@@ -160,6 +161,11 @@ SWEEP_RETRIES, SWEEP_PACING_S = 5, 0.01
 # Least time between voluntary moves of a deep quote: it waits for a sweep,
 # so tracking every join in the gap only spends writes.
 DEEP_REQUOTE_S = 10.0
+# A resting near quote stays while it would still be NEAR_KEEP of near_min_size
+# (the exit depth it is sized to hovers around any threshold). It is cut at
+# once when what the exits take falls under NEAR_SHRINK of it, and grown or
+# repriced only every DEEP_REQUOTE_S: that depth changes on every print.
+NEAR_KEEP, NEAR_SHRINK, NEAR_GROW = 0.5, 0.8, 1.5
 # Longest an eval pass runs before letting the websocket reader in: a fill that
 # lands mid-pass isn't even read until the pass yields (fill -> exit decision
 # p99 was 176 ms with whole passes, 10-30/31). A yield costs microseconds.
@@ -482,9 +488,9 @@ class ArbsRunner:
         # live exit 7 s behind a burst of placements (FURIABB-2 10-29). Dirty
         # at start so ids read from a pre-split ledger reach their own file.
         self.ids_dirty = True
-        # ticker -> unix time a bad exit flagged it live: an unwind or a fast
-        # move means the market reprices like a live game (weather readings,
-        # news). Cleared by a clean completion or an even take on it.
+        # ticker -> unix time a bad exit flagged it live: a fast move, or an
+        # unwind that loses, means the market reprices like a live game (weather
+        # readings, news). Cleared by a clean completion or an even take on it.
         self.flagged: dict[str, float] = {}
         self.unpriced_alert_at: dict[str, float | None] = {}
         self._horizon: tuple[float, pd.Timestamp] | None = None
@@ -2060,6 +2066,44 @@ class ArbsRunner:
         return pricing.QuotePlan(leg=j, price=price, max_price=p.max_price, edge=edge,
                                  others_cost=p.others_cost), n
 
+    def near_plan(self, b: Basket, vs, j: int, main: Quote, need: float, resting: bool) -> tuple:
+        """(plan, size) for a second quote one tick under leg j's resting arb
+        quote on a pre-game basket, sized to the bundles that price adds: the
+        arb quote is sized to what the other legs complete at exactly its
+        price, often one level, and a tick lower takes in the next. (None, 0)
+        unless that adds near_min_size. Sweeps that ran through our pre-game
+        quotes where it would have been 1,000+ lots made it $3,245 on 23 fills
+        with one loser, replayed on prints 11-05..12; smaller ones lost. Not
+        held to depth_age_s: that ages the other legs' touch only, which the
+        arb quote has already used."""
+        t = self.cfg.trading
+        y, k, vy = b, j, vs
+        via = self.via.get((b.basket_id, j))
+        if via is not None:
+            # The arb quote is priced through another basket: so is this one.
+            leg = b.legs[j]
+            y = self.baskets.get(via)
+            k = None if y is None else next((i for i, l in enumerate(y.legs)
+                                             if l.ticker == leg.ticker and l.side == leg.side), None)
+            vy = self.views(y) if k is not None else None
+            if vy is None or self.live_now(y, _utc()):
+                return None, 0
+            need = edge_dollars(y.payout, t.min_edge + t.quote_edge_add)
+        lv = vy[k]
+        price = lv.ticks.down(main.price)
+        cap = min(float(t.near_quote_size), self.room_bundles(y, k) - main.remaining,
+                  float(self.quote_size_by_dollars(y)) - main.remaining)
+        least = max(1.0, t.near_min_size * (NEAR_KEEP if resting else 1.0))
+        if price < lv.ticks.lo - _EPS or cap < least:
+            return None, 0
+        total = pricing.depth_size(vy, k, y.payout, need, float(int(main.remaining + cap + _EPS)), at=price)
+        n = float(int(total - main.remaining + _EPS))
+        p = pricing.quote_leg(vy, k, y.payout, need, total) if n >= least else None
+        if p is None or price > p.max_price + _EPS:
+            return None, 0
+        edge = y.payout - p.others_cost - pricing.maker_cost(price, lv.maker_rate)
+        return pricing.QuotePlan(leg=j, price=price, max_price=p.max_price, edge=edge, others_cost=p.others_cost), n
+
     def deep_cap(self, b: Basket, j: int, live: bool) -> float:
         """Most bundles a deep quote on leg j may rest: deep_quote_size, held to
         the arb quote's own size cap and to the bundle and dollar room left
@@ -2097,6 +2141,7 @@ class ArbsRunner:
         11-07..08, 16 non-live deep fills at up to 400 made +$284, completing
         0.1 s or 1 s after the print."""
         t, reserve, acts = self.cfg.trading, self.cfg.runtime.write_reserve_tokens, []
+        near_on = on and not live and t.near_quote_size >= 1
         on = on and t.deep_quote_size >= 1
         for j, leg in enumerate(b.legs):
             dq = self.quotes.get((b.basket_id, j, "deep"))
@@ -2106,14 +2151,19 @@ class ArbsRunner:
                 if dq is not None:
                     acts.append(self.cancel_quote(dq, "pull"))
                 continue
-            if on and j in mains:
+            plan, size, near = None, 0, False
+            main = self.quotes.get((b.basket_id, j))
+            if dq is not None and dq.near and main is not None and main.pending:
+                continue                    # the arb quote is being re-placed: judge the near quote once it rests
+            if near_on and j in mains and main is not None and not main.pending:
+                plan, size = self.near_plan(b, vs, j, main, need, dq is not None and dq.near)
+                near = plan is not None
+            if plan is None and on and j in mains:
                 # A sweep fills both quotes: the deep one gets what the aged depth leaves.
-                main = self.quotes.get((b.basket_id, j))
                 aged = self.aged_room(b, j) - (main.remaining if main is not None else 0.0)
-                cap = min(self.deep_cap(b, j, live), max(aged, dq.remaining if dq is not None else 0.0))
+                held = dq.remaining if dq is not None and not dq.near else 0.0
+                cap = min(self.deep_cap(b, j, live), max(aged, held))
                 plan, size = self.deep_plan(b, vs, j, mains[j], need, cap)
-            else:
-                plan, size = None, 0
             if plan is None:
                 if dq is None:
                     continue
@@ -2130,20 +2180,25 @@ class ArbsRunner:
                     dq.max_price = p.max_price
                 else:
                     acts.append(self.cancel_quote(dq, "deep_off"))
-            elif dq is None:
+                continue
+            if dq is None:
                 # Only behind an arb quote that has rested a while: golf's
                 # overlapping baskets hand one side's arb quote back and forth
                 # every few 100 ms, and a deep quote followed each hop (10-30).
-                main = self.quotes.get((b.basket_id, j))
                 settled = main is not None and not main.pending and now - main.placed_at >= DEEP_REQUOTE_S
                 if settled and (not self.live or self.gw.can_afford(leg.ticker, "order", reserve)):
-                    acts.append(self.place_quote(self.new_quote(b, plan, size, deep=True)))
-            elif dq.price > plan.max_price + _EPS:
+                    acts.append(self.place_quote(self.new_quote(b, plan, size, deep=True, near=near)))
+                continue
+            past_limit = dq.price > plan.max_price + _EPS
+            cooled = now - max(dq.moved_at, dq.placed_at) >= DEEP_REQUOTE_S
+            stepped = vs[j].ticks.steps(plan.price, dq.price) >= t.requote_min_ticks
+            if near and dq.near:
+                move = size < NEAR_SHRINK * dq.remaining or (cooled and (stepped or size >= NEAR_GROW * dq.remaining))
+            else:
+                move = cooled and (stepped or abs(dq.remaining - size) > _EPS)
+            if past_limit or (move and (not self.live or self.gw.can_afford(leg.ticker, "amend", reserve))):
+                dq.near = near
                 acts.append(self.move_quote(dq, plan, size))
-            elif ((abs(dq.remaining - size) > _EPS or vs[j].ticks.steps(plan.price, dq.price) >= t.requote_min_ticks)
-                  and now - max(dq.moved_at, dq.placed_at) >= DEEP_REQUOTE_S):
-                if not self.live or self.gw.can_afford(leg.ticker, "amend", reserve):
-                    acts.append(self.move_quote(dq, plan, size))
             else:
                 dq.edge, dq.max_price = plan.edge, plan.max_price
         return acts
@@ -2527,7 +2582,9 @@ class ArbsRunner:
                       "orders": {t: [sd, n, p] for _, t, sd, n, _, p in orders}})
         if worse is not None and worse > _EPS:
             self.alert("warn", bid, f"{path} ${worse:.2f} worse than planned ({why})")
-        if path == "unwind" or why == "fast move":
+        # Not an unwind that doesn't lose: real arbs within 5 min of one made
+        # 3.8c/lot (225 arbs, 10-30..11-12), against -4.1c after a losing unwind.
+        if why == "fast move" or (path == "unwind" and why != "at plan"):
             self.flag_live(b, f"a {why} {path}")
         elif why == "at plan":
             self.unflag_live(b)
@@ -2597,11 +2654,12 @@ class ArbsRunner:
                 await asyncio.gather(*acts)
             self.spawn(run(), b.basket_id)
 
-    def new_quote(self, b: Basket, plan: pricing.QuotePlan, size: float, deep: bool = False) -> Quote:
+    def new_quote(self, b: Basket, plan: pricing.QuotePlan, size: float, deep: bool = False,
+                  near: bool = False) -> Quote:
         leg = b.legs[plan.leg]
         q = Quote(basket_id=b.basket_id, leg=plan.leg, ticker=leg.ticker, side=leg.side, price=plan.price,
                   size=size, cid=str(uuid.uuid4()), edge=plan.edge, max_price=plan.max_price,
-                  placed_at=time.time(), deep=deep)
+                  placed_at=time.time(), deep=deep, near=near)
         self.quotes[q.key] = q
         self._commit_cache = None
         return q
@@ -3418,7 +3476,7 @@ def flips(baskets: list[Basket]) -> dict[str, str]:
 
 
 def _deep(q: Quote) -> dict:
-    return {"deep": True} if q.deep else {}
+    return ({"deep": True, "near": True} if q.near else {"deep": True}) if q.deep else {}
 
 
 def datetime_iso(ts: float) -> str:
