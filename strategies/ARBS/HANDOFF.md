@@ -76,8 +76,10 @@ them where they differ.
   is a sweep. Sweeps 20c+ under the touch lost 2–5c/lot for 2–5c quotes and
   made 6–10c/lot for 15–20c ones. The model picks 15–20c on 16% of prints;
   there 5c made +$2.1 on 76 fills, 15c +$11.2 on 40, 20c +$7.8 on 20.
-- **Near quote** (`ab3e647`; `trading.near_quote_size`, 0 = off, and
-  `near_min_size` 1000): on a pre-game basket a second quote one tick under
+- **Near quote** (`ab3e647`; `trading.near_min_size`, 0 = off, 1000 is the
+  size that held up; capped at `quote_size` like any quote, so raising
+  `quote_size` raises it, the arb quote and non-live deep quotes together):
+  on a pre-game basket a second quote one tick under
   each arb quote, in the deep quote's slot (journal `deep` + `near`, fills
   `fill_kind: deep`), sized to the bundles the other legs complete at that
   price beyond the arb quote's own. The arb quote is sized to the exit depth
@@ -179,8 +181,9 @@ them where they differ.
    after the hold, are the two things to test.
    **Near quotes**: once on, compare real near fills (`near` quote rows,
    deep fills one tick under the arb fill) with the replay before raising
-   `near_quote_size`; a 5,000 total per side was the replay's $400/day, 2,000
-   its $170/day. Cash caps it: 4,000 bundles is ~$8k of shard 0's $16k.
+   `quote_size`; a 5,000 total per side was the replay's $400/day, 2,000
+   (today's `quote_size` 1000 for each quote) its $170/day. Cash caps it:
+   4,000 bundles is ~$8k of shard 0's $16k.
    **Quote price flips between baskets** on pre-game soccer legs (2-leg vs
    3-leg basket, ~18c apart): about half of 11-12's amends on CONCACAF legs
    were jumps of 5c+. Costs writes and queue place; not looked into.

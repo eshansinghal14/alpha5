@@ -1349,7 +1349,7 @@ def _near(r, b, second_level, **cfg):
     """b pre-game. A's arb quote rests at its 0.40 limit, sized to the 10 at
     B's 0.55 ask; B's next ask, 0.56, completes a quote at 0.39."""
     r.cfg.trading = dataclasses.replace(r.cfg.trading, **{
-        "quote_size": 100, "near_quote_size": 5000, "near_min_size": 100, "deep_quote_size": 0,
+        "quote_size": 5000, "near_min_size": 100, "deep_quote_size": 0,
         "max_bundles_per_basket": 10000, "max_dollars": 1e6, "requote_cooldown_s": 0.0, "depth_age_s": 0.0, **cfg})
     book(r, "X-A", [(0.45, 100)], [(0.35, 10)])
     book(r, "X-B", [(0.40, 10)], [(0.45, 10), (0.44, second_level)])
@@ -1378,14 +1378,16 @@ def test_near_quote_rests_a_tick_under_a_pre_game_arb_quote_with_the_size_that_t
 
 def test_no_near_quote_when_off_too_small_or_live(arbs):
     r, b = arbs
-    _near(r, b, 500, near_quote_size=0)
+    _near(r, b, 500, near_min_size=0)
+    assert (b.basket_id, 0, "deep") not in r.quotes
+    _near(r, b, 500, quote_size=50)                 # the near quote is held to quote_size, like any quote
     assert (b.basket_id, 0, "deep") not in r.quotes
     _near(r, b, 500, near_min_size=1000)
     assert (b.basket_id, 0, "deep") not in r.quotes
     live = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
     r.set_baskets([live])
     r.hot = [live.basket_id]
-    _near(r, live, 500, quote_live_events=True, live_quote_size=100, live_edge_add=0.0)
+    _near(r, live, 500, quote_live_events=True, live_quote_size=5000, live_edge_add=0.0)
     assert (live.basket_id, 0) in r.quotes and (live.basket_id, 0, "deep") not in r.quotes
 
 
@@ -1419,7 +1421,7 @@ def test_resting_near_quote_stays_down_to_half_its_minimum_then_goes(arbs):
 def test_near_quote_is_sized_through_the_basket_the_arb_quote_is_priced_through(arbs):
     r, b = arbs
     c = _second_basket(r, b, (Leg("X-A", "yes"), Leg("X-C", "yes")))
-    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=100, near_quote_size=5000, near_min_size=100,
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=5000, near_min_size=100,
                                         deep_quote_size=0, max_bundles_per_basket=10000, max_dollars=1e6,
                                         requote_cooldown_s=0.0, depth_age_s=0.0)
     book(r, "X-A", [(0.43, 100)], [(0.55, 10)])                 # A ask 0.45

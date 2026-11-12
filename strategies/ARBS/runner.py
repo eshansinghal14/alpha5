@@ -2068,10 +2068,10 @@ class ArbsRunner:
 
     def near_plan(self, b: Basket, vs, j: int, main: Quote, need: float, resting: bool) -> tuple:
         """(plan, size) for a second quote one tick under leg j's resting arb
-        quote on a pre-game basket, sized to the bundles that price adds: the
-        arb quote is sized to what the other legs complete at exactly its
-        price, often one level, and a tick lower takes in the next. (None, 0)
-        unless that adds near_min_size. Sweeps that ran through our pre-game
+        quote on a pre-game basket, sized to the bundles that price adds, up to
+        quote_size: the arb quote is sized to what the other legs complete at
+        exactly its price, often one level, and a tick lower takes in the next.
+        (None, 0) unless that adds near_min_size. Sweeps that ran through our pre-game
         quotes where it would have been 1,000+ lots made it $3,245 on 23 fills
         with one loser, replayed on prints 11-05..12; smaller ones lost. Not
         held to depth_age_s: that ages the other legs' touch only, which the
@@ -2091,7 +2091,7 @@ class ArbsRunner:
             need = edge_dollars(y.payout, t.min_edge + t.quote_edge_add)
         lv = vy[k]
         price = lv.ticks.down(main.price)
-        cap = min(float(t.near_quote_size), self.room_bundles(y, k) - main.remaining,
+        cap = min(float(t.quote_size), self.room_bundles(y, k) - main.remaining,
                   float(self.quote_size_by_dollars(y)) - main.remaining)
         least = max(1.0, t.near_min_size * (NEAR_KEEP if resting else 1.0))
         if price < lv.ticks.lo - _EPS or cap < least:
@@ -2141,7 +2141,7 @@ class ArbsRunner:
         11-07..08, 16 non-live deep fills at up to 400 made +$284, completing
         0.1 s or 1 s after the print."""
         t, reserve, acts = self.cfg.trading, self.cfg.runtime.write_reserve_tokens, []
-        near_on = on and not live and t.near_quote_size >= 1
+        near_on = on and not live and t.near_min_size >= 1
         on = on and t.deep_quote_size >= 1
         for j, leg in enumerate(b.legs):
             dq = self.quotes.get((b.basket_id, j, "deep"))

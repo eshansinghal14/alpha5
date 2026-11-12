@@ -83,13 +83,12 @@ class TradingParams:
     pull_window_s: float = param("Seconds the pull's peak depth is taken over.", min=0.05, max=30.0, step=0.05)
     pull_hold_s: float = param("Seconds a pulled side stays unquoted after the last pull signal.", min=0.0,
                                max=60.0, step=0.5)
-    near_quote_size: int = param("Pre-game baskets: most bundles in a second quote one tick under each arb "
-                                 "quote, sized to the bundles the other legs complete at that price beyond "
-                                 "the arb quote's own (it takes the deep quote's place on that leg). 0 = off.",
-                                 min=0, max=10000, step=100)
-    near_min_size: int = param("The near quote is placed only when it would be at least this many bundles. "
-                               "Replayed on prints 11-05..12, ones of 1,000+ made $3,245 on 23 fills with one "
-                               "loser; smaller ones lost $334.", min=1, max=10000, step=100)
+    near_min_size: int = param("Pre-game baskets: a second quote one tick under each arb quote, sized to the "
+                               "bundles the other legs complete at that price beyond the arb quote's own, up "
+                               "to quote_size, and placed only when that is at least this many bundles (it "
+                               "takes the deep quote's place on that leg). 0 = off. Replayed on prints "
+                               "11-05..12, ones of 1,000+ made $3,245 on 23 fills with one loser; smaller "
+                               "ones lost $334.", min=0, max=10000, step=100)
     deep_min_gap_ticks: int = param("Least gap, in cents (not a tapered market's 0.1c ticks), between the arb "
                                     "quote and the deep quote's price; a smaller "
                                     "gap gains too little over the arb quote to be worth the order.",
