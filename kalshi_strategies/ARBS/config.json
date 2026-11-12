@@ -52,6 +52,7 @@
     "complete_set_exclude": [],
     "hand_spec": true,
     "live_before_settle_h": 6.0,
+    "live_early_h": {"KXITFMATCH": 2.0, "KXITFWMATCH": 2.0, "KXATPCHALLENGERMATCH": 2.0, "KXWTACHALLENGERMATCH": 2.0},
     "live_windows": {}
   },
   "runtime": {

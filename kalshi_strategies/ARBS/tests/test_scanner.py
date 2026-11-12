@@ -209,6 +209,15 @@ def test_live_before_settlement_unless_a_kickoff():
     assert not b.is_live(pd.Timestamp("2026-11-14T19:00:00Z"))      # kickoff decides, not settlement
 
 
+def test_live_early_by_series():
+    e = event("KXITFMATCH-26NOV12AB", "MECNET", [mkt("KXITFMATCH-26NOV12AB-A"), mkt("KXITFMATCH-26NOV12AB-B")])
+    start = {"KXITFMATCH-26NOV12AB": "2026-11-12T15:43:00Z"}
+    b = next(iter(baskets(run([e], starts=start, early_h={"KXITFMATCH": 2.0})).values()))
+    assert b.is_live(pd.Timestamp("2026-11-12T13:43:00Z")) and not b.is_live(pd.Timestamp("2026-11-12T13:42:00Z"))
+    b = next(iter(baskets(run([e], starts=start, early_h={"KXATPMATCH": 2.0})).values()))
+    assert not b.is_live(pd.Timestamp("2026-11-12T15:24:00Z"))
+
+
 def test_live_window_by_category():
     win = {"Elections": ["2026-11-03T22:00:00Z", "2026-11-06T00:00:00Z"]}
     vote = event("SENATEX-26", "MECNET", buckets("SENATEX-26")) | {"category": "Elections"}

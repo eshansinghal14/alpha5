@@ -176,6 +176,10 @@ class ScanParams:
                                         "(live size, edge, exits). Non-sports arbs started within "
                                         "6h of settlement netted -$3 over 10-28..11-09, then -$179 on 11-10; "
                                         "0 = off.", min=0.0, max=72.0, step=1.0)
+    live_early_h: dict[str, float] = param("Series -> hours before its listed start its events turn live. "
+                                           "Lower-tier tennis starts before its listed time: pre-game ITF "
+                                           "quotes lost $44 (11-11 doubles) and $44 (11-12 singles, 19 min "
+                                           "before the listed start) to single fills.", editable=False)
 
 
 @section
