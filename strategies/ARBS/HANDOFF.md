@@ -49,6 +49,33 @@ them where they differ.
   +$198 of 7 fills 11-11..12; the model has no data above 100 lots). First
   results (11-11 23:39 → 11-12 16:00, CS2/NFL/NCAAMB only): +$18.75 on 22
   arbs, 2.3c/lot vs 2.0c/lot fixed the day before. Too little data to call.
+- **Model quoting fixes** (`21ccc89`, live 11-12 19:32 UTC), from a churn
+  check of 16:09–18:49 UTC (the model's own changes cause 2–3% of the writes on
+  the legs it quotes, ~1.4 tokens/s on shard 0; pull cancels and their
+  re-creates dominate, and live esports writes per resting leg-hour are the
+  same as on fixed quoting):
+  - A quote priced through another basket (`best_plan`) must clear the leg's
+    model edge too (`min_need`). The other baskets were priced at the config
+    edge (5c live) and undercut the model wherever a market side sits in 2+
+    baskets: on weather (72% of model-quoted sides) 40% of new quotes for
+    15–20c picks rested ~11c tighter and the quote flipped between the two
+    prices (amends of 5c+ 5–7 → 31 per resting leg-hour, writes 220 → 333, same
+    hours 11-11 vs 11-12). Soccer's hour on the model had the same leak (58%),
+    so it was not a clean test of the model's soccer edges. Each alternate
+    taking its own model pick was tried and dropped: a pick costs ~1.1 ms.
+  - A held pick that can't be priced no longer restarts at the model's pick
+    (586 times in 2.7 h, a narrow or grow with no hold, a quarter undone
+    within minutes). Size shrinks at once; a narrower pick waits the 120 s hold
+    and then moves to the widest edge that can be priced; size grows only if
+    the bigger size can be priced at the held edge; the hold clocks reset on a
+    real start. Such a leg rests no quote from that basket during the hold.
+- **Weather edges, replay 11-05..12** (34.8k live weather prints our quotes
+  met, 5-lot quote, pull rule applied): fixed 5c +$32, 4c +$32, 15c +$27
+  (half of it 11-10), 20c +$20; the model's pick +$44 (fitted on these days).
+  Even a 3c quote sits a median 9c under the touch on weather, so every fill
+  is a sweep. Sweeps 20c+ under the touch lost 2–5c/lot for 2–5c quotes and
+  made 6–10c/lot for 15–20c ones. The model picks 15–20c on 16% of prints;
+  there 5c made +$2.1 on 76 fills, 15c +$11.2 on 40, 20c +$7.8 on 20.
 - **Shard 3 / ARBS3** (`129265b`, `96c9976`, `b25d9e7`, `65ef47c`): per-shard
   hot budget (Kalshi bills a shard's writes to that shard), cash only from the
   scanned shards, one unscoped balance read for every shard (`5937f88`; a
@@ -100,24 +127,36 @@ them where they differ.
 
 1. **Model on soccer**: compare its soccer picks with our real soccer fills
    (it over-predicts exit cost on many-leg soccer baskets) before re-adding.
+   Its one hour live (11-12 16:11–17:28) ran with the alternate-basket leak,
+   so judge it on replay or a rerun, not on that hour.
 2. **Model results by group**: nightly check; watch for fill rates dropping as
    they did on soccer (fills/h fell from 12.6 to 5 in the first hour with all
-   groups on). Weather at 15–20c is intended (day-of weather sets lost
-   −$13 on 11-10..11 completing after a bucket jumped).
-3. **Pre-game on the model**: revisit after ~a week of live results; needs the
+   groups on). Weather: with `21ccc89` quotes rest at the model's edge, so
+   expect fewer weather fills; compare real fills at 15–20c with the replay
+   above once there are some (replay is validated only on narrow-edge fills).
+3. **Model's wide end**: it cannot tell 15c from 20c (exit loss is one bin
+   above 10c of edge, fill odds stop falling at 30c under the touch), so
+   wherever the quote is deep under the touch it takes the top of the grid;
+   15c replayed better than 20c on those weather prints. And live weather legs
+   spent 45% of leg-time at 20c and 11% at 15c (11-12 16:09–18:49) against 16%
+   of prints in replay: widening is immediate, narrowing back from 20c takes
+   2+ min a step. Finer bins above 10c, or narrowing straight to the pick
+   after the hold, are the two things to test.
+4. **Pre-game on the model**: revisit after ~a week of live results; needs the
    size grid extended above 100 once there is data there.
-4. **Record-only markets**: after a few days, rerun the excluded-markets test
+5. **Record-only markets**: after a few days, rerun the excluded-markets test
    (`~/scratch/excl_model.py` on the box: replay at the model's pick vs fixed
    rules, per series × live) on hockey, cricket and doubles. Live doubles
    already replayed positive under the model (+$2.8..11.6 over 2 days), but
    live tennis quoting is off.
-5. **Shadow sizer** (`live_params_shadow`, `df2ebb6`/`b024127`) and
+6. **Shadow sizer** (`live_params_shadow`, `df2ebb6`/`b024127`) and
    `regime_shadow` still run in shadow; the model supersedes the sizer —
    candidate for removal.
-6. **Pull rule** churn: ~3,900 pull cancels/h on live basketball (11-11);
+7. **Pull rule** churn: ~3,900 pull cancels/h on live basketball (11-11);
    each costs queue place and write tokens on write-bound shard 0. Worth a
-   look.
-7. Startup: both processes arm at once; one balance read can 429 and delay
+   look. On 11-12 a live esports leg had a queue-resetting write about every
+   10 s, 177 pull cancels per resting leg-hour.
+8. Startup: both processes arm at once; one balance read can 429 and delay
    arming ~1–3 min (seen 11-12 16:09). Staggering is a small fix.
 
 ## Ops (current practice; supersedes the 11-04 deploy recipe below)
@@ -125,9 +164,12 @@ them where they differ.
 - Box `ubuntu@3.131.100.179`, key `~/.ssh/alpha5-live-key.pem`, `/opt/alpha5`,
   `.venv/bin/python`. Log `data/live/arbs.out.log` (both processes print
   `[ARBS]`).
-- **Deploy code by file path**, never `git pull`/checkout of strategy configs:
-  `git show HEAD:<path> | ssh … "cat > /opt/alpha5/<path>"`, after checking
-  the box file equals the previous HEAD (`diff --strip-trailing-cr`). Then
+- **Deploy code by file path**, never `git pull`/checkout of strategy configs.
+  Since the 11-12 rename the box is a detached checkout of `origin/ec2-live`
+  with later files checked out on top: push, then on the box
+  `git fetch origin ec2-live`, check `git diff --cached --stat origin/ec2-live`
+  lists only the files you mean to change, and
+  `git checkout origin/ec2-live -- <files>`. Then
   `sudo systemctl restart alpha5-arbs` (and `alpha5-dashboard` when config.py
   or the page changed — a stale dashboard reports "config.json is invalid" on
   new keys).
@@ -139,7 +181,7 @@ them where they differ.
 - Bulk research on the box: `sudo systemd-run --uid=ubuntu --gid=ubuntu
   -p MemoryMax=2G -p Nice=19 …`, scripts in `~/scratch` (`/tmp/re.py`
   shadows the stdlib). Strategies have priority for CPU and memory.
-- Tests: `python -m pytest -q strategies/ARBS` (204) and
+- Tests: `python -m pytest -q strategies/ARBS` (199) and
   `infra/tests`. `test_slow_drift_keeps_resting` is flaky on Windows.
 
 ---
