@@ -14,7 +14,7 @@ Two to four bullets: where the money came from and where it leaked (which series
 slippage), compared with previous days.
 
 Before writing this section, go through ARBS's trades for the day on both shards (data/live/{ARBS,ARBS3}/journal/
-<date>.jsonl and kalshi_viz.arbs_pnl.bundle_log_all) and find the main drawdowns: the losing baskets and runs of losses that account
+<date>.jsonl and viz.arbs_pnl.bundle_log_all) and find the main drawdowns: the losing baskets and runs of losses that account
 for most of the day's losses. For each one:
 - Work out what happened: which legs filled, at what prices, what the book and the market did around the fill,
   and how completion or the exit went compared with the plan.

@@ -1,9 +1,9 @@
-kalshi_infra/keys.py
-kalshi_infra/secrets/
-kalshi_infra/logs/
-kalshi_infra/*_log.txt
+infra/keys.py
+infra/secrets/
+infra/logs/
+infra/*_log.txt
 data/
-kalshi_viz/static/
+viz/static/
 __pycache__/
 .venv/
 *.pem

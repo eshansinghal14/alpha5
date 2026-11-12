@@ -11,16 +11,16 @@ here.
   config, what comes from Kalshi, modes, guards, quoting (edge + LIP
   quotes), rate limit, rollover.
 - [`adding-a-strategy.md`](adding-a-strategy.md) — the contract a new
-  `kalshi_strategies/<FOLDER>` implements.
+  `strategies/<FOLDER>` implements.
 - [`CHANGES.md`](CHANGES.md) — reverse-chronological change log. Add
   one dated section per material change; keep entries short, link to
   deeper write-ups here.
 ## Quick start
 
 ```
-python -m kalshi_strategies.run --series ARBS KXCRYPTOLEAD15M   # shadow
-streamlit run kalshi_viz/app.py
-python -m pytest kalshi_infra/tests kalshi_strategies -q
+python -m strategies.run --series ARBS KXCRYPTOLEAD15M   # shadow
+streamlit run viz/app.py
+python -m pytest infra/tests strategies -q
 ```
 
 All commands run from the repo root.

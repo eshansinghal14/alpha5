@@ -1,0 +1,232 @@
+"""Per-basket holdings, persisted to disk.
+
+Kalshi only knows a net position per ticker, so which basket a contract
+belongs to exists nowhere but here. These positions live for weeks, so the
+ledger is saved after every change and reloaded at start; the audit checks
+its per-ticker sum against Kalshi.
+
+Kalshi nets YES against NO on one ticker (and credits $1 per pair). Two
+baskets holding opposite sides of the same ticker are still each correct
+here: the pair's $1 is what the two legs would have paid at settlement.
+"""
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+
+from infra.config import atomic_write_json
+
+_EPS = 1e-9
+MAX_LOTS = 8
+
+
+@dataclasses.dataclass
+class LegPos:
+    side: str = "yes"
+    qty: float = 0.0
+    cost: float = 0.0        # dollars paid incl. fees
+    # [qty, cost] per fill, oldest first. A ledger saved before lots has none:
+    # its contracts count at the average.
+    lots: list[list[float]] = dataclasses.field(default_factory=list)
+
+    @property
+    def avg(self) -> float:
+        return self.cost / self.qty if self.qty > _EPS else 0.0
+
+    def newest_cost(self, qty: float) -> float:
+        """Cost of the `qty` most recently bought contracts. A leg's contracts
+        beyond complete bundles are almost always its latest fill (the quote
+        fill that broke it), so they cost what that fill paid, not the leg's
+        average: at the average, an unwind moved cost between the netted
+        contracts and the bundles still held."""
+        qty = min(qty, self.qty)
+        left, cost = qty, 0.0
+        for n, c in reversed(self.lots):
+            if left <= _EPS:
+                break
+            take = min(n, left)
+            cost += c * take / n
+            left -= take
+        if left > _EPS:
+            rest_qty = self.qty - sum(n for n, _ in self.lots)
+            rest_cost = self.cost - sum(c for _, c in self.lots)
+            cost += rest_cost / rest_qty * left if rest_qty > _EPS else self.avg * left
+        return cost
+
+    def drop_newest(self, qty: float):
+        left = qty
+        while left > _EPS and self.lots:
+            n, c = self.lots[-1]
+            if n <= left + _EPS:
+                self.lots.pop()
+                left -= n
+            else:
+                self.lots[-1] = [n - left, c * (n - left) / n]
+                left = 0.0
+
+
+@dataclasses.dataclass
+class BasketPos:
+    legs: dict[str, LegPos] = dataclasses.field(default_factory=dict)   # ticker -> pos
+    broken_since: float | None = None       # unix time the basket first went uneven
+    # The basket's definition (spec.basket_to_dict), kept while it is held: a
+    # scanned basket can drop out of the scan before it settles.
+    spec: dict | None = None
+
+    def held(self, tickers: list[str]) -> list[float]:
+        return [self.legs.get(t, LegPos()).qty for t in tickers]
+
+    def bundles(self, tickers: list[str]) -> float:
+        return min(self.held(tickers)) if tickers else 0.0
+
+    def cost(self) -> float:
+        return sum(l.cost for l in self.legs.values())
+
+    def unhedged(self, tickers: list[str]) -> dict[str, float]:
+        b = self.bundles(tickers)
+        return {t: q - b for t, q in zip(tickers, self.held(tickers)) if q - b > _EPS}
+
+    def broken_spent(self, tickers: list[str]) -> float:
+        """Cost of the contracts beyond complete bundles, each leg's newest."""
+        b = self.bundles(tickers)
+        return sum(self.legs[t].newest_cost(self.legs[t].qty - b) for t in tickers
+                   if t in self.legs and self.legs[t].qty - b > _EPS)
+
+
+class Ledger:
+    def __init__(self, path: str | None):
+        self.path = path
+        # Quote ids live in their own file, saved on a timer: kept in the
+        # ledger they made every fill's save ~40 ms (0.9 MB, 10-29), and nine
+        # fills in one burst booked 240 ms late.
+        self.ids_path = None if path is None else os.path.splitext(path)[0] + "_quote_ids.json"
+        # Changes since the last full write, one line each: rewriting the whole
+        # file each second held the loop 44 ms (11k ids, 10-31).
+        self.ids_log_path = None if path is None else os.path.splitext(path)[0] + "_quote_ids.log.jsonl"
+        self._ids_pending: set[str] = set()
+        self.baskets: dict[str, BasketPos] = {}
+        # exchange order id -> {basket_id, ticker, side, retired_at}: every
+        # quote we placed, so a maker fill (websocket, REST backstop, or one
+        # taken while the process was down) finds its basket.
+        self.quote_ids: dict[str, dict] = {}
+        self.last_fill_ts: float | None = None
+        self.seen_trades: set[str] = set()
+        self.settled: list[dict] = []
+        if path and os.path.exists(path):
+            self._load()
+
+    def _load(self):
+        with open(self.path, encoding="utf-8") as fh:
+            d = json.load(fh)
+        for bid, b in d.get("baskets", {}).items():
+            self.baskets[bid] = BasketPos(legs={t: LegPos(**l) for t, l in b["legs"].items()},
+                                          broken_since=b.get("broken_since"), spec=b.get("spec"))
+        self.quote_ids = d.get("quote_ids", {})          # before the split
+        if os.path.exists(self.ids_path):
+            with open(self.ids_path, encoding="utf-8") as fh:
+                self.quote_ids = json.load(fh)
+        if os.path.exists(self.ids_log_path):
+            with open(self.ids_log_path, encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        oid, rec = json.loads(line)
+                    except ValueError:
+                        continue                  # a line cut short by a crash
+                    self.quote_ids[oid] = rec
+        self.last_fill_ts = d.get("last_fill_ts")
+        self.seen_trades = set(d.get("seen_trades", []))
+        self.settled = d.get("settled", [])
+
+    def save(self, now: float | None = None):
+        if not self.path:
+            return
+        atomic_write_json(self.path, {
+            "baskets": {bid: {"legs": {t: dataclasses.asdict(l) for t, l in b.legs.items()},
+                              "broken_since": b.broken_since, "spec": b.spec}
+                        for bid, b in self.baskets.items() if b.legs},
+            "last_fill_ts": self.last_fill_ts,
+            # Bounded: only dedupes quote fills replayed from the REST backstop.
+            "seen_trades": sorted(self.seen_trades)[-20000:],
+            "settled": self.settled,
+        }, indent=None)
+
+    def note_quote_id(self, oid: str):
+        """Mark a quote id added or changed, for the next flush_quote_ids."""
+        self._ids_pending.add(oid)
+
+    def flush_quote_ids(self):
+        """Append the noted ids' current records to the log."""
+        if not self.ids_log_path or not self._ids_pending:
+            return
+        lines = "".join(json.dumps([oid, self.quote_ids[oid]]) + "\n"
+                        for oid in self._ids_pending if oid in self.quote_ids)
+        with open(self.ids_log_path, "a", encoding="utf-8") as fh:
+            fh.write(lines)
+        self._ids_pending.clear()
+
+    def save_quote_ids(self, now: float):
+        """Full write, then an empty log. Log records are whole, so a crash
+        between the two only replays what the file already holds."""
+        if not self.ids_path:
+            return
+        # A retired quote's late fills arrive within seconds; an hour is ample.
+        self.quote_ids = {k: v for k, v in self.quote_ids.items()
+                          if v.get("retired_at") is None or now - v["retired_at"] < 3600}
+        atomic_write_json(self.ids_path, self.quote_ids, indent=None)
+        open(self.ids_log_path, "w").close()
+        self._ids_pending.clear()
+
+    def close(self, basket_id: str, row: dict):
+        """Move a fully settled basket to the settled history."""
+        self.baskets.pop(basket_id, None)
+        self.settled.append(row)
+        self.save()
+
+    def pos(self, basket_id: str) -> BasketPos:
+        return self.baskets.setdefault(basket_id, BasketPos())
+
+    def record(self, basket_id: str, tickers: list[str], ticker: str, side: str, qty: float, cost: float,
+               now: float):
+        b = self.pos(basket_id)
+        lp = b.legs.setdefault(ticker, LegPos(side=side))
+        lp.qty += qty
+        lp.cost += cost
+        lp.lots.append([qty, cost])
+        if len(lp.lots) > MAX_LOTS:       # only the newest few are ever beyond the bundles
+            n, c = (sum(x) for x in zip(*lp.lots[:-MAX_LOTS + 1]))
+            lp.lots[:-MAX_LOTS + 1] = [[n, c]]
+        if b.unhedged(tickers):
+            b.broken_since = b.broken_since or now
+        else:
+            b.broken_since = None
+        self.save(now)
+
+    def unwind(self, basket_id: str, tickers: list[str], ticker: str, qty: float, now: float) -> float:
+        """Net `qty` contracts out of a leg (we bought the other side; Kalshi
+        pays $1 a pair). The leg shrinks by its newest contracts, whose cost
+        is returned."""
+        b = self.baskets[basket_id]
+        lp = b.legs[ticker]
+        qty = min(qty, lp.qty)
+        basis = lp.newest_cost(qty)
+        lp.drop_newest(qty)
+        lp.qty -= qty
+        lp.cost -= basis
+        if lp.qty <= _EPS:
+            del b.legs[ticker]
+        if not b.legs:
+            del self.baskets[basket_id]
+        else:
+            b.broken_since = (b.broken_since or now) if b.unhedged(tickers) else None
+        self.save(now)
+        return basis
+
+    def net_by_ticker(self) -> dict[str, float]:
+        """Signed YES position per ticker summed over baskets (NO negative),
+        the way Kalshi's positions endpoint reports it."""
+        out: dict[str, float] = {}
+        for b in self.baskets.values():
+            for t, lp in b.legs.items():
+                out[t] = out.get(t, 0.0) + (lp.qty if lp.side == "yes" else -lp.qty)
+        return out

@@ -1,4 +1,4 @@
-﻿# Copy the gitignored secrets (keys.py and kalshi_infra/secrets/) to the server
+﻿# Copy the gitignored secrets (keys.py and infra/secrets/) to the server
 # over SSH, and the last few hours of crypto data the live process warms up
 # from (vol forecaster: 4 h of composite bars; burst calibration: 2 h of
 # prints). Never through git.
@@ -15,10 +15,10 @@ function Check($what) { if ($LASTEXITCODE -ne 0) { throw "$what failed (exit $LA
 $app = "/opt/alpha5"
 $ssh = @("-i", $Key, "-o", "StrictHostKeyChecking=accept-new")
 
-& ssh @ssh $Target "mkdir -p -m 700 $app/kalshi_infra/secrets; mkdir -p $app/data/kalshi_crypto/composite $app/data/kalshi_crypto/prints"
-& scp @ssh "$root\kalshi_infra\keys.py" "${Target}:$app/kalshi_infra/keys.py"; Check 'copy keys.py'
-& scp @ssh @(Get-ChildItem "$root\kalshi_infra\secrets\*" -File).FullName "${Target}:$app/kalshi_infra/secrets/"; Check 'copy private keys'
-& ssh @ssh $Target "chmod 600 $app/kalshi_infra/keys.py $app/kalshi_infra/secrets/*"; Check 'chmod secrets'
+& ssh @ssh $Target "mkdir -p -m 700 $app/infra/secrets; mkdir -p $app/data/kalshi_crypto/composite $app/data/kalshi_crypto/prints"
+& scp @ssh "$root\infra\keys.py" "${Target}:$app/infra/keys.py"; Check 'copy keys.py'
+& scp @ssh @(Get-ChildItem "$root\infra\secrets\*" -File).FullName "${Target}:$app/infra/secrets/"; Check 'copy private keys'
+& ssh @ssh $Target "chmod 600 $app/infra/keys.py $app/infra/secrets/*"; Check 'chmod secrets'
 $cut = (Get-Date).ToUniversalTime().AddHours(-$Hours)
 foreach ($sub in "composite", "prints") {
     $files = Get-ChildItem "$root\data\kalshi_crypto\$sub\*.parquet" |

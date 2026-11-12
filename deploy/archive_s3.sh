@@ -2,7 +2,7 @@
 # Moves recorded data older than KEEP_DAYS off the live box to S3, one tar per
 # folder and day, keyed by its path under data/: live/KXINXU/2026-10-14/journal.tar,
 # kalshi_crypto/books/2026-10-14.tar. The 60 GB disk was 95% full on 2026-10-30
-# at ~3.5 GB/day. Only day journals and the crypto recorders move; summaries,
+# at ~3.5 GB/day. Only day journals and the crypto and Polymarket recorders move; summaries,
 # *_df parquets and perf/ stay for the dashboard.
 #
 # Restore a day into the same layout, from any machine with access:
@@ -51,6 +51,16 @@ for dir in kalshi_crypto/*/; do
     else
       ship "$dir/$day.tar" "$dir"/*"$day"*.parquet || fail=1
     fi
+  done
+done
+# Polymarket US books are ~1.5 GB/day (2026-11-12) and are read off the box,
+# so they leave after one day instead of KEEP_DAYS.
+pm_cutoff=$(date -u -d "-1 days" +%F)
+for dir in polymarket_us/*/; do
+  dir=${dir%/}
+  for day in $(ls "$dir" | grep -oE '^20[0-9]{2}-[0-9]{2}-[0-9]{2}$'); do
+    [[ "$day" < "$pm_cutoff" ]] || continue
+    ship "$dir/$day.tar" "$dir/$day" || fail=1
   done
 done
 df -h / | tail -1

@@ -19,10 +19,10 @@ config and commits win.
 Where to look for more:
 - data/live/<SERIES>/<YYYY-MM-DD>/summary.json: current live state.
 - data/live/<SERIES>/perf/fills.parquet: every real fill with mo0/mo1/mo10/mo60 (c/contract), pnl_c, settled, event, role.
-- data/live/<SERIES>/<YYYY-MM-DD>/journal/{fills,orders,decisions,bbo}/part-*.parquet (kalshi_infra.runtime.journal.read_journal).
-- data/live/{ARBS,ARBS3}/journal/<date>.jsonl and ledger.json; kalshi_viz.arbs_pnl (load_all / bundle_log_all
+- data/live/<SERIES>/<YYYY-MM-DD>/journal/{fills,orders,decisions,bbo}/part-*.parquet (infra.runtime.journal.read_journal).
+- data/live/{ARBS,ARBS3}/journal/<date>.jsonl and ledger.json; viz.arbs_pnl (load_all / bundle_log_all
   combine the shards). Logs data/live/arbs3.{out,err}.log for shard 3.
-- Strategy code: kalshi_strategies/KXCRYPTOLEAD15M/, kalshi_strategies/ARBS/, shared quoting in kalshi_infra/trading/.
+- Strategy code: strategies/KXCRYPTOLEAD15M/, strategies/ARBS/, shared quoting in infra/trading/.
 - Logs: data/live/{run,arbs}.{out,err}.log (no timestamps; use tail). journalctl -u alpha5-<name>.
 - git: use `git -c safe.directory=/opt/alpha5 log ...` (plain git refuses the repo for this user).
 - Run analysis with /opt/alpha5/.venv/bin/python (cwd /opt/alpha5). The box has 7.7 GB shared with live trading

@@ -9,6 +9,6 @@ base = "dark"
 gatherUsageStats = false
 
 [server]
-# Serves kalshi_viz/static/ at /app/static/ -- how the live chart fetches its own
+# Serves viz/static/ at /app/static/ -- how the live chart fetches its own
 # data snapshot same-origin, without a second web server or CORS setup.
 enableStaticServing = true

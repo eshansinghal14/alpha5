@@ -6,7 +6,7 @@ guards, persistence and the dashboard are shared.
 ## 1. Folder
 
 ```
-kalshi_strategies/<FOLDER>/
+strategies/<FOLDER>/
   __init__.py      SERIES = {"<TICKER>": Series(...)}   (registered automatically by run.py)
   config.py        <X>Config section: shared sections + your own `pricing` section
   config.json      every value, no defaults anywhere
@@ -40,8 +40,8 @@ from these declarations.
 
 ## 3. Model
 
-`kalshi_infra/runtime/series.py` (`EventModel`) and
-`kalshi_infra/trading/fair.py` (`FairModel`) are the contract:
+`infra/runtime/series.py` (`EventModel`) and
+`infra/trading/fair.py` (`FairModel`) are the contract:
 
 | Method | Returns |
 |---|---|
@@ -69,11 +69,11 @@ SERIES = {"KXFOO": Series(ticker="KXFOO", config_cls=MyConfig, config_path=CONFI
 `pick_event(open_events, cfg, now)` chooses which open event to trade;
 `build_model(event, cfg)` is async and returns the EventModel.
 
-Then `python -m kalshi_strategies.run --series KXFOO` and the dashboard
+Then `python -m strategies.run --series KXFOO` and the dashboard
 picks it up.
 
 ## 5. Backtest
 
-Drive the same `Quoter` through `kalshi_backtest.engine.Backtest`, feeding
+Drive the same `Quoter` through `backtest.engine.Backtest`, feeding
 your fairs as `FairUpdate` external events. Fees come from
 `kalshi.fees.for_event` exactly as live.

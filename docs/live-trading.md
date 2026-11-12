@@ -1,20 +1,20 @@
 # Live trading architecture
 
-The "why" behind `kalshi_infra/runtime/session.py` and what it drives.
+The "why" behind `infra/runtime/session.py` and what it drives.
 Code-level details stay in the files.
 
 ## Layout
 
 ```
-kalshi_strategies/run.py          launcher: --series A B ..., one child process per series
-kalshi_strategies/<FOLDER>/       per-series pricing only (see adding-a-strategy.md)
-kalshi_infra/runtime/session.py   rollover + per-event loops (series-agnostic)
-kalshi_infra/trading/quoter.py    edge, takes, edge quotes, LIP quote (series-agnostic)
-kalshi_infra/trading/engine.py    order resolution: shadow fills or real Kalshi orders
-kalshi_infra/kalshi/              auth, REST, websocket feed, orders, fees, markets
-kalshi_infra/runtime/writer.py    writer process: snapshots, chart streams, journal
-kalshi_infra/runtime/persist.py   snapshot file formats the dashboard reads
-kalshi_viz/app.py                 dashboard (reads only; never launches a session)
+strategies/run.py          launcher: --series A B ..., one child process per series
+strategies/<FOLDER>/       per-series pricing only (see adding-a-strategy.md)
+infra/runtime/session.py   rollover + per-event loops (series-agnostic)
+infra/trading/quoter.py    edge, takes, edge quotes, LIP quote (series-agnostic)
+infra/trading/engine.py    order resolution: shadow fills or real Kalshi orders
+infra/kalshi/              auth, REST, websocket feed, orders, fees, markets
+infra/runtime/writer.py    writer process: snapshots, chart streams, journal
+infra/runtime/persist.py   snapshot file formats the dashboard reads
+viz/app.py                 dashboard (reads only; never launches a session)
 ```
 
 Per event the data path is:
@@ -38,11 +38,11 @@ GIL long enough to stall the loop past `max_signal_age_s`.
 ## Running
 
 ```
-python -m kalshi_strategies.run --series ARBS KXCRYPTOLEAD15M                       # folders: all their series
-python -m kalshi_strategies.run --only ARBS3                                         # one series of a folder
-python -m kalshi_strategies.run --only KXCRYPTOLEAD15M --event-ticker KXCRYPTOLEAD15M-26NOV121400  # one event, no rollover
-python -m kalshi_strategies.run --series KXCRYPTOLEAD15M --live-trading              # REAL orders from start
-streamlit run kalshi_viz/app.py
+python -m strategies.run --series ARBS KXCRYPTOLEAD15M                       # folders: all their series
+python -m strategies.run --only ARBS3                                         # one series of a folder
+python -m strategies.run --only KXCRYPTOLEAD15M --event-ticker KXCRYPTOLEAD15M-26NOV121400  # one event, no rollover
+python -m strategies.run --series KXCRYPTOLEAD15M --live-trading              # REAL orders from start
+streamlit run viz/app.py
 ```
 
 `--series` takes strategy folder names; `--only` takes series tickers.
@@ -66,7 +66,7 @@ quoted (2026-10-13). The trade-off: one crash takes down every member.
 ## Config
 
 Each strategy folder has a tracked `config.json`; nothing tunable has a
-default in code (`kalshi_infra/config.py` loads strictly: missing, unknown
+default in code (`infra/config.py` loads strictly: missing, unknown
 or out-of-range fields fail). The dashboard edits the file; the running
 session polls it every `runtime.control_poll_s`:
 
@@ -85,7 +85,7 @@ What is NOT in config, because Kalshi is the source of truth:
 
 ## Modes
 
-- **Shadow** (default): fills simulated via `kalshi_backtest.execution`,
+- **Shadow** (default): fills simulated via `backtest.execution`,
   after the measured one-way send latency plus the dispatch's processing
   time. Nothing is sent to Kalshi.
 - **Real** (`--live-trading`, or the dashboard checkbox): takes go out as
@@ -166,7 +166,7 @@ Per market and side (`trading/quoter.py` docstring has the formula):
     priority). At most once per side per 5s; one in the front quarter of the
     threshold may spend any token above `cancels_token`, the rest only spare
     ones (two creates' worth on top).
-  Why: `kalshi_strategies/KXCRYPTOLEAD15M/research/LIP_REPORT.md`.
+  Why: `strategies/KXCRYPTOLEAD15M/research/LIP_REPORT.md`.
 
 Every reason a side doesn't trade (`no_fair`, `stale_signal`,
 `outside_atm_set`, or a series `side_block` string) is logged per decision
@@ -193,7 +193,7 @@ file writes on the loop's default executor.
 streams every 3s when anything changed; `journal/` append-only parts
 (every 30s) that survive restarts and arming. The dashboard reads the
 session snapshot, not the decisions journal (that reaches hundreds of MB a
-day). Per-market chart streams go to `kalshi_viz/static/{series}/` so
+day). Per-market chart streams go to `viz/static/{series}/` so
 Streamlit serves them same-origin.
 
 ## Rollover

@@ -1,0 +1,406 @@
+"""
+Per-second composite price bars.
+
+Each `CompositeFeed` instance owns one coin's rolling 1s history. The
+spot-feed adapters push `VenueBook`s into it as they arrive; a
+`sample(now)` call pins the current CF Spot Rate at the wall-clock
+second.
+
+Why not emit on every book update: Kalshi settles on 60-sample TWAPs at
+exactly `[S-60, S)` and `[T-60, T)`. The one source of truth has to be
+these per-second samples; the nowcast on every update is a separate
+output used only for quoting responsiveness.
+
+Persistence (section 2.1, "Persist everything"): raw ticks are already
+caught by the adapters as they call back; this module appends 1s bars to
+`data/kalshi_crypto/composite/{coin}_{date}_{HH}.parquet`, one per hour. Hot path
+keeps them in memory; disk writes happen on `flush()` to avoid taking a
+GIL hit every second.
+"""
+from __future__ import annotations
+
+import collections
+import dataclasses
+import itertools
+import math
+import os
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from infra import DATA_ROOT as _DATA_ROOT
+
+from .cf_rate import compute_cf_spot, CFSpotResult
+from .spot_feed import VenueBook
+from .series import COINS
+
+
+@dataclasses.dataclass(frozen=True)
+class CompositeBar:
+    coin: str
+    ts_s: float               # wall-clock second (unix seconds)
+    price: float
+    utilized_depth: float
+    n_venues_in: int
+    n_venues_dropped: int
+    is_fallback: bool
+    fallback_mid: float | None
+    nowcast_count: int        # how many underlying venue-book updates landed in this second
+
+    @property
+    def mid(self) -> float:
+        """The PRICING series: median of venue top-of-book mids (= the raw
+        Coinbase BBO mid while Coinbase is the only venue). The CF-replica
+        `price` is kept for diagnostics only -- on thin books its weighting
+        flips between levels and adds persistent noise (HYPE: 40bp rms vs
+        the mid, 1s-signature 9.4x; 2026-10-08), which inflated HAR
+        forecasts ~16x and diluted correlations to ~0.2. The mid matched
+        the Kalshi winner on 6/7 settled events that day vs 4/7 for the
+        replica. Falls back to `price` for bars persisted without a mid."""
+        return self.fallback_mid if self.fallback_mid is not None else self.price
+
+
+DATA_ROOT = Path(_DATA_ROOT) / "kalshi_crypto" / "composite"
+
+# Multi-venue coins price on Coinbase's mid plus a slow offset to the venue
+# median, so a move Coinbase shows first is followed in full instead of being
+# outvoted by venues that haven't caught up. Other venues' books reach us
+# p50 25-166ms after their exchange time and Bitstamp/Bullish only snapshot
+# every 0.2-0.5s (recorder 10-21 14:00-21:00 UTC), against ~10ms for
+# Coinbase. Time constant of that offset (s); not calibrated beyond being
+# well past the slowest venue's lag.
+LEAD_OFFSET_TAU_S = 2.0
+LEAD_VENUE = "coinbase"
+
+
+def bar_filename(coin: str, hour: pd.Timestamp) -> str:
+    """{coin}_{YYYY-MM-DD}_{HH}.parquet. Older files are daily,
+    {coin}_{YYYY-MM-DD}.parquet; readers handle both."""
+    return f"{coin}_{hour.strftime('%Y-%m-%d')}_{hour.strftime('%H')}.parquet"
+
+
+def bar_files(coin: str, start_s: float, end_s: float, root: Path = DATA_ROOT) -> list[Path]:
+    """Files that can hold bars in [start_s, end_s], by name alone."""
+    lo = pd.Timestamp(start_s, unit="s", tz="UTC")
+    hi = pd.Timestamp(end_s, unit="s", tz="UTC")
+    out = []
+    for path in sorted(root.glob(f"{coin}_*.parquet")):
+        if ".tmp-" in path.name:   # a flush interrupted before its replace
+            continue
+        parts = path.stem.split("_")
+        try:
+            day = pd.Timestamp(parts[1], tz="UTC")
+            if len(parts) == 2:
+                first, last = day, day + pd.Timedelta(days=1)
+            else:
+                first = day + pd.Timedelta(hours=int(parts[2]))
+                last = first + pd.Timedelta(hours=1)
+        except (IndexError, ValueError):
+            continue
+        if first <= hi and last > lo:
+            out.append(path)
+    return out
+
+
+class CompositeFeed:
+    """One instance per coin. Holds the most recent per-venue `VenueBook`,
+    produces per-second composite bars + fast nowcast prices, and persists
+    the 1s bars to parquet."""
+
+    def __init__(self, coin: str, history_s: int = 3600,
+                 persist: bool = True, persist_dir: Path = DATA_ROOT,
+                 venues: tuple[str, ...] | None = None, venue_stale_s: float | None = None,
+                 depth_priced: bool = False):
+        """`venues`: which venues' books form the mid (None = every venue
+        observed). `venue_stale_s`: a venue whose book is older than this
+        leaves the median until it updates again. `depth_priced`: the pricing
+        mid (per message and in the bars) is the CF replica of the live books,
+        not the median touch mid."""
+        self.coin = coin
+        self.depth_priced = depth_priced
+        self.venues = None if venues is None else tuple(venues)
+        self.venue_stale_s = venue_stale_s
+        self._venue_books: dict[str, VenueBook] = {}
+        self._bars: collections.deque[CompositeBar] = collections.deque(maxlen=history_s)
+        self._nowcast: CFSpotResult | None = None
+        self._mid: float | None = None
+        self._nowcast_count: int = 0
+        self._bar_last_second_s: int | None = None
+        self._persist = persist
+        self._persist_dir = Path(persist_dir)
+        if self._persist:
+            self._persist_dir.mkdir(parents=True, exist_ok=True)
+        self._pending_disk: list[CompositeBar] = []
+        # ln(median / Coinbase mid), smoothed; and when it was last advanced.
+        self._lead_off: float | None = None
+        self._lead_t = 0.0
+        self.shadow_cb_mid: float | None = None
+        self.shadow_med_mid: float | None = None
+
+    def _lead_mid(self, live: list[VenueBook], median: float, now: float) -> float:
+        """Coinbase's mid shifted onto the venue median's level by the smoothed
+        offset. The plain median when Coinbase isn't among the live books."""
+        cb = next((b for b in live if b.venue == LEAD_VENUE), None)
+        cm = cb.mid() if cb is not None else None
+        # Shadow: both candidates at the same instant, for decision rows.
+        self.shadow_cb_mid, self.shadow_med_mid = cm, median
+        if cm is None or cm <= 0 or median <= 0:
+            self._lead_off = None
+            return median
+        gap = math.log(median / cm)
+        if self._lead_off is None:
+            self._lead_off = gap
+        else:
+            w = 1.0 - math.exp(-max(0.0, now - self._lead_t) / LEAD_OFFSET_TAU_S)
+            self._lead_off += w * (gap - self._lead_off)
+        self._lead_t = now
+        return cm * math.exp(self._lead_off)
+
+    def observe(self, vb: VenueBook):
+        """One update from any contributing venue. Updates stored venue
+        state and refreshes the nowcast.
+
+        Keeps the LAST good nowcast if this update can't produce a valid
+        composite (e.g. the only venue is momentarily one-sided or
+        resyncing). The feed-health monitor decides when a coin is too
+        stale to use; the nowcast itself should not flicker to None on a
+        single bad book and strand the pricer -- a DEGRADED coin is
+        priced off exactly this last-good value."""
+        if vb.coin != self.coin or (self.venues is not None and vb.venue not in self.venues):
+            return
+        self._venue_books[vb.venue] = vb
+        # Per message only the MID is needed (the pricing series). For most
+        # coins the CF replica only feeds diagnostics, so it runs once a second
+        # in sample(); on every message it was ~4ms x ~85 msg/s (deep books).
+        # A depth-priced coin runs it here on its 25-level view: ~0.23ms per
+        # HYPE message on the c7g box (2026-10-20).
+        live = self._live_books(vb.receive_ts)
+        mids = [b.mid() for b in live]
+        if mids:
+            m = float(np.median(mids))
+            if len(mids) > 1:
+                m = self._lead_mid(live, m, vb.receive_ts)
+            # A held through-the-touch print (Coinbase trade_px) is newer than
+            # any book, so it still wins while it holds.
+            if self.depth_priced and not any(b.trade_px is not None for b in live):
+                res = compute_cf_spot(self.coin, live)
+                if res is not None and not res.is_fallback:
+                    m = res.price
+            self._mid = m
+            prev = self._nowcast
+            self._nowcast = CFSpotResult(
+                coin=self.coin, price=prev.price if prev is not None else m,
+                utilized_depth=prev.utilized_depth if prev is not None else 0.0,
+                n_venues_in=len(mids), n_venues_dropped=len(self._venue_books) - len(mids),
+                drop_reasons={}, fallback_median_mid=m, is_fallback=prev is None)
+        self._nowcast_count += 1
+
+    def _live_books(self, now_mono: float) -> list[VenueBook]:
+        """Synced, two-sided books fresh enough to price on. A venue dropping
+        out shifts the median by its basis (a few tenths of a bp across
+        the constituents, recorder 2026-10-11) -- small next to keeping a
+        frozen book in."""
+        out = []
+        for b in self._venue_books.values():
+            if b.is_resyncing or b.mid() is None:
+                continue
+            if self.venue_stale_s is not None and now_mono - b.receive_ts > self.venue_stale_s:
+                continue
+            out.append(b)
+        return out
+
+    def touch(self, venue: str, receive_ts: float):
+        """The venue's connection is live and its book unchanged: advance the
+        book's freshness in place (the parent-side analog of
+        CoinbaseAdapter._mark_fresh, for books from the venue process)."""
+        b = self._venue_books.get(venue)
+        if b is not None and receive_ts > b.receive_ts:
+            b.receive_ts = receive_ts
+
+    def nowcast(self) -> CFSpotResult | None:
+        """Latest composite price given the latest known venue books, no
+        clock dependency. Used for quoting responsiveness."""
+        return self._nowcast
+
+    def mid_nowcast(self) -> float | None:
+        """Latest venue-median top-of-book mid -- the pricing series (see
+        CompositeBar.mid). Last-good value, same semantics as nowcast()."""
+        nc = self._nowcast
+        if nc is None:
+            return None
+        return nc.fallback_median_mid if nc.fallback_median_mid is not None else nc.price
+
+    def venue_books(self) -> list[VenueBook]:
+        return list(self._venue_books.values())
+
+    def sample(self, now_s: float) -> CompositeBar | None:
+        """Pin a composite bar for the wall-clock second containing
+        `now_s`. Idempotent per second: calling it repeatedly inside the
+        same second returns None after the first successful bar."""
+        second_s = int(now_s)
+        if self._bar_last_second_s is not None and second_s <= self._bar_last_second_s:
+            return None
+        import time as _time
+        books = self._live_books(_time.monotonic()) if self.venue_stale_s is not None else list(self._venue_books.values())
+        res = compute_cf_spot(self.coin, books)
+        if res is None:
+            # No sample this second -- do not advance last_second_s so
+            # the next tick can try again inside the same second if a
+            # venue update arrives.
+            return None
+        # A depth-priced coin's bars carry the replica as their mid, so the
+        # basis and vol are fitted on the same series the fair is priced on.
+        bar_mid = res.price if self.depth_priced and not res.is_fallback else res.fallback_median_mid
+        # Bars keep the plain median (the settlement-like series the basis is
+        # fitted on); the pricing mid stays the per-message one from observe(),
+        # or a lead move would snap back to the median once a second.
+        self._nowcast = dataclasses.replace(res, fallback_median_mid=self._mid if self._mid is not None else bar_mid)
+        bar = CompositeBar(
+            coin=self.coin, ts_s=float(second_s), price=res.price,
+            utilized_depth=res.utilized_depth,
+            n_venues_in=res.n_venues_in,
+            n_venues_dropped=res.n_venues_dropped,
+            is_fallback=res.is_fallback,
+            fallback_mid=bar_mid,
+            nowcast_count=self._nowcast_count,
+        )
+        self._bars.append(bar)
+        self._pending_disk.append(bar)
+        self._bar_last_second_s = second_s
+        self._nowcast_count = 0
+        return bar
+
+    def bars(self, since_s: float | None = None) -> list[CompositeBar]:
+        if since_s is None:
+            return list(self._bars)
+        return [b for b in self._bars if b.ts_s >= since_s]
+
+    def tail(self, n: int) -> list[CompositeBar]:
+        """The newest `n` bars, oldest first, without scanning the whole hour."""
+        return list(itertools.islice(reversed(self._bars), n))[::-1]
+
+    def newest_ts(self) -> float | None:
+        return self._bars[-1].ts_s if self._bars else None
+
+    def flush(self) -> int:
+        """Append any pending bars to parquet. Returns the number of
+        bars written. Rotates hourly (see bar_filename).
+
+        Done on a cadence by the caller -- NOT every bar -- because
+        `to_parquet` is CPU-bound pandas work (holds the GIL) and this is
+        a hot async loop. Call on a 10-30s cadence from a flush task.
+
+        Crash-safe (hardened 2026-10-07 after an ArrowInvalid storm):
+          * ATOMIC write -- serialise to a temp file, then os.replace onto
+            the target. A process killed mid-write (asyncio task cancelled
+            during shutdown, OOM, Ctrl-C) can only ever leave a stray .tmp,
+            never a half-written target whose parquet footer points past
+            the real bytes. The old in-place to_parquet produced exactly
+            that: a 25KB file whose footer claimed 827MB, which then made
+            EVERY subsequent flush raise on read and abort.
+          * RECOVER from a corrupt existing file -- if the read of `old`
+            fails, quarantine it (.corrupt-<ts>) and start the day's file
+            fresh from the pending bars rather than wedging the flush loop
+            forever.
+          * KEEP pending bars until the write actually succeeds -- the old
+            code cleared `_pending_disk` up front, so any exception dropped
+            that cadence's bars on the floor.
+        """
+        if not self._persist or not self._pending_disk:
+            return 0
+        rows = [dataclasses.asdict(b) for b in self._pending_disk]
+        df = pd.DataFrame(rows)
+        df["ts"] = pd.to_datetime(df["ts_s"], unit="s", utc=True)
+        # One file per UTC hour: each flush re-reads and rewrites the file it
+        # appends to, and a whole day's file reached 86ms per coin by 15:00
+        # UTC (2026-10-09), on a thread that holds the trading loop's GIL.
+        written = 0
+        for hour, chunk in df.groupby(df["ts"].dt.floor("h")):
+            path = self._persist_dir / bar_filename(self.coin, hour)
+            if path.exists():
+                try:
+                    old = pd.read_parquet(path)
+                    chunk = pd.concat([old, chunk], ignore_index=True)
+                    chunk = chunk.drop_duplicates(subset=["ts_s"], keep="last")
+                except Exception as e:
+                    # Suffix deliberately does NOT end in .parquet so a
+                    # later {coin}_*.parquet glob (load_composite_bars) can't
+                    # match it and re-raise the same corruption.
+                    quarantine = path.with_suffix(
+                        f".parquet.corrupt-{int(time.time())}")
+                    try:
+                        os.replace(path, quarantine)
+                    except OSError:
+                        pass
+                    print(f"[KXCRYPTOLEAD15M] composite: {path.name} unreadable "
+                          f"({e!r}); quarantined to {quarantine.name}, "
+                          f"starting a fresh file")
+            tmp = path.with_suffix(f".tmp-{os.getpid()}.parquet")
+            chunk.to_parquet(tmp, index=False)
+            os.replace(tmp, path)   # atomic on the same filesystem
+            written += len(chunk)
+        # Only now that every date-chunk is durably written do we drop the
+        # pending buffer.
+        self._pending_disk.clear()
+        return len(rows)
+
+
+class CompositeBus:
+    """Convenience: one `CompositeFeed` per coin, with a single sampling
+    tick that advances them all. Routes incoming venue books to the
+    right feed by `vb.coin`."""
+
+    def __init__(self, coins=COINS, persist: bool = True,
+                 persist_dir: Path = DATA_ROOT, venues: dict[str, tuple] | None = None,
+                 venue_stale_s: float | None = None, depth_priced=frozenset()):
+        """`venues`: coin -> venues forming that coin's mid (missing = all).
+        `depth_priced`: coins priced on the CF replica (CompositeFeed)."""
+        venues = venues or {}
+        self.feeds: dict[str, CompositeFeed] = {
+            c: CompositeFeed(c, persist=persist, persist_dir=persist_dir, venues=venues.get(c),
+                             venue_stale_s=venue_stale_s, depth_priced=c in depth_priced) for c in coins
+        }
+
+    def touch(self, venue: str, coin: str, receive_ts: float):
+        feed = self.feeds.get(coin)
+        if feed is not None:
+            feed.touch(venue, receive_ts)
+
+    def observe(self, vb: VenueBook):
+        feed = self.feeds.get(vb.coin)
+        if feed is None:
+            return
+        feed.observe(vb)
+
+    # Optional: callable(coin) -> deep VenueBook. Per-message books are thin
+    # (spot_feed.coinbase.PER_MSG_LEVELS); the once-a-second bar re-reads
+    # the deep view so the CF replica still sees its full depth.
+    deep_book_fn = None
+
+    def sample_all(self, now_s: float | None = None) -> dict[str, CompositeBar]:
+        now_s = time.time() if now_s is None else now_s
+        if self.deep_book_fn is not None:
+            for c, f in self.feeds.items():
+                if f._bar_last_second_s is None or int(now_s) > f._bar_last_second_s:
+                    vb = self.deep_book_fn(c)
+                    if vb is not None:
+                        f._venue_books[vb.venue] = vb
+        return {c: b for c, b in ((c, f.sample(now_s)) for c, f in self.feeds.items())
+                if b is not None}
+
+    def nowcast(self, coin: str):
+        return self.feeds[coin].nowcast()
+
+    def mid_nowcast(self, coin: str) -> float | None:
+        return self.feeds[coin].mid_nowcast()
+
+    def venue_books_per_coin(self) -> dict[str, list[VenueBook]]:
+        return {c: f.venue_books() for c, f in self.feeds.items()}
+
+    def flush_all(self) -> int:
+        return sum(f.flush() for f in self.feeds.values())
+
+
+__all__ = ["CompositeBar", "CompositeFeed", "CompositeBus"]

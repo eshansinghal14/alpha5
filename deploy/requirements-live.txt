@@ -15,7 +15,7 @@ psutil==7.2.2
 # Dashboard (served on localhost only, viewed through an SSH tunnel).
 streamlit==1.39.0
 bokeh==3.10.0
-# Charts and Markdown in the scheduled review emails (kalshi_infra.runtime.report_email).
+# Charts and Markdown in the scheduled review emails (infra.runtime.report_email).
 matplotlib==3.11.2
 Markdown==3.11.2
 # CME crypto futures live feed (Coin Race lead signal; research/latency/cme_live_rec.py).

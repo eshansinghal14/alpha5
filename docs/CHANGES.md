@@ -5,13 +5,13 @@ Reverse chronological. One section per material change. Entries before
 
 ## 2026-10-25 — ARBS single-leg backtest; dashboard "risk-free" / "single-leg"
 
-- `kalshi_strategies/ARBS/single_leg/`: backtest of buying only a basket's
+- `strategies/ARBS/single_leg/`: backtest of buying only a basket's
   lagging leg (fair = payout - other legs' mids, lag rule "thinnest" or
   "stale"), exit at a resting sell at fair, a stop off the entry bid, or a
   max hold (sell, or complete into the full basket). One position per leg
   across baskets. 1-minute candles from GET /markets/candlesticks, cached
   in `data/arbs_single_leg/candles/` (batch cap is 10,000 candles counted as
-  tickers x minutes requested). `python -m kalshi_strategies.ARBS.single_leg.backtest --days 30`
+  tickers x minutes requested). `python -m strategies.ARBS.single_leg.backtest --days 30`
   writes `data/arbs_single_leg/result.json` + trades parquet and sweeps
   entry edge, lag rule, stop, hold, completion and max spread.
 - Dashboard: Arbitrage section shows the live strategy as "risk-free" and
@@ -23,14 +23,14 @@ Reverse chronological. One section per material change. Entries before
 
 ## 2026-10-24 — ARBS: cross-market basket arbitrage (shadow only so far)
 
-- `kalshi_strategies/ARBS`: 789 baskets / 407 markets / 71 events from
+- `strategies/ARBS`: 789 baskets / 407 markets / 71 events from
   `Kalshi arb baskets spec.json`. Take a whole basket when payout minus
   sum(ask + taker fee) >= `trading.min_edge`; or rest a bid on every leg of
   the top `watch.max_quoted_baskets` baskets (ranked by that same gap), each
   priced to clear `min_edge + quote_edge_add` if completed at the other legs'
   asks. A fill on one leg pulls the basket's other quotes while completing.
 - Position-audit halt clears itself on a clean audit; positions bought by
-  hand are booked into a basket with `python -m kalshi_strategies.ARBS.adopt`. A fill, or
+  hand are booked into a basket with `python -m strategies.ARBS.adopt`. A fill, or
   an uneven take, is completed by IOCs limited by cap_j (see
   `pricing.completion`), retried every `completion.retry_s`; a leg that
   can't be bought within `completion.max_loss_per_bundle` is a dashboard
@@ -56,14 +56,14 @@ Reverse chronological. One section per material change. Entries before
   the race process's samples to 1.0% (py-spy, 10-22 02:23 vs 15:40 UTC).
   First 3 min live: 3,352 creates / 3,355 cancels acked ok, create RTT p50
   5.7ms, ack back on the loop p50 1.1ms (was 15ms p50 on 10-22 02:00 UTC).
-- Keys live in `kalshi_infra/secrets/` (gitignored): `kalshi-ed25519.pem`
+- Keys live in `infra/secrets/` (gitignored): `kalshi-ed25519.pem`
   (in use) and `kalshi-rsa.pem`. `keys.py` keeps the RSA id and path as
   `KALSHI_API_KEY_RSA` / `KALSHI_PRIVATE_KEY_PATH_RSA`; on the box,
   `secrets/keys.py.rsa-rollback` is the pre-switch keys.py.
 - Removed `kalshi_btc_hedge/`, `kalshi_vol_trading/` and the KXHIGHLAX vol
-  pipeline in `kalshi_infra` (black_scholes, regen/generate/repair caches,
+  pipeline in `infra` (black_scholes, regen/generate/repair caches,
   backfills, station temps, debug/scratch scripts) plus
-  `kalshi_backtest/strategies/crossing_arb` and its example. Temperature
+  `backtest/strategies/crossing_arb` and its example. Temperature
   series dropped from `ws_raw_ob_collector`, which now signs through
   `kalshi.auth`. Weather data deleted (predexon/kalshi_trades/kalshi_ws
   KXHIGH*/KXLOWT*, kalshi_1min_historical, station_temps; ~5 GB local).
@@ -145,7 +145,7 @@ process and held the GIL through cold journal passes: 64s on KXINXU and
 over 11 minutes on KXCRYPTOLEAD15M (25k bbo + 25k decisions parts, 10
 days), redone on every dashboard restart (18 restarts on 10-20).
 
-- New `kalshi_viz/perf_worker.py` (unit `alpha5-perf`, nice 19,
+- New `viz/perf_worker.py` (unit `alpha5-perf`, nice 19,
   MemoryMax 1500M) refreshes every series every 30s, one thread each, and
   writes `data/live/<series>/perf/{fills,lip,prints}.parquet` + `meta.json`.
   The panel only reads those (`perf.read_result`); no refresh threads in
@@ -415,12 +415,12 @@ sent after the fill and the rest spent p50 34ms in that overhead.
 
 ## 2026-10-20 — Databento removed; IB is the only option source
 
-- Deleted `kalshi_infra/databento_functions.py` and everything that only
+- Deleted `infra/databento_functions.py` and everything that only
   existed to replay its SPXW history: the S&P backtest
   (`KXINX/backtest/`, `grid_pricing.py`, `signal_grid.py`,
   `ib_emulation.py`), `research/run_ib_sweep.py`,
   `research/spxw_kxinx_lag.ipynb`, `tests/parity/backtest_spx_parity.py`,
-  and the unused `kalshi_infra/spx_cash.py`. `databento` dropped from
+  and the unused `infra/spx_cash.py`. `databento` dropped from
   `deploy/requirements-live.txt`.
 - The Kalshi-side helpers the live S&P model used from it moved, unchanged,
   to `ib_functions`: `event_markets`, `bracket_listed_strikes`,
@@ -533,7 +533,7 @@ sent after the fill and the rest spent p50 34ms in that overhead.
 
 ## 2026-10-18 — S&P: KXINX range buckets no longer traded; one KXINX+ page
 
-- `kalshi_strategies/KXINX` registers only KXINXU and KXINXDUD; the KXINX
+- `strategies/KXINX` registers only KXINXU and KXINXDUD; the KXINX
   section of config.json is gone. It never ran armed: 10-14..10-16 shadow
   was 212 of 223 fills taker at -1.3c/contract 10s markout. Bucket pricing
   (`bucket_fairs`, grid/backtest) is kept for research.
@@ -864,7 +864,7 @@ $80 halt.
 
 ## 2026-10-14 — LIP quote: best bid, price bands, no edge
 
-Backtest and rationale: `kalshi_strategies/KXCRYPTOLEAD15M/research/LIP_REPORT.md`.
+Backtest and rationale: `strategies/KXCRYPTOLEAD15M/research/LIP_REPORT.md`.
 
 - `quoter._lip_target`: one order per side at others' best bid, sized by
   price band, off near close. No longer held outside the edge reservation:
@@ -883,7 +883,7 @@ Backtest and rationale: `kalshi_strategies/KXCRYPTOLEAD15M/research/LIP_REPORT.m
 
 ## 2026-10-12..14 — Crypto live tuning, audit race, signal age
 
-Findings and numbers: `kalshi_strategies/KXCRYPTOLEAD15M/research/HANDOFF.md` §7 #5-#8.
+Findings and numbers: `strategies/KXCRYPTOLEAD15M/research/HANDOFF.md` §7 #5-#8.
 
 - `quoting.enable_taking` (dashboard checkbox): off = maker-only. Takes
   lost money on every window tested; crypto runs with it off.
@@ -911,7 +911,7 @@ Findings and numbers: `kalshi_strategies/KXCRYPTOLEAD15M/research/HANDOFF.md` §
 
 ## 2026-10-13 — S&P folder renamed, KXINXDUD, shared pricing hub
 
-- `kalshi_strategies/KXINX_U` -> `kalshi_strategies/KXINX`. It now also
+- `strategies/KXINX_U` -> `strategies/KXINX`. It now also
   serves KXINXDUD (one "above prior close" market per day).
 - `run --series` takes folder names and runs all their series;
   `--only` names single series. `--series KXINX` = KXINX + KXINXU +
@@ -932,16 +932,16 @@ Findings and numbers: `kalshi_strategies/KXCRYPTOLEAD15M/research/HANDOFF.md` §
   per-series split (26.7 tokens each) sat below reserve + one create, so no
   S&P quote was ever placed with three series running.
 
-## 2026-10-09 — Reorg: kalshi_strategies + generic runtime + kalshi_viz
+## 2026-10-09 — Reorg: strategies + generic runtime + viz
 
 **Layout.** `kalshi_crypto/`, `kalshi_latency_arbs/`, `kalshi_main/` and
-`viz/` are removed. Pricing lives in `kalshi_strategies/<FOLDER>/`
+`viz/` are removed. Pricing lives in `strategies/<FOLDER>/`
 (`KXINX` serves KXINX and KXINXU; `KXCRYPTOLEAD15M`); everything else is
-shared in `kalshi_infra/` (`kalshi/`, `trading/`, `runtime/`). One launcher:
-`python -m kalshi_strategies.run --series ...`. One dashboard:
-`streamlit run kalshi_viz/app.py`. All code is packages imported from the
-repo root (no `sys.path` inserts); loose `kalshi_infra` scripts now run as
-`python -m kalshi_infra.<script>`. See [live-trading.md](live-trading.md)
+shared in `infra/` (`kalshi/`, `trading/`, `runtime/`). One launcher:
+`python -m strategies.run --series ...`. One dashboard:
+`streamlit run viz/app.py`. All code is packages imported from the
+repo root (no `sys.path` inserts); loose `infra` scripts now run as
+`python -m infra.<script>`. See [live-trading.md](live-trading.md)
 and [adding-a-strategy.md](adding-a-strategy.md).
 
 **Config.** `config_override.json` and CLI tuning flags are gone. Each
@@ -1036,7 +1036,7 @@ Causes and fixes:
 - `LiveIBFeed` refuses to start if the scope is over the 100-line budget.
 - Error 10090 (no SPX index subscription) is filtered from the logs; the
   OPRA leg is unaffected.
-- New tools: `kalshi_infra/measure_ib_latency.py`,
+- New tools: `infra/measure_ib_latency.py`,
   `kalshi_latency_arbs/live/check_fair_value.py`.
 
 Results: [ib-migration.md § Validation](ib-migration.md#validation-2026-10-08).
@@ -1053,7 +1053,7 @@ Details: [ib-migration.md](ib-migration.md).
 
 ### Files added
 
-- `kalshi_infra/ib_functions.py` — IB contract helpers, strike
+- `infra/ib_functions.py` — IB contract helpers, strike
   resolution, deferred ib_async import.
 - `kalshi_latency_arbs/live/live_ib_feed.py` — live SPXW feed
   implementing the `LiveIBFeed` interface `run_live.py` already
@@ -1062,14 +1062,14 @@ Details: [ib-migration.md](ib-migration.md).
 
 ### Files removed
 
-- `kalshi_infra/thetadata_functions.py`
-- `kalshi_infra/option_source.py`
+- `infra/thetadata_functions.py`
+- `infra/option_source.py`
 - `kalshi_latency_arbs/live/__pycache__/live_databento_feed.cpython-312.pyc`
   (stale bytecode of the retired ES-daily feed).
 
 ### Files modified
 
-- `kalshi_infra/keys.py` — added `IB_HOST`, `IB_PORT`, `IB_CLIENT_ID`,
+- `infra/keys.py` — added `IB_HOST`, `IB_PORT`, `IB_CLIENT_ID`,
   `IB_ACCOUNT` placeholders. IB uses no bearer token.
 - `kalshi_latency_arbs/latency_arbs_functions.py` and
   `kalshi_latency_arbs/spxw_signal.py` — now import

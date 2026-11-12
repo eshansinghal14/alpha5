@@ -1,6 +1,6 @@
 #!/bin/bash
 # Scheduled Claude review of live trading, emailed as HTML with charts through
-# SES (kalshi_infra.runtime.report_email); plain text through SNS if that fails.
+# SES (infra.runtime.report_email); plain text through SNS if that fails.
 #   daily:  8am ET report, always emailed (alpha5-report-daily.timer)
 #   hourly: health check, emailed only on STATUS: ALERT (alpha5-report-hourly.timer)
 # Runs as alpha5-report (deploy/setup_report.sh): it can read the repo and data/
@@ -36,7 +36,7 @@ send() {  # subject, body file
 }
 
 send_html() {  # subject, Markdown body file, [proposals json]; falls back to plain text
-  if [ -n "$EMAIL" ] && $REPO/.venv/bin/python -W ignore -m kalshi_infra.runtime.report_email \
+  if [ -n "$EMAIL" ] && $REPO/.venv/bin/python -W ignore -m infra.runtime.report_email \
       --subject "$1" --body "$2" --hours "$CHART_HOURS" --status "$STATUS" --sender "$EMAIL" --to "$EMAIL" \
       ${3:+--proposals "$3"} 2> "$OUT/email.err"; then
     return 0
@@ -44,7 +44,7 @@ send_html() {  # subject, Markdown body file, [proposals json]; falls back to pl
   send "$1" "$2"
 }
 
-$REPO/.venv/bin/python -W ignore -m kalshi_infra.runtime.trading_digest --hours "$HOURS" \
+$REPO/.venv/bin/python -W ignore -m infra.runtime.trading_digest --hours "$HOURS" \
     --log-state "$OUT/logpos.json" > "$OUT/digest.txt" 2> "$OUT/digest.err"
 
 {
@@ -60,7 +60,7 @@ $REPO/.venv/bin/python -W ignore -m kalshi_infra.runtime.trading_digest --hours 
 # alone are ~80 KB, near Linux's 128 KB cap on a single argument.
 {
   if [ "$MODE" = daily ]; then
-    for s in "ARBS:kalshi_strategies/ARBS" "KXCRYPTOLEAD15M (coin race):kalshi_strategies/KXCRYPTOLEAD15M"; do
+    for s in "ARBS:strategies/ARBS" "KXCRYPTOLEAD15M (coin race):strategies/KXCRYPTOLEAD15M"; do
       name=${s%%:*} dir=${s#*:}
       echo "===== $name: HANDOFF ====="
       cat "$dir/HANDOFF.md" "$dir/research/HANDOFF.md" 2>/dev/null
@@ -126,7 +126,7 @@ if [ "$MODE" = daily ]; then
   # The ```proposals block becomes /var/lib/alpha5-proposals/<day>.json, which
   # owner replies approve (report_replies poll); it isn't shown in the email.
   PROPS=/var/lib/alpha5-proposals/$DAY.json
-  $REPO/.venv/bin/python -W ignore -m kalshi_infra.runtime.report_replies extract --reply "$OUT/body.txt" \
+  $REPO/.venv/bin/python -W ignore -m infra.runtime.report_replies extract --reply "$OUT/body.txt" \
       --out "$OUT/body.txt" --day "$DAY" > "$OUT/proposals.log" 2>&1 || PROPS=
   send_html "$tag Daily $DAY: $SUBJECT" "$OUT/body.txt" "$PROPS"
 elif [ "$STATUS" = ALERT ]; then
