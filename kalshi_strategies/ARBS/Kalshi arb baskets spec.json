@@ -3,34 +3,6 @@
  "notation": "P(ticker) = YES probability. A NO leg's price is the NO price. A basket is an arb when the sum of its leg prices is below its payout.",
  "filter": "Only relationships whose markets are expected to settle by end of Jan 2027. expected_settlement_month is an estimate from the market rules (accelerated determination / certification dates), not Kalshi's expected_expiration_time placeholder.",
  "settlement_basis_by_series": {
-  "SENATETX": {
-   "expected_settlement_month": "2026-11",
-   "basis": "accelerated determination on media projection; fallback swearing-in 2027-01-03"
-  },
-  "SENATEME": {
-   "expected_settlement_month": "2026-11",
-   "basis": "accelerated determination on media projection; fallback swearing-in 2027-01-03"
-  },
-  "GOVPARTYTX": {
-   "expected_settlement_month": "2026-11",
-   "basis": "accelerated determination on media projection; fallback inauguration 2027-01-19"
-  },
-  "GOVPARTYFL": {
-   "expected_settlement_month": "2026-11",
-   "basis": "accelerated determination on media projection; fallback inauguration 2027-01"
-  },
-  "KXTXSENOUTCOME": {
-   "expected_settlement_month": "2026-11",
-   "basis": "Paxton nominee leg already satisfied; settles with the general-election winner"
-  },
-  "KXTXSENGOVCOMBO": {
-   "expected_settlement_month": "2026-11",
-   "basis": "settles when components resolve (winner rulesets, accelerated determination)"
-  },
-  "KXMETXCOMBO": {
-   "expected_settlement_month": "2026-11",
-   "basis": "settles when components resolve (USELECTION rulesets)"
-  },
   "KXGENERALCOUNTY": {
    "expected_settlement_month": "2026-11",
    "basis": "county winner"
