@@ -8,7 +8,7 @@ User=alpha5-report
 Environment=HOME=/var/lib/alpha5-report
 Environment=PYTHONPATH=/opt/alpha5/deploy/claude_report/pyhook
 ExecStart=/bin/bash /opt/alpha5/deploy/claude_report.sh daily
-TimeoutStartSec=40min
+TimeoutStartSec=50min
 Nice=19
 IOSchedulingClass=idle
 # Not trading: first for the OOM killer, and capped (Claude Code plus its

@@ -25,7 +25,7 @@ if [ "$MODE" = hourly ]; then
   HOURS=1 CHART_HOURS=6 MODEL=sonnet TURNS=15 LIMIT=12m
 else
   flock -w 900 9 || { echo "lock wait timed out"; exit 1; }
-  HOURS=24 CHART_HOURS=24 MODEL=opus TURNS=40 LIMIT=25m
+  HOURS=24 CHART_HOURS=24 MODEL=opus TURNS=60 LIMIT=32m
 fi
 
 send() {  # subject, body file
@@ -37,7 +37,8 @@ send() {  # subject, body file
 
 send_html() {  # subject, Markdown body file; falls back to plain text
   if [ -n "$EMAIL" ] && $REPO/.venv/bin/python -W ignore -m kalshi_infra.runtime.report_email \
-      --subject "$1" --body "$2" --hours "$CHART_HOURS" --sender "$EMAIL" --to "$EMAIL" 2> "$OUT/email.err"; then
+      --subject "$1" --body "$2" --hours "$CHART_HOURS" --status "$STATUS" --sender "$EMAIL" --to "$EMAIL" \
+      2> "$OUT/email.err"; then
     return 0
   fi
   send "$1" "$2"
@@ -53,17 +54,42 @@ $REPO/.venv/bin/python -W ignore -m kalshi_infra.runtime.trading_digest --hours 
   fi
 } > "$OUT/prompt.txt"
 
+# Daily: the strategies' handoffs, live configs and recent commits go in ahead of the
+# digest so suggestions build on what was already tried, and the last few reports
+# after it so ideas aren't repeated. Stdin, not the prompt argument: the handoffs
+# alone are ~80 KB, near Linux's 128 KB cap on a single argument.
+{
+  if [ "$MODE" = daily ]; then
+    for s in "ARBS:kalshi_strategies/ARBS" "KXCRYPTOLEAD15M (coin race):kalshi_strategies/KXCRYPTOLEAD15M"; do
+      name=${s%%:*} dir=${s#*:}
+      echo "===== $name: HANDOFF ====="
+      cat "$dir/HANDOFF.md" "$dir/research/HANDOFF.md" 2>/dev/null
+      echo; echo "===== $name: live config.json ====="; cat "$dir/config.json"
+      echo; echo "===== $name: commits, last 14 days ====="
+      git -c safe.directory=$REPO log --since=14.days --format='%h %ad %s' --date=short -- "$dir" | head -40
+      echo
+    done
+  fi
+  echo "===== DIGEST ====="; cat "$OUT/digest.txt"
+  if [ "$MODE" = daily ]; then
+    for f in $(ls -t "$OUT"/reply-*.txt 2>/dev/null | head -3); do
+      echo; echo "===== earlier report $(basename "$f" .txt) ====="; cat "$f"
+    done
+  fi
+} > "$OUT/stdin.txt"
+
 # The OS user is the real boundary (no secrets, no write access to anything
 # trading reads); this list just keeps Claude to reading.
 TOOLS=(Read Grep Glob "Bash(/opt/alpha5/.venv/bin/python:*)" "Bash(.venv/bin/python:*)" "Bash(cd:*)"
        "Bash(grep:*)" "Bash(tail:*)" "Bash(head:*)" "Bash(cut:*)" "Bash(sort:*)" "Bash(uniq:*)" "Bash(echo:*)"
        "Bash(ls:*)" "Bash(wc:*)" "Bash(cat:*)" "Bash(date:*)" "Bash(journalctl:*)" "Bash(systemctl status:*)"
-       "Bash(systemctl show:*)" "Bash(git log:*)" "Bash(git show:*)" "Bash(git diff:*)" "Bash(git status:*)"
+       "Bash(systemctl show:*)" "Bash(git -c safe.directory=/opt/alpha5 log:*)"
+       "Bash(git -c safe.directory=/opt/alpha5 show:*)" "Bash(git -c safe.directory=/opt/alpha5 diff:*)"
        "Bash(free:*)" "Bash(df:*)")
 CLAUDE_CODE_OAUTH_TOKEN=$(tr -d '\r\n ' < /etc/alpha5/claude-token) timeout "$LIMIT" \
   "$HOME/.local/bin/claude" -p "$(cat "$OUT/prompt.txt")" --model "$MODEL" --max-turns "$TURNS" \
     --allowedTools "${TOOLS[@]}" --disallowedTools Write Edit NotebookEdit WebFetch WebSearch \
-    < "$OUT/digest.txt" > "$OUT/reply.txt" 2> "$OUT/claude.err"
+    < "$OUT/stdin.txt" > "$OUT/reply.txt" 2> "$OUT/claude.err"
 rc=$?
 
 # Searched for, not read off line 1: Claude sometimes writes a sentence first (11-09).
