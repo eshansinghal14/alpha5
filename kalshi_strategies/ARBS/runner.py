@@ -39,7 +39,7 @@ from kalshi_infra.config import ConfigStore, atomic_write_json
 from kalshi_infra.kalshi import fees as kfees
 from kalshi_infra.kalshi.orders import (RealFill, error_code, http_status, is_market_paused, is_order_group_reject,
                                         is_post_only_reject)
-from kalshi_infra.kalshi.orders import KEEPALIVE_S, write_budget_tokens_per_s
+from kalshi_infra.kalshi.orders import KEEPALIVE_S, ReadBudgetLow, read_stats, write_budget_tokens_per_s
 from kalshi_infra.trading.engine import MARKET_PAUSE_RETRY_S
 from kalshi_infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
 from kalshi_infra.runtime.persist import LIVE_ROOT, day_dir
@@ -76,6 +76,10 @@ BALANCE_LOG_S = 60.0       # journal interval for the shards' cash and positions
 # (runtime.balance_poll_s): two processes reading every 30 s had about half
 # their reads 429 (11-12). A failed read retries after 60 s, doubling to this.
 BALANCE_BACKOFF_MAX_S = 300.0
+# A balance read only goes out with this many read tokens left after it (a
+# third of a second of the account's 300/s), waiting up to BALANCE_WAIT_S.
+BALANCE_READ_RESERVE = 100.0
+BALANCE_WAIT_S = 10.0
 
 
 def _log(msg: str):
@@ -1821,8 +1825,18 @@ class ArbsRunner:
         now = time.time()
         if now < self._balance_retry_at:
             raise RuntimeError(f"balance read backing off {self._balance_retry_at - now:.0f}s")
+        deadline = now + BALANCE_WAIT_S
         try:
-            got = await self.gw.call(self.gw.any_client().shard_balances)
+            while True:
+                try:
+                    got = await self.gw.call(self.gw.any_client().shard_balances, BALANCE_READ_RESERVE)
+                    break
+                except ReadBudgetLow:
+                    if time.time() >= deadline:
+                        raise
+                    await asyncio.sleep(0.25)
+        except ReadBudgetLow:
+            raise
         except Exception:
             self._balance_fails += 1
             self._balance_retry_at = time.time() + min(BALANCE_BACKOFF_MAX_S,
@@ -3294,6 +3308,7 @@ class ArbsRunner:
             "session_started": self.started.isoformat(), "live_trading": self.live, "arm_requested": self.arm_want,
             "ledger": "real" if led is self.real_ledger else "shadow",
             "halted": self.halt is not None, "halt_reason": self.halt, "blocked_reason": self.blocked(),
+            "reads": read_stats(),
             "feed": {"up": self.feed.up, "reconnects": self.feed.n_reconnects, "seq_gaps": self.feed.n_seq_gaps,
                      "ws_errors": self.feed.n_errors, "refreshes": self.feed.n_refreshes, "last_msg_s": self.feed.seconds_since_message()},
             "n_baskets": len(self.all_baskets), "n_tickers": len(self.tickers),

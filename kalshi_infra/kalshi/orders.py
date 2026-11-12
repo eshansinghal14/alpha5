@@ -30,6 +30,7 @@ is per-call there):
   * one persistent requests.Session, reused for every order,
   * the private key parsed once at construction, not per request.
 """
+import collections
 import contextlib
 import dataclasses
 import mmap
@@ -370,11 +371,19 @@ class SharedWriteBudget(WriteBudget):
     def empty(self):
         self._update(lambda t: (min(t, 0.0), None))
 
+    def take_keeping(self, cost: float, keep: float) -> bool:
+        """Spend `cost` only if `keep` tokens are left after it."""
+        return self._update(lambda t: (t, False) if t < cost + keep else (t - cost, True))
+
 
 def _shared_budget_path(shard: int) -> str:
+    return _shm_path(f"alpha5-write-shard{int(shard)}.bucket")
+
+
+def _shm_path(name: str) -> str:
     import tempfile
     root = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
-    return os.path.join(root, f"alpha5-write-shard{int(shard)}.bucket")
+    return os.path.join(root, name)
 
 
 def _flock(fd: int, on: bool):
@@ -399,6 +408,44 @@ def shard_budget(shard: int) -> WriteBudget:
         if b is None:
             b = _SHARED[shard] = SharedWriteBudget(write_budget_tokens_per_s(), shard)
         return b
+
+
+# The account's read bucket (account/limits "read": 300/s refill, 900 held,
+# Advanced tier, 11-12). A read is taken to cost what an order write does.
+READ_TOKENS_PER_S = 300.0
+READ_COST = 10.0
+_READ: SharedWriteBudget | None = None
+# This process's authenticated reads per wall-clock second (read_stats).
+_READS: collections.Counter = collections.Counter()
+
+
+class ReadBudgetLow(RuntimeError):
+    """A read held back because the shared read bucket couldn't pay for it."""
+
+
+def read_budget() -> SharedWriteBudget:
+    """The machine-wide read bucket every order client's reads count against."""
+    global _READ
+    with _SHARED_LOCK:
+        if _READ is None:
+            _READ = SharedWriteBudget(READ_TOKENS_PER_S, 0, path=_shm_path("alpha5-read.bucket"))
+        return _READ
+
+
+def _note_read(n: int = 1):
+    now = int(time.time())
+    _READS[now] += n
+    if len(_READS) > 180:
+        for k in [k for k in _READS if k < now - 120]:
+            del _READS[k]
+
+
+def read_stats() -> dict:
+    """Read tokens left machine-wide, and this process's reads in the last
+    whole second and the busiest second of the last minute."""
+    now = int(time.time())
+    return {"tokens": round(read_budget().tokens_now(), 1), "last_s": _READS.get(now - 1, 0),
+            "max_s_60s": max((_READS.get(t, 0) for t in range(now - 60, now)), default=0)}
 
 
 KEEPALIVE_S = 30.0
@@ -426,6 +473,32 @@ def _pooled(session) -> int:
             if q is not None:
                 n += sum(c is not None for c in list(q.queue))
     return n
+
+
+def _pay_read(reserve: float, force: bool = False):
+    """Take a balance read's tokens up front (its response isn't counted again),
+    or raise ReadBudgetLow if that would leave less than `reserve`."""
+    if force:
+        read_budget().take(READ_COST, force=True)
+    elif not read_budget().take_keeping(READ_COST, reserve):
+        raise ReadBudgetLow(f"read bucket below {READ_COST + reserve:g} tokens")
+    _note_read()
+
+
+def _count_read(resp, *a, **kw):
+    """Session hook: every authenticated GET spends read tokens, and a 429
+    empties the bucket (Kalshi's is emptier than ours thinks)."""
+    try:
+        req = resp.request
+        if req.method != "GET":
+            return
+        if resp.status_code == 429:
+            read_budget().empty()
+        if not req.path_url.startswith(BALANCE_PATH):
+            read_budget().take(READ_COST, force=True)
+            _note_read()
+    except Exception:
+        pass
 
 
 class KalshiOrderClient:
@@ -458,6 +531,7 @@ class KalshiOrderClient:
         # Nothing in the environment sets them.
         for s in (self._session, self._cancel_session):
             s.trust_env = False
+        self._session.hooks["response"].append(_count_read)
         self._key = auth.load_private_key()
         self._lock = threading.Lock()
         self.budget = budget if budget is not None else WriteBudget(tokens_per_s)
@@ -904,6 +978,7 @@ class KalshiOrderClient:
         balance read. The positions' value only comes as integer cents
         (portfolio_value; no _dollars field, 2026-11-11)."""
         params = {"exchange_index": exchange_index} if exchange_index is not None else None
+        _pay_read(0.0, force=True)          # counted, never held: other strategies arm on it
         resp = self._session.get(BASE_URL + BALANCE_PATH,
                                  headers=self._headers("GET", BALANCE_PATH),
                                  params=params, timeout=self.timeout_s)
@@ -911,10 +986,13 @@ class KalshiOrderClient:
         data = resp.json()
         return _dollars(data, "balance") or 0.0, float(data.get("portfolio_value") or 0) / 100.0
 
-    def shard_balances(self) -> tuple[dict[int, float], float]:
+    def shard_balances(self, reserve: float = 0.0) -> tuple[dict[int, float], float]:
         """({shard: available balance}, the account's positions' value), in
         dollars, from one unscoped read: reading each shard's balance back to
-        back drew 429s on the second every poll (2026-11-11)."""
+        back drew 429s on the second every poll (2026-11-11). Raises
+        ReadBudgetLow, sending nothing, unless the read bucket keeps `reserve`
+        tokens after it."""
+        _pay_read(reserve)
         resp = self._session.get(BASE_URL + BALANCE_PATH, headers=self._headers("GET", BALANCE_PATH),
                                  timeout=self.timeout_s)
         resp.raise_for_status()
