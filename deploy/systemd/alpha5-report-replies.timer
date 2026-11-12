@@ -1,0 +1,9 @@
+[Unit]
+Description=alpha5: check for replies to the daily review every 5 minutes
+
+[Timer]
+OnCalendar=*:0/5
+Persistent=false
+
+[Install]
+WantedBy=timers.target

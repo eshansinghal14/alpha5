@@ -35,10 +35,10 @@ send() {  # subject, body file
       --message "file://$2" --output text >/dev/null
 }
 
-send_html() {  # subject, Markdown body file; falls back to plain text
+send_html() {  # subject, Markdown body file, [proposals json]; falls back to plain text
   if [ -n "$EMAIL" ] && $REPO/.venv/bin/python -W ignore -m kalshi_infra.runtime.report_email \
       --subject "$1" --body "$2" --hours "$CHART_HOURS" --status "$STATUS" --sender "$EMAIL" --to "$EMAIL" \
-      2> "$OUT/email.err"; then
+      ${3:+--proposals "$3"} 2> "$OUT/email.err"; then
     return 0
   fi
   send "$1" "$2"
@@ -75,6 +75,8 @@ $REPO/.venv/bin/python -W ignore -m kalshi_infra.runtime.trading_digest --hours 
     for f in $(ls -t "$OUT"/reply-*.txt 2>/dev/null | head -3); do
       echo; echo "===== earlier report $(basename "$f" .txt) ====="; cat "$f"
     done
+    echo; echo "===== owner's decisions on earlier ideas (replies to the email; newest last) ====="
+    tail -n 40 /var/lib/alpha5-replies/decisions.jsonl 2>/dev/null || echo "(none yet)"
   fi
 } > "$OUT/stdin.txt"
 
@@ -119,7 +121,12 @@ find "$OUT" -name 'reply-*.txt' -mtime +14 -delete
 
 if [ "$MODE" = daily ]; then
   tag=$([ "$STATUS" = ALERT ] && echo "[alpha5 ALERT]" || echo "[alpha5]")
-  send_html "$tag Daily $DAY: $SUBJECT" "$OUT/body.txt"
+  # The ```proposals block becomes /var/lib/alpha5-proposals/<day>.json, which
+  # owner replies approve (report_replies poll); it isn't shown in the email.
+  PROPS=/var/lib/alpha5-proposals/$DAY.json
+  $REPO/.venv/bin/python -W ignore -m kalshi_infra.runtime.report_replies extract --reply "$OUT/body.txt" \
+      --out "$OUT/body.txt" --day "$DAY" > "$OUT/proposals.log" 2>&1 || PROPS=
+  send_html "$tag Daily $DAY: $SUBJECT" "$OUT/body.txt" "$PROPS"
 elif [ "$STATUS" = ALERT ]; then
   echo "$NOW $SUBJECT" >> "$OUT/alerts.log"
   send_html "[alpha5 ALERT] $SUBJECT" "$OUT/body.txt"

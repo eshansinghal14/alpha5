@@ -215,14 +215,28 @@ def _style_markdown(body_md: str) -> str:
                .replace("<code>", '<code style="background:#f6f8fa;padding:1px 4px;border-radius:4px;font-size:12px">'))
 
 
+def _reply_box(proposals: list[dict]) -> str:
+    """What each "N yes" reply would change (report_replies applies it)."""
+    if not proposals:
+        return ""
+    rows = "".join(f'<li style="margin:0 0 4px"><b>{p["n"]}</b> · {html.escape(p["title"])}<br>'
+                   f'<code style="font-size:12px;color:{MUTED}">{html.escape(p["summary"])}</code></li>'
+                   for p in proposals)
+    return (f'<div style="margin:22px 0 0;padding:10px 14px;border:1px solid {RULE};border-radius:8px;'
+            f'background:#f6f8fa;font-size:13px"><b>Reply to apply</b> with e.g. <code>1 yes, 2 no</code>. '
+            f"An approved change goes into the live config within ~5 minutes, and you get a confirmation. "
+            f"Your answers on every idea are kept for the next reviews."
+            f'<ul style="margin:8px 0 0;padding-left:18px">{rows}</ul></div>')
+
+
 def build(subject: str, body_md: str, hours: float, sender: str, to: str, charts: bool = True,
-          status: str | None = None) -> MIMEMultipart:
+          status: str | None = None, proposals: list[dict] | None = None) -> MIMEMultipart:
     totals, tables, images = strategy_sections(hours) if charts else ([], "", [])
     imgs = "".join(f'<img src="cid:{cid}" style="display:block;max-width:100%;margin:8px 0" alt="{cid}">'
                    for cid, _ in images)
     page = (f'<div style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:{TEXT};'
             f'max-width:680px;font-size:14px;line-height:1.55">'
-            f"{_headline(totals, hours, status)}{_style_markdown(body_md)}"
+            f"{_headline(totals, hours, status)}{_style_markdown(body_md)}{_reply_box(proposals or [])}"
             f"{_h('Numbers') if tables else ''}{tables}{_h('Charts') if imgs else ''}{imgs}</div>")
     msg = MIMEMultipart("related")
     msg["Subject"], msg["From"], msg["To"] = subject, sender, to
@@ -260,13 +274,18 @@ def main():
     ap.add_argument("--sender", required=True)
     ap.add_argument("--to", required=True)
     ap.add_argument("--status", default=None, help="OK or ALERT, shown next to the date")
+    ap.add_argument("--proposals", default=None, help="report_replies extract output: the reply-to-apply box")
     ap.add_argument("--no-charts", action="store_true")
     ap.add_argument("--dry-run", default=None, help="write the .eml here instead of sending")
     args = ap.parse_args()
     with open(args.body, encoding="utf-8") as fh:
         body = fh.read()
+    proposals = []
+    if args.proposals and os.path.exists(args.proposals):
+        with open(args.proposals, encoding="utf-8") as fh:
+            proposals = json.load(fh)
     msg = build(args.subject, body, args.hours, args.sender, args.to, charts=not args.no_charts,
-                status=args.status)
+                status=args.status, proposals=proposals)
     if args.dry_run:
         with open(args.dry_run, "wb") as fh:
             fh.write(msg.as_bytes())
