@@ -215,11 +215,12 @@ MODEL_AGE_S = 0.25            # the depth age the model's training rows measured
 # MODEL_NARROW_GAIN x the current for MODEL_NARROW_HOLD_S, growing the bigger
 # pick for MODEL_GROW_HOLD_S, each one step. Widening on value alone and a 30 s
 # narrow hold made 27 changes per leg-hour on live NCAAMB, 166 of them a narrow
-# undone by a widen within a minute (first hour, 11-11).
+# undone by a widen within a minute (first hour, 11-11). A 60 s grow hold left
+# 2,300 of 4,000 changes as shrink/grow pairs (11-12); each grow loses the queue.
 MODEL_MIN_NET_C = 0.5
 MODEL_NARROW_GAIN = 1.25
 MODEL_NARROW_HOLD_S = 120.0
-MODEL_GROW_HOLD_S = 60.0
+MODEL_GROW_HOLD_S = 300.0
 
 
 class _Rate:
