@@ -793,6 +793,23 @@ def test_excluded_basket_is_no_alternative(arbs):
     assert (b.basket_id, 0) not in r.via
 
 
+def test_a_model_quote_priced_through_another_basket_keeps_the_models_edge(arbs, monkeypatch):
+    r, b = arbs
+    c = _cheaper_through_c(r, b)
+    b, c = (dataclasses.replace(x, live_from=pd.Timestamp("2026-01-01", tz="UTC")) for x in (b, c))
+    r.set_baskets([b, c])
+    r.hot = [b.basket_id]
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_live_events=True, live_quote_size=5, live_edge_add=0.0,
+                                        requote_cooldown_s=0.0, depth_age_s=0.0, model_series=["X"])
+    r.exit_model = object()                                 # model_pick is stubbed: only its presence counts
+    monkeypatch.setattr(r, "model_pick", lambda b, j, vs, now_ts: (0.20, 5.0))
+    own = R.pricing.quote_leg(r.views(b), 0, 1.0, 0.20, 5)
+    _eval(r, b)
+    q = r.quotes[(b.basket_id, 0)]
+    assert r.via[(b.basket_id, 0)] == c.basket_id                           # still through c, 10c cheaper to complete
+    assert q.max_price == pytest.approx(own.max_price + 0.10, abs=0.005)    # at the model's 20c, not config's 3c
+
+
 def test_unwind_nets_out_the_newest_contracts(arbs):
     r, b = arbs
     L = r.shadow_ledger
@@ -2047,6 +2064,48 @@ def test_model_pick_is_quick_to_cut_risk_and_slow_to_add_it(arbs, monkeypatch):
     table_none = {(e, n): (-1.0, -1.0) for e in R.MODEL_EDGES for n in R.MODEL_SIZES}
     table.clear(); table.update(table_none); r._model_cache.clear()
     assert r.model_pick(b, 0, vs, now_ts) == (None, 0.0)          # nothing worth quoting
+
+
+def test_model_pick_keeps_its_holds_when_the_held_pick_cannot_be_priced(arbs, monkeypatch):
+    import types
+    r, b = arbs
+    table, gone, rows = {}, set(), []
+    r.journal = rows.append
+
+    class Stub:
+        def value(self, f, x, live, n, maker_rate=0.0):
+            return table.get((x, n), (1.0, 2.0))
+
+    r.exit_model = Stub()
+    monkeypatch.setattr(R.exit_cost, "live_features", lambda *a, **k: {})
+    monkeypatch.setattr(R.pricing, "quote_leg",
+                        lambda vs, j, payout, e, n: None if (e, n) in gone else types.SimpleNamespace(price=e))
+    now_ts = pd.Timestamp.now(tz="UTC")
+    vs = [types.SimpleNamespace(maker_rate=0.0)] * 2
+    st = lambda: r.model_state[(b.basket_id, 0)]
+
+    def pick(best, unpriceable=()):
+        table.clear(); table.update(best)
+        gone.clear(); gone.update(unpriceable)
+        r._model_cache.clear()
+        return r.model_pick(b, 0, vs, now_ts)
+
+    wide = {(e, n) for e in (0.15, 0.20) for n in R.MODEL_SIZES}
+    narrower_bigger = {(0.05, 100.0): (5.0, 2.0)}
+    assert pick({(0.20, 50.0): (5.0, 2.0)}) == (0.20, 50.0)
+    assert pick(narrower_bigger, wide) == (0.20, 50.0)                      # 20c can't be priced: no jump to the pick
+    st()["narrow"] -= R.MODEL_NARROW_HOLD_S
+    assert pick(narrower_bigger, wide) == (0.10, 50.0)                      # after the hold: the widest edge that prices
+    st()["grow"] -= R.MODEL_GROW_HOLD_S
+    assert pick(narrower_bigger, wide | {(0.10, 100.0)}) == (0.10, 50.0)    # 10c can't be priced bigger: stays
+    assert pick(narrower_bigger, wide) == (0.10, 100.0)                     # it can: one step
+    no_100 = {(e, 100.0) for e in R.MODEL_EDGES}
+    assert pick({(0.05, 50.0): (5.0, 2.0)}, no_100) == (0.10, 50.0)         # size gone: shrinks, edge keeps its hold
+    assert [x["why"] for x in rows] == ["start", "narrow", "grow", "shrink"]
+    st()["grow"] = st()["narrow"] = time.time() - 3600                      # clocks running into a restart
+    assert pick({k: (-1.0, -1.0) for k in [(e, n) for e in R.MODEL_EDGES for n in R.MODEL_SIZES]}) == (None, 0.0)
+    assert pick({(0.05, 20.0): (5.0, 2.0)}) == (0.05, 20.0)
+    assert st()["grow"] is None and st()["narrow"] is None
 
 
 def test_live_features_match_the_training_inputs():

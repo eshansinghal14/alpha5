@@ -224,6 +224,8 @@ MODEL_AGE_S = 0.25            # the depth age the model's training rows measured
 # narrow hold made 27 changes per leg-hour on live NCAAMB, 166 of them a narrow
 # undone by a widen within a minute (first hour, 11-11). A 60 s grow hold left
 # 2,300 of 4,000 changes as shrink/grow pairs (11-12); each grow loses the queue.
+# A held pick that can't be priced goes through the same rules: restarting at
+# the model's pick skipped both holds 586 times in 2.7 h (11-12 16:09-18:49).
 MODEL_MIN_NET_C = 0.5
 MODEL_NARROW_GAIN = 1.25
 MODEL_NARROW_HOLD_S = 120.0
@@ -1729,44 +1731,49 @@ class ArbsRunner:
             return None
         (pe, pn), (pv, _) = max(cands.items(), key=lambda kv: kv[1][0])
         st = self.model_state.get(key)
+        prev = (st or {}).get("edge"), (st or {}).get("size")
         why = None
-        if pv <= 0:
-            res, why = (None, 0.0), "no positive value"
-        elif st is None or st["edge"] is None or (st["edge"], st["size"]) not in cands:
-            res, why = (pe, pn), "start"
+        if pv <= 0 or st is None or st["edge"] is None:
+            res, why = ((None, 0.0), "no positive value") if pv <= 0 else ((pe, pn), "start")
+            # Fresh clocks: one left running would let the next narrow or grow through early.
+            st = {"narrow": None, "grow": None}
         else:
-            e, n = st["edge"], st["size"]
-            cur_v, cur_net = cands[(e, n)]
+            # Size first, so the edge rules judge the held edge at the size it
+            # will rest at. A held edge that can't be priced there is worth
+            # nothing: the pick is then narrower and waits out the narrow hold.
+            e, n = st["edge"], min(st["size"], pn)
+            cur_v, cur_net = cands.get((e, n), (0.0, 0.0))
             if cur_net < MODEL_MIN_NET_C and pe > e:
                 e, why, st["narrow"] = pe, "widen", None
             elif pe < e and pv >= MODEL_NARROW_GAIN * max(cur_v, 1e-9):
                 since = st.get("narrow") or now
                 st["narrow"] = since
                 if now - since >= MODEL_NARROW_HOLD_S:
-                    e, why, st["narrow"] = MODEL_EDGES[MODEL_EDGES.index(e) - 1], "narrow", None
+                    # One step when the held edge can be priced (every narrower one can then).
+                    e = max((x for x in MODEL_EDGES if x < e and (x, n) in cands), default=pe)
+                    why, st["narrow"] = "narrow", None
             else:
                 st["narrow"] = None
-            if pn < n:
-                n, why, st["grow"] = pn, why or "shrink", None
+            if n < st["size"]:
+                why, st["grow"] = why or "shrink", None
             elif pn > n:
                 since = st.get("grow") or now
                 st["grow"] = since
-                if now - since >= MODEL_GROW_HOLD_S:
-                    n, why, st["grow"] = MODEL_SIZES[MODEL_SIZES.index(n) + 1], why or "grow", None
+                up = MODEL_SIZES[MODEL_SIZES.index(n) + 1]
+                if now - since >= MODEL_GROW_HOLD_S and (e, up) in cands:
+                    n, why, st["grow"] = up, why or "grow", None
             else:
                 st["grow"] = None
             res = (e, n)
-        prev = (st or {}).get("edge"), (st or {}).get("size")
         if res != prev:
             self.n["model_changes"] = self.n.get("model_changes", 0) + 1
-            v, net = cands.get(res, (pv, None)) if res[0] is not None else (pv, None)
+            v, net = (pv, None) if res[0] is None else cands.get(res, (0.0, None))
             self.journal({"kind": "model_quote", "basket_id": b.basket_id, "leg": j, "ticker": leg.ticker,
                           "edge": res[0], "size": res[1], "prev_edge": prev[0], "prev_size": prev[1], "why": why,
                           "value": round(v, 3), "net_c": None if net is None else round(net, 2),
                           "pick": [pe, pn]})
-        nst = st if st is not None else {"narrow": None, "grow": None}
-        nst["edge"], nst["size"] = res
-        self.model_state[key] = nst
+        st["edge"], st["size"] = res
+        self.model_state[key] = st
         if len(self._model_cache) > 20000:
             self._model_cache.clear()
         self._model_cache[key] = (now, res)
@@ -1973,11 +1980,11 @@ class ArbsRunner:
                 if size >= 1 and (q is None or q.remaining <= size + _EPS):
                     plan = pricing.quote_leg(vs, j, b.payout, need, size)
             elif want:
-                need_j, cap_j = quote_need, cap
+                need_j, cap_j, picked = quote_need, cap, False
                 if live and self.model_on(b):
                     mp = self.model_pick(b, j, vs, now_ts)
                     if mp is not None:
-                        need_j, cap_j = mp
+                        (need_j, cap_j), picked = mp, True
                 if need_j is None:
                     room = 0.0                        # the model values no quote here now
                 else:
@@ -1986,7 +1993,7 @@ class ArbsRunner:
                 size = pricing.depth_size(vs, j, b.payout, need_j, float(int(room + _EPS))) if room >= 1 else 0.0
                 plan = pricing.quote_leg(vs, j, b.payout, need_j, size) if size >= 1 else None
                 if room >= 1:
-                    plan, size = self.best_plan(b, j, plan, size, room)
+                    plan, size = self.best_plan(b, j, plan, size, room, need_j if picked else 0.0)
                 if q is not None and q.remaining > size + _EPS:
                     plan = None
             if plan is None:
@@ -2217,11 +2224,14 @@ class ArbsRunner:
         for t in y.tickers:
             self.by_ticker.setdefault(t, []).append(y.basket_id)
 
-    def best_plan(self, b: Basket, j: int, plan, size: float, room: float):
+    def best_plan(self, b: Basket, j: int, plan, size: float, room: float, min_need: float = 0.0):
         """(plan, size) for b's quote on leg j, priced through whichever basket
         with that market side allows the highest price: a fill is booked into
         the basket that completes it cheapest (book_target), so the quote can
-        rest as high as the best of them clears its edge."""
+        rest as high as the best of them clears its edge. `min_need` is the
+        leg's model edge, which the other baskets must clear too: at their
+        config edge they undercut it (on weather, 40% of quotes for 15-20c
+        picks rested ~11c tighter, 11-12)."""
         t, now_ts = self.cfg.trading, _utc()
         best, via = (plan, size), None
         cands = None
@@ -2243,6 +2253,7 @@ class ArbsRunner:
                 continue
             live = self.live_now(y, now_ts)
             need = edge_dollars(y.payout, t.min_edge + t.quote_edge_add) + (t.live_edge_add if live else 0.0)
+            need = max(need, min_need)
             r = min(room, self.room_bundles(y), float(self.quote_size_by_dollars(y)))
             n = pricing.depth_size(vy, k, y.payout, need, float(int(r + _EPS)))
             p = pricing.quote_leg(vy, k, y.payout, need, n) if n >= 1 else None
