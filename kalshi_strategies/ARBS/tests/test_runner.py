@@ -1706,6 +1706,30 @@ def test_dollar_room_follows_shard_cash_when_live(arbs):
     r.live = False
 
 
+def test_balance_read_is_shared_and_backs_off(arbs, tmp_path, monkeypatch):
+    r, _ = arbs
+    monkeypatch.setattr(R, "BALANCE_FILE", str(tmp_path / "balance.json"))
+    calls = []
+
+    async def call(fn, *a):
+        calls.append(fn)
+        if len(calls) > 1:
+            raise RuntimeError("429")
+        return {0: 900.0, 3: 50.0}, 10.0
+
+    monkeypatch.setattr(r.gw, "call", call)
+    monkeypatch.setattr(r.gw, "any_client", lambda: type("C", (), {"shard_balances": None})())
+    cash, value, _ = asyncio.run(r.shard_balances())
+    assert cash == {0: 900.0, 3: 50.0} and value == 10.0 and len(calls) == 1
+    assert asyncio.run(r.shard_balances())[0] == {0: 900.0, 3: 50.0} and len(calls) == 1   # shared read
+    R.atomic_write_json(R.BALANCE_FILE, {"t": 0.0, "cash": {"0": 1.0}, "value": 0.0})
+    with pytest.raises(RuntimeError):
+        asyncio.run(r.shard_balances())                                 # stale: reads, 429
+    with pytest.raises(RuntimeError, match="backing off"):
+        asyncio.run(r.shard_balances())                                 # no second call
+    assert len(calls) == 2
+
+
 _OUR_QUOTE = {"basket_id": "complete_set:X:buy_all_yes", "price": 0.41, "left": 100.0, "edge": 0.05,
               "age_s": 5.0, "pending": False, "tripped": False}
 

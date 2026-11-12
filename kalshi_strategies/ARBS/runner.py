@@ -72,6 +72,11 @@ LOST_LOOKUP_S = 1.0
 ORPHAN_FILL_S = 30.0
 CASH_STALE_POLLS = 6       # balance reads missed before max_dollars_auto falls back to max_dollars
 BALANCE_LOG_S = 60.0       # journal interval for the shards' cash and positions' value (dashboard capital)
+# One unscoped balance read serves every ARBS process (it lists all shards):
+# each reuses another's read younger than balance_poll_s. Two processes polling
+# at 30 s had about half their reads 429 (11-12).
+BALANCE_FILE = os.path.join(LIVE_ROOT, "ARBS", "balance.json")
+BALANCE_BACKOFF_MAX_S = 300.0
 
 
 def _log(msg: str):
@@ -394,6 +399,8 @@ class ArbsRunner:
         self.cash_at = 0.0
         self.pos_value: dict[int, float] = {}     # shard -> Kalshi's value of our positions
         self.balance_logged = 0.0
+        self._balance_retry_at = 0.0
+        self._balance_fails = 0
         self.paused_until: dict[str, float] = {}  # ticker -> monotonic time Kalshi's pause is next retried
         self.exchange_paused = False              # Kalshi's exchange-wide trading_active is off
         self.priority_trading: list[str] = []     # write_priority_series in session now
@@ -1784,18 +1791,44 @@ class ArbsRunner:
         cash = self.cash_room(b)
         return self.cfg.trading.max_dollars - self.committed() if cash is None else cash
 
+    async def shard_balances(self) -> tuple[dict[int, float], float, float]:
+        """(cash by shard, positions' value, read time): the shared read if it
+        is younger than balance_poll_s, else a fresh one, shared. Raises on a
+        failed read or while backing off from one."""
+        now = time.time()
+        try:
+            with open(BALANCE_FILE, encoding="utf-8") as fh:
+                d = json.load(fh)
+            if now - d["t"] < self.cfg.runtime.balance_poll_s:
+                return {int(s): v for s, v in d["cash"].items()}, d["value"], d["t"]
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        if now < self._balance_retry_at:
+            raise RuntimeError(f"balance read backing off {self._balance_retry_at - now:.0f}s")
+        try:
+            cash, value = await self.gw.call(self.gw.any_client().shard_balances)
+        except Exception:
+            self._balance_fails += 1
+            self._balance_retry_at = time.time() + min(BALANCE_BACKOFF_MAX_S,
+                                                       self.cfg.runtime.balance_poll_s * 2 ** self._balance_fails)
+            raise
+        self._balance_fails, t = 0, time.time()
+        atomic_write_json(BALANCE_FILE, {"t": t, "cash": {str(s): v for s, v in cash.items()}, "value": value},
+                          indent=None)
+        return cash, value, t
+
     async def balance_loop(self):
         while True:
             await asyncio.sleep(self.cfg.runtime.balance_poll_s)
             if not (self.live and self.cfg.trading.max_dollars_auto):
                 continue
             try:
-                cash, value = await self.gw.call(self.gw.any_client().shard_balances)
+                cash, value, t = await self.shard_balances()
                 # Only shards this process scans: one kept for a held basket on
                 # another's shard would count that shard's cash twice.
                 self.cash = {s: cash.get(s, 0.0) for s in self.gw.clients if s in self.cfg.scan.shards}
                 self.pos_value = {"all": value}
-                self.cash_at = time.time()
+                self.cash_at = t
                 if self.cash_at - self.balance_logged >= BALANCE_LOG_S:
                     self.balance_logged = self.cash_at
                     self.journal({"kind": "balance", "cash": {str(s): round(v, 2) for s, v in self.cash.items()},
@@ -3107,7 +3140,7 @@ class ArbsRunner:
             self.alert("error", None, "arm refused: no order clients")
             return False
         try:
-            cash, _ = await self.gw.call(self.gw.any_client().shard_balances)
+            cash, _, _ = await self.shard_balances()
             bal = {s: cash.get(s, 0.0) for s in self.gw.clients}
         except Exception as e:
             self.alert("error", None, f"arm refused: balance read failed ({e!r})")
