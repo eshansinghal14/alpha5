@@ -599,6 +599,15 @@ class CoinRaceModel:
         return self.signal_age_s()
 
     def side_block(self, ticker, side, fair, now_s):
+        ex = fair.extras or {}
+        coin = ex.get("coin")
+        thr = (self.cfg.pricing.perp_gap_block_c or {}).get(coin)
+        gap, dpdx = ex.get("perp_gap_bp"), ex.get(f"dpdx_{str(coin).lower()}")
+        if thr is None or gap is None or dpdx is None:
+            return None
+        shift_c = gap * dpdx * 100
+        if (side == "yes" and shift_c < -thr) or (side == "no" and shift_c > thr):
+            return "perp_gap"
         return None
 
     def quote_block(self, ticker, now_s):

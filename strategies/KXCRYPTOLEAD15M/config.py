@@ -76,7 +76,14 @@ class CryptoPricingParams:
         "on HYPE, a Binance increment over 1bp was followed by Coinbase the same way 73-75% of the time "
         "(0.25-2s ahead), covering 0.50-0.73 of it; on SOL 28-56% and 0.20-0.46, so SOL stays on spot. "
         "Coinbase HYPE prints ~9/min vs Binance's ~900/min. The start TWAP and CF basis stay on spot. "
+        "SOL added 11-12: replay of 11-08..12 maker fills (shifted reservations 50ms before each fill) "
+        "avoided 68 fills worth -$72, ~+$14/day; XRP's increment is nonzero 0.6% of the time, so no gain. "
         "null = every coin.")
+    perp_gap_block_c: dict[str, float] | None = param(
+        "Per coin, block a side (quotes and LIP) when the perp-vs-spot gap moves this market's fair "
+        "against it by more than this many cents (perp_gap_bp x own-coin dpdx). Replay 11-08..12, decision "
+        "50ms before each maker fill: SOL at 1c blocked 260 of 620 fills worth -$99, +$20/day (0.5c: +$28/day "
+        "but half of SOL's fills); XRP +$4/day; BTC/ETH lose. A coin left out, or null, is never blocked.")
     quote_markets: list[str] | None = param(
         "Markets that rest quotes (edge and LIP, LIP exit included), by coin. null = every market. A market "
         "left out is still priced (the race is joint) and keeps any position to settlement. HYPE left out "

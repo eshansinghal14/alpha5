@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 from infra.kalshi.markets import EventInfo
+from infra.trading.fair import Fair
 from strategies.KXCRYPTOLEAD15M.cf_index import STALE_S, CfIndex
 from strategies.KXCRYPTOLEAD15M.composite import CompositeBar, CompositeBus
 from strategies.KXCRYPTOLEAD15M.cov_forecaster import ConstantCovForecaster
@@ -269,12 +270,30 @@ def test_cf_age_under_threshold_does_not_add_to_signal_age():
     assert m.signal_age_s() < 0.5
 
 
-def test_no_side_blocks():
+def test_no_side_blocks_without_a_perp_gap():
     now = time.time()
     m = _model(now, recovery_s=0.0)
     _feed(m, time.monotonic())
     fairs = m.reprice(now)
     assert all(m.side_block(t, s, f, now) is None for t, f in fairs.items() for s in ("yes", "no"))
+
+
+def test_perp_gap_blocks_the_side_it_moves_fair_against():
+    now = time.time()
+    m = _model(now, recovery_s=0.0, perp_gap_block_c={"SOL": 1.0})
+    # 2bp gap x 0.006/bp = 1.2c of SOL's fair: perps say SOL's YES is worth less.
+    sol = Fair(prob=0.3, lo=0.2, hi=0.4, extras={"coin": "SOL", "perp_gap_bp": -2.0, "dpdx_sol": 0.006})
+    assert m.side_block("T-SOL", "yes", sol, now) == "perp_gap"
+    assert m.side_block("T-SOL", "no", sol, now) is None
+    up = Fair(prob=0.3, lo=0.2, hi=0.4, extras={"coin": "SOL", "perp_gap_bp": 2.0, "dpdx_sol": 0.006})
+    assert m.side_block("T-SOL", "no", up, now) == "perp_gap"
+    small = Fair(prob=0.3, lo=0.2, hi=0.4, extras={"coin": "SOL", "perp_gap_bp": -1.0, "dpdx_sol": 0.006})
+    assert m.side_block("T-SOL", "yes", small, now) is None
+    # A coin left out of the map is never blocked; neither is a stale perp (gap None).
+    btc = Fair(prob=0.3, lo=0.2, hi=0.4, extras={"coin": "BTC", "perp_gap_bp": -9.0, "dpdx_btc": 0.006})
+    assert m.side_block("T-BTC", "yes", btc, now) is None
+    stale = Fair(prob=0.3, lo=0.2, hi=0.4, extras={"coin": "SOL", "perp_gap_bp": None, "dpdx_sol": 0.006})
+    assert m.side_block("T-SOL", "yes", stale, now) is None
 
 
 def test_perp_priced_coin_moves_with_binance_lead_others_stay_on_spot():

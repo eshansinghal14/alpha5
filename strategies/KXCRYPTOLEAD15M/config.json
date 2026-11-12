@@ -83,6 +83,9 @@
     "perp_priced_markets": [
       "HYPE"
     ],
+    "perp_gap_block_c": {
+      "SOL": 1.0
+    },
     "quote_markets": [
       "BTC",
       "ETH",
