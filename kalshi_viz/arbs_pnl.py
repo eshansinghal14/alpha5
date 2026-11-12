@@ -244,3 +244,40 @@ def bundle_log(series: str, days: int = 2) -> pd.DataFrame:
                     "return": None if pnl is None or c["cost"] <= 0 else f"{pnl / c['cost']:.2%}",
                     "fills": ", ".join(f"{t.split('-', 1)[-1]} {s} {q:g}" for (t, s), q in c["legs"].items())})
     return pd.DataFrame(out)
+
+
+def combine(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    """Several processes' PnL histories as one: settled and total summed at
+    every time any of them changed; capital is the account's, from the
+    first frame that has it."""
+    frames = [f.drop_duplicates("time", keep="last").set_index("time") for f in frames if len(f)]
+    if not frames:
+        return pd.DataFrame(columns=["time", "settled", "total", "capital"])
+    if len(frames) == 1:
+        return frames[0].reset_index()
+    times = sorted(set().union(*(set(f.index) for f in frames)))
+    out = pd.DataFrame({"time": times, "settled": 0.0, "total": 0.0})
+    for f in frames:
+        for c in ("settled", "total"):
+            out[c] += f[c].reindex(times, method="ffill").fillna(0.0).values
+    cap = next((f for f in frames if f.capital.notna().any()), frames[0])
+    out["capital"] = cap.capital.reindex(times, method="ffill").values
+    return out
+
+
+def shards() -> list[str]:
+    """ARBS's processes (one per Kalshi shard), reported as one strategy."""
+    from kalshi_strategies.ARBS import SERIES
+    return list(SERIES)
+
+
+def load_all(series: list[str] | None = None) -> pd.DataFrame:
+    return combine([load(s) for s in series or shards()])
+
+
+def bundle_log_all(series: list[str] | None = None, days: int = 2) -> pd.DataFrame:
+    """bundle_log of every shard, newest first."""
+    logs = [x for s in series or shards() if len(x := bundle_log(s, days))]
+    if not logs:
+        return pd.DataFrame()
+    return pd.concat(logs, ignore_index=True).sort_values("time", ascending=False, kind="stable")

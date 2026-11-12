@@ -64,7 +64,9 @@ $REPO/.venv/bin/python -W ignore -m kalshi_infra.runtime.trading_digest --hours 
       name=${s%%:*} dir=${s#*:}
       echo "===== $name: HANDOFF ====="
       cat "$dir/HANDOFF.md" "$dir/research/HANDOFF.md" 2>/dev/null
-      echo; echo "===== $name: live config.json ====="; cat "$dir/config.json"
+      for c in "$dir"/config.json "$dir"/config_shard3.json; do
+        [ -f "$c" ] && { echo; echo "===== $name: live $(basename "$c") ====="; cat "$c"; }
+      done
       echo; echo "===== $name: commits, last 14 days ====="
       git -c safe.directory=$REPO log --since=14.days --format='%h %ad %s' --date=short -- "$dir" | head -40
       echo

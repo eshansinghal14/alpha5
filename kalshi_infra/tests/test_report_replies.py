@@ -41,16 +41,24 @@ class _Cfg:
 
 @pytest.fixture
 def series(tmp_path, monkeypatch):
-    path = tmp_path / "config.json"
-    path.write_text(json.dumps({"watch": {"exclude": ["A"], "size": 1.0}}))
-    s = SimpleNamespace(config_cls=_Cfg, config_path=str(path), config_key=None)
-    monkeypatch.setattr(rr, "_series", lambda name: s)
-    return s
+    """Two shard processes, like ARBS and ARBS3."""
+    procs = []
+    for name, exclude in (("config.json", ["A"]), ("config_shard3.json", ["A", "B"])):
+        path = tmp_path / name
+        path.write_text(json.dumps({"watch": {"exclude": exclude, "size": 1.0}}))
+        procs.append(SimpleNamespace(config_cls=_Cfg, config_path=str(path), config_key=None))
+    monkeypatch.setattr(rr, "_series", lambda name: procs)
+    return procs
 
 
-def test_resolve_adds_to_the_current_list(series):
-    _, new, old = rr.resolve({"series": "ARBS", "changes": [{"key": "watch.exclude", "add": ["B", "A"]}]})
-    assert new == {"watch.exclude": ["A", "B"]} and old == {"watch.exclude": ["A"]}
+def test_resolve_adds_to_each_shards_current_list(series):
+    targets = rr.resolve({"series": "ARBS", "changes": [{"key": "watch.exclude", "add": ["C"]}]})
+    assert [new for _, new, _ in targets] == [{"watch.exclude": ["A", "C"]}, {"watch.exclude": ["A", "B", "C"]}]
+
+
+def test_resolve_skips_a_shard_that_already_has_it(series):
+    targets = rr.resolve({"series": "ARBS", "changes": [{"key": "watch.exclude", "add": ["B"]}]})
+    assert [s.config_path for s, _, _ in targets] == [series[0].config_path]
 
 
 @pytest.mark.parametrize("change", [
@@ -70,4 +78,5 @@ def test_extract_strips_block_and_keeps_valid(series):
         {"n": 2, "series": "ARBS", "title": "bad", "changes": [{"key": "nope", "set": 1}]}]) + "\n```\n"
     out, props = rr.extract(body, "11-13")
     assert "proposals" not in out and [p["n"] for p in props] == [1]
+    # The same change on both shards reads as one line.
     assert props[0]["summary"] == "ARBS watch.size 1.0 → 2.0"

@@ -51,10 +51,13 @@ VERDICT_REV = re.compile(r"\b(" + _WORDS + r")[ \t]+(?:to[ \t]+)?(?:idea[ \t]+)?
 ALL = -1
 
 
-def _series(name: str):
+def _series(name: str) -> list:
+    """The processes a proposal for `name` changes: ARBS is one strategy run
+    as one process per Kalshi shard, each with its own config.json."""
     if name not in SERIES:
         raise ConfigError(f"series {name!r} isn't one a reply may change ({', '.join(SERIES)})")
-    return importlib.import_module(f"kalshi_strategies.{SERIES[name]}").SERIES[name]
+    procs = importlib.import_module(f"kalshi_strategies.{SERIES[name]}").SERIES
+    return list(procs.values()) if name == "ARBS" else [procs[name]]
 
 
 def _node(raw: dict, dotted: str):
@@ -69,15 +72,32 @@ def _node(raw: dict, dotted: str):
     return node, parts[-1]
 
 
-def resolve(proposal: dict) -> tuple[object, dict[str, object], dict[str, object]]:
-    """(series, {key: new value}, {key: current value}) for a proposal's
-    changes against the config as it is NOW, validated as a whole. "add" and
-    "remove" act on the current list, so edits made since the proposal stay."""
-    s = _series(proposal["series"])
+def resolve(proposal: dict) -> list[tuple[object, dict[str, object], dict[str, object]]]:
+    """[(process, {key: new value}, {key: current value})] for each process
+    whose config the proposal changes, against the configs as they are NOW,
+    each validated as a whole. "add" and "remove" act on the current list, so
+    edits made since the proposal stay. Raises if any config rejects it or
+    none would change."""
+    out = []
+    for s in _series(proposal["series"]):
+        try:
+            out.append(_resolve_one(s, proposal["changes"]))
+        except _NoChange:
+            pass
+    if not out:
+        raise ConfigError("no change against the current config")
+    return out
+
+
+class _NoChange(Exception):
+    pass
+
+
+def _resolve_one(s, changes: list[dict]):
     doc = read_json(s.config_path)
     raw = doc if s.config_key is None else doc[s.config_key]
     new, old = {}, {}
-    for ch in proposal["changes"]:
+    for ch in changes:
         key = ch["key"]
         node, leaf = _node(raw, key)
         cur = node[leaf]
@@ -96,9 +116,15 @@ def resolve(proposal: dict) -> tuple[object, dict[str, object], dict[str, object
         old[key], new[key] = cur, val
         node[leaf] = val
     if not new or new == old:
-        raise ConfigError("no change against the current config")
+        raise _NoChange
     build(s.config_cls, raw, s.config_key or "")
     return s, new, old
+
+
+def summarize(name: str, targets: list) -> str:
+    """One line per distinct change, e.g. "ARBS watch.exclude + X"."""
+    lines = list(dict.fromkeys(describe(new, old) for _, new, old in targets))
+    return f"{name} " + " | ".join(lines)
 
 
 def describe(new: dict, old: dict) -> str:
@@ -130,12 +156,12 @@ def extract(reply_body: str, day: str) -> tuple[str, list[dict]]:
     valid = []
     for p in props if isinstance(props, list) else []:
         try:
-            _, new, old = resolve(p)
+            targets = resolve(p)
         except (ConfigError, KeyError, TypeError, ImportError) as e:
             print(f"proposal {p.get('n')} dropped: {e}", file=sys.stderr)
             continue
         valid.append({"day": day, "n": int(p["n"]), "series": p["series"], "title": p.get("title", ""),
-                      "changes": p["changes"], "summary": f"{p['series']} {describe(new, old)}"})
+                      "changes": p["changes"], "summary": summarize(p["series"], targets)})
     return body, valid
 
 
@@ -215,11 +241,13 @@ def poll(days: int = 7, dry_run: bool = False):
                    "verdict": verdict, "title": p["title"] if p else None, "note": text[:2000]}
             if verdict == "yes" and p:
                 try:
-                    s, new, old = resolve(p)
-                    rec["applied"] = describe(new, old)
+                    # Every process's config is validated before any is written.
+                    targets = resolve(p)
+                    rec["applied"] = summarize(p["series"], targets)
                     if not dry_run:
-                        update_file(s.config_cls, s.config_path, s.config_key, new)
-                    report.append(f"#{n} APPLIED: {p['series']} {rec['applied']}")
+                        for s, new, _ in targets:
+                            update_file(s.config_cls, s.config_path, s.config_key, new)
+                    report.append(f"#{n} APPLIED: {rec['applied']}")
                 except (ConfigError, KeyError, TypeError) as e:
                     rec["error"] = str(e)
                     report.append(f"#{n} NOT applied ({e}): {p['title']}")

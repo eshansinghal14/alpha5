@@ -5,7 +5,9 @@ Cover these two strategies only (the hourly check also watches LIPFARM, see belo
 and service in the digest (KXINX*, KXBTC15M and the other single-coin 15M series, ...):
 - Coin race, KXCRYPTOLEAD15M (service alpha5-crypto): quotes 15-minute crypto "lead" markets (which of
   BTC/ETH/SOL/HYPE/XRP moves most), Kalshi shard 2.
-- ARBS (service alpha5-arbs): arbitrage across baskets of related markets (complete sets, ladders, ...), shard 0.
+- ARBS (service alpha5-arbs): arbitrage across baskets of related markets (complete sets, ladders, ...). It runs
+  as two processes on disjoint markets: ARBS on Kalshi shard 0 (config.json) and ARBS3 on shard 3, tennis and
+  basketball (config_shard3.json). Report them as ONE strategy; name a shard only where they differ.
 
 For the daily report, stdin starts with each strategy's HANDOFF.md (its current state, what has been tried and
 measured, what was rejected and why, open questions), its live config.json and its recent commits, and ends with
@@ -19,7 +21,8 @@ Where to look for more:
 - data/live/<SERIES>/<YYYY-MM-DD>/summary.json: current live state.
 - data/live/<SERIES>/perf/fills.parquet: every real fill with mo0/mo1/mo10/mo60 (c/contract), pnl_c, settled, event, role.
 - data/live/<SERIES>/<YYYY-MM-DD>/journal/{fills,orders,decisions,bbo}/part-*.parquet (kalshi_infra.runtime.journal.read_journal).
-- data/live/ARBS/journal/<date>.jsonl, data/live/ARBS/ledger.json; kalshi_viz.arbs_pnl.
+- data/live/{ARBS,ARBS3}/journal/<date>.jsonl and ledger.json; kalshi_viz.arbs_pnl (load_all / bundle_log_all
+  combine the shards). Logs data/live/arbs3.{out,err}.log for shard 3.
 - Strategy code: kalshi_strategies/KXCRYPTOLEAD15M/, kalshi_strategies/ARBS/, shared quoting in kalshi_infra/trading/.
 - Logs: data/live/{run,arbs}.{out,err}.log (no timestamps; use tail). journalctl -u alpha5-<name>.
 - git: use `git -c safe.directory=/opt/alpha5 log ...` (plain git refuses the repo for this user).

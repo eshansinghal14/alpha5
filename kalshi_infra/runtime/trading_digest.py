@@ -115,9 +115,9 @@ def perf_section(since: pd.Timestamp, now: pd.Timestamp) -> list[str]:
 
 
 def arbs_section(since: pd.Timestamp, now: pd.Timestamp) -> list[str]:
-    out = ["## ARBS (ledger replay: total = settled + locked complete bundles)"]
+    out = ["## ARBS, all shards (ledger replay: total = settled + locked complete bundles)"]
     try:
-        curve = arbs_pnl.load("ARBS")
+        curve = arbs_pnl.load_all()
     except Exception as e:
         return out + [f"replay failed: {e!r}"]
     if curve.empty:
@@ -129,7 +129,7 @@ def arbs_section(since: pd.Timestamp, now: pd.Timestamp) -> list[str]:
                f"settled ${last.settled - (t0.settled if t0 is not None else 0):+.2f}; "
                f"capital held now ${last.capital:.2f}; all-time total ${last.total:+.2f}")
     days = max(2, math.ceil((now - since).total_seconds() / 86400) + 1)
-    log = arbs_pnl.bundle_log("ARBS", days=days)
+    log = arbs_pnl.bundle_log_all(days=days)
     if log.empty:
         return out
     log = log[log.time >= since]

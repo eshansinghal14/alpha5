@@ -14,6 +14,7 @@ import streamlit as st
 
 from kalshi_infra.runtime.persist import LIVE_ROOT
 from kalshi_viz import arbs_pnl
+from kalshi_viz.arbs_pnl import combine  # noqa: F401  (tests use arbs_page.combine)
 from kalshi_viz.arm import arm_control
 from kalshi_viz.perf_panel import time_axis
 from kalshi_viz.data import latest_summary, read_summary, summary_age_s
@@ -194,10 +195,7 @@ def _metrics(s: dict):
 
 @st.cache_data(ttl=5, show_spinner=False)
 def _bundle_log(series: str) -> pd.DataFrame:
-    logs = [x for x in (arbs_pnl.bundle_log(p) for p in parts(series)) if len(x)]
-    if not logs:
-        return pd.DataFrame()
-    return pd.concat(logs, ignore_index=True).sort_values("time", ascending=False, kind="stable")
+    return arbs_pnl.bundle_log_all(parts(series), days=2)
 
 
 def _tables(series: str, s: dict):
@@ -253,25 +251,6 @@ def _tables(series: str, s: dict):
 @st.cache_data(ttl=15, show_spinner=False)
 def _pnl_frame(series: str) -> pd.DataFrame:
     return combine([arbs_pnl.load(p) for p in parts(series)])
-
-
-def combine(frames: list[pd.DataFrame]) -> pd.DataFrame:
-    """Several processes' PnL histories as one: settled and total summed at
-    every time any of them changed; capital is the account's, from the
-    first frame that has it."""
-    frames = [f.drop_duplicates("time", keep="last").set_index("time") for f in frames if len(f)]
-    if not frames:
-        return pd.DataFrame(columns=["time", "settled", "total", "capital"])
-    if len(frames) == 1:
-        return frames[0].reset_index()
-    times = sorted(set().union(*(set(f.index) for f in frames)))
-    out = pd.DataFrame({"time": times, "settled": 0.0, "total": 0.0})
-    for f in frames:
-        for c in ("settled", "total"):
-            out[c] += f[c].reindex(times, method="ffill").fillna(0.0).values
-    cap = next((f for f in frames if f.capital.notna().any()), frames[0])
-    out["capital"] = cap.capital.reindex(times, method="ffill").values
-    return out
 
 
 PNL_WINDOWS = {"6h": pd.Timedelta(hours=6), "24h": pd.Timedelta(hours=24), "7d": pd.Timedelta(days=7), "All": None}

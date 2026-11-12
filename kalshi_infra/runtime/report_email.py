@@ -146,7 +146,7 @@ def strategy_sections(hours: float) -> tuple[list[tuple[str, float]], str, list[
 
 def _arbs(since: pd.Timestamp):
     try:
-        curve = arbs_pnl.load("ARBS")
+        curve = arbs_pnl.load_all()
     except Exception:
         return None
     if curve.empty:
@@ -155,7 +155,7 @@ def _arbs(since: pd.Timestamp):
     base = before.iloc[-1] if len(before) else pd.Series({"total": 0.0, "settled": 0.0})
     w = curve[curve.time >= since]
     days = max(2, math.ceil((pd.Timestamp.now(tz="UTC") - since).total_seconds() / 86400) + 1)
-    log = arbs_pnl.bundle_log("ARBS", days=days)
+    log = arbs_pnl.bundle_log_all(days=days)
     log = log[log.time >= since] if len(log) else log
     done = log[log.pnl.notna()] if len(log) else log
     last = curve.iloc[-1]

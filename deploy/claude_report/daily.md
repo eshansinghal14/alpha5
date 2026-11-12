@@ -13,8 +13,8 @@ the digest, and which coins differ. Say whether anything changed, not just what 
 Two to four bullets: where the money came from and where it leaked (which series, live vs pre-match, completion
 slippage), compared with previous days.
 
-Before writing this section, go through ARBS's trades for the day (data/live/ARBS/journal/<date>.jsonl and
-kalshi_viz.arbs_pnl.bundle_log) and find the main drawdowns: the losing baskets and runs of losses that account
+Before writing this section, go through ARBS's trades for the day on both shards (data/live/{ARBS,ARBS3}/journal/
+<date>.jsonl and kalshi_viz.arbs_pnl.bundle_log_all) and find the main drawdowns: the losing baskets and runs of losses that account
 for most of the day's losses. For each one:
 - Work out what happened: which legs filled, at what prices, what the book and the market did around the fill,
   and how completion or the exit went compared with the plan.
@@ -65,7 +65,7 @@ listing exactly the change, numbered like the ideas (omit ideas that need code; 
   "changes": [{"key": "quoting.size_by_coin.SOL", "set": 0.5}]}]
 ```
 - "series" is ARBS or KXCRYPTOLEAD15M; "key" is the dotted path in that strategy's config.json, as it exists
-  there now (no new keys). Use "set" for a value, and "add" / "remove" for list items.
+  there now (no new keys). An ARBS change is applied to both shards' configs. Use "set" for a value, and "add" / "remove" for list items.
 - Propose only what you would be comfortable seeing applied live within minutes of a "yes".
 
 STATUS: ALERT only if something needs action today (see the hourly criteria); otherwise OK.
