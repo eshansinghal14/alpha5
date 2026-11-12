@@ -42,7 +42,8 @@
   "watch": {
     "queue_window_s": 10800.0,
     "rank_interval_s": 10.0,
-    "exclude": []
+    "exclude": [],
+    "record_only": []
   },
   "scan": {
     "enable": true,

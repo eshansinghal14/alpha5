@@ -2008,6 +2008,17 @@ def test_an_excluded_event_covers_its_baskets(arbs):
     assert r.excluded(b)
 
 
+def test_record_only_series_is_watched_but_never_traded(arbs):
+    r, b = arbs
+    assert not r.excluded(b)
+    series = r._lp_path(b.legs[0].ticker)[1]
+    r.cfg.watch = dataclasses.replace(r.cfg.watch, record_only=[series])
+    assert r.excluded(b)
+    r.series_group = {series: "S:Hockey"}
+    r.cfg.watch = dataclasses.replace(r.cfg.watch, record_only=["S:Hockey"])
+    assert r.excluded(b)
+
+
 def test_model_pick_is_quick_to_cut_risk_and_slow_to_add_it(arbs, monkeypatch):
     import types
     r, b = arbs

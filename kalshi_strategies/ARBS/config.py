@@ -145,6 +145,9 @@ class WatchParams:
                                    "for the ranking.", min=0.5, step=0.5, editable=False)
     exclude: list[str] = param("basket_id, relationship_id, event or cluster names never traded. Open positions "
                                "in them are still completed and settled.", editable=False)
+    record_only: list[str] = param("Series, events or groups (S:Hockey) still scanned and watched, so their "
+                                   "prints are recorded for the shadow check and the exit model, but never "
+                                   "quoted or taken. Unlike exclude, they take scan budget.", editable=False)
 
 
 @section

@@ -797,6 +797,11 @@ class ArbsRunner:
         if ex and (b.basket_id in ex or b.relationship_id in ex or b.cluster in ex
                    or b.relationship_id.split(":", 1)[-1] in ex):
             return True
+        ro = self.cfg.watch.record_only
+        if ro:
+            group, series, event = self._lp_path(b.legs[0].ticker)
+            if series in ro or group in ro or event in ro or b.cluster in ro:
+                return True
         # A scanned basket on a shard this process no longer scans (another
         # process's, ARBS3) stays only to finish its position, not to quote.
         if b.basket_id not in self.hand_ids and (s := self.basket_shard(b)) is not None                 and s not in self.cfg.scan.shards:
