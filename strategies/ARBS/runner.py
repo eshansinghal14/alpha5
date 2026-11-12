@@ -54,17 +54,11 @@ from strategies.ARBS.liquidity import Liquidity
 from strategies.ARBS.prints import AFTER_S, Prints, top as prints_top
 from strategies.ARBS.spec import Basket, Leg, basket_from_dict, basket_to_dict, load_spec, merge, parse_spec
 
-# Client-id prefix of LIPFARM's orders (LIPFARM.farm.CID_PREFIX): never ours to sweep.
-LIPFARM_CID_PREFIX = "lipf-"
-
 _EPS = 1e-9
 OTHER = {"yes": "no", "no": "yes"}
 TRADEABLE = ("active", "open")
 SETTLED = ("determined", "settled", "finalized")
 SUMMARY_S = 2.0
-# A market LIPFARM stops claiming stays off for LIP_RELEASE_S while its cancels land
-# (our completions would otherwise take against its resting bids).
-LIP_RELEASE_S = 5.0
 MAX_ALERTS = 300
 # A quote whose create got no response may still rest at Kalshi; look for it
 # by client id after this long.
@@ -72,6 +66,15 @@ LOST_LOOKUP_S = 1.0
 ORPHAN_FILL_S = 30.0
 CASH_STALE_POLLS = 6       # balance reads missed before max_dollars_auto falls back to max_dollars
 BALANCE_LOG_S = 60.0       # journal interval for the shards' cash and positions' value (dashboard capital)
+BALANCE_WAKE_S = 5.0
+# A settlement re-reads the balance this long after instead of adding its payout:
+# Kalshi pays a covered set's guaranteed part when the set is completed, so the
+# payout was booked twice (a 2,000-bundle NO set, $4,000 on shard 0, 11-12), and
+# pays the rest about a minute after the result (KENNMTU 10-29).
+SETTLE_REREAD_S = 60.0
+# Account positions that aren't ARBS's, {ticker: signed YES}: retired LIPFARM's,
+# written 11-12. The audit takes them off Kalshi's; ARBS still trades those markets.
+FOREIGN_POSITIONS = "foreign_positions.json"
 # Cash is tracked from our own fills and settlements between balance reads
 # (runtime.balance_poll_s): two processes reading every 30 s had about half
 # their reads 429 (11-12). A failed read retries after 60 s, doubling to this.
@@ -353,12 +356,6 @@ class ArbsRunner:
         self.hand_ids = {b.basket_id for b in self.hand}
         self.scan_path = os.path.join(self.root, scanner.SELECTED)
         self.scan_status: dict = {}
-        # LIPFARM's claims (live): tickers we neither take nor quote, and its
-        # signed-yes positions, which the audit takes off Kalshi's.
-        self.lip_claims: set[str] = set()
-        self.lip_positions: dict[str, float] = {}
-        self._lip_mtime: float | None = None
-        self.lip_released: dict[str, float] = {}     # ticker -> when LIPFARM stopped claiming it
         self.set_baskets(merge(self.hand, self.scanned()))
         for led in (self.real_ledger, self.shadow_ledger):
             for bid, pos in led.baskets.items():
@@ -402,6 +399,8 @@ class ArbsRunner:
         # shard -> balance at the last read, moved by our own fills and settlements since.
         self.cash_base: dict[int, float] = {}
         self.cash_at = 0.0
+        self._cash_reread_at: float | None = None
+        self.foreign = _load_foreign()
         self._cash_read_total = 0.0
         self._pos_read = 0.0
         self.pos_value: dict[int, float] = {}     # shard -> Kalshi's value of our positions
@@ -789,10 +788,9 @@ class ArbsRunner:
                 return False
         return True
 
-    def excluded(self, b: Basket, lip: bool = True) -> bool:
-        """Not traded: in watch.exclude, held off by LIPFARM's claims (lip=False
-        ignores them, so a claimed basket is still ranked), or settling past
-        the horizon."""
+    def excluded(self, b: Basket) -> bool:
+        """Not traded: in watch.exclude or record_only, on another process's
+        shard, or settling past the horizon."""
         ex = self.cfg.watch.exclude
         if ex and (b.basket_id in ex or b.relationship_id in ex or b.cluster in ex
                    or b.relationship_id.split(":", 1)[-1] in ex):
@@ -806,49 +804,7 @@ class ArbsRunner:
         # process's, ARBS3) stays only to finish its position, not to quote.
         if b.basket_id not in self.hand_ids and (s := self.basket_shard(b)) is not None                 and s not in self.cfg.scan.shards:
             return True
-        if lip and self.lip_blocked(b):
-            return True
         return b.settles is not None and b.settles > self.horizon()
-
-    def lip_blocked(self, b: Basket) -> bool:
-        now = time.time()
-        return any(t in self.lip_claims or now - self.lip_released.get(t, -1e18) < LIP_RELEASE_S for t in b.tickers)
-
-    def poll_lip_claims(self):
-        """Reload LIPFARM's claimed.json when it changes; baskets on tickers
-        that changed are re-evaluated, which pulls our quotes on a new claim.
-        A held basket still completes (evaluate resolves it before excluded)."""
-        path = os.path.join(LIVE_ROOT, "LIPFARM", "live", "claimed.json")
-        try:
-            m = os.path.getmtime(path)
-        except OSError:
-            m = None
-        if m == self._lip_mtime:
-            return
-        if m is None:
-            tickers, pos = set(), {}
-        else:
-            try:
-                with open(path, encoding="utf-8") as fh:
-                    doc = json.load(fh)
-            except (OSError, ValueError):
-                return          # mid-write: retry next poll
-            tickers = set(doc.get("tickers") or [])
-            pos = {t: float(v) for t, v in (doc.get("positions") or {}).items()}
-        now = time.time()
-        try:
-            asyncio.get_running_loop()
-            wake = True
-        except RuntimeError:
-            wake = False
-        for t in self.lip_claims - tickers:
-            self.lip_released[t] = now
-            for bid in self.by_ticker.get(t, ()) if wake else ():
-                self.later(bid, LIP_RELEASE_S + 0.05)
-        for t in tickers ^ self.lip_claims:
-            self.dirty |= set(self.by_ticker.get(t, ()))
-        self.lip_claims, self.lip_positions, self._lip_mtime = tickers, pos, m
-        self.lip_released = {t: at for t, at in self.lip_released.items() if now - at < LIP_RELEASE_S}
 
     def horizon(self) -> pd.Timestamp:
         """Latest settlement traded, refreshed once a second: evaluate asks
@@ -1690,7 +1646,7 @@ class ArbsRunner:
 
     def cash_now(self) -> dict[int, float]:
         """Shard -> available balance: the last read moved by our own fills
-        and settlements since. Kalshi's balance doesn't drop for resting
+        and unwinds since (a settlement re-reads it instead). Kalshi's balance doesn't drop for resting
         orders (flat at $17,158 under ~800 resting quotes, 11-12)."""
         return dict(self.cash_base)
 
@@ -1700,8 +1656,8 @@ class ArbsRunner:
         self.cash_at = time.time()
 
     def _cash_move(self, ticker: str, amount: float):
-        """Our own fill (-cost with fees), unwind (+$1 a pair) or settlement
-        moving its shard's cash until the next balance read."""
+        """Our own fill (-cost with fees) or unwind (+$1 a pair) moving its
+        shard's cash until the next balance read."""
         m = self.meta.get(ticker)
         if self.live and m is not None and m.shard in self.cash_base:
             self.cash_base[m.shard] += amount
@@ -1851,25 +1807,30 @@ class ArbsRunner:
         return got
 
     async def balance_loop(self):
+        logged = 0.0
         while True:
-            await asyncio.sleep(BALANCE_LOG_S)
+            await asyncio.sleep(BALANCE_WAKE_S)
             if not (self.live and self.cfg.trading.max_dollars_auto):
                 continue
-            if time.time() - self.cash_at >= self.cfg.runtime.balance_poll_s:
+            now = time.time()
+            due = now - self.cash_at >= self.cfg.runtime.balance_poll_s or                 (self._cash_reread_at is not None and now >= self._cash_reread_at)
+            if due and now >= self._balance_retry_at:
                 try:
                     cash, value = await self.shard_balances()
                     # Only shards this process scans: one kept for a held basket on
                     # another's shard would count that shard's cash twice.
                     before = self.cash_now() if self.cash_base else {}
                     self.set_cash({s: cash.get(s, 0.0) for s in self.gw.clients if s in self.cfg.scan.shards}, value)
+                    self._cash_reread_at = None
                     if before:
                         self.journal({"kind": "balance_drift", "drift": {
                             str(s): round(before.get(s, 0.0) - v, 2) for s, v in self.cash_now().items()}})
                 except Exception as e:
                     _log(f"WARN: balance read failed ({e!r})")
-            if self.cash_base:
+            if self.cash_base and now - logged >= BALANCE_LOG_S:
+                logged = now
                 cash = self.cash_now()
-                # Cash spent since the read went into positions (at cost), and comes back on settling.
+                # Cash spent since the read went into positions (at cost); the read after a settlement brings it back.
                 self.pos_value = {"all": self._pos_read - (sum(self.cash_base.values()) - self._cash_read_total)}
                 self.journal({"kind": "balance", "cash": {str(s): round(v, 2) for s, v in cash.items()},
                               "positions": {str(s): round(v, 2) for s, v in self.pos_value.items()}})
@@ -2903,8 +2864,6 @@ class ArbsRunner:
         ours = set(self.tickers)
         resting = await self.gw.call(c._resting, "")
         for oid, ticker, cid in resting:
-            if (cid or "").startswith(LIPFARM_CID_PREFIX):
-                continue
             if ticker not in ours and oid not in self.real_ledger.quote_ids:
                 continue
             # Paced, with retries: ~700 cancels at once drew 429s on 180 of
@@ -2931,7 +2890,7 @@ class ArbsRunner:
     # ------------------------------------------------------------------ ranking
 
     def rank_row(self, b: Basket, vs):
-        g = None if vs is None or self.excluded(b, lip=False) else pricing.gap(vs, b.payout)
+        g = None if vs is None or self.excluded(b) else pricing.gap(vs, b.payout)
         if g is None:
             self.rank_rows.pop(b.basket_id, None)
             return
@@ -3102,8 +3061,7 @@ class ArbsRunner:
         which basket a contract belongs to)."""
         c = self.gw.any_client()
         real = await self.gw.call(c.positions_all)
-        self.poll_lip_claims()
-        for t, v in self.lip_positions.items():
+        for t, v in self.foreign.items():
             real[t] = real.get(t, 0.0) - v
         mine = self.real_ledger.net_by_ticker()
         diff = {t: {"kalshi": real.get(t, 0.0), "ledger": round(mine.get(t, 0.0), 4)}
@@ -3170,7 +3128,7 @@ class ArbsRunner:
                        "pnl": round(paid - cost, 4), "results": res, "live": led is self.real_ledger}
                 led.close(bid, row)
                 if led is self.real_ledger:
-                    self._cash_move(next(iter(legs)), paid)
+                    self._cash_reread_at = self._cash_reread_at or time.time() + SETTLE_REREAD_S
                 self.journal({"kind": "settled", **row})
 
     # ------------------------------------------------------------------ arm / control
@@ -3233,7 +3191,6 @@ class ArbsRunner:
                 _log(f"STOP: {reason}")
                 stop.set()
                 return
-            self.poll_lip_claims()
             want = trading.poll()
             if want is not None:
                 self.arm_want, retry_at = want, 0.0
@@ -3411,6 +3368,14 @@ class ArbsRunner:
                               indent=None)
             self.pool.shutdown(wait=False)
             self.write_pool.shutdown(wait=False)
+
+
+def _load_foreign() -> dict[str, float]:
+    try:
+        with open(os.path.join(LIVE_ROOT, "ARBS", FOREIGN_POSITIONS), encoding="utf-8") as fh:
+            return {t: float(v) for t, v in json.load(fh).items()}
+    except FileNotFoundError:
+        return {}
 
 
 def series_groups() -> dict[str, str]:

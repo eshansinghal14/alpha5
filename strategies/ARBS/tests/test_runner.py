@@ -1788,49 +1788,38 @@ def test_series_groups_read_sports_tags(monkeypatch):
     assert R.series_groups() == {"KXEPL": "S:Soccer", "KXHOUSE": "Elections"}
 
 
-def test_lipfarm_claim_excludes_basket_and_audit_nets_its_position(arbs):
+def test_audit_takes_foreign_positions_off_kalshis(arbs):
     r, b = arbs
-    path = R.os.path.join(R.LIVE_ROOT, "LIPFARM", "live")
-    R.os.makedirs(path)
-    with open(R.os.path.join(path, "claimed.json"), "w") as fh:
-        json.dump({"tickers": ["X-A"], "positions": {"X-A": -100.0}}, fh)
-    r.dirty = set()
-    r.poll_lip_claims()
-    assert r.excluded(b) and b.basket_id in r.dirty
+    path = R.os.path.join(R.LIVE_ROOT, "ARBS")
+    R.os.makedirs(path, exist_ok=True)
+    with open(R.os.path.join(path, R.FOREIGN_POSITIONS), "w") as fh:
+        json.dump({"X-A": -100.0}, fh)
+    r.foreign = R._load_foreign()
+    r.real_ledger.record(b.basket_id, b.tickers, "X-A", "yes", 30, 0.4, time.time())
 
     class Client:
         def positions_all(self):
-            return {"X-A": -100.0}          # LIPFARM's NO fill, not ours
+            return {"X-A": -70.0}           # LIPFARM's 100 NO netted with our 30 YES
 
     async def call(fn, *a):
         return fn(*a)
     r.gw.any_client, r.gw.call = Client, call
     assert asyncio.run(r.audit()) and r.audit_diff is None
-    R.os.remove(R.os.path.join(path, "claimed.json"))
-    r.poll_lip_claims()
-    assert r.excluded(b) and not r.lip_positions        # held off while LIPFARM's cancels land
-    r.lip_released["X-A"] -= R.LIP_RELEASE_S
-    assert not r.excluded(b)
+    assert not r.excluded(b)                                     # still traded
 
 
-def test_sweep_leaves_lipfarm_orders(arbs, monkeypatch):
+def test_settlement_rereads_the_balance_instead_of_adding_its_payout(arbs):
     r, b = arbs
-    cancelled = []
-
-    class Client:
-        def _resting(self, prefix):
-            return [("o1", "X-A", "lipf-abc"), ("o2", "X-A", "ours")]
-
-    async def call(fn, *a):
-        return fn(*a)
-
-    async def cancel(ticker, oid, reason):
-        cancelled.append(oid)
-        return None, None, None
-    r.gw.any_client, r.gw.call, r.gw.cancel = Client, call, cancel
-    monkeypatch.setattr(R, "SWEEP_PACING_S", 0.0)
-    asyncio.run(r.sweep("test"))
-    assert cancelled == ["o2"]
+    r.live = True
+    r.set_cash({0: 900.0}, 0.0)
+    r.real_ledger.record(b.basket_id, b.tickers, "X-A", "yes", 2, 0.4, time.time())
+    r.real_ledger.record(b.basket_id, b.tickers, "X-B", "yes", 2, 0.5, time.time())
+    r.meta["X-A"].status, r.meta["X-A"].result = "finalized", "yes"
+    r.meta["X-B"].status, r.meta["X-B"].result = "finalized", "no"
+    r.settle()
+    assert r.cash_now()[0] == 900.0
+    assert r._cash_reread_at is not None and r._cash_reread_at > time.time()
+    r.live = False
 
 
 def test_move_watch_legs_together_and_jump():

@@ -87,8 +87,8 @@ them where they differ.
   probably a per-endpoint limit or uncounted reads (scanner, other
   strategies).
 - **LIP removed from ARBS** (`27f056d`): the LIP edge discount, LIP pricing
-  and the LIP ranking are gone; ARBS only yields markets LIPFARM claims
-  (`claimed.json`). LIPFARM is another session's strategy — don't modify it.
+  and the LIP ranking are gone. LIPFARM was retired 11-12 and ARBS's
+  `claimed.json` yielding removed with it.
 - **CPU** (`ddd3ffc`): 85% → ~60% of a core for ARBS; ARBS3 ~40%.
 - **Replay fixes** (`06397cf`): shadow fills exit by the cheaper of
   completing and unwinding at the 0.1 s book, as the runner does.

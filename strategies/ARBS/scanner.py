@@ -271,13 +271,11 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
 
 
 def select(doc: dict, *, now: pd.Timestamp, days: float, max_markets: int, known_tickers: set[str] = frozenset(),
-           held: set[str] = frozenset(), exclude: set[str] = frozenset(),
-           yield_events: set[str] = frozenset()) -> dict:
+           held: set[str] = frozenset(), exclude: set[str] = frozenset()) -> dict:
     """The part of a scan to trade: relationships settling within `days`, the
     most traded per market first (24h volume),
     until max_markets markets beyond `known_tickers`. Relationships holding a
-    basket in `held` are always kept; otherwise one with a leg in
-    `yield_events` (another strategy's) is skipped."""
+    basket in `held` are always kept."""
     # Per market, not in total: on 11-05 a 400-market Nasdaq ladder and the
     # 14-market election-margin ladders outranked 3-market games trading
     # $40-110k a day, and only 10 games within 36 h made the budget (32 per market).
@@ -295,8 +293,6 @@ def select(doc: dict, *, now: pd.Timestamp, days: float, max_markets: int, known
             continue
         s = r.get("expected_settlement_utc")
         if (s and pd.Timestamp(s) > horizon) or r.get("cluster") in exclude                 or r["relationship_id"].split(":", 1)[-1] in exclude:
-            continue
-        if yield_events and any(t.rsplit("-", 1)[0] in yield_events for t in ts):
             continue
         if len(used | ts) <= max_markets:
             out.append(r)
