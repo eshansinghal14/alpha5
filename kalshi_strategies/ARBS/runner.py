@@ -200,17 +200,21 @@ ALT_SEARCH_S = 0.5
 HELD_CACHE_S = 0.25
 # Live quotes in trading.model_series: edge and size from the exit-cost model,
 # picked over this grid (sizes within the model's 11-08..10 training range).
-MODEL_EDGES = (0.02, 0.03, 0.04, 0.05, 0.075, 0.10, 0.15, 0.20)
+# No 2c: on its first hour (11-11) the model took 11 live NCAAMB legs to 2c.
+MODEL_EDGES = (0.03, 0.04, 0.05, 0.075, 0.10, 0.15, 0.20)
 MODEL_SIZES = (5.0, 20.0, 50.0, 100.0)
 MODEL_EVAL_S = 0.5            # a leg's pick is reused this long between book changes
 MODEL_AGE_S = 0.25            # the depth age the model's training rows measured
-# Sticky by design: the pick flipped edge on 49% of consecutive prints a minute
-# apart (11-05..10), and every price move or size increase costs queue place.
-# Risk-reducing moves (wider, smaller) go at once; narrowing and growing wait
-# for the pick to hold, and move one step.
-MODEL_MIN_NET_C = 0.5         # widen at once when the current edge nets less than this a lot
-MODEL_WIDEN_GAIN = 1.5        # ... or a wider edge is worth this many times more
-MODEL_NARROW_HOLD_S = 30.0
+# Sticky by design: every price move or size increase costs queue place. Only
+# risk moves at once: widening when the current edge is predicted to net under
+# MODEL_MIN_NET_C a lot, and shrinking. Narrowing needs a narrower pick worth
+# MODEL_NARROW_GAIN x the current for MODEL_NARROW_HOLD_S, growing the bigger
+# pick for MODEL_GROW_HOLD_S, each one step. Widening on value alone and a 30 s
+# narrow hold made 27 changes per leg-hour on live NCAAMB, 166 of them a narrow
+# undone by a widen within a minute (first hour, 11-11).
+MODEL_MIN_NET_C = 0.5
+MODEL_NARROW_GAIN = 1.25
+MODEL_NARROW_HOLD_S = 120.0
 MODEL_GROW_HOLD_S = 60.0
 
 
@@ -1737,12 +1741,9 @@ class ArbsRunner:
         else:
             e, n = st["edge"], st["size"]
             cur_v, cur_net = cands[(e, n)]
-            if pe > e:
-                st["narrow"] = None
-                wider = cands.get((pe, n), (pv, 0.0))[0]
-                if cur_net < MODEL_MIN_NET_C or wider >= MODEL_WIDEN_GAIN * max(cur_v, 1e-9):
-                    e, why = pe, "widen"
-            elif pe < e:
+            if cur_net < MODEL_MIN_NET_C and pe > e:
+                e, why, st["narrow"] = pe, "widen", None
+            elif pe < e and pv >= MODEL_NARROW_GAIN * max(cur_v, 1e-9):
                 since = st.get("narrow") or now
                 st["narrow"] = since
                 if now - since >= MODEL_NARROW_HOLD_S:

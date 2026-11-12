@@ -2004,8 +2004,11 @@ def test_model_pick_is_quick_to_cut_risk_and_slow_to_add_it(arbs, monkeypatch):
         return r.model_pick(b, 0, vs, now_ts)
 
     assert pick({(0.05, 50.0): (5.0, 2.0)}) == (0.05, 50.0)                 # start at the pick
-    assert pick({(0.10, 50.0): (9.0, 3.0)}) == (0.10, 50.0)                 # wider and worth 1.5x: at once
-    assert pick({(0.05, 50.0): (12.0, 2.0)}) == (0.10, 50.0)                # narrower: waits
+    assert pick({(0.10, 50.0): (9.0, 3.0)}) == (0.05, 50.0)                 # wider worth more, no risk: stays
+    assert pick({(0.10, 50.0): (9.0, 3.0), (0.05, 50.0): (1.0, 0.2)}) == (0.10, 50.0)   # 0.2c a lot: widens
+    assert pick({(0.05, 50.0): (1.1, 2.0)}) == (0.10, 50.0)                 # narrower, under 1.25x: no clock
+    assert r.model_state[(b.basket_id, 0)]["narrow"] is None
+    assert pick({(0.05, 50.0): (12.0, 2.0)}) == (0.10, 50.0)                # narrower and worth it: waits
     r.model_state[(b.basket_id, 0)]["narrow"] -= R.MODEL_NARROW_HOLD_S
     assert pick({(0.05, 50.0): (12.0, 2.0)}) == (0.075, 50.0)               # then one step
     assert pick({(0.075, 20.0): (12.0, 2.0)}) == (0.075, 20.0)              # smaller: at once
