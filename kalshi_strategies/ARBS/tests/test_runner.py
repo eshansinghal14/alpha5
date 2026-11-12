@@ -1679,7 +1679,7 @@ def test_dollar_room_is_the_baskets_own_shard_cash(arbs):
     t = r.cfg.trading
     t.max_dollars_auto, t.cash_reserve = True, 100.0
     r.live = True
-    r.cash, r.cash_at = {0: 900.0, 3: 150.0}, time.time()
+    r.set_cash({0: 900.0, 3: 150.0}, 0.0)
     for tk in ("X-A", "X-B"):
         r.meta[tk] = dataclasses.replace(r.meta[tk], shard=3)
     assert abs(r.room_dollars(b) - (150.0 - 100.0)) < 1e-9          # shard 0's cash can't back it
@@ -1694,10 +1694,10 @@ def test_dollar_room_follows_shard_cash_when_live(arbs):
     assert r.room_dollars(b) == 50.0 - r.committed()               # shadow: max_dollars
     r.live = True
     assert r.room_dollars(b) == 50.0 - r.committed()               # balance not read yet
-    r.cash, r.cash_at = {0: 900.0}, time.time()
     q = R.Quote(basket_id=b.basket_id, leg=0, ticker="X-A", side="yes", price=0.40, size=50, cid="c", edge=0.05,
                 max_price=0.40, pending=False, exchange_id="oid")
     r.quotes[q.key] = q
+    r.set_cash({0: 900.0}, 0.0)
     # Kalshi's balance is net of this quote's 50 x 0.40; the basket gets it back.
     assert abs(r.room_dollars(b) - (900.0 + 20.0 - 100.0)) < 1e-9
     assert abs(r.room_dollars() - 800.0) < 1e-9
@@ -1706,28 +1706,33 @@ def test_dollar_room_follows_shard_cash_when_live(arbs):
     r.live = False
 
 
-def test_balance_read_is_shared_and_backs_off(arbs, tmp_path, monkeypatch):
-    r, _ = arbs
-    monkeypatch.setattr(R, "BALANCE_FILE", str(tmp_path / "balance.json"))
+def test_cash_is_tracked_between_balance_reads(arbs, monkeypatch):
+    r, b = arbs
+    r.live = True
+    r.set_cash({0: 900.0}, 10.0)
+    q = R.Quote(basket_id=b.basket_id, leg=0, ticker="X-A", side="yes", price=0.40, size=50, cid="c", edge=0.05,
+                max_price=0.40, pending=False, exchange_id="oid")
+    r.quotes[q.key] = q
+    assert abs(r.cash_now()[0] - 880.0) < 1e-9                      # Kalshi holds back 50 x 0.40
+    del r.quotes[q.key]                                             # it fills: the reserve becomes a position
+    r._cash_move("X-A", -20.1)                                      # cost with a 10c fee
+    assert abs(r.cash_now()[0] - 879.9) < 1e-9
+    r._cash_move("X-A", 50.0)                                       # settles or unwinds for $50
+    assert abs(r.cash_now()[0] - 929.9) < 1e-9
+    r.live = False
     calls = []
 
     async def call(fn, *a):
         calls.append(fn)
-        if len(calls) > 1:
-            raise RuntimeError("429")
-        return {0: 900.0, 3: 50.0}, 10.0
+        raise RuntimeError("429")
 
     monkeypatch.setattr(r.gw, "call", call)
     monkeypatch.setattr(r.gw, "any_client", lambda: type("C", (), {"shard_balances": None})())
-    cash, value, _ = asyncio.run(r.shard_balances())
-    assert cash == {0: 900.0, 3: 50.0} and value == 10.0 and len(calls) == 1
-    assert asyncio.run(r.shard_balances())[0] == {0: 900.0, 3: 50.0} and len(calls) == 1   # shared read
-    R.atomic_write_json(R.BALANCE_FILE, {"t": 0.0, "cash": {"0": 1.0}, "value": 0.0})
-    with pytest.raises(RuntimeError):
-        asyncio.run(r.shard_balances())                                 # stale: reads, 429
+    with pytest.raises(RuntimeError, match="429"):
+        asyncio.run(r.shard_balances())
     with pytest.raises(RuntimeError, match="backing off"):
         asyncio.run(r.shard_balances())                                 # no second call
-    assert len(calls) == 2
+    assert len(calls) == 1
 
 
 _OUR_QUOTE = {"basket_id": "complete_set:X:buy_all_yes", "price": 0.41, "left": 100.0, "edge": 0.05,

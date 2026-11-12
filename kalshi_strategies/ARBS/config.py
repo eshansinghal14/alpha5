@@ -203,7 +203,8 @@ class RuntimeParams:
                            min=5.0, step=5.0, editable=False)
     fill_poll_s: float = param("REST backstop for quote fills the websocket missed.", min=1.0, step=1.0,
                                editable=False)
-    balance_poll_s: float = param("Seconds between shard balance reads, for trading.max_dollars_auto.",
+    balance_poll_s: float = param("Seconds between shard balance reads, for trading.max_dollars_auto; "
+                                  "between them cash moves with our own fills and settlements.",
                                   min=1.0, step=1.0, editable=False)
     meta_refresh_s: float = param("Seconds between market status / settlement reads.", min=30.0, step=30.0,
                                   editable=False)

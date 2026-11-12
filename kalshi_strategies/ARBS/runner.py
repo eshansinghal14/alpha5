@@ -72,10 +72,9 @@ LOST_LOOKUP_S = 1.0
 ORPHAN_FILL_S = 30.0
 CASH_STALE_POLLS = 6       # balance reads missed before max_dollars_auto falls back to max_dollars
 BALANCE_LOG_S = 60.0       # journal interval for the shards' cash and positions' value (dashboard capital)
-# One unscoped balance read serves every ARBS process (it lists all shards):
-# each reuses another's read younger than balance_poll_s. Two processes polling
-# at 30 s had about half their reads 429 (11-12).
-BALANCE_FILE = os.path.join(LIVE_ROOT, "ARBS", "balance.json")
+# Cash is tracked from our own fills and settlements between balance reads
+# (runtime.balance_poll_s): two processes reading every 30 s had about half
+# their reads 429 (11-12). A failed read retries after 60 s, doubling to this.
 BALANCE_BACKOFF_MAX_S = 300.0
 
 
@@ -395,8 +394,13 @@ class ArbsRunner:
         self._group_retry: dict[str, float] = {}
         self.book_time: dict[str, float] = {}     # ticker -> monotonic time of its last book update
         self.book_wall: dict[str, float] = {}     # the same on the wall clock, for the order log
-        self.cash: dict[int, float] = {}          # shard -> available balance, for max_dollars_auto
+        # shard -> balance at the last read plus our resting quotes' reserve
+        # then, moved by our own fills and settlements since (cash_now()).
+        self.cash_base: dict[int, float] = {}
         self.cash_at = 0.0
+        self._cash_read_total = 0.0
+        self._pos_read = 0.0
+        self._reserve_cache: dict[int, float] | None = None
         self.pos_value: dict[int, float] = {}     # shard -> Kalshi's value of our positions
         self.balance_logged = 0.0
         self._balance_retry_at = 0.0
@@ -1333,6 +1337,7 @@ class ArbsRunner:
         pos.spec = basket_to_dict(b)
         self._cycle_open(b, pos, ticker, side, kind)
         self.ledger.record(basket_id, b.tickers, ticker, side, size, cost, time.time())
+        self._cash_move(ticker, -cost)
         self._cycle_add(b, ticker, size, cost)
         self.journal({"kind": "fill", "fill_kind": kind, "basket_id": basket_id, "ticker": ticker, "side": side,
                       "size": size, "cost": round(cost, 4), "price": round((cost / size) if size else 0, 4),
@@ -1346,6 +1351,7 @@ class ArbsRunner:
         the loss is realized now and goes to the settled history."""
         now = time.time()
         basis = self.ledger.unwind(b.basket_id, b.tickers, ticker, size, now)
+        self._cash_move(ticker, size - cost)
         row = {"basket_id": b.basket_id, "type": b.type, "settled_at": _utc().isoformat(), "bundles": 0.0,
                "payout": round(size - cost, 4), "cost": round(basis, 4), "pnl": round(size - cost - basis, 4),
                "results": {ticker: f"unwound {size:g} ({kind})"}, "live": self.live}
@@ -1661,17 +1667,52 @@ class ArbsRunner:
         """Shard cash a fill on `b` may spend under max_dollars_auto, or None
         to fall back to max_dollars (shadow, or the balance unread/stale)."""
         t = self.cfg.trading
-        if not (t.max_dollars_auto and self.live and self.cash
+        if not (t.max_dollars_auto and self.live and self.cash_base
                 and time.time() - self.cash_at <= CASH_STALE_POLLS * self.cfg.runtime.balance_poll_s):
             return None
+        cash = self.cash_now()
         # Kalshi's balance already holds back what our resting orders could
         # cost; the basket's own are added back or its quotes would size
         # against cash net of themselves and shrink every pass.
         if b is None:
-            return sum(self.cash.values()) - t.cash_reserve * len(self.cash)
+            return sum(cash.values()) - t.cash_reserve * len(cash)
         own = sum(q.price * q.remaining for q in self.basket_quotes(b.basket_id))
         # Kalshi checks collateral per shard: a basket sizes on its own shard's cash.
-        return self.cash.get(self.basket_shard(b), 0.0) + own - t.cash_reserve
+        return cash.get(self.basket_shard(b), 0.0) + own - t.cash_reserve
+
+    def _reserved(self) -> dict[int, float]:
+        """Shard -> what our resting quotes hold back of Kalshi's balance.
+        Cached within an eval pass, like committed()."""
+        if self._reserve_cache is not None:
+            return self._reserve_cache
+        out: dict[int, float] = collections.defaultdict(float)
+        for q in self.quotes.values():
+            m = self.meta.get(q.ticker)
+            if q.exchange_id and q.remaining > 0 and m is not None:
+                out[m.shard] += q.price * q.remaining
+        if self._in_pass:
+            self._reserve_cache = out
+        return out
+
+    def cash_now(self) -> dict[int, float]:
+        """Shard -> available balance as Kalshi would show it now."""
+        r = self._reserved()
+        return {s: v - r.get(s, 0.0) for s, v in self.cash_base.items()}
+
+    def set_cash(self, bal: dict[int, float], value: float):
+        """A balance read (net of our resting quotes then) becomes the base."""
+        self._reserve_cache = None
+        r = self._reserved()
+        self.cash_base = {s: v + r.get(s, 0.0) for s, v in bal.items()}
+        self._cash_read_total, self._pos_read = sum(self.cash_base.values()), value
+        self.cash_at = time.time()
+
+    def _cash_move(self, ticker: str, amount: float):
+        """Our own fill (-cost with fees), unwind (+$1 a pair) or settlement
+        moving its shard's cash until the next balance read."""
+        m = self.meta.get(ticker)
+        if self.live and m is not None and m.shard in self.cash_base:
+            self.cash_base[m.shard] += amount
 
     def _held_depth(self, ticker: str, side: str, now: float, age: float) -> float | None:
         """TopHistory.held_depth, reused until the market's book changes or
@@ -1791,50 +1832,45 @@ class ArbsRunner:
         cash = self.cash_room(b)
         return self.cfg.trading.max_dollars - self.committed() if cash is None else cash
 
-    async def shard_balances(self) -> tuple[dict[int, float], float, float]:
-        """(cash by shard, positions' value, read time): the shared read if it
-        is younger than balance_poll_s, else a fresh one, shared. Raises on a
-        failed read or while backing off from one."""
+    async def shard_balances(self) -> tuple[dict[int, float], float]:
+        """(cash by shard, positions' value) from Kalshi. Raises on a failed
+        read, or while backing off from one."""
         now = time.time()
-        try:
-            with open(BALANCE_FILE, encoding="utf-8") as fh:
-                d = json.load(fh)
-            if now - d["t"] < self.cfg.runtime.balance_poll_s:
-                return {int(s): v for s, v in d["cash"].items()}, d["value"], d["t"]
-        except (OSError, ValueError, KeyError, TypeError):
-            pass
         if now < self._balance_retry_at:
             raise RuntimeError(f"balance read backing off {self._balance_retry_at - now:.0f}s")
         try:
-            cash, value = await self.gw.call(self.gw.any_client().shard_balances)
+            got = await self.gw.call(self.gw.any_client().shard_balances)
         except Exception:
             self._balance_fails += 1
             self._balance_retry_at = time.time() + min(BALANCE_BACKOFF_MAX_S,
-                                                       self.cfg.runtime.balance_poll_s * 2 ** self._balance_fails)
+                                                       BALANCE_LOG_S * 2 ** (self._balance_fails - 1))
             raise
-        self._balance_fails, t = 0, time.time()
-        atomic_write_json(BALANCE_FILE, {"t": t, "cash": {str(s): v for s, v in cash.items()}, "value": value},
-                          indent=None)
-        return cash, value, t
+        self._balance_fails = 0
+        return got
 
     async def balance_loop(self):
         while True:
-            await asyncio.sleep(self.cfg.runtime.balance_poll_s)
+            await asyncio.sleep(BALANCE_LOG_S)
             if not (self.live and self.cfg.trading.max_dollars_auto):
                 continue
-            try:
-                cash, value, t = await self.shard_balances()
-                # Only shards this process scans: one kept for a held basket on
-                # another's shard would count that shard's cash twice.
-                self.cash = {s: cash.get(s, 0.0) for s in self.gw.clients if s in self.cfg.scan.shards}
-                self.pos_value = {"all": value}
-                self.cash_at = t
-                if self.cash_at - self.balance_logged >= BALANCE_LOG_S:
-                    self.balance_logged = self.cash_at
-                    self.journal({"kind": "balance", "cash": {str(s): round(v, 2) for s, v in self.cash.items()},
-                                  "positions": {str(s): round(v, 2) for s, v in self.pos_value.items()}})
-            except Exception as e:
-                _log(f"WARN: balance read failed ({e!r})")
+            if time.time() - self.cash_at >= self.cfg.runtime.balance_poll_s:
+                try:
+                    cash, value = await self.shard_balances()
+                    # Only shards this process scans: one kept for a held basket on
+                    # another's shard would count that shard's cash twice.
+                    before = self.cash_now() if self.cash_base else {}
+                    self.set_cash({s: cash.get(s, 0.0) for s in self.gw.clients if s in self.cfg.scan.shards}, value)
+                    if before:
+                        self.journal({"kind": "balance_drift", "drift": {
+                            str(s): round(before.get(s, 0.0) - v, 2) for s, v in self.cash_now().items()}})
+                except Exception as e:
+                    _log(f"WARN: balance read failed ({e!r})")
+            if self.cash_base:
+                cash = self.cash_now()
+                # Cash spent since the read went into positions (at cost), and comes back on settling.
+                self.pos_value = {"all": self._pos_read - (sum(self.cash_base.values()) - self._cash_read_total)}
+                self.journal({"kind": "balance", "cash": {str(s): round(v, 2) for s, v in cash.items()},
+                              "positions": {str(s): round(v, 2) for s, v in self.pos_value.items()}})
 
     def quote_size_by_dollars(self, b: Basket) -> int:
         """Largest quote size any leg of `b` may have under max_dollars (or
@@ -1852,7 +1888,7 @@ class ArbsRunner:
             await self.wake.wait()
             self.wake.clear()
             self._replay_orphans()
-            self._in_pass, self._commit_cache = True, None
+            self._in_pass, self._commit_cache, self._reserve_cache = True, None, None
             if len(self._lv_cache) > 20000:
                 self._lv_cache.clear()
             # One basket at a time off the sets (no sort or copy of thousands
@@ -1876,7 +1912,7 @@ class ArbsRunner:
                     break
             if self.urgent or self.dirty:
                 self.wake.set()
-            self._in_pass, self._commit_cache = False, None
+            self._in_pass, self._commit_cache, self._reserve_cache = False, None, None
             # Let the websocket reader run before the next pass.
             await asyncio.sleep(0)
 
@@ -2577,7 +2613,7 @@ class ArbsRunner:
                 q = Quote(basket_id=b.basket_id, leg=j, ticker=t, side=sd, price=price, size=n,
                           cid=str(uuid.uuid4()), edge=0.0, max_price=price, placed_at=now, kind=path)
                 self.quotes[q.key] = q
-                self._commit_cache = None
+                self._commit_cache = self._reserve_cache = None
                 acts.append(self.place_quote(q))
             elif abs(q.price - price) > _EPS:
                 acts.append(self.move_quote(q, pricing.QuotePlan(leg=j, price=price, max_price=price, edge=0.0,
@@ -2593,7 +2629,7 @@ class ArbsRunner:
                   size=size, cid=str(uuid.uuid4()), edge=plan.edge, max_price=plan.max_price,
                   placed_at=time.time(), deep=deep)
         self.quotes[q.key] = q
-        self._commit_cache = None
+        self._commit_cache = self._reserve_cache = None
         return q
 
     async def place_quote(self, q: Quote):
@@ -2817,7 +2853,7 @@ class ArbsRunner:
             if new_id and new_id != q.exchange_id:
                 self._retire(q)
                 self.quotes[q.key] = q
-                self._commit_cache = None
+                self._commit_cache = self._reserve_cache = None
                 self._register(q, new_id)
         q.price, q.edge, q.max_price = plan.price, plan.edge, plan.max_price
         q.size = q.filled + left
@@ -3131,6 +3167,8 @@ class ArbsRunner:
                        "bundles": pos.bundles(list(legs)), "payout": round(paid, 4), "cost": round(cost, 4),
                        "pnl": round(paid - cost, 4), "results": res, "live": led is self.real_ledger}
                 led.close(bid, row)
+                if led is self.real_ledger:
+                    self._cash_move(next(iter(legs)), paid)
                 self.journal({"kind": "settled", **row})
 
     # ------------------------------------------------------------------ arm / control
@@ -3140,7 +3178,7 @@ class ArbsRunner:
             self.alert("error", None, "arm refused: no order clients")
             return False
         try:
-            cash, _, _ = await self.shard_balances()
+            cash, value = await self.shard_balances()
             bal = {s: cash.get(s, 0.0) for s in self.gw.clients}
         except Exception as e:
             self.alert("error", None, f"arm refused: balance read failed ({e!r})")
@@ -3148,7 +3186,7 @@ class ArbsRunner:
         if any(v <= 0 for v in bal.values()):
             self.alert("error", None, f"arm refused: zero balance on shard(s) {bal}")
             return False
-        self.cash, self.cash_at = bal, time.time()
+        self.set_cash(bal, value)
         await self.pull_all("arm")        # shadow quotes
         self.live = True
         try:
@@ -3284,7 +3322,7 @@ class ArbsRunner:
                     "upside": round(sum(h["upside"] for h in holdings), 4),
                     "held_cost": round(sum(h["cost"] for h in holdings), 4),
                     "committed": round(self.committed(), 4), "max_dollars": self.cfg.trading.max_dollars,
-                    "cash": round(sum(self.cash.values()), 2) if self.cash else None,
+                    "cash": round(sum(self.cash_now().values()), 2) if self.cash_base else None,
                     "positions_value": round(sum(self.pos_value.values()), 2) if self.pos_value else None,
                     "cash_room": None if (cr := self.cash_room(None)) is None else round(cr, 2)},
             "holdings": holdings, "quotes": quotes, "hot": self.hot, "ranking": self.ranking[:60],
