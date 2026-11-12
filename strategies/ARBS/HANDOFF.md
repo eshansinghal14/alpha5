@@ -76,6 +76,41 @@ them where they differ.
   is a sweep. Sweeps 20c+ under the touch lost 2–5c/lot for 2–5c quotes and
   made 6–10c/lot for 15–20c ones. The model picks 15–20c on 16% of prints;
   there 5c made +$2.1 on 76 fills, 15c +$11.2 on 40, 20c +$7.8 on 20.
+- **Near quote** (`ab3e647`; `trading.near_quote_size`, 0 = off, and
+  `near_min_size` 1000): on a pre-game basket a second quote one tick under
+  each arb quote, in the deep quote's slot (journal `deep` + `near`, fills
+  `fill_kind: deep`), sized to the bundles the other legs complete at that
+  price beyond the arb quote's own. The arb quote is sized to the exit depth
+  at exactly its price, often one level: 61 lots on Curaçao–Panama 11-12 with
+  3,809 a cent lower, where one buyer sold 112,851 NO in four sweeps in two
+  minutes and we bought 1,894 (+$108). Priced through the basket the arb
+  quote is priced through; cut at once when the exits take under 80% of it,
+  grown or repriced at most every 10 s; not held to `depth_age_s`.
+- **Sweep research 11-12** (every recorded print 11-05..12 that offered arb
+  edge, replayed against the books before and 0.1 s after; scripts were in a
+  session scratchpad, prefiltered rows in `~/scratch/sweeps` on the box):
+  - Held up: the near quote where it would be 1,000+ lots, pre-game: $3,245
+    on 23 fills over 18 events and all 8 days, one loser (−$6), positive in
+    both halves, the same at 500 or 2,000, unchanged with exits at 1 s or half
+    the fills. Real arbs of 500+ lots (16, 11-09..12) all made money, 5.1c/lot.
+  - Did not hold up, not built: near quotes under 1,000 lots (−$334);
+    quotes 5–15 ticks lower (−$717, in-play); the same quote in-play, always
+    or for 5 min after a clean fill (negative on shard 3 and at larger size);
+    asking more edge after a clean fill (a fraction of sizing up); standing
+    down after a losing fill (on real fills −$34 10-30..11-04, −$2 11-05..08,
+    +$184 11-09..12 of which +$203 is Liga Pro table tennis, now excluded).
+  - True in all three periods on real fills, but no rule built on it yet:
+    arbs within 5 min of one that made money made 3–9c/lot, of one that lost
+    −3 to +0.4c/lot.
+  - Deep quotes, real: 166 fills 10-30..11-12, about +$110 (5.6c/lot), for
+    5–10 write tokens/s on shard 0 (7–11% of quote writes sent, mostly
+    amends). About what those tokens would earn on the next baskets; left as
+    they are.
+- **Live flag** (`ab3e647`): an unwind that doesn't lose ("at plan") no
+  longer flags its markets live; a fast move still does. Real arbs within 5
+  min of a profitable unwind made 3.8c/lot (225), −4.1c after a losing one.
+  The first Curaçao–Panama fill was such an unwind and left a 61-lot live
+  quote for the second sweep.
 - **Shard 3 / ARBS3** (`129265b`, `96c9976`, `b25d9e7`, `65ef47c`): per-shard
   hot budget (Kalshi bills a shard's writes to that shard), cash only from the
   scanned shards, one unscoped balance read for every shard (`5937f88`; a
@@ -142,6 +177,13 @@ them where they differ.
    of prints in replay: widening is immediate, narrowing back from 20c takes
    2+ min a step. Finer bins above 10c, or narrowing straight to the pick
    after the hold, are the two things to test.
+   **Near quotes**: once on, compare real near fills (`near` quote rows,
+   deep fills one tick under the arb fill) with the replay before raising
+   `near_quote_size`; a 5,000 total per side was the replay's $400/day, 2,000
+   its $170/day. Cash caps it: 4,000 bundles is ~$8k of shard 0's $16k.
+   **Quote price flips between baskets** on pre-game soccer legs (2-leg vs
+   3-leg basket, ~18c apart): about half of 11-12's amends on CONCACAF legs
+   were jumps of 5c+. Costs writes and queue place; not looked into.
 4. **Pre-game on the model**: revisit after ~a week of live results; needs the
    size grid extended above 100 once there is data there.
 5. **Record-only markets**: after a few days, rerun the excluded-markets test
@@ -181,7 +223,7 @@ them where they differ.
 - Bulk research on the box: `sudo systemd-run --uid=ubuntu --gid=ubuntu
   -p MemoryMax=2G -p Nice=19 …`, scripts in `~/scratch` (`/tmp/re.py`
   shadows the stdlib). Strategies have priority for CPU and memory.
-- Tests: `python -m pytest -q strategies/ARBS` (199) and
+- Tests: `python -m pytest -q strategies/ARBS` (206) and
   `infra/tests`. `test_slow_drift_keeps_resting` is flaky on Windows.
 
 ---
