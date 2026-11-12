@@ -23,7 +23,7 @@ import pandas as pd
 from kalshi_infra.runtime.persist import LIVE_ROOT
 from kalshi_viz import arbs_pnl, perf
 
-UNITS = ("alpha5-crypto", "alpha5-spx", "alpha5-arbs", "alpha5-ibgateway", "alpha5-perf", "alpha5-dashboard")
+UNITS = ("alpha5-crypto", "alpha5-arbs", "alpha5-perf", "alpha5-dashboard")
 LOGS = ("run.out.log", "run.err.log", "spx.out.log", "spx.err.log", "arbs.out.log", "arbs.err.log")
 _BAD = re.compile(r"ERROR|WARN|HALT|CIRCUIT|Traceback|STOP")
 # Logs carry no timestamps; on a first run (no saved offset) only this much

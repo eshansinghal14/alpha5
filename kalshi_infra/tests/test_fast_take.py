@@ -2,15 +2,6 @@ import math
 import types
 
 from kalshi_infra.trading.fast_take import FastTaker, Ticket, whole_touch_shift_bp
-from kalshi_strategies.CRYPTO15M.model import TakeKernel
-from kalshi_strategies.CRYPTO15M.pricer import prob_from_mu
-
-
-def test_kernel_threshold_prices_at_the_required_prob():
-    k = TakeKernel("BTC", 0.0, 0.0, 2.0, 1.0, m0=0.0003, slope=0.00008, sd=0.002, nu=None)
-    for req in (0.3, 0.52, 0.7):
-        x = k.shift_bp_for(req)
-        assert abs(prob_from_mu(k.m0 + k.slope * x, k.sd, None) - req) < 1e-9
 
 
 def test_whole_touch_shift_needs_both_sides_and_is_capped():

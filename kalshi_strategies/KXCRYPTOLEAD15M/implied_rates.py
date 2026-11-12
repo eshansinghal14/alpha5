@@ -2,7 +2,7 @@
 Per-coin vol for the Coin Race from the single-coin 15M markets (KXBTC15M,
 ...): the same event window, so each coin's Kalshi mid prices that coin's
 15-minute up/down with exactly the start and spot the race uses, and backs out
-its vol (CRYPTO15M/implied_vol.py: precision-weighted EMA of ln vol).
+its vol (implied_vol.py: precision-weighted EMA of ln vol).
 
 The race's five legs on Kalshi only identify vol *differences* between coins;
 the single-coin mids identify each coin's level directly, with more volume
@@ -20,7 +20,7 @@ import math
 import time
 
 from kalshi_infra.api_functions import kalshi_get
-from kalshi_strategies.CRYPTO15M.implied_vol import ImpliedVolEMA, observe
+from kalshi_strategies.KXCRYPTOLEAD15M.implied_vol import ImpliedVolEMA, observe
 from kalshi_strategies.KXCRYPTOLEAD15M.series import COINS
 
 POLL_S = 1.0

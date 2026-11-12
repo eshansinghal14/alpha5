@@ -14,10 +14,10 @@ kalshi_strategies/<FOLDER>/
   backtest/ research/ tests/
 ```
 
-One folder may serve several series tickers (KXINX serves KXINX, KXINXU
-and KXINXDUD), with one complete `config.json` section per ticker.
+One folder may serve several series tickers (ARBS serves ARBS and ARBS3),
+with one complete `config.json` section per ticker.
 `run --series <FOLDER>` runs all of them. A folder can also declare
-`SERVICES = [Service(...)]`, processes its series share (KXINX's pricing
+`SERVICES = [Service(...)]`, processes its series share (e.g. a shared pricing
 hub); the launcher starts and supervises them.
 
 ## 2. Config
@@ -75,6 +75,5 @@ picks it up.
 ## 5. Backtest
 
 Drive the same `Quoter` through `kalshi_backtest.engine.Backtest`, feeding
-your fairs as `FairUpdate` external events (see
-`KXCRYPTOLEAD15M/backtest/run_backtest.py`). Fees come from
+your fairs as `FairUpdate` external events. Fees come from
 `kalshi.fees.for_event` exactly as live.

@@ -1,7 +1,5 @@
 kalshi_infra/keys.py
 kalshi_infra/secrets/
-deploy/ibgateway/ib.env
-deploy/ibgateway/tws_settings/
 kalshi_infra/logs/
 kalshi_infra/*_log.txt
 data/
@@ -9,3 +7,4 @@ kalshi_viz/static/
 __pycache__/
 .venv/
 *.pem
+deploy/ibgateway/ib.env

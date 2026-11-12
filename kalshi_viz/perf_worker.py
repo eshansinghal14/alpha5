@@ -4,7 +4,7 @@ the Streamlit process (see perf.read_result), and keeps each series' state on
 disk so a restart only catches up.
 
     python -m kalshi_viz.perf_worker            # every registered series
-    python -m kalshi_viz.perf_worker --series KXINXU KXINXDUD
+    python -m kalshi_viz.perf_worker --series ARBS KXCRYPTOLEAD15M
 """
 from __future__ import annotations
 

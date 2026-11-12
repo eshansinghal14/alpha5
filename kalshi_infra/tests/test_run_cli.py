@@ -14,21 +14,14 @@ def _resolve(fmap, series=None, only=None):
     return run.resolve(argparse.ArgumentParser(), series, only, fmap)
 
 
-def test_folder_expands_to_all_its_series_and_hub(fmap):
-    s, svc = _resolve(fmap, ["KXINX"])
-    assert s == ["KXINXU", "KXINXDUD"]
-    assert [x.name for x in svc] == ["spx-hub"]
+def test_folder_expands_to_all_its_series(fmap):
+    s, svc = _resolve(fmap, ["ARBS"])
+    assert s == ["ARBS", "ARBS3"] and svc == []
 
 
-def test_kxinx_buckets_not_traded(fmap):
-    assert "KXINX" not in run.registry()
-    with pytest.raises(SystemExit):
-        _resolve(fmap, only=["KXINX"])
-
-
-def test_only_runs_one_series_but_keeps_its_hub(fmap):
-    s, svc = _resolve(fmap, only=["KXINXU"])
-    assert s == ["KXINXU"] and [x.name for x in svc] == ["spx-hub"]
+def test_only_runs_one_series(fmap):
+    s, _ = _resolve(fmap, only=["ARBS3"])
+    assert s == ["ARBS3"]
 
 
 def test_crypto_has_no_services(fmap):
@@ -38,16 +31,15 @@ def test_crypto_has_no_services(fmap):
 
 def test_series_ticker_is_not_a_folder(fmap):
     with pytest.raises(SystemExit):
-        _resolve(fmap, ["KXINXU"])
+        _resolve(fmap, ["ARBS3"])
 
 
 def test_dedup_and_case(fmap):
-    s, _ = _resolve(fmap, ["kxinx", "KXINX"], ["KXINXDUD"])
-    assert s == ["KXINXU", "KXINXDUD"]
+    s, _ = _resolve(fmap, ["arbs", "ARBS"])
+    assert s == ["ARBS", "ARBS3"]
 
 
-def test_write_group_runs_as_one_process(fmap):
+def test_series_without_a_write_group_run_apart(fmap):
     reg = run.registry()
-    s, _ = _resolve(fmap, ["KXINX", "KXCRYPTOLEAD15M"])
-    assert run.units_of(s, reg) == [["KXINXU", "KXINXDUD"], ["KXCRYPTOLEAD15M"]]
-    assert run.units_of(["KXINXU"], reg) == [["KXINXU"]]
+    s, _ = _resolve(fmap, ["ARBS", "KXCRYPTOLEAD15M"])
+    assert run.units_of(s, reg) == [["ARBS"], ["ARBS3"], ["KXCRYPTOLEAD15M"]]

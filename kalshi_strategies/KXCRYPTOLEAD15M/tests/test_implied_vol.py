@@ -1,7 +1,7 @@
 import math
 
-from kalshi_strategies.CRYPTO15M.implied_vol import ImpliedVolEMA, observe
-from kalshi_strategies.CRYPTO15M.pricer import prob_up
+from kalshi_strategies.KXCRYPTOLEAD15M.implied_vol import ImpliedVolEMA, observe
+from kalshi_strategies.KXCRYPTOLEAD15M.updown import prob_up
 
 KW = dict(mid_noise_floor=0.005, max_obs_se=0.5, max_curvature=0.5, s_bounds=(1e-5, 5e-4))
 S = 1e-4            # 1bp / sqrt(s)

@@ -34,7 +34,7 @@ import math
 import numpy as np
 from scipy import special
 
-from kalshi_strategies.CRYPTO15M.pricer import _cdf, _ppf, variance_clock
+from kalshi_strategies.KXCRYPTOLEAD15M.updown import _cdf, _ppf, variance_clock
 
 
 def _pdf(z: float, nu: float | None) -> float:

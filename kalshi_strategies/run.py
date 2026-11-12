@@ -1,11 +1,10 @@
 """
 Run one or more Kalshi strategies live (shadow by default).
 
-    python -m kalshi_strategies.run --series KXINX                  # every S&P series + the pricing hub
-    python -m kalshi_strategies.run --series KXINX KXCRYPTOLEAD15M
-    python -m kalshi_strategies.run --series KXINX --only KXINXU    # one series of the folder
-    python -m kalshi_strategies.run --series KXINX --live-trading   # REAL MONEY from the start
-    python -m kalshi_strategies.run --only KXINX --event-ticker KXINX-26OCT09H1600
+    python -m kalshi_strategies.run --series ARBS                   # every series the folder registers (ARBS, ARBS3)
+    python -m kalshi_strategies.run --series ARBS KXCRYPTOLEAD15M
+    python -m kalshi_strategies.run --only ARBS3                    # one series of a folder
+    python -m kalshi_strategies.run --series KXCRYPTOLEAD15M --live-trading   # REAL MONEY from the start
 
 --series takes strategy folder names (kalshi_strategies/<FOLDER>) and runs
 every series that folder registers, plus its shared SERVICES. --only names
@@ -335,7 +334,7 @@ def main(argv=None):
         # Trading outranks everything else on the box. Children inherit this and
         # the writer drops itself back down; may be refused without privileges.
         # ALPHA5_PRIORITY lets a second strategy on the same box sit below the
-        # first (deploy/systemd/alpha5-spx.service runs S&P at "normal").
+        # first.
         set_priority(os.environ.get("ALPHA5_PRIORITY", "above_normal"))
         # Order sends run on worker threads that need the GIL from a busy loop
         # thread, which holds it up to the switch interval (default 5 ms). On

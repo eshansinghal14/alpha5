@@ -19,12 +19,6 @@ if ! command -v aws >/dev/null; then
   curl -sSo /tmp/awscliv2.zip "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip"
   unzip -qo /tmp/awscliv2.zip -d /tmp && sudo /tmp/aws/install && rm -rf /tmp/aws /tmp/awscliv2.zip
 fi
-# Docker only runs IB Gateway (deploy/ibgateway) for the S&P strategy.
-if ! command -v docker >/dev/null; then
-  sudo apt-get install -y docker.io docker-compose-v2
-  sudo systemctl enable --now docker
-fi
-
 if [ ! -d "$APP/.git" ]; then
   sudo mkdir -p "$APP" && sudo chown ubuntu:ubuntu "$APP"
   git clone "$REPO" "$APP"
@@ -38,14 +32,10 @@ python3.12 -m venv "$APP/.venv"
 "$APP/.venv/bin/pip" install --upgrade pip
 "$APP/.venv/bin/pip" install -r deploy/requirements-live.txt
 
-mkdir -p "$APP/data/live" "$APP/data/kalshi_crypto" "$APP/secrets" "$APP/deploy/ibgateway/tws_settings"
+mkdir -p "$APP/data/live" "$APP/data/kalshi_crypto" "$APP/secrets"
 chmod 700 "$APP/secrets"
-# The gateway image runs as uid 1000 and saves its settings here.
-sudo chown 1000:1000 "$APP/deploy/ibgateway/tws_settings"
 
 sudo cp deploy/systemd/*.service deploy/systemd/*.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now alpha5-archive.timer
-echo "bootstrap done at $(git rev-parse --short HEAD). Copy secrets, then: sudo systemctl enable --now alpha5-crypto"
-echo "S&P (needs deploy/ibgateway/ib.env, see docs/ec2-spx.md):"
-echo "  sudo systemctl enable --now alpha5-ibgateway alpha5-spx"
+echo "bootstrap done at $(git rev-parse --short HEAD). Copy secrets, then: sudo systemctl enable --now alpha5-crypto alpha5-arbs"

@@ -15,16 +15,10 @@ here.
 - [`CHANGES.md`](CHANGES.md) — reverse-chronological change log. Add
   one dated section per material change; keep entries short, link to
   deeper write-ups here.
-- [`ec2-spx.md`](ec2-spx.md) — running the S&P strategy and IB Gateway
-  (docker, IBC) on the EC2 box next to crypto; sizing, 2FA, one dashboard.
-- [`ib-migration.md`](ib-migration.md) — the S&P option feed: IB SPXW,
-  the only option-data source. Live-feed architecture, IB contract spec,
-  line budget.
-
 ## Quick start
 
 ```
-python -m kalshi_strategies.run --series KXINX KXCRYPTOLEAD15M   # shadow; KXINX = all S&P series
+python -m kalshi_strategies.run --series ARBS KXCRYPTOLEAD15M   # shadow
 streamlit run kalshi_viz/app.py
 python -m pytest kalshi_infra/tests kalshi_strategies -q
 ```

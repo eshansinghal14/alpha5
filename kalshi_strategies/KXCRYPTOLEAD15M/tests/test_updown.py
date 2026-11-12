@@ -2,7 +2,7 @@ import math
 
 import numpy as np
 
-from kalshi_strategies.CRYPTO15M.pricer import implied_mu, prob_up
+from kalshi_strategies.KXCRYPTOLEAD15M.updown import implied_mu, prob_up
 
 RATE = (0.5e-4) ** 2      # 0.5bp per sqrt(s)
 

@@ -4,7 +4,7 @@ import time
 
 import numpy as np
 
-from kalshi_strategies.CRYPTO15M.pricer import prob_up
+from kalshi_strategies.KXCRYPTOLEAD15M.updown import prob_up
 from kalshi_strategies.KXCRYPTOLEAD15M.implied_rates import ImpliedRates, single_coin_tickers
 from kalshi_strategies.KXCRYPTOLEAD15M.series import COINS
 from kalshi_strategies.KXCRYPTOLEAD15M.tests.conftest import config

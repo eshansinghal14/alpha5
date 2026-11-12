@@ -1,10 +1,8 @@
 """Coin Race (KXCRYPTOLEAD15M): which of BTC/ETH/SOL/XRP/HYPE has the best
 15-minute return. Pricing only -- the runtime does the rest.
 
-Shares a process, a SpotFeed (shared.py) and a write group with whichever
-single-coin CRYPTO15M series run beside it (run --series KXCRYPTOLEAD15M
---only KXETH15M): one bucket and quote queue at equal priority. Run alone, it
-still reads the single-coin 15M mids for its vols (implied_rates.py)."""
+Reads Kalshi's single-coin 15M mids (KXBTC15M, ...) for its vols
+(implied_rates.py)."""
 from __future__ import annotations
 
 from kalshi_infra.runtime.series import Series

@@ -19,15 +19,6 @@ $ssh = @("-i", $Key, "-o", "StrictHostKeyChecking=accept-new")
 & scp @ssh "$root\kalshi_infra\keys.py" "${Target}:$app/kalshi_infra/keys.py"; Check 'copy keys.py'
 & scp @ssh @(Get-ChildItem "$root\kalshi_infra\secrets\*" -File).FullName "${Target}:$app/kalshi_infra/secrets/"; Check 'copy private keys'
 & ssh @ssh $Target "chmod 600 $app/kalshi_infra/keys.py $app/kalshi_infra/secrets/*"; Check 'chmod secrets'
-# IB Gateway login (S&P only). Skipped if you haven't created it.
-$ibEnv = "$root\deploy\ibgateway\ib.env"
-if (Test-Path $ibEnv) {
-    & ssh @ssh $Target "mkdir -p $app/deploy/ibgateway"
-    & scp @ssh $ibEnv "${Target}:$app/deploy/ibgateway/ib.env"; Check 'copy ib.env'
-    & ssh @ssh $Target "chmod 600 $app/deploy/ibgateway/ib.env"; Check 'chmod ib.env'
-    "ib.env copied"
-}
-
 $cut = (Get-Date).ToUniversalTime().AddHours(-$Hours)
 foreach ($sub in "composite", "prints") {
     $files = Get-ChildItem "$root\data\kalshi_crypto\$sub\*.parquet" |
