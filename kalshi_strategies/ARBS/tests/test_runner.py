@@ -1713,9 +1713,9 @@ def test_cash_is_tracked_between_balance_reads(arbs, monkeypatch):
     q = R.Quote(basket_id=b.basket_id, leg=0, ticker="X-A", side="yes", price=0.40, size=50, cid="c", edge=0.05,
                 max_price=0.40, pending=False, exchange_id="oid")
     r.quotes[q.key] = q
-    assert abs(r.cash_now()[0] - 880.0) < 1e-9                      # Kalshi holds back 50 x 0.40
-    del r.quotes[q.key]                                             # it fills: the reserve becomes a position
-    r._cash_move("X-A", -20.1)                                      # cost with a 10c fee
+    assert r.cash_now()[0] == 900.0                                 # a resting quote holds nothing back
+    del r.quotes[q.key]
+    r._cash_move("X-A", -20.1)                                      # it fills: cost with a 10c fee
     assert abs(r.cash_now()[0] - 879.9) < 1e-9
     r._cash_move("X-A", 50.0)                                       # settles or unwinds for $50
     assert abs(r.cash_now()[0] - 929.9) < 1e-9

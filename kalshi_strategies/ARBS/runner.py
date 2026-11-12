@@ -394,13 +394,11 @@ class ArbsRunner:
         self._group_retry: dict[str, float] = {}
         self.book_time: dict[str, float] = {}     # ticker -> monotonic time of its last book update
         self.book_wall: dict[str, float] = {}     # the same on the wall clock, for the order log
-        # shard -> balance at the last read plus our resting quotes' reserve
-        # then, moved by our own fills and settlements since (cash_now()).
+        # shard -> balance at the last read, moved by our own fills and settlements since.
         self.cash_base: dict[int, float] = {}
         self.cash_at = 0.0
         self._cash_read_total = 0.0
         self._pos_read = 0.0
-        self._reserve_cache: dict[int, float] | None = None
         self.pos_value: dict[int, float] = {}     # shard -> Kalshi's value of our positions
         self.balance_logged = 0.0
         self._balance_retry_at = 0.0
@@ -1680,30 +1678,14 @@ class ArbsRunner:
         # Kalshi checks collateral per shard: a basket sizes on its own shard's cash.
         return cash.get(self.basket_shard(b), 0.0) + own - t.cash_reserve
 
-    def _reserved(self) -> dict[int, float]:
-        """Shard -> what our resting quotes hold back of Kalshi's balance.
-        Cached within an eval pass, like committed()."""
-        if self._reserve_cache is not None:
-            return self._reserve_cache
-        out: dict[int, float] = collections.defaultdict(float)
-        for q in self.quotes.values():
-            m = self.meta.get(q.ticker)
-            if q.exchange_id and q.remaining > 0 and m is not None:
-                out[m.shard] += q.price * q.remaining
-        if self._in_pass:
-            self._reserve_cache = out
-        return out
-
     def cash_now(self) -> dict[int, float]:
-        """Shard -> available balance as Kalshi would show it now."""
-        r = self._reserved()
-        return {s: v - r.get(s, 0.0) for s, v in self.cash_base.items()}
+        """Shard -> available balance: the last read moved by our own fills
+        and settlements since. Kalshi's balance doesn't drop for resting
+        orders (flat at $17,158 under ~800 resting quotes, 11-12)."""
+        return dict(self.cash_base)
 
     def set_cash(self, bal: dict[int, float], value: float):
-        """A balance read (net of our resting quotes then) becomes the base."""
-        self._reserve_cache = None
-        r = self._reserved()
-        self.cash_base = {s: v + r.get(s, 0.0) for s, v in bal.items()}
+        self.cash_base = dict(bal)
         self._cash_read_total, self._pos_read = sum(self.cash_base.values()), value
         self.cash_at = time.time()
 
@@ -1888,7 +1870,7 @@ class ArbsRunner:
             await self.wake.wait()
             self.wake.clear()
             self._replay_orphans()
-            self._in_pass, self._commit_cache, self._reserve_cache = True, None, None
+            self._in_pass, self._commit_cache = True, None
             if len(self._lv_cache) > 20000:
                 self._lv_cache.clear()
             # One basket at a time off the sets (no sort or copy of thousands
@@ -1912,7 +1894,7 @@ class ArbsRunner:
                     break
             if self.urgent or self.dirty:
                 self.wake.set()
-            self._in_pass, self._commit_cache, self._reserve_cache = False, None, None
+            self._in_pass, self._commit_cache = False, None
             # Let the websocket reader run before the next pass.
             await asyncio.sleep(0)
 
@@ -2613,7 +2595,7 @@ class ArbsRunner:
                 q = Quote(basket_id=b.basket_id, leg=j, ticker=t, side=sd, price=price, size=n,
                           cid=str(uuid.uuid4()), edge=0.0, max_price=price, placed_at=now, kind=path)
                 self.quotes[q.key] = q
-                self._commit_cache = self._reserve_cache = None
+                self._commit_cache = None
                 acts.append(self.place_quote(q))
             elif abs(q.price - price) > _EPS:
                 acts.append(self.move_quote(q, pricing.QuotePlan(leg=j, price=price, max_price=price, edge=0.0,
@@ -2629,7 +2611,7 @@ class ArbsRunner:
                   size=size, cid=str(uuid.uuid4()), edge=plan.edge, max_price=plan.max_price,
                   placed_at=time.time(), deep=deep)
         self.quotes[q.key] = q
-        self._commit_cache = self._reserve_cache = None
+        self._commit_cache = None
         return q
 
     async def place_quote(self, q: Quote):
@@ -2853,7 +2835,7 @@ class ArbsRunner:
             if new_id and new_id != q.exchange_id:
                 self._retire(q)
                 self.quotes[q.key] = q
-                self._commit_cache = self._reserve_cache = None
+                self._commit_cache = None
                 self._register(q, new_id)
         q.price, q.edge, q.max_price = plan.price, plan.edge, plan.max_price
         q.size = q.filled + left
