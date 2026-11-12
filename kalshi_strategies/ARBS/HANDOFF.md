@@ -1,4 +1,150 @@
-# ARBS — CURRENT STATE 2026-11-04 ~17:00 UTC (read this first)
+# ARBS — CURRENT STATE 2026-11-12 ~17:40 UTC (read this first)
+
+Cross-market basket arbitrage on Kalshi: buy a set of legs (a "basket") whose
+payout is guaranteed whatever happens, for less than that payout. Live with
+real money on the `ec2-live` box since 2026-10-28. Commits are on `ec2-live`.
+The 11-04 sections further down are kept as history; this section supersedes
+them where they differ.
+
+## Where it stands (11-12 ~17:40 UTC)
+
+- **Two processes, one service.** `alpha5-arbs` runs `run.py --series ARBS`,
+  which starts each registered series as its own child: **ARBS** (Kalshi shard
+  0, hand spec + scan, `config.json`, `data/live/ARBS`) and **ARBS3** (shard 3:
+  tennis, basketball, baseball; scan only, `config_shard3.json`,
+  `data/live/ARBS3`). Same code and rules; separate configs that are kept in
+  step by hand (`scan.shards`, `scan.hand_spec`, `scan.max_markets` differ).
+  The dashboard shows both on one ARBS page (`DASHBOARD_MERGED`).
+- **PnL** (summary.json): ARBS settled +$2,273, locked +$1,173; ARBS3
+  settled −$67 (two ITF tennis fills, −$44 each, see below), locked +$10.
+- **Cash**: shard 0 $17.6k, shard 3 $9.0k (moved from shard 0 on 11-11,
+  $3k + $6k). Quote room = shard cash − `cash_reserve` $1k.
+- Both armed (`--resume-arm`). No halts.
+
+## What changed 11-05 → 11-12
+
+- **Exit-cost model** (`exit_cost.py`, `e071bf6`): predicts what exiting a
+  maker fill costs from the exit legs' books (top depth, depth that has held
+  0.25 s, depth 2c deep, unwind top), live, time to settlement. Additive
+  binned ridge on daily X'X/X'y; fill odds from how far prints swept below the
+  touch; expected filled lots from print volumes. Fitted nightly on every
+  saved day of both processes and written to `data/live/ARBS/exit_model.json`
+  by the **daily shadow check** (`shadow_check.py`, timer
+  `alpha5-arbs-shadow-check` 00:40 UTC; dashboard tab per shard). Validated:
+  replay exits land ~30–90 ms after the print, and replay at 0.1 s is within
+  ~0.15c/lot of our real fills; the model generalizes across groups where
+  per-market learning didn't.
+- **Model quoting on live events** (`aeb866a`, `4874964`, `7f1cf4a`):
+  live quotes in `trading.model_series` take edge (3–20c grid) and size cap
+  (5/20/50/100) from the model: the pair with the best fill odds × expected
+  lots × predicted net. Sticky: widen only when the current edge is predicted
+  to net under 0.5c a lot; narrow one step after a narrower pick worth 1.25×
+  holds 120 s; shrink at once; grow one step after the bigger pick holds
+  300 s; no positive value pulls the quote. Journal `kind: model_quote` (why:
+  start/widen/narrow/shrink/grow), counter `model_changes`.
+  **On**: S:Esports, S:Basketball, S:Football, S:Baseball, Climate and
+  Weather. **Off: soccer** (11-12: the model quoted it 10–20c against a fixed
+  5c that made +$72 on 73 live arbs the day before; 7.5c cut soccer fills
+  85–90% on 11-04) and **all pre-game** (pre-game profit is >300-lot sweeps,
+  +$198 of 7 fills 11-11..12; the model has no data above 100 lots). First
+  results (11-11 23:39 → 11-12 16:00, CS2/NFL/NCAAMB only): +$18.75 on 22
+  arbs, 2.3c/lot vs 2.0c/lot fixed the day before. Too little data to call.
+- **Shard 3 / ARBS3** (`129265b`, `96c9976`, `b25d9e7`, `65ef47c`): per-shard
+  hot budget (Kalshi bills a shard's writes to that shard), cash only from the
+  scanned shards, one unscoped balance read for every shard (`5937f88`; a
+  second per-shard read 429'd every poll). ARBS excludes baskets on shards it
+  doesn't scan. `scan.max_markets` 3700 on ARBS3 (watches ~2,800, every shard-3
+  market that forms a basket); ARBS stays at 1500 because shard 0 is
+  **write-bound** (hot list 250/250 tokens/s, ~360 quote creates refused a
+  day) — more markets there only add candidates.
+- **Live rules**:
+  - `scan.live_before_settle_h` 6 (`2bfb2a9`): an event with no kickoff is
+    live from 6 h before expected settlement (a weekly Hormuz ladder lost $108
+    to one headline 1.7 h out, 11-10).
+  - `scan.live_early_h` (`4e0dc10`): ITF / ITF women's / ATP and WTA
+    Challenger singles live 2 h before their listed start (lower-tier tennis
+    starts early: −$44 doubles 11-11, −$44 singles 11-12 19 min before start).
+  - `trading.late_quote_cutoff_min` {S:Soccer 75, S:Tennis 0}: no live tennis
+    quoting at all; soccer stops 75 min after kickoff.
+  - Fast-move flags (unchanged): a basket exiting on a fast move marks its
+    markets live until a clean fill.
+- **Markets**: `watch.exclude` (series, events or clusters, never traded)
+  = Liga Pro, ETTAN, NBA and NCAAMB race-to-10 (they close mid-game, so a
+  broken basket can't be exited). `watch.record_only` (`3693525`; watched and
+  recorded, never quoted) = hockey (NHL, AHL, KHL, NCAA), cricket (T20, ODI,
+  Test, women's T20/ODI) and tennis doubles (ITF, ITF women's, Challenger,
+  WTA): their prints build data to test them under the model. The user
+  manages these lists by hand (declined an automated quarantine 11-12).
+- **Cash and reads** (`ec1f79c`, `a58612d`, `b7b4123`): cash is read from
+  Kalshi once an hour per process (`runtime.balance_poll_s` 3600) and moved
+  locally by our fills (cost + fees), unwinds (+$1 a pair) and settlements;
+  each read journals the drift (`balance_drift`). Kalshi's balance does not
+  drop for resting orders. A machine-wide read bucket
+  (`orders.read_budget`, 300 tokens/s, 10 per read, a 429 empties it) counts
+  every order client's authenticated GET; the balance read only goes out with
+  100 tokens left after it. Summary `reads` shows tokens left and reads/s.
+  Our counted reads are ~5–6/s per process, so earlier balance 429s were
+  probably a per-endpoint limit or uncounted reads (scanner, other
+  strategies).
+- **LIP removed from ARBS** (`27f056d`): the LIP edge discount, LIP pricing
+  and the LIP ranking are gone; ARBS only yields markets LIPFARM claims
+  (`claimed.json`). LIPFARM is another session's strategy — don't modify it.
+- **CPU** (`ddd3ffc`): 85% → ~60% of a core for ARBS; ARBS3 ~40%.
+- **Replay fixes** (`06397cf`): shadow fills exit by the cheaper of
+  completing and unwinding at the 0.1 s book, as the runner does.
+- **Hand spec**: settlement dates for 7 settled election series removed
+  (`5b9fc46`); 8 remain (county/margin/vote-share, Brazil rate, streamer
+  awards).
+
+## Open items
+
+1. **Model on soccer**: compare its soccer picks with our real soccer fills
+   (it over-predicts exit cost on many-leg soccer baskets) before re-adding.
+2. **Model results by group**: nightly check; watch for fill rates dropping as
+   they did on soccer (fills/h fell from 12.6 to 5 in the first hour with all
+   groups on). Weather at 15–20c is intended (day-of weather sets lost
+   −$13 on 11-10..11 completing after a bucket jumped).
+3. **Pre-game on the model**: revisit after ~a week of live results; needs the
+   size grid extended above 100 once there is data there.
+4. **Record-only markets**: after a few days, rerun the excluded-markets test
+   (`~/scratch/excl_model.py` on the box: replay at the model's pick vs fixed
+   rules, per series × live) on hockey, cricket and doubles. Live doubles
+   already replayed positive under the model (+$2.8..11.6 over 2 days), but
+   live tennis quoting is off.
+5. **Shadow sizer** (`live_params_shadow`, `df2ebb6`/`b024127`) and
+   `regime_shadow` still run in shadow; the model supersedes the sizer —
+   candidate for removal.
+6. **Pull rule** churn: ~3,900 pull cancels/h on live basketball (11-11);
+   each costs queue place and write tokens on write-bound shard 0. Worth a
+   look.
+7. Startup: both processes arm at once; one balance read can 429 and delay
+   arming ~1–3 min (seen 11-12 16:09). Staggering is a small fix.
+
+## Ops (current practice; supersedes the 11-04 deploy recipe below)
+
+- Box `ubuntu@3.131.100.179`, key `~/.ssh/alpha5-live-key.pem`, `/opt/alpha5`,
+  `.venv/bin/python`. Log `data/live/arbs.out.log` (both processes print
+  `[ARBS]`).
+- **Deploy code by file path**, never `git pull`/checkout of strategy configs:
+  `git show HEAD:<path> | ssh … "cat > /opt/alpha5/<path>"`, after checking
+  the box file equals the previous HEAD (`diff --strip-trailing-cr`). Then
+  `sudo systemctl restart alpha5-arbs` (and `alpha5-dashboard` when config.py
+  or the page changed — a stale dashboard reports "config.json is invalid" on
+  new keys).
+- **Config**: edit single values on the box (python json edit or sed) after
+  copying both configs to `/tmp/before_<what>/`. A new required key must land
+  with (or after) the code that defines it; a running process logs
+  "REJECTED config change: unknown <key>" if the key lands first — harmless
+  once restarted. Many trading params apply live without a restart.
+- Bulk research on the box: `sudo systemd-run --uid=ubuntu --gid=ubuntu
+  -p MemoryMax=2G -p Nice=19 …`, scripts in `~/scratch` (`/tmp/re.py`
+  shadows the stdlib). Strategies have priority for CPU and memory.
+- Tests: `python -m pytest -q kalshi_strategies/ARBS` (204) and
+  `kalshi_infra/tests`. `test_slow_drift_keeps_resting` is flaky on Windows.
+
+---
+
+# ARBS — STATE 2026-11-04 ~17:00 UTC (history)
 
 Cross-market basket arbitrage on Kalshi: buy a set of legs (a "basket") whose
 payout is guaranteed whatever happens, for less than that payout. Live with
