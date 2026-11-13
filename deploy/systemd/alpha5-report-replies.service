@@ -9,7 +9,8 @@ Type=oneshot
 User=ubuntu
 WorkingDirectory=/opt/alpha5
 ExecStart=/opt/alpha5/.venv/bin/python -W ignore -m infra.runtime.report_replies poll
-TimeoutStartSec=3min
+TimeoutStartSec=4min
+# Claude Code (deploy/claude_reply.sh) runs in this unit's memory when there's a reply.
 Nice=19
 OOMScoreAdjust=1000
-MemoryMax=400M
+MemoryMax=900M

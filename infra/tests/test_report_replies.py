@@ -9,26 +9,24 @@ from infra.config import ConfigError, param, section
 from infra.runtime import report_replies as rr
 
 
-@pytest.mark.parametrize("text,want", [
-    ("1 yes, 2 no", {1: "yes", 2: "no"}),
-    ("1: yes\n2 - no keep SOL", {1: "yes", 2: "no"}),
-    ("yes to 1, reject #2", {1: "yes", 2: "no"}),
-    ("approve 2", {2: "yes"}),
-    ("1 no 2 yes", {1: "no", 2: "yes"}),
-    ("1 yes 2 no", {1: "yes", 2: "no"}),
-    ("apply changes for 2", {2: "yes"}),
-    ("1 yes. reject 1", {1: "unclear"}),
-    ("SOL lost 3c at 60s, no idea", {}),
-    ("Yes all", {rr.ALL: "yes"}),
-])
-def test_verdicts(text, want):
-    assert rr.verdicts(text) == want
+PROPS = {1: {"title": "a", "summary": "x"}, 2: {"title": "b", "summary": "y"}}
 
 
-def test_quoted_original_is_not_read_as_votes():
+def test_votes_keep_only_known_ideas_and_verdicts():
+    reading = {"votes": [{"n": 1, "verdict": "yes", "reason": ""}, {"n": 7, "verdict": "yes", "reason": ""},
+                         {"n": 2, "verdict": "maybe", "reason": ""}], "note": ""}
+    assert rr.votes_from(reading, PROPS) == {1: ("yes", "")}
+
+
+def test_two_verdicts_on_one_idea_are_unclear():
+    reading = {"votes": [{"n": 1, "verdict": "yes", "reason": ""}, {"n": 1, "verdict": "no", "reason": "r"}]}
+    assert rr.votes_from(reading, PROPS) == {1: ("unclear", "r")}
+
+
+def test_quoted_original_is_cut():
     raw = "Subject: Re: x\nContent-Type: text/plain\n\n1 yes\n\nOn Thu, Nov 13, 2026 at 8:01 AM <a@b> wrote:\n> 2 no\n"
     msg = email.message_from_string(raw, policy=email.policy.default)
-    assert rr.verdicts(rr._text(msg)) == {1: "yes"}
+    assert rr._text(msg) == "1 yes"
 
 
 @section
