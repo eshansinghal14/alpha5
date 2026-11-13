@@ -21,6 +21,34 @@ them where they differ.
   $3k + $6k). Quote room = shard cash − `cash_reserve` $1k.
 - Both armed (`--resume-arm`). No halts.
 
+## Polymarket US: third process ARBSPM (b965106, deployed 11-13 00:20 UTC, shadow)
+
+- **What it trades** (`pm_scan.py`, `config_pm.json`, `data/live/ARBSPM`):
+  Polymarket three-way soccer (complete set both ways, NO pairs), weather
+  buckets for the six stations both exchanges list (NYC hi/lo, Chicago MDW hi/lo,
+  MIA, LAX, SFO, PHL highs), and `cross_venue` baskets: one outcome on both
+  exchanges (PM YES + Kalshi NO and the reverse, payout 1). Soccer games pair by
+  both team names + date (~230 games/week); weather by station and bucket edges.
+- **Plumbing**: Polymarket is shard `PM_SHARD` (100); a lowercase ticker is a
+  slug (`venues.is_pm`). `infra/polymarket/orders.py` (client behind
+  KalshiOrderClient's interface; NO = BUY_SHORT at 1 − p; a move is cancel +
+  create), `infra/polymarket/feed.py` (whole books, offers → NO bids; private
+  websocket for our fills and rejected/unfunded orders). Polymarket fills book
+  up to each order's `cumQuantity` (websocket and reconcile can't double-book).
+- **Rules that differ**: ARBSPM rests quotes on Polymarket legs only (a quote
+  of its own on a Kalshi market ARBS trades could meet an ARBS IOC, which
+  self-trade prevention cancels); a cross basket's Kalshi leg is taken. Each
+  process's audit subtracts the other processes' Kalshi ledgers
+  (`ARBS_PROCESSES`). $300 max, 5 lots, 3 days out, no live events, 100 write
+  tokens/s = 10 of the key's 20 requests/s. Fee: taker 0.095·p(1−p), maker 0.
+- **Not yet**: the Polymarket account has no funds (the 11-12 $8,000 deposit
+  shows REJECTED), so arming refuses (zero balance). Unconfirmed in the docs and
+  only checkable live: whether a modify keeps the id (we cancel + create
+  instead), whether an IOC's synchronous executions always come back, how a
+  post-only cross is reported, settlement timing for sports, and any in-play
+  order delay. Arm with a small first session and watch `order_gone` rows,
+  fills and the audit.
+
 ## What changed 11-05 → 11-12
 
 - **Exit-cost model** (`exit_cost.py`, `e071bf6`): predicts what exiting a
