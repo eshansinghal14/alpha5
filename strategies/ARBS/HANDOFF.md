@@ -104,13 +104,21 @@ them where they differ.
   is a sweep. Sweeps 20c+ under the touch lost 2–5c/lot for 2–5c quotes and
   made 6–10c/lot for 15–20c ones. The model picks 15–20c on 16% of prints;
   there 5c made +$2.1 on 76 fills, 15c +$11.2 on 40, 20c +$7.8 on 20.
-- **Near quote** (`ab3e647`; `trading.near_min_size`, 0 = off and off on
-  the box, 1000 is the size that held up). It takes only what the arb quote
+- **Shard 0 since 11-13 00:19–00:26 UTC: `quote_size` 2000 and
+  `near_min_size` 1000** (shard 3 unchanged: 1000 and 0). After it: 335 arb
+  quotes at 2,000 ($431k resting in arb quotes against $16k of cash), ~235
+  near quotes, median 1,800 lots ($225k resting), costing 4–5 write tokens/s;
+  the write bucket stayed full while they went in.
+- **Near quote** (`ab3e647`, `f1523b8`; `trading.near_min_size`, 0 = off,
+  1000 is the size that held up). It takes only what the arb quote
   leaves of `quote_size`, so at `quote_size` 1000 it never appears; with a
   cap of its own it sat under every arb quote already at `quote_size`: on
   for 3 min on 11-12 (23:53–23:56 UTC) it placed ~700 quotes of 1,000 lots
   on the two shards, emptied shard 0's write bucket and cut the hot list
-  from 1,510 to 1,106 baskets; no fills.
+  from 1,510 to 1,106 baskets; no fills. Since then it comes last for
+  writes: placed, repriced and grown only with half the write cap left in
+  the bucket (`NEAR_RESERVE`), not charged to its basket's write cost, and
+  a leg without one is checked for one every 2 s.
   On a pre-game basket a second quote one tick under
   each arb quote, in the deep quote's slot (journal `deep` + `near`, fills
   `fill_kind: deep`), sized to the bundles the other legs complete at that
@@ -220,12 +228,13 @@ them where they differ.
    of prints in replay: widening is immediate, narrowing back from 20c takes
    2+ min a step. Finer bins above 10c, or narrowing straight to the pick
    after the hold, are the two things to test.
-   **`quote_size` and near quotes**: raising `quote_size` (1000 on the box)
-   is the first step, see the replay above; then compare real fills over
-   1,000 lots with it. Near quotes after that: once on, compare real near
-   fills (`near` quote rows, deep fills one tick under the arb fill) with
-   the replay and watch their write cost. Cash caps both: 4,000 bundles is
-   ~$8k of shard 0's $16k.
+   **`quote_size` 2000 and near quotes on shard 0** (11-13): compare real
+   fills over 1,000 lots, and real near fills (`near` quote rows, deep fills
+   one tick under the arb fill), with the replay above before going to 3000;
+   the replay's worst fill at this size was −$181 (pre-game CS2) and esports
+   and boxing lost. Resting size is now ~40x the cash: several large fills at
+   once could leave a completion short of cash (4,000 bundles is ~$8k of
+   shard 0's $16k).
    **Quote price flips between baskets** on pre-game soccer legs (2-leg vs
    3-leg basket, ~18c apart): about half of 11-12's amends on CONCACAF legs
    were jumps of 5c+. Costs writes and queue place; not looked into.
