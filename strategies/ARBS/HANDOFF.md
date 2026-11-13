@@ -148,6 +148,60 @@ them where they differ.
   quote losing its edge or its place on the hot list, and one leg
   (KXAAAGASM 3.80=>3.60) whose near quote went 1.3 s after each of 13
   placements with the arb quote unchanged, then held; cause not found.
+- **Two-leg baskets and `trading.second_level_size`** (`fd35fa2`, deployed
+  11-13 17:15 UTC, **off** on all three processes; the user decides when it
+  goes on).
+  - Why: 11-13 14:59 UTC shard 3 lost $118 on one pre-game fill (women's
+    college basketball: a 2,356-lot sweep took our 200-lot NO bid and the one
+    200-lot bid we planned to exit through; the price went from ~20c to
+    ~80c). It is not the shard: both run the same rules and shard 3 sends
+    exits as fast. It is the basket. Real arbs 11-05..13: 3+ legs made +$967
+    pre-game (5.6c/lot, worst −$4.92) and +$424 in-play; two legs +$196 and
+    −$85. In a two-outcome market YES on A is NO on B, so one trader takes
+    our quote and our exit together; shard 3 is almost all two-leg.
+  - The rule: a two-leg basket's quotes (arb, near, deep, the baskets a
+    quote may be priced through, the ranking's size) are held to what the
+    other leg still completes, without a loss, with its best ask level gone.
+    Every recorded sweep 11-04..13 replayed (183k rows, dedup 3 s): pre-game
+    two-leg −$179 as sized today, +$399 with the rule (both halves, no worse
+    on 9 of 10 days, +$269 without the 3 best events; looser tolerances do
+    worse in order). Real fills scaled to the smaller size: pre-game +$58 →
+    +$150, in-play −$131 → +$274. It costs 3+ leg baskets $100–150, so it is
+    two-leg only. Shard 3 pre-game stays negative even with it (−$72 replay).
+  - Not the answer: more edge alone (5% → +$115, second half −$103; shard 3
+    negative at every edge and size); exits taken 1 s later (−$255).
+  - Before switching on: against the public books at 17:14 UTC it adds no
+    orders and removes 102 of shard 0's 315 two-leg arb quotes (29 more cut;
+    resting lots −20%) and 124 of shard 3's 1,179 (108 cut; lots −17%). Not
+    measured: how often a resting quote is cancelled and re-placed because
+    the level behind the best changed (a quote over its new size is
+    cancelled, as today). Switch on one shard and read cancel reasons and
+    quote lifetimes within the hour.
+- **Exit model, checked 11-13** (the user asked why it missed these and
+  whether to put every market on it):
+  - It only prices in-play quotes (`model_pick` passes live) and all five
+    large losses were pre-game. On those fills it predicts 1.5–3.3c of exit
+    cost (real 8–63c): it predicts 2.7–3.9c for a two-leg pre-game fill
+    whatever is behind the best exit level, where the replayed cost runs
+    2.8c to 9.0c. It is fitted on every print at ≤100 lots with losses
+    clipped at 50c, is additive (one −1.0/−1.5c adjustment for leg count),
+    its `top_r_min` is ~1 for any quote sized to the best level, and
+    **`spread_c` is always 0**: `exit_cost.features` subtracts the ask from
+    itself and `live_features` passes 0.0. Not fixed.
+  - In-play, each day scored by the model fitted on earlier days only (as
+    the shadow check does), all sweeps 11-05..13, sizes 5–100: model $4,072
+    vs fixed 5c×100 $3,048, ahead on 8 of 9 days; groups on it $1,385 →
+    $1,721, groups not on it $1,664 → $2,351, soccer $959 → $1,402 (7 of 9
+    days). Basketball slightly worse, football flat. Sizes over 100 in-play
+    lose on two-leg baskets (one −$589). The replay matches real in-play
+    fills on 3+ leg baskets (4.2 vs 3.6c/lot) and flatters two-leg ones by
+    ~1.5c/lot. Real, in the five groups: +$75 on 277 arbs (1.6c/lot) in the
+    34 h before, +$46 on 138 (2.7c/lot) in the 21 h since: about the same
+    dollars an hour on 40% fewer lots.
+  - Pre-game on the model: with its 100-lot grid the replay falls from
+    $1,159 to $475 (without the 3 best events); with sizes to 1,000 it is
+    $1,595, all of the gain on two-leg baskets (−$179 → +$412), which the
+    size rule gets too, and 3+ leg baskets lose $200.
 - **Sweep research 11-12** (every recorded print 11-05..12 that offered arb
   edge, replayed against the books before and 0.1 s after; scripts were in a
   session scratchpad, prefiltered rows in `~/scratch/sweeps` on the box):
@@ -308,7 +362,7 @@ them where they differ.
 - Bulk research on the box: `sudo systemd-run --uid=ubuntu --gid=ubuntu
   -p MemoryMax=2G -p Nice=19 …`, scripts in `~/scratch` (`/tmp/re.py`
   shadows the stdlib). Strategies have priority for CPU and memory.
-- Tests: `python -m pytest -q strategies/ARBS` (223) and
+- Tests: `python -m pytest -q strategies/ARBS` (231) and
   `infra/tests`. `test_slow_drift_keeps_resting` is flaky on Windows.
 
 ---
