@@ -208,6 +208,16 @@ them where they differ.
   Test, women's T20/ODI) and tennis doubles (ITF, ITF women's, Challenger,
   WTA): their prints build data to test them under the model. The user
   manages these lists by hand (declined an automated quarantine 11-12).
+  **ITF singles (KXITFMATCH, KXITFWMATCH) record-only on shard 3 since 11-13
+  06:46 UTC** (box config, the user's call; 144 quotes came off on the
+  reload, no restart). Pre-game ITF made −$79.35 on 48 arbs 11-11..13, all of
+  it three fills of 81–426 lots buying NO on the longshot at 86–92c into a
+  650–4,800-lot sweep of that longshot (−$107.06; the other 45 made +$27.71).
+  The third (−$19.17, 11-13 03:20 UTC) was 6 h before its listed start, so
+  `live_early_h` did not cover it. The same fill shape on other two-outcome
+  markets (boxing, streamer awards) made +$105.83 on 6 arbs. ITF only began
+  trading 11-11, so three days is the whole record; shard 0 quotes no ITF
+  singles.
 - **Cash and reads** (`ec1f79c`, `a58612d`, `b7b4123`): cash is read from
   Kalshi once an hour per process (`runtime.balance_poll_s` 3600) and moved
   locally by our fills (cost + fees), unwinds (+$1 a pair) and settlements;
@@ -262,7 +272,8 @@ them where they differ.
    size grid extended above 100 once there is data there.
 5. **Record-only markets**: after a few days, rerun the excluded-markets test
    (`~/scratch/excl_model.py` on the box: replay at the model's pick vs fixed
-   rules, per series × live) on hockey, cricket and doubles. Live doubles
+   rules, per series × live) on hockey, cricket, doubles and ITF singles
+   (record-only since 11-13). Live doubles
    already replayed positive under the model (+$2.8..11.6 over 2 days), but
    live tennis quoting is off.
 6. **Shadow sizer** (`live_params_shadow`, `df2ebb6`/`b024127`) and
