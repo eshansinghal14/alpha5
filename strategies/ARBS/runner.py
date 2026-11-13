@@ -2273,14 +2273,13 @@ class ArbsRunner:
         return pricing.quote_leg(vs, j, b.payout, need, q.remaining), q.remaining
 
     def deep_cap(self, b: Basket, j: int, live: bool) -> float:
-        """Most bundles a deep quote on leg j may rest: deep_quote_size, held to
-        the arb quote's own size cap and to the bundle and dollar room left
-        after the arb quote on that leg (a sweep can fill both)."""
+        """Most bundles a deep quote on leg j may rest: the arb quote's own
+        size cap, held to the bundle and dollar room left after the arb quote
+        on that leg (a sweep can fill both)."""
         t = self.cfg.trading
         main = self.quotes.get((b.basket_id, j))
         dollars = self.quote_size_by_dollars(b) - (main.remaining if main is not None else 0.0)
-        return max(0.0, min(float(t.deep_quote_size), float(t.live_quote_size if live else t.quote_size),
-                            self.room_bundles(b, j), dollars))
+        return max(0.0, min(float(t.live_quote_size if live else t.quote_size), self.room_bundles(b, j), dollars))
 
     def aged_room(self, b: Basket, j: int) -> float:
         """Bundles the other legs' touch has offered for trading.depth_age_s:
@@ -2311,7 +2310,9 @@ class ArbsRunner:
         t, reserve, acts = self.cfg.trading, self.cfg.runtime.write_reserve_tokens, []
         near_on = on and not live and t.near_min_size >= 1
         near_reserve = max(reserve, NEAR_RESERVE * self.write_budget())
-        on = on and t.deep_quote_size >= 1
+        # None on the Polymarket process: its config had them off until
+        # deep_quote_size was removed (11-13), and they are untested there.
+        on = on and not self.pm_process
         for j, leg in enumerate(b.legs):
             dq = self.quotes.get((b.basket_id, j, "deep"))
             if dq is not None and dq.pending:

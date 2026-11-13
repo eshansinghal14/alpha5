@@ -126,6 +126,11 @@ def _eval(r, b):
     asyncio.run(go())
 
 
+def _no_deep(r):
+    """No room for deep quotes, for tests about the other quotes."""
+    r.deep_cap = lambda b, j, live: 0.0
+
+
 def test_broken_basket_rests_on_the_cheaper_exit(arbs):
     r, b = arbs
     _broken(r, b)
@@ -1181,7 +1186,7 @@ def _live_gap(r, b, a_yes_bids):
     r.set_baskets([live])
     r.hot = [live.basket_id]
     r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_live_events=True, live_quote_size=2, live_edge_add=0.0,
-                                        deep_quote_size=5, deep_min_gap_ticks=5, requote_cooldown_s=0.0)
+                                        deep_min_gap_ticks=5, requote_cooldown_s=0.0)
     book(r, "X-A", a_yes_bids, [(0.35, 10)])
     book(r, "X-B", [(0.40, 10)], [(0.45, 10)])      # B's YES ask 0.55
     _eval(r, live)
@@ -1196,7 +1201,7 @@ def test_deep_quote_rests_one_tick_over_the_next_bid_behind(arbs):
     live = _live_gap(r, b, [(0.45, 10), (0.20, 5)])
     main, deep = r.quotes[(live.basket_id, 0)], r.quotes[(live.basket_id, 0, "deep")]
     assert main.price == pytest.approx(0.40) and not main.deep
-    # deep_quote_size 5, held to the arb quote's live_quote_size of 2.
+    # Held to the arb quote's live_quote_size of 2.
     assert deep.price == pytest.approx(0.21) and deep.size == 2 and deep.edge > main.edge
 
 
@@ -1206,9 +1211,8 @@ def test_no_deep_quote_on_a_small_gap(arbs):
     assert (live.basket_id, 0) in r.quotes and (live.basket_id, 0, "deep") not in r.quotes
 
 
-def _slow_gap(r, b, deep_quote_size):
-    r.cfg.trading = dataclasses.replace(r.cfg.trading, deep_quote_size=deep_quote_size, deep_min_gap_ticks=5,
-                                        requote_cooldown_s=0.0)
+def _slow_gap(r, b):
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, deep_min_gap_ticks=5, requote_cooldown_s=0.0)
     book(r, "X-A", [(0.45, 10), (0.20, 5)], [(0.35, 10)])
     book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
     _eval(r, b)
@@ -1219,7 +1223,7 @@ def _slow_gap(r, b, deep_quote_size):
 
 def test_non_live_basket_gets_a_deep_quote_at_its_quote_size(arbs):
     r, b = arbs
-    _slow_gap(r, b, deep_quote_size=10000)
+    _slow_gap(r, b)
     deep = r.quotes[(b.basket_id, 0, "deep")]
     assert deep.price == pytest.approx(0.21) and deep.size == r.cfg.trading.quote_size
 
@@ -1227,7 +1231,7 @@ def test_non_live_basket_gets_a_deep_quote_at_its_quote_size(arbs):
 def test_deep_quote_sized_to_what_the_other_legs_complete(arbs):
     r, b = arbs
     r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=50)
-    _slow_gap(r, b, deep_quote_size=10000)
+    _slow_gap(r, b)
     # B's NO bids hold 10 at 0.45 (its YES ask 0.55): past that nothing completes.
     assert r.quotes[(b.basket_id, 0, "deep")].size == 10
 
@@ -1338,19 +1342,22 @@ def test_no_deep_quote_behind_a_fresh_arb_quote(arbs):
     r.set_baskets([live])
     r.hot = [live.basket_id]
     r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_live_events=True, live_quote_size=2, live_edge_add=0.0,
-                                        deep_quote_size=5, deep_min_gap_ticks=5)
+                                        deep_min_gap_ticks=5)
     book(r, "X-A", [(0.45, 10), (0.20, 5)], [(0.35, 10)])
     book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
     _eval(r, live)
     assert (live.basket_id, 0) in r.quotes and not any(q.deep for q in r.quotes.values())
 
 
-def _near(r, b, second_level, **cfg):
+def _near(r, b, second_level, deep=False, **cfg):
     """b pre-game. A's arb quote rests at its 0.40 limit, sized to the 10 at
-    B's 0.55 ask; B's next ask, 0.56, completes a quote at 0.39."""
+    B's 0.55 ask; B's next ask, 0.56, completes a quote at 0.39. No deep
+    quotes unless `deep`."""
     r.cfg.trading = dataclasses.replace(r.cfg.trading, **{
-        "quote_size": 5000, "near_min_size": 100, "deep_quote_size": 0,
+        "quote_size": 5000, "near_min_size": 100,
         "max_bundles_per_basket": 10000, "max_dollars": 1e6, "requote_cooldown_s": 0.0, "depth_age_s": 0.0, **cfg})
+    if not deep:
+        _no_deep(r)
     book(r, "X-A", [(0.45, 100)], [(0.35, 10)])
     book(r, "X-B", [(0.40, 10)], [(0.45, 10), (0.44, second_level)])
     _eval(r, b)
@@ -1460,8 +1467,9 @@ def test_near_quote_is_sized_through_the_basket_the_arb_quote_is_priced_through(
     r, b = arbs
     c = _second_basket(r, b, (Leg("X-A", "yes"), Leg("X-C", "yes")))
     r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=5000, near_min_size=100,
-                                        deep_quote_size=0, max_bundles_per_basket=10000, max_dollars=1e6,
+                                        max_bundles_per_basket=10000, max_dollars=1e6,
                                         requote_cooldown_s=0.0, depth_age_s=0.0)
+    _no_deep(r)
     book(r, "X-A", [(0.43, 100)], [(0.55, 10)])                 # A ask 0.45
     book(r, "X-B", [(0.30, 10)], [(0.35, 10)])                  # B ask 0.65: b alone clears at 0.30
     book(r, "X-C", [(0.40, 10)], [(0.45, 10), (0.44, 500)])     # C asks 0.55 x 10, 0.56 x 500
@@ -1519,12 +1527,12 @@ def test_near_quote_waits_for_an_arb_quote_that_has_stopped_moving(arbs):
 
 def test_near_quote_with_no_near_plan_goes_at_once_even_where_a_deep_quote_could_rest(arbs):
     r, b = arbs
-    _near(r, b, 500, deep_quote_size=5)
+    _near(r, b, 500, deep=True)
     assert r.quotes[(b.basket_id, 0, "deep")].near
     _b_depth(r, b, 10)                              # the exits no longer take it
     assert not any(q.near for q in r.quotes.values())
     r._near_at.clear()
-    _near(r, b, 500, deep_quote_size=5, quote_live_events=True, live_quote_size=5000, live_edge_add=0.0)
+    _near(r, b, 500, deep=True, quote_live_events=True, live_quote_size=5000, live_edge_add=0.0)
     assert r.quotes[(b.basket_id, 0, "deep")].near
     r.flag_live(b, "test")
     _eval(r, b)
@@ -1599,7 +1607,8 @@ def _live_groups(r, b, log):
     r.hot = [live.basket_id]
     r.live = True
     r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_live_events=True, live_quote_size=2,
-                                        live_edge_add=0.0, live_order_groups=True, deep_quote_size=0)
+                                        live_edge_add=0.0, live_order_groups=True)
+    _no_deep(r)
     ids = iter(range(1000))
 
     async def rest(ticker, side, price, size, cid, group=None):
@@ -2351,8 +2360,9 @@ def _second_level(r, b, behind, **cfg):
     0.55, `behind` at 0.56 (the last level that completes a fill at 0.40
     without a loss), 500 at 0.70. A's only ask is 10 at 0.65."""
     r.cfg.trading = dataclasses.replace(r.cfg.trading, **{
-        "quote_size": 1000, "deep_quote_size": 0, "near_min_size": 0, "max_bundles_per_basket": 10000,
+        "quote_size": 1000, "near_min_size": 0, "max_bundles_per_basket": 10000,
         "max_dollars": 1e6, "requote_cooldown_s": 0.0, "depth_age_s": 0.0, **cfg})
+    _no_deep(r)
     book(r, "X-A", [(0.45, 100)], [(0.35, 10)])
     book(r, "X-B", [(0.40, 10)], [(0.45, 100), (0.44, behind), (0.30, 500)])
     _eval(r, b)
@@ -2406,8 +2416,9 @@ def test_basket_of_three_legs_is_not_held_to_the_second_level(arbs):
     r.hot = [c.basket_id]
     r.feed._books.setdefault("X-C", L2Book("X-C"))
     r.meta["X-C"] = R.Meta(ticker="X-C", event="X", status="active", shard=0, taker_rate=0.07, maker_rate=0.0)
-    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=1000, deep_quote_size=0, depth_age_s=0.0,
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=1000, depth_age_s=0.0,
                                         max_bundles_per_basket=10000, max_dollars=1e6, second_level_size=True)
+    _no_deep(r)
     book(r, "X-A", [(0.45, 100)], [(0.35, 10)])
     book(r, "X-B", [(0.20, 10)], [(0.70, 100)])             # B's YES ask 0.30 x 100, nothing behind it
     book(r, "X-C", [(0.15, 10)], [(0.75, 100)])             # C's 0.25 x 100
@@ -2425,7 +2436,7 @@ def test_near_quote_and_arb_quote_together_stay_within_the_second_level(arbs):
 
 def test_deep_quote_is_held_to_the_second_level_and_goes_when_it_is_gone(arbs):
     r, b = arbs
-    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=50, deep_quote_size=10000, deep_min_gap_ticks=5,
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=50, deep_min_gap_ticks=5,
                                         requote_cooldown_s=0.0, depth_age_s=0.0, second_level_size=True)
     book(r, "X-A", [(0.45, 10), (0.20, 5)], [(0.35, 10)])
     book(r, "X-B", [(0.40, 10)], [(0.45, 10), (0.44, 5), (0.30, 40)])      # B's asks 0.55 x 10, 0.56 x 5, 0.70 x 40

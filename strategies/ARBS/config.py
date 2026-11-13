@@ -70,11 +70,6 @@ class TradingParams:
                                     "contracts match in 15 s, Kalshi cancels the rest inside the matching "
                                     "engine, before the rest of a sweep lands, and exits go out without "
                                     "waiting on our own cancels.")
-    deep_quote_size: int = param("Most bundles in the second quote a basket rests one tick over the next bid "
-                                 "behind each arb quote, where a sweep through the arb quote lands. Also held "
-                                 "to the arb quote's own cap (live_quote_size / quote_size) and the room left "
-                                 "after it, so at or over quote_size it is the regular size. 0 = off.",
-                                 min=0, max=10000, step=1)
     # Scored on fill_context 11-02..04: sports, others' depth -50% in 2 s with a
     # 2 s hold skipped $60 of losing fills for $30 of winners, 1.7% of quote
     # time; live elections about even (most losses there gave no warning).
@@ -91,10 +86,12 @@ class TradingParams:
                                "that leg), so it needs quote_size above this. 0 = off. Replayed on prints "
                                "11-05..12, ones of 1,000+ made $3,245 on 23 fills with one loser; smaller "
                                "ones lost $334.", min=0, max=10000, step=100)
-    deep_min_gap_ticks: int = param("Least gap, in cents (not a tapered market's 0.1c ticks), between the arb "
-                                    "quote and the deep quote's price; a smaller "
-                                    "gap gains too little over the arb quote to be worth the order.",
-                                    min=1, max=99, step=1)
+    deep_min_gap_ticks: int = param("A basket rests a second, deep quote one tick over the next bid behind each "
+                                    "arb quote, where a sweep through the arb quote lands, up to the arb "
+                                    "quote's own cap (live_quote_size / quote_size) and the room left after "
+                                    "it. This is the least gap, in cents (not a tapered market's 0.1c ticks), "
+                                    "between the arb quote and that price; a smaller gap gains too little "
+                                    "over the arb quote to be worth the order.", min=1, max=99, step=1)
     depth_age_s: float = param("New and grown quotes are held to the other legs' touch depth that has rested "
                                "this long (an existing quote keeps its size); 0 = off. Live fills 11-02..10 "
                                "over 50 lots made +2.1c/lot when that depth (5 s) covered them, -3.0c/lot "
