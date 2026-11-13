@@ -149,8 +149,19 @@ them where they differ.
   (KXAAAGASM 3.80=>3.60) whose near quote went 1.3 s after each of 13
   placements with the arb quote unchanged, then held; cause not found.
 - **Two-leg baskets and `trading.second_level_size`** (`fd35fa2`, deployed
-  11-13 17:15 UTC, **off** on all three processes; the user decides when it
-  goes on).
+  11-13 17:15 UTC). **On for shard 3 since 17:27:55 UTC** (the user's call);
+  shard 0 follows once an hour of shard 3's cancel reasons and quote
+  lifetimes has been read; off on ARBSPM. First 10 min on shard 3: two-leg
+  arb quotes 1,052 → ~970 and their lots −16% as predicted, bucket full, no
+  alerts; two-leg quotes cancelled for size 243/min against 134/min in the
+  hour before (median life 8 s against 73 s), 61% of them quotes of 20 lots
+  or fewer, a third re-placed at the same size 12 ms later: the level behind
+  the best flickers on thin books. About +20 write tokens/s.
+- **Soccer in-play on the model since 11-13 17:31:10 UTC** (`S:Soccer` added
+  to `trading.model_series` on both Kalshi shards; a trial, the user's
+  call). Five minutes in, 59% of soccer legs sat at the grid's 20c edge.
+  Compare a day of real soccer fills with the replay below before adding
+  other groups.
   - Why: 11-13 14:59 UTC shard 3 lost $118 on one pre-game fill (women's
     college basketball: a 2,356-lot sweep took our 200-lot NO bid and the one
     200-lot bid we planned to exit through; the price went from ~20c to
