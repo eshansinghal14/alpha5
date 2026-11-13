@@ -2372,15 +2372,26 @@ def test_second_level_size_off_sizes_quotes_to_the_best_level(arbs):
     assert r.quotes[(b.basket_id, 0)].size == 100 and r.quotes[(b.basket_id, 1)].size == 10
 
 
-def test_resting_two_leg_quote_goes_when_the_level_behind_the_best_thins(arbs):
+def test_resting_two_leg_quote_rides_out_a_dip_behind_the_best_level_and_goes_if_it_lasts(arbs):
     r, b = arbs
+    rows = []
+    r.journal = rows.append
     _second_level(r, b, 60, second_level_size=True)
-    assert r.quotes[(b.basket_id, 0)].size == 60
+    q = r.quotes[(b.basket_id, 0)]
+    assert q.size == 60
     book(r, "X-B", [(0.40, 10)], [(0.45, 100), (0.44, 25), (0.30, 500)])
     _eval(r, b)
+    assert r.quotes[(b.basket_id, 0)] is q and q.short_at is not None       # over its cover: it waits
+    book(r, "X-B", [(0.40, 10)], [(0.45, 100), (0.44, 60), (0.30, 500)])
     _eval(r, b)
-    assert r.quotes[(b.basket_id, 0)].remaining == 25       # re-placed at what is covered now
-    book(r, "X-B", [(0.40, 10)], [(0.45, 100)])
+    assert q.short_at is None and not [x for x in rows if x["kind"] == "cancel"]     # the level came back
+    book(r, "X-B", [(0.40, 10)], [(0.45, 100), (0.44, 25), (0.30, 500)])
+    _eval(r, b)
+    q.short_at -= R.COVER_GRACE_S
+    _eval(r, b)
+    _eval(r, b)
+    assert r.quotes[(b.basket_id, 0)].remaining == 25       # still short after the wait: re-placed at the cover
+    book(r, "X-B", [(0.40, 10)], [(0.45, 20)])              # the best level no longer holds it: no wait
     _eval(r, b)
     assert (b.basket_id, 0) not in r.quotes
 
@@ -2427,7 +2438,10 @@ def test_deep_quote_is_held_to_the_second_level_and_goes_when_it_is_gone(arbs):
     assert deep.price == pytest.approx(0.21) and deep.size == 45        # 0.21 through 0.70 as well
     book(r, "X-B", [(0.40, 10)], [(0.45, 100)])             # 100 at the best ask, nothing behind it
     _eval(r, b)
-    assert not r.basket_quotes(b.basket_id)                 # on its own the deep quote still cleared its edge
+    assert (b.basket_id, 0, "deep") not in r.quotes         # on its own the deep quote still cleared its edge
+    main.short_at -= R.COVER_GRACE_S
+    _eval(r, b)
+    assert not r.basket_quotes(b.basket_id)
 
 
 def test_quote_is_not_priced_through_a_two_leg_basket_with_nothing_behind_its_best_level(arbs):

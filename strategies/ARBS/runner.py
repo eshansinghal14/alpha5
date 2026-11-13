@@ -127,6 +127,7 @@ class Quote:
     near: bool = False          # a deep quote resting one tick under a pre-game arb quote (near_plan)
     group: str | None = None    # Kalshi order group it rests in (live events, live_order_groups)
     booked_to: str | None = None  # basket its last fill was booked into (see book_target)
+    short_at: float | None = None  # since when its second-level cover has been under it (COVER_GRACE_S)
 
     @property
     def remaining(self) -> float:
@@ -180,6 +181,12 @@ NEAR_RESERVE = 0.5
 # A leg with no near quote resting is checked for one at most this often: the
 # check prices the leg a second time on every pass.
 NEAR_EVAL_S = 2.0
+# A resting two-leg arb quote over its second-level cover (trading.second_level_size)
+# goes only once it has been short this long: the level behind the best
+# flickers on thin books. Cancelled at once, shard 3's two-leg quotes went for
+# size 253 times a minute against 134 before the rule, a third of them
+# re-placed at the same size ~15 ms later (11-13 17:30-18:15 UTC).
+COVER_GRACE_S = 1.0
 # Longest an eval pass runs before letting the websocket reader in: a fill that
 # lands mid-pass isn't even read until the pass yields (fill -> exit decision
 # p99 was 176 ms with whole passes, 10-30/31). A yield costs microseconds.
@@ -2105,7 +2112,10 @@ class ArbsRunner:
                     room = min(room, max(self.aged_room(b, j), q.remaining if q is not None else 0.0))
                 size = pricing.depth_size(vs, j, b.payout, need_j, float(int(room + _EPS))) if room >= 1 else 0.0
                 plan = pricing.quote_leg(vs, j, b.payout, need_j, size) if size >= 1 else None
+                full = size
                 plan, size = self.cover_plan(b, vs, j, plan, size, need_j)
+                if q is not None:
+                    plan, size = self.cover_grace(b, vs, j, q, plan, size, full, need_j, now)
                 if room >= 1:
                     plan, size = self.best_plan(b, j, plan, size, room, need_j if picked else 0.0)
                 if q is not None and q.remaining > size + _EPS:
@@ -2246,6 +2256,21 @@ class ArbsRunner:
         if n >= size:
             return plan, size
         return (pricing.quote_leg(vs, j, b.payout, need, n), n) if n >= 1 else (None, 0.0)
+
+    def cover_grace(self, b: Basket, vs, j: int, q: Quote, plan, size: float, full: float, need: float,
+                    now: float) -> tuple:
+        """(plan, size) for resting arb quote q. While the best level still
+        completes it (`full`) and only the cover (`size`) is short, it keeps
+        its size for COVER_GRACE_S from when the cover first fell short."""
+        if not (size + _EPS < q.remaining <= full + _EPS):
+            q.short_at = None
+            return plan, size
+        if q.short_at is None:
+            q.short_at = now
+            self.later(b.basket_id, COVER_GRACE_S + 0.01)
+        if now - q.short_at >= COVER_GRACE_S:
+            return plan, size
+        return pricing.quote_leg(vs, j, b.payout, need, q.remaining), q.remaining
 
     def deep_cap(self, b: Basket, j: int, live: bool) -> float:
         """Most bundles a deep quote on leg j may rest: deep_quote_size, held to
