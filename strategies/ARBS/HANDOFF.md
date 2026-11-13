@@ -110,9 +110,19 @@ them where they differ.
   near quotes, median 1,800 lots ($225k resting), costing 4–5 write tokens/s;
   the write bucket stayed full while they went in. By 01:40 the evening's
   pulls had cut that to ~550 arb quotes (145 at 2,000) and ~85 near quotes.
-  **`deep_quote_size` 1000 on shard 0 since 02:04 UTC**: deep quotes take
-  `quote_size` as their cap, so at 2000 they rested up to 2,000 lots (19 of
-  them) until then. First fill over 1,000 lots: 1,877 pre-game NO on
+  `deep_quote_size` was 1000 on shard 0 from 02:04 UTC (deep quotes had
+  followed `quote_size` to 2,000, 19 of them) until **the setting was
+  removed 11-13 18:58 UTC (`5bda05f`, the user's call): a deep quote's cap
+  is the arb quote's own (`quote_size`, `live_quote_size` in-play)**, still
+  held to the room left after the arb quote and to what the exits complete
+  at its price. The user set shard 0's `quote_size` to 3000 the same
+  evening, so its pre-game deep quotes may rest 3,000: against the books
+  just before, 153 of the 181 then at the 1,000 cap would grow, 150 to
+  3,000 (+$133k resting); ten minutes after, 123 of 255 deep and near
+  quotes rested 2,000+ and one at 1,000, bucket 215/250, no errors. A sweep
+  through both quotes on one leg is now up to 6,000 bundles. The Polymarket
+  process, whose config had deep quotes off, rests none (`manage_deep`).
+  First fill over 1,000 lots: 1,877 pre-game NO on
   KXSTREAMERAWARDS-VTUBER26-THE at 02:03:57, completed for +$55.20
   (2.9c/lot); no near fills yet.
 - **Near quote** (`ab3e647`, `f1523b8`; `trading.near_min_size`, 0 = off,
