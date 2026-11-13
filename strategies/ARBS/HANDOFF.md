@@ -108,7 +108,13 @@ them where they differ.
   `near_min_size` 1000** (shard 3 unchanged: 1000 and 0). After it: 335 arb
   quotes at 2,000 ($431k resting in arb quotes against $16k of cash), ~235
   near quotes, median 1,800 lots ($225k resting), costing 4–5 write tokens/s;
-  the write bucket stayed full while they went in.
+  the write bucket stayed full while they went in. By 01:40 the evening's
+  pulls had cut that to ~550 arb quotes (145 at 2,000) and ~85 near quotes.
+  **`deep_quote_size` 1000 on shard 0 since 02:04 UTC**: deep quotes take
+  `quote_size` as their cap, so at 2000 they rested up to 2,000 lots (19 of
+  them) until then. First fill over 1,000 lots: 1,877 pre-game NO on
+  KXSTREAMERAWARDS-VTUBER26-THE at 02:03:57, completed for +$55.20
+  (2.9c/lot); no near fills yet.
 - **Near quote** (`ab3e647`, `f1523b8`; `trading.near_min_size`, 0 = off,
   1000 is the size that held up). It takes only what the arb quote
   leaves of `quote_size`, so at `quote_size` 1000 it never appears; with a
@@ -128,6 +134,20 @@ them where they differ.
   minutes and we bought 1,894 (+$108). Priced through the basket the arb
   quote is priced through; cut at once when the exits take under 80% of it,
   grown or repriced at most every 10 s; not held to `depth_age_s`.
+  Since `19edc27` (11-13 02:00 UTC) a resting one stays where it is when the
+  arb quote steps away, while under 5c (`deep_min_gap_ticks`) below it and
+  the exits still cover it there; it is placed, repriced and grown only
+  under an arb quote that has not moved for 10 s; and with no near plan it
+  goes at once under an arb quote or in-play (where a deep quote could rest
+  on its leg it used to wait out the deep cooldown at full size). Before,
+  it was pulled each time the arb quote moved: 590 of 1,414 cancelled near
+  quotes had rested under 10 s (shard 0, 00:20–01:43 UTC), 433 right after
+  the arb quote stepped up, and a 1,998-lot one under a 2-lot arb quote
+  hopping 46c/48c was re-placed 99 times. After (02:02–02:18): 42 of 264
+  under 10 s, 4 after a step up. What is left: exit depth going, the arb
+  quote losing its edge or its place on the hot list, and one leg
+  (KXAAAGASM 3.80=>3.60) whose near quote went 1.3 s after each of 13
+  placements with the arb quote unchanged, then held; cause not found.
 - **Sweep research 11-12** (every recorded print 11-05..12 that offered arb
   edge, replayed against the books before and 0.1 s after; scripts were in a
   session scratchpad, prefiltered rows in `~/scratch/sweeps` on the box):
@@ -277,7 +297,7 @@ them where they differ.
 - Bulk research on the box: `sudo systemd-run --uid=ubuntu --gid=ubuntu
   -p MemoryMax=2G -p Nice=19 …`, scripts in `~/scratch` (`/tmp/re.py`
   shadows the stdlib). Strategies have priority for CPU and memory.
-- Tests: `python -m pytest -q strategies/ARBS` (206) and
+- Tests: `python -m pytest -q strategies/ARBS` (223) and
   `infra/tests`. `test_slow_drift_keeps_resting` is flaky on Windows.
 
 ---
