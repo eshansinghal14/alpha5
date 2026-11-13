@@ -1474,6 +1474,63 @@ def test_near_quote_is_sized_through_the_basket_the_arb_quote_is_priced_through(
     assert near.near and near.price == pytest.approx(0.39) and near.size == 500
 
 
+def test_resting_near_quote_stays_where_it_is_when_the_arb_quote_steps_up(arbs):
+    r, b = arbs
+    rows = []
+    r.journal = rows.append
+    _near(r, b, 500)
+    main, near = r.quotes[(b.basket_id, 0)], r.quotes[(b.basket_id, 0, "deep")]
+    book(r, "X-B", [(0.40, 10)], [(0.47, 10), (0.45, 10), (0.44, 500)])     # B's ask 0.53 x 10: A's limit 0.42
+    _eval(r, b)
+    _eval(r, b)
+    assert main.price == pytest.approx(0.42)                    # and 0.41 adds nothing to its 10
+    assert r.quotes[(b.basket_id, 0, "deep")] is near and near.price == pytest.approx(0.39) and near.remaining == 500
+    assert not [x for x in rows if x["kind"] == "cancel"]
+    book(r, "X-B", [(0.40, 10)], [(0.47, 10), (0.45, 10), (0.44, 300)])
+    _eval(r, b)
+    assert near.price == pytest.approx(0.39) and near.remaining == 310      # still cut at once, where it rests
+    book(r, "X-B", [(0.40, 10)], [(0.49, 10), (0.45, 10), (0.44, 500)])     # A's limit 0.44: 5c over it
+    _eval(r, b)
+    _eval(r, b)
+    assert main.price == pytest.approx(0.44) and (b.basket_id, 0, "deep") not in r.quotes
+
+
+def test_near_quote_waits_for_an_arb_quote_that_has_stopped_moving(arbs):
+    r, b = arbs
+    _near(r, b, 50)                                 # a tick lower adds too little
+    main = r.quotes[(b.basket_id, 0)]
+    main.moved_at = time.time()
+    r._near_at.clear()
+    _b_depth(r, b, 500)                             # now it adds enough, but the arb quote has just moved
+    assert (b.basket_id, 0, "deep") not in r.quotes
+    main.moved_at -= R.DEEP_REQUOTE_S
+    _b_depth(r, b, 500)
+    near = r.quotes[(b.basket_id, 0, "deep")]
+    assert near.near and near.price == pytest.approx(0.39)
+    near.placed_at -= R.DEEP_REQUOTE_S
+    book(r, "X-B", [(0.40, 10)], [(0.47, 10), (0.46, 500)])     # A's limit 0.42, and 0.41 adds 500
+    _eval(r, b)
+    _eval(r, b)
+    assert main.price == pytest.approx(0.42) and near.price == pytest.approx(0.39)
+    main.moved_at -= R.DEEP_REQUOTE_S
+    _eval(r, b)
+    assert near.price == pytest.approx(0.41)
+
+
+def test_near_quote_with_no_near_plan_goes_at_once_even_where_a_deep_quote_could_rest(arbs):
+    r, b = arbs
+    _near(r, b, 500, deep_quote_size=5)
+    assert r.quotes[(b.basket_id, 0, "deep")].near
+    _b_depth(r, b, 10)                              # the exits no longer take it
+    assert not any(q.near for q in r.quotes.values())
+    r._near_at.clear()
+    _near(r, b, 500, deep_quote_size=5, quote_live_events=True, live_quote_size=5000, live_edge_add=0.0)
+    assert r.quotes[(b.basket_id, 0, "deep")].near
+    r.flag_live(b, "test")
+    _eval(r, b)
+    assert not any(q.near for q in r.quotes.values())
+
+
 def test_deep_gap_is_in_cents_not_ticks(arbs):
     r, b = arbs
     r.cfg.trading = dataclasses.replace(r.cfg.trading, deep_min_gap_ticks=5)

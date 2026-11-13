@@ -2171,19 +2171,19 @@ class ArbsRunner:
         return pricing.QuotePlan(leg=j, price=price, max_price=p.max_price, edge=edge,
                                  others_cost=p.others_cost), n
 
-    def near_plan(self, b: Basket, vs, j: int, main: Quote, need: float, resting: bool) -> tuple:
+    def near_plan(self, b: Basket, vs, j: int, main: Quote, need: float, held: Quote | None) -> tuple:
         """(plan, size) for a second quote one tick under leg j's resting arb
         quote on a pre-game basket, sized to the bundles that price adds, within
         what the arb quote leaves of quote_size: the arb quote is sized to what
         the other legs complete at exactly its price, often one level, and a
-        tick lower takes in the next.
+        tick lower takes in the next. `held` is the near quote resting there.
         (None, 0) unless that adds near_min_size. Sweeps that ran through our pre-game
         quotes where it would have been 1,000+ lots made it $3,245 on 23 fills
         with one loser, replayed on prints 11-05..12; smaller ones lost. Not
         held to depth_age_s: that ages the other legs' touch only, which the
         arb quote has already used."""
         t = self.cfg.trading
-        least = max(1.0, t.near_min_size * (NEAR_KEEP if resting else 1.0))
+        least = max(1.0, t.near_min_size * (NEAR_KEEP if held is not None else 1.0))
         if t.quote_size - main.remaining < least:
             return None, 0
         y, k, vy = b, j, vs
@@ -2199,20 +2199,30 @@ class ArbsRunner:
                 return None, 0
             need = edge_dollars(y.payout, t.min_edge + t.quote_edge_add)
         lv = vy[k]
-        price = lv.ticks.down(main.price)
         # Only what the arb quote leaves of quote_size: with a quote_size of its
         # own it sat under every arb quote already at quote_size, ~700 of them
         # at 1,000 lots within 2 min, and emptied the write bucket (11-12 23:53).
         cap = min(float(t.quote_size), self.room_bundles(y, k), float(self.quote_size_by_dollars(y))) - main.remaining
-        if price < lv.ticks.lo - _EPS or cap < least:
+        if cap < least:
             return None, 0
-        total = pricing.depth_size(vy, k, y.payout, need, float(int(main.remaining + cap + _EPS)), at=price)
-        n = float(int(total - main.remaining + _EPS))
-        p = pricing.quote_leg(vy, k, y.payout, need, total) if n >= least else None
-        if p is None or price > p.max_price + _EPS:
-            return None, 0
-        edge = y.payout - p.others_cost - pricing.maker_cost(price, lv.maker_rate)
-        return pricing.QuotePlan(leg=j, price=price, max_price=p.max_price, edge=edge, others_cost=p.others_cost), n
+        prices = [lv.ticks.down(main.price)]
+        # A resting one stays where it is when the tick under the arb quote adds
+        # too little: pulled each time the arb quote stepped up, 590 of 1,414
+        # lived under 10 s (shard 0, 11-13 00:20-01:43 UTC). Not from
+        # deep_min_gap_ticks under: quotes 5-15 ticks down lost on the 11-05..12 replay.
+        if held is not None and held.price < prices[0] - _EPS and not self.deep_gap(held.price, main.price):
+            prices.append(held.price)
+        for price in prices:
+            if price < lv.ticks.lo - _EPS:
+                continue
+            total = pricing.depth_size(vy, k, y.payout, need, float(int(main.remaining + cap + _EPS)), at=price)
+            n = float(int(total - main.remaining + _EPS))
+            p = pricing.quote_leg(vy, k, y.payout, need, total) if n >= least else None
+            if p is not None and price <= p.max_price + _EPS:
+                edge = y.payout - p.others_cost - pricing.maker_cost(price, lv.maker_rate)
+                return pricing.QuotePlan(leg=j, price=price, max_price=p.max_price, edge=edge,
+                                         others_cost=p.others_cost), n
+        return None, 0
 
     def deep_cap(self, b: Basket, j: int, live: bool) -> float:
         """Most bundles a deep quote on leg j may rest: deep_quote_size, held to
@@ -2266,14 +2276,23 @@ class ArbsRunner:
             main = self.quotes.get((b.basket_id, j))
             if dq is not None and dq.near and main is not None and main.pending:
                 continue                    # the arb quote is being re-placed: judge the near quote once it rests
+            # A near quote is placed, repriced and grown only under an arb quote
+            # that has stopped moving: a 2-lot arb quote hopping 46c/48c had its
+            # 1,998-lot near quote re-placed 99 times (shard 0, 11-13 00:26-01:41 UTC).
+            still = main is not None and now - max(main.placed_at, main.moved_at) >= DEEP_REQUOTE_S
             if near_on and j in mains and main is not None and not main.pending:
                 resting = dq is not None and dq.near
-                if resting or now - self._near_at.get((b.basket_id, j), 0.0) >= NEAR_EVAL_S:
+                if resting or (still and now - self._near_at.get((b.basket_id, j), 0.0) >= NEAR_EVAL_S):
                     if len(self._near_at) > 50000:
                         self._near_at.clear()
                     self._near_at[(b.basket_id, j)] = now
-                    plan, size = self.near_plan(b, vs, j, main, need, resting)
+                    plan, size = self.near_plan(b, vs, j, main, need, dq if resting else None)
                     near = plan is not None
+            if dq is not None and dq.near and not near and (j in mains or not near_on):
+                # Only a near plan covers its size: under an arb quote or in-play it
+                # must not wait out a deep quote's cooldown, or stay as one.
+                acts.append(self.cancel_quote(dq, "deep_off"))
+                continue
             if plan is None and on and j in mains:
                 # A sweep fills both quotes: the deep one gets what the aged depth leaves.
                 aged = self.aged_room(b, j) - (main.remaining if main is not None else 0.0)
@@ -2288,7 +2307,8 @@ class ArbsRunner:
                 # under 1.4 s and they took 13% of our writes (10-30 18:16-18:21).
                 # Not once our arb quote has come down to it: that is just more
                 # size at the arb price (KXHIGHMIA 10-30 filled both at 0.73).
-                keep = on and self.quoted_elsewhere(b.basket_id, leg.ticker, leg.side) is None and \
+                keep = (on or dq.near) and \
+                    self.quoted_elsewhere(b.basket_id, leg.ticker, leg.side) is None and \
                     (j not in mains or self.deep_gap(dq.price, mains[j].price)) and \
                     (p := pricing.quote_leg(vs, j, b.payout, need, dq.remaining)) is not None and \
                     dq.price <= p.max_price + _EPS
@@ -2312,7 +2332,7 @@ class ArbsRunner:
             left = near_reserve if near else reserve
             if near and dq.near:
                 cut = size < NEAR_SHRINK * dq.remaining
-                move = cut or (cooled and (stepped or size >= NEAR_GROW * dq.remaining))
+                move = cut or (cooled and still and (stepped or size >= NEAR_GROW * dq.remaining))
                 left = reserve if cut else near_reserve
             else:
                 move = cooled and (stepped or abs(dq.remaining - size) > _EPS)
