@@ -47,7 +47,8 @@ NO = {"no", "n", "reject", "rejected", "skip", "keep", "don't", "dont"}
 _WORDS = "|".join(sorted(YES | NO, key=len, reverse=True))
 # "1 yes", "#2: no", and the other way round: "yes to 1", "reject #2".
 VERDICT = re.compile(r"(?<![\d.$])#?(\d)\s*[:.)\-=]?\s*(" + _WORDS + r")\b", re.I)
-VERDICT_REV = re.compile(r"\b(" + _WORDS + r")[ \t]+(?:to[ \t]+)?(?:idea[ \t]+)?#?(\d)(?![\d.%c$])", re.I)
+VERDICT_REV = re.compile(r"\b(" + _WORDS + r")[ \t]+(?:(?:the[ \t]+)?changes?[ \t]+)?(?:(?:to|for)[ \t]+)?"
+                         r"(?:idea[ \t]+)?#?(\d)(?![\d.%c$])", re.I)
 ALL = -1
 
 
@@ -182,7 +183,13 @@ def _text(msg) -> str:
 def verdicts(text: str) -> dict[int, str]:
     """{idea number: "yes" | "no" | "unclear"}; {ALL: "yes"} for "yes to all"."""
     out = {}
-    for n, word in VERDICT.findall(text) + [(n, w) for w, n in VERDICT_REV.findall(text)]:
+    fwd = list(VERDICT.finditer(text))
+    # Blank the forward matches first: in "1 no 2 yes", "no 2" would read as a second verdict on 2.
+    rest = list(text)
+    for m in fwd:
+        rest[m.start():m.end()] = " " * (m.end() - m.start())
+    pairs = [m.groups() for m in fwd] + [(n, w) for w, n in VERDICT_REV.findall("".join(rest))]
+    for n, word in pairs:
         v = "yes" if word.lower() in YES else "no"
         # Both readings of one number ("1 yes ... reject 1"): apply nothing.
         out[int(n)] = v if out.get(int(n), v) == v else "unclear"
