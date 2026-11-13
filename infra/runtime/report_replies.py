@@ -58,7 +58,8 @@ def _series(name: str) -> list:
     if name not in SERIES:
         raise ConfigError(f"series {name!r} isn't one a reply may change ({', '.join(SERIES)})")
     procs = importlib.import_module(f"strategies.{SERIES[name]}").SERIES
-    return list(procs.values()) if name == "ARBS" else [procs[name]]
+    # ARBSPM (Polymarket) shares the package but not the Kalshi tickers the report proposes.
+    return [s for k, s in procs.items() if k != "ARBSPM"] if name == "ARBS" else [procs[name]]
 
 
 def _node(raw: dict, dotted: str):
