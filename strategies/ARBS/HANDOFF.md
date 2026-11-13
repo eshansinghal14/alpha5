@@ -149,19 +149,19 @@ them where they differ.
   (KXAAAGASM 3.80=>3.60) whose near quote went 1.3 s after each of 13
   placements with the arb quote unchanged, then held; cause not found.
 - **Two-leg baskets and `trading.second_level_size`** (`fd35fa2`, deployed
-  11-13 17:15 UTC). **On for shard 3 since 17:27:55 UTC** (the user's call);
-  shard 0 follows once an hour of shard 3's cancel reasons and quote
-  lifetimes has been read; off on ARBSPM. First 10 min on shard 3: two-leg
-  arb quotes 1,052 → ~970 and their lots −16% as predicted, bucket full, no
-  alerts; two-leg quotes cancelled for size 243/min against 134/min in the
-  hour before (median life 8 s against 73 s), 61% of them quotes of 20 lots
-  or fewer, a third re-placed at the same size 12 ms later: the level behind
-  the best flickers on thin books. About +20 write tokens/s.
-- **Soccer in-play on the model since 11-13 17:31:10 UTC** (`S:Soccer` added
-  to `trading.model_series` on both Kalshi shards; a trial, the user's
-  call). Five minutes in, 59% of soccer legs sat at the grid's 20c edge.
-  Compare a day of real soccer fills with the replay below before adding
-  other groups.
+  11-13 17:15 UTC). **On for shard 3 since 17:27:55 UTC and shard 0 since
+  18:16:14 UTC** (the user's call); off on ARBSPM.
+  - Since switch-on. Shard 3 (48 min): two-leg arb quotes 1,052 → ~900 and
+    their lots −15%, bucket full, no errors. Two-leg quotes cancelled for
+    size 253/min against 134/min in the hour before, median life 9 s against
+    73 s; 64% of them are quotes of 20 lots or fewer, a third are re-placed
+    at the same size ~15 ms later, and two legs alone were cancelled 817 and
+    688 times: the level behind the best flickers on thin books. Two-leg
+    writes 112 tokens/s against 90. Shard 0 (first 5 min): two-leg lots
+    −10%, size cancels 87/min against 70, two-leg writes 53 tokens/s against
+    50, bucket ~full, hot list 599 → 658. Not built: a short grace before
+    cancelling on a dip that comes straight back, which would remove most of
+    the added churn.
   - Why: 11-13 14:59 UTC shard 3 lost $118 on one pre-game fill (women's
     college basketball: a 2,356-lot sweep took our 200-lot NO bid and the one
     200-lot bid we planned to exit through; the price went from ~20c to
@@ -188,6 +188,13 @@ them where they differ.
     the level behind the best changed (a quote over its new size is
     cancelled, as today). Switch on one shard and read cancel reasons and
     quote lifetimes within the hour.
+- **Soccer in-play on the model since 11-13 17:31:10 UTC** (`S:Soccer` added
+  to `trading.model_series` on both Kalshi shards; a trial, the user's
+  call). After 50 min: 54 soccer legs with a pick, 52% at the grid's 20c
+  edge and 21% at 5c or under, 57% at 5 or 20 lots; 8 in-play arbs, 48 lots,
+  +$3.42, none losing (the hour before at the fixed 5c: 3 arbs, 162 lots,
+  +$0.96). Too little to judge: compare a day of real soccer fills with the
+  replay below before adding other groups.
 - **Exit model, checked 11-13** (the user asked why it missed these and
   whether to put every market on it):
   - It only prices in-play quotes (`model_pick` passes live) and all five
