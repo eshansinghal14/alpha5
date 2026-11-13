@@ -47,7 +47,8 @@ from strategies.ARBS import exit_cost
 from strategies.ARBS import live_params as lparams, pricing, replay, scanner
 from strategies.ARBS.config import SPEC_PATH
 from strategies.ARBS.execution import Gateway
-from strategies.ARBS.feed import MultiFeed
+from strategies.ARBS import venues
+from strategies.ARBS.venues import PM_SHARD, Feeds, is_pm
 from strategies.ARBS.ledger import Ledger
 from strategies.ARBS.depth import MoveWatch, PullWatch, TopHistory
 from strategies.ARBS.liquidity import Liquidity
@@ -75,6 +76,10 @@ SETTLE_REREAD_S = 60.0
 # Account positions that aren't ARBS's, {ticker: signed YES}: retired LIPFARM's,
 # written 11-12. The audit takes them off Kalshi's; ARBS still trades those markets.
 FOREIGN_POSITIONS = "foreign_positions.json"
+# Every ARBS process trading on this one Kalshi account. A process's audit
+# takes the others' ledgers off Kalshi's positions: the Polymarket process's
+# cross-exchange legs sit on markets ARBS trades too.
+ARBS_PROCESSES = ("ARBS", "ARBS3", "ARBSPM")
 # Cash is tracked from our own fills and settlements between balance reads
 # (runtime.balance_poll_s): two processes reading every 30 s had about half
 # their reads 429 (11-12). A failed read retries after 60 s, doubling to this.
@@ -385,8 +390,12 @@ class ArbsRunner:
         # log: sharing it, a quote's send -> answer was p99 105 ms (2026-10-30).
         self.write_pool = concurrent.futures.ThreadPoolExecutor(max_workers=16, thread_name_prefix="arbs-write")
         self.gw = Gateway(self.pool, self.write_pool)
-        self.feed = MultiFeed(self.tickers, self._on_quote, self._on_trade, label=self.S,
-                              on_fill=self._on_fill, on_error=lambda m: self.alert("warn", None, m))
+        self.feed = Feeds(self.tickers, self._on_quote, self._on_trade, label=self.S, on_fill=self._on_fill,
+                          on_gone=self._on_gone, on_error=lambda m: self.alert("warn", None, m))
+        # The Polymarket process rests quotes on Polymarket legs only: a resting
+        # quote of its own on a Kalshi market ARBS also trades could meet an ARBS
+        # IOC, which self-trade prevention cancels.
+        self.pm_process = PM_SHARD in self.cfg.scan.shards
         # (ticker, side) -> contracts our IOCs in flight are buying. Held from
         # the decision, not the send: baskets sharing a leg are evaluated in
         # one pass, and each sized against the same touch (10-28 16:24, the
@@ -664,6 +673,12 @@ class ArbsRunner:
         for b in self.all_baskets:
             for t in b.tickers:
                 self.by_ticker.setdefault(t, []).append(b.basket_id)
+        self.pm_event: dict[str, str] = {}
+        for b in self.all_baskets:
+            kind, _, rest = b.relationship_id.partition(":")
+            for t in b.tickers:
+                if is_pm(t) and (kind in ("complete_set", "mecnet") or t not in self.pm_event):
+                    self.pm_event[t] = rest if kind in ("complete_set", "mecnet") else t.rsplit("-", 1)[0]
         self.event_markets: dict[str, set[str]] = {}
         for b in self.all_baskets:
             kind, _, et = b.relationship_id.partition(":")
@@ -731,14 +746,16 @@ class ArbsRunner:
 
     def load_meta(self):
         """Blocking. Market status/result for every leg; shard and fees per event."""
+        self.load_pm_meta([t for t in self.tickers if is_pm(t)])
+        kt = [t for t in self.tickers if not is_pm(t)]
         got: dict[str, dict] = {}
-        for i in range(0, len(self.tickers), 100):
-            batch = self.tickers[i:i + 100]
+        for i in range(0, len(kt), 100):
+            batch = kt[i:i + 100]
             for m in kalshi_get("/trade-api/v2/markets", params={"tickers": ",".join(batch), "limit": 1000}) \
                     .get("markets", []):
                 got[m["ticker"]] = m
         events = {}
-        for t in self.tickers:
+        for t in kt:
             m = got.get(t)
             if m is None:
                 if t not in self.meta:
@@ -784,6 +801,35 @@ class ArbsRunner:
                 self.series_group_at = time.time()
             except Exception as e:
                 _log(f"WARN: series groups read failed ({e!r})")
+
+    def load_pm_meta(self, slugs: list[str]):
+        """Blocking. Polymarket markets' status, result, ticks and fees."""
+        if not slugs:
+            return
+        got = venues.pm_markets(slugs)
+        for t in slugs:
+            m = got.get(t)
+            mt = self.meta.get(t) or Meta(ticker=t, event=self.pm_event.get(t, t.rsplit("-", 1)[0]))
+            if m is None:
+                if mt.status == "unknown":
+                    self.alert("warn", None, f"{t}: not listed by Polymarket; its baskets are not traded")
+                mt.status = "missing"
+                self.meta[t] = mt
+                continue
+            st = venues.pm_status(m)
+            if st in SETTLED and not mt.result:
+                mt.result, mt.value = venues.pm_result(venues.pm_settlement(t))
+                # No settlement price yet: not settled for our books until there is one.
+                st = st if mt.result else "closed"
+            if mt.status != st and mt.status != "unknown":
+                self.journal({"kind": "status", "ticker": t, "from": mt.status, "to": st})
+            mt.status = st
+            mt.series = "pm:" + t.split("-")[1] if "-" in t else "pm"
+            mt.shard = PM_SHARD
+            mt.taker_rate = float(m.get("feeCoefficient") or venues.PM_TAKER_RATE)
+            mt.maker_rate = venues.PM_MAKER_RATE
+            mt.ticks = venues.ticks(m.get("orderPriceMinTickSize"))
+            self.meta[t] = mt
 
     async def meta_loop(self):
         while True:
@@ -1505,6 +1551,17 @@ class ArbsRunner:
             return True
         self.real_ledger.seen_trades.add(key)
         size, cost = float(f["size"]), float(f["price"]) * float(f["size"]) + float(f.get("fee") or 0.0)
+        if f.get("cum") is not None:
+            # Polymarket: booked up to the order's filled quantity, so a fill read
+            # by both the websocket and reconcile counts once.
+            booked = info.get("booked", 0.0)
+            size = min(size, float(f["cum"]) - booked)
+            if size <= _EPS:
+                return True
+            cost = cost * size / float(f["size"])
+            info["booked"] = booked + size
+            info["booked_px"] = info.get("booked_px", 0.0) + size * float(f["price"])
+            self.real_ledger.note_quote_id(oid)
         b = self.baskets.get(info["basket_id"])
         leg = b.tickers.index(info["ticker"]) if b is not None and info["ticker"] in b.tickers else -1
         q = self.quotes.get((info["basket_id"], leg, "deep") if info.get("deep") else (info["basket_id"], leg))
@@ -1523,6 +1580,18 @@ class ArbsRunner:
         if not self.apply_real_fill(f, "ws") and f.get("ticker") in self.meta:
             # Fill can beat the create's ack; replayed once the id is known.
             self.orphans.append((time.monotonic(), f))
+
+    def _on_gone(self, oid: str, why: str, reason):
+        """A Polymarket order ended on the exchange's side: a post-only cross is
+        rejected, an order no longer funded after a fill is cancelled."""
+        for q in [q for q in self.quotes.values() if q.exchange_id == oid]:
+            if why == "EXECUTION_TYPE_REJECTED":
+                self.n["post_only_rejects"] += 1
+            else:
+                self.journal({"kind": "order_gone", "ticker": q.ticker, "order_id": oid, "why": why,
+                              "reason": reason})
+            self._retire(q)
+            self.mark(q.basket_id)
 
     def _replay_orphans(self):
         now = time.monotonic()
@@ -1544,7 +1613,10 @@ class ArbsRunner:
                     _log(f"WARN: fill poll failed ({e!r})")
 
     async def poll_fills(self):
-        c = self.gw.any_client()
+        pm = self.gw.clients.get(PM_SHARD)
+        if pm is not None:
+            await self.reconcile_pm(pm)
+        c = self.gw.kalshi_client()
         if c is None:
             return
         since = self.real_ledger.last_fill_ts or (time.time() - 3600)
@@ -1558,6 +1630,25 @@ class ArbsRunner:
                 newest = max(newest, pd.Timestamp(ts).timestamp())
         self.real_ledger.last_fill_ts = newest
         self.real_ledger.save(time.time())
+
+    async def reconcile_pm(self, c):
+        """Polymarket fills the private websocket didn't deliver, from each
+        quote's filled quantity: open orders in one read, others one each
+        (quotes retired in the last 10 min)."""
+        now = time.time()
+        ids = [oid for oid, v in self.real_ledger.quote_ids.items() if is_pm(v.get("ticker", ""))
+               and (v.get("retired_at") is None or now - v["retired_at"] < 600)]
+        if not ids:
+            return
+        for r in await self.gw.call(c.reconcile, ids):
+            info = self.real_ledger.quote_ids.get(r["order_id"])
+            if info is None or r["cum"] - info.get("booked", 0.0) <= _EPS:
+                continue
+            new = r["cum"] - info.get("booked", 0.0)
+            px = (r["avg"] * r["cum"] - info.get("booked_px", 0.0)) / new
+            self.apply_real_fill({"ticker": r["ticker"], "side": r["side"], "price": px, "size": new, "fee": 0.0,
+                                  "liquidity": "maker", "order_id": r["order_id"],
+                                  "trade_id": f"cum:{r['cum']}", "cum": r["cum"]}, "reconcile")
 
     # ------------------------------------------------------------------ limits
 
@@ -1813,7 +1904,7 @@ class ArbsRunner:
         try:
             while True:
                 try:
-                    got = await self.gw.call(self.gw.any_client().shard_balances, BALANCE_READ_RESERVE)
+                    got = await self.gw.call(self.gw.balances, BALANCE_READ_RESERVE)
                     break
                 except ReadBudgetLow:
                     if time.time() >= deadline:
@@ -1984,6 +2075,10 @@ class ArbsRunner:
             if j in pulled:
                 if q is not None:
                     acts.append(self.cancel_quote(q, "pull"))
+                continue
+            if self.pm_process and not is_pm(leg.ticker):
+                if q is not None:
+                    acts.append(self.cancel_quote(q, "venue"))
                 continue
             plan, size = None, 0.0
             # As big as the other legs' books can complete at the edge needed,
@@ -2955,11 +3050,12 @@ class ArbsRunner:
         """Cancel anything of ours resting: on our tickers, or placed by us on a
         market since dropped from the scan (KXYTVIEWSW quotes sat 19 h, 10-29).
         The ground truth after a restart."""
-        c = self.gw.any_client()
-        if c is None:
+        if not self.gw.clients:
             return
         ours = set(self.tickers)
-        resting = await self.gw.call(c._resting, "")
+        resting = []
+        for c in self.gw.venue_clients():
+            resting += await self.gw.call(c._resting, "")
         for oid, ticker, cid in resting:
             if ticker not in ours and oid not in self.real_ledger.quote_ids:
                 continue
@@ -3156,9 +3252,12 @@ class ArbsRunner:
         """Ledger vs Kalshi on our tickers. Two misses in a row halt new
         entries; a ledger fix is by hand (the ledger is the only record of
         which basket a contract belongs to)."""
-        c = self.gw.any_client()
-        real = await self.gw.call(c.positions_all)
+        real: dict[str, float] = {}
+        for c in self.gw.venue_clients():
+            real.update(await self.gw.call(c.positions_all))
         for t, v in self.foreign.items():
+            real[t] = real.get(t, 0.0) - v
+        for t, v in (await asyncio.get_running_loop().run_in_executor(self.pool, self.siblings)).items():
             real[t] = real.get(t, 0.0) - v
         mine = self.real_ledger.net_by_ticker()
         diff = {t: {"kalshi": real.get(t, 0.0), "ledger": round(mine.get(t, 0.0), 4)}
@@ -3195,6 +3294,23 @@ class ArbsRunner:
             self.halt = f"position audit: ledger != Kalshi on {len(diff)} markets"
             self.alert("error", None, f"{self.halt}: {diff}")
         return False
+
+    def siblings(self) -> dict[str, float]:
+        """Blocking. Kalshi positions the other ARBS processes' ledgers hold."""
+        out: dict[str, float] = {}
+        for s in ARBS_PROCESSES:
+            if s == self.S:
+                continue
+            try:
+                with open(os.path.join(LIVE_ROOT, s, "ledger.json"), encoding="utf-8") as fh:
+                    baskets = json.load(fh).get("baskets") or {}
+            except (OSError, ValueError):
+                continue
+            for b in baskets.values():
+                for t, lp in (b.get("legs") or {}).items():
+                    if not is_pm(t):
+                        out[t] = out.get(t, 0.0) + (lp["qty"] if lp["side"] == "yes" else -lp["qty"])
+        return out
 
     # ------------------------------------------------------------------ settlement
 

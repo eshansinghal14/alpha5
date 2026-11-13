@@ -16,6 +16,7 @@ import pandas as pd
 
 from backtest.core import Order
 from infra.kalshi.orders import KalshiOrderClient, http_status
+from infra.polymarket.orders import PM_SHARD, PolymarketOrderClient
 
 
 class Gateway:
@@ -37,7 +38,7 @@ class Gateway:
         self.shard_of = dict(shard_of)
         for s in sorted(set(shard_of.values())):
             if s not in self.clients:
-                c = KalshiOrderClient.from_account(shard=s)
+                c = PolymarketOrderClient() if s == PM_SHARD else KalshiOrderClient.from_account(shard=s)
                 c.cap_fn = cap_fn
                 c.price_dp = 4
                 self.clients[s] = c
@@ -47,7 +48,24 @@ class Gateway:
         return None if s is None else self.clients.get(s)
 
     def any_client(self) -> KalshiOrderClient | None:
-        return next(iter(self.clients.values()), None)
+        return self.kalshi_client() or next(iter(self.clients.values()), None)
+
+    def kalshi_client(self) -> KalshiOrderClient | None:
+        """Any Kalshi shard's client: account-wide reads (fills, positions, balance)."""
+        return next((c for s, c in self.clients.items() if s != PM_SHARD), None)
+
+    def venue_clients(self) -> list:
+        """One client per exchange, for account-wide reads."""
+        return [c for c in (self.kalshi_client(), self.clients.get(PM_SHARD)) if c is not None]
+
+    def balances(self, reserve: float) -> tuple[dict[int, float], float]:
+        """Blocking. (cash by shard, positions' value) over both exchanges."""
+        cash, value = {}, 0.0
+        for c in self.venue_clients():
+            got, v = c.shard_balances(reserve)
+            cash.update(got)
+            value += v
+        return cash, value
 
     def can_afford(self, ticker: str, kind: str, reserve: float) -> bool:
         c = self.client(ticker)

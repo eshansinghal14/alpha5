@@ -1,0 +1,79 @@
+{
+  "trading": {
+    "enable_takes": true,
+    "enable_quoting": true,
+    "min_edge": 0.015,
+    "quote_edge_add": 0.02,
+    "min_exit_edge": 0.01,
+    "exit_ref_days": 30.0,
+    "days_till_expiry": 3.0,
+    "quote_size": 5,
+    "quote_live_events": false,
+    "take_live_events": false,
+    "live_edge_add": 0.01,
+    "late_quote_cutoff_min": {},
+    "live_quote_size": 5,
+    "model_series": [],
+    "live_take_size": 1,
+    "live_order_groups": false,
+    "deep_quote_size": 0,
+    "near_min_size": 0,
+    "deep_min_gap_ticks": 5,
+    "depth_age_s": 5.0,
+    "pull_drop": 0.5,
+    "pull_window_s": 2.0,
+    "pull_hold_s": 2.0,
+    "max_bundles_per_basket": 25,
+    "max_dollars": 300.0,
+    "max_dollars_auto": false,
+    "cash_reserve": 0.0,
+    "requote_min_ticks": 1,
+    "requote_hold_up": 0.01,
+    "requote_cooldown_s": 5.0,
+    "take_cooldown_s": 1.0
+  },
+  "completion": {
+    "chase_ticks": 2,
+    "chase_window_s": 1.0,
+    "max_exit_misses": 5,
+    "max_broken_baskets": 2
+  },
+  "watch": {
+    "queue_window_s": 10800.0,
+    "rank_interval_s": 10.0,
+    "exclude": [],
+    "record_only": []
+  },
+  "scan": {
+    "enable": true,
+    "max_markets": 300,
+    "shards": [
+      100
+    ],
+    "interval_s": 600.0,
+    "mecnet_max_legs": 6,
+    "ladder_span": 3,
+    "complete_set_exclude": [],
+    "hand_spec": false,
+    "live_before_settle_h": 0.0,
+    "live_early_h": {},
+    "live_windows": {}
+  },
+  "runtime": {
+    "control_poll_s": 1.0,
+    "max_write_tokens_per_s": 100.0,
+    "max_write_tokens_per_s_solo": null,
+    "write_priority_series": [],
+    "write_reserve_tokens": 20.0,
+    "audit_s": 30.0,
+    "fill_poll_s": 10.0,
+    "balance_poll_s": 300.0,
+    "meta_refresh_s": 120.0,
+    "max_order_errors": 5,
+    "liquidity_log_s": 300.0,
+    "feed_down_pull_s": 5.0,
+    "record_prints": true,
+    "live_params_shadow": false,
+    "regime_shadow": false
+  }
+}

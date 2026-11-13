@@ -20,7 +20,7 @@ from viz.perf_panel import time_axis
 from viz.data import latest_summary, read_summary, summary_age_s
 
 STALE_S = 15.0
-SHARD_OF = {"ARBS": "shard 0", "ARBS3": "shard 3"}
+SHARD_OF = {"ARBS": "shard 0", "ARBS3": "shard 3", "ARBSPM": "Polymarket"}
 
 
 def parts(series: str) -> list[str]:

@@ -1970,7 +1970,7 @@ def test_audit_takes_foreign_positions_off_kalshis(arbs):
 
     async def call(fn, *a):
         return fn(*a)
-    r.gw.any_client, r.gw.call = Client, call
+    r.gw.venue_clients, r.gw.call = lambda: [Client()], call
     assert asyncio.run(r.audit()) and r.audit_diff is None
     assert not r.excluded(b)                                     # still traded
 

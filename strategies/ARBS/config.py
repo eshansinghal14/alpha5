@@ -10,6 +10,7 @@ from infra.config import param, section
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 CONFIG3_PATH = os.path.join(os.path.dirname(__file__), "config_shard3.json")
+CONFIGPM_PATH = os.path.join(os.path.dirname(__file__), "config_pm.json")
 SPEC_PATH = os.path.join(os.path.dirname(__file__), "Kalshi arb baskets spec.json")
 
 

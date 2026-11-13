@@ -356,6 +356,10 @@ def scan_and_select(root: str, config_path: str | None = None) -> dict:
                 held |= set(json.load(fh).get("baskets") or {})
         except (OSError, ValueError):
             pass
+    from infra.polymarket.orders import PM_SHARD
+    if PM_SHARD in cfg.scan.shards:
+        from strategies.ARBS import pm_scan
+        return pm_scan.scan_and_select(root, cfg, held)
     doc = run(cfg, hand, os.path.join(root, "scanned_spec.json"), held)
     sel = select(doc, now=pd.Timestamp.now(tz="UTC"), days=cfg.trading.days_till_expiry,
                  max_markets=cfg.scan.max_markets, known_tickers=known,
