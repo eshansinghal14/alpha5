@@ -2344,3 +2344,102 @@ def test_a_model_series_live_quote_takes_the_models_edge_and_size(arbs, monkeypa
     monkeypatch.setattr(r, "model_pick", lambda b, j, vs, now_ts: (None, 0.0))
     _eval(r, live)
     assert (live.basket_id, 0) not in r.quotes or r.quotes[(live.basket_id, 0)].pending   # pulled
+
+
+def _second_level(r, b, behind, **cfg):
+    """b pre-game. A's arb quote rests at its 0.40 limit. B's YES asks: 100 at
+    0.55, `behind` at 0.56 (the last level that completes a fill at 0.40
+    without a loss), 500 at 0.70. A's only ask is 10 at 0.65."""
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, **{
+        "quote_size": 1000, "deep_quote_size": 0, "near_min_size": 0, "max_bundles_per_basket": 10000,
+        "max_dollars": 1e6, "requote_cooldown_s": 0.0, "depth_age_s": 0.0, **cfg})
+    book(r, "X-A", [(0.45, 100)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 100), (0.44, behind), (0.30, 500)])
+    _eval(r, b)
+
+
+def test_two_leg_quote_is_held_to_what_the_other_leg_completes_without_its_best_level(arbs):
+    r, b = arbs
+    _second_level(r, b, 30, second_level_size=True)
+    main = r.quotes[(b.basket_id, 0)]
+    assert main.price == pytest.approx(0.40) and main.size == 30
+    assert (b.basket_id, 1) not in r.quotes                 # A has nothing behind its best ask
+
+
+def test_second_level_size_off_sizes_quotes_to_the_best_level(arbs):
+    r, b = arbs
+    _second_level(r, b, 30)
+    assert r.quotes[(b.basket_id, 0)].size == 100 and r.quotes[(b.basket_id, 1)].size == 10
+
+
+def test_resting_two_leg_quote_goes_when_the_level_behind_the_best_thins(arbs):
+    r, b = arbs
+    _second_level(r, b, 60, second_level_size=True)
+    assert r.quotes[(b.basket_id, 0)].size == 60
+    book(r, "X-B", [(0.40, 10)], [(0.45, 100), (0.44, 25), (0.30, 500)])
+    _eval(r, b)
+    _eval(r, b)
+    assert r.quotes[(b.basket_id, 0)].remaining == 25       # re-placed at what is covered now
+    book(r, "X-B", [(0.40, 10)], [(0.45, 100)])
+    _eval(r, b)
+    assert (b.basket_id, 0) not in r.quotes
+
+
+def test_basket_of_three_legs_is_not_held_to_the_second_level(arbs):
+    from backtest.book import L2Book
+    r, b = arbs
+    c = Basket(basket_id="t:c", relationship_id="t2", type="complete_set", cluster="t2",
+               legs=(Leg("X-A", "yes"), Leg("X-B", "yes"), Leg("X-C", "yes")), payout=1.0,
+               quote_until=None, resume_quoting=None)
+    r.set_baskets([c])
+    r.hot = [c.basket_id]
+    r.feed._books.setdefault("X-C", L2Book("X-C"))
+    r.meta["X-C"] = R.Meta(ticker="X-C", event="X", status="active", shard=0, taker_rate=0.07, maker_rate=0.0)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=1000, deep_quote_size=0, depth_age_s=0.0,
+                                        max_bundles_per_basket=10000, max_dollars=1e6, second_level_size=True)
+    book(r, "X-A", [(0.45, 100)], [(0.35, 10)])
+    book(r, "X-B", [(0.20, 10)], [(0.70, 100)])             # B's YES ask 0.30 x 100, nothing behind it
+    book(r, "X-C", [(0.15, 10)], [(0.75, 100)])             # C's 0.25 x 100
+    _eval(r, c)
+    assert r.quotes[(c.basket_id, 0)].size == 100
+
+
+def test_near_quote_and_arb_quote_together_stay_within_the_second_level(arbs):
+    r, b = arbs
+    _near(r, b, 500, second_level_size=True)
+    main, near = r.quotes[(b.basket_id, 0)], r.quotes[(b.basket_id, 0, "deep")]
+    # B's asks: 10 at 0.55, 500 at 0.56. Without the 10, 500 complete at 0.39: 10 of them are the arb quote's.
+    assert main.size == 10 and near.near and near.price == pytest.approx(0.39) and near.size == 490
+
+
+def test_deep_quote_is_held_to_the_second_level_and_goes_when_it_is_gone(arbs):
+    r, b = arbs
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=50, deep_quote_size=10000, deep_min_gap_ticks=5,
+                                        requote_cooldown_s=0.0, depth_age_s=0.0, second_level_size=True)
+    book(r, "X-A", [(0.45, 10), (0.20, 5)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10), (0.44, 5), (0.30, 40)])      # B's asks 0.55 x 10, 0.56 x 5, 0.70 x 40
+    _eval(r, b)
+    for q in list(r.quotes.values()):
+        q.placed_at -= R.DEEP_REQUOTE_S
+    _eval(r, b)
+    main, deep = r.quotes[(b.basket_id, 0)], r.quotes[(b.basket_id, 0, "deep")]
+    assert main.size == 5                                   # 0.40 completes through 0.56 without the best level
+    assert deep.price == pytest.approx(0.21) and deep.size == 45        # 0.21 through 0.70 as well
+    book(r, "X-B", [(0.40, 10)], [(0.45, 100)])             # 100 at the best ask, nothing behind it
+    _eval(r, b)
+    assert not r.basket_quotes(b.basket_id)                 # on its own the deep quote still cleared its edge
+
+
+def test_quote_is_not_priced_through_a_two_leg_basket_with_nothing_behind_its_best_level(arbs):
+    r, b = arbs
+    c = _cheaper_through_c(r, b)
+    book(r, "X-B", [(0.30, 10)], [(0.35, 10), (0.34, 20)])  # B's asks 0.65 x 10, 0.66 x 20; C's only 0.55 x 10
+    _eval(r, b)
+    assert r.via[(b.basket_id, 0)] == c.basket_id
+    through_c = r.quotes[(b.basket_id, 0)].max_price
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, second_level_size=True, requote_cooldown_s=0.0)
+    r._alt_pick.clear()
+    _eval(r, b)
+    _eval(r, b)
+    q = r.quotes[(b.basket_id, 0)]
+    assert (b.basket_id, 0) not in r.via and q.max_price == pytest.approx(through_c - 0.10, abs=0.005)

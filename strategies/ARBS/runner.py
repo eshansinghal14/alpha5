@@ -911,6 +911,8 @@ class ArbsRunner:
         for j, leg in enumerate(b.legs):
             size = max(1.0, pricing.depth_size(vs, j, b.payout, need, float(t.quote_size)))
             plan = pricing.quote_leg(vs, j, b.payout, need, size)
+            if plan is not None:
+                size = max(1.0, self.covered(b, vs, j, size, plan.price))
             px.append(None if plan is None else (plan.price, plan.edge, size))
             if plan is None:
                 continue
@@ -2103,6 +2105,7 @@ class ArbsRunner:
                     room = min(room, max(self.aged_room(b, j), q.remaining if q is not None else 0.0))
                 size = pricing.depth_size(vs, j, b.payout, need_j, float(int(room + _EPS))) if room >= 1 else 0.0
                 plan = pricing.quote_leg(vs, j, b.payout, need_j, size) if size >= 1 else None
+                plan, size = self.cover_plan(b, vs, j, plan, size, need_j)
                 if room >= 1:
                     plan, size = self.best_plan(b, j, plan, size, room, need_j if picked else 0.0)
                 if q is not None and q.remaining > size + _EPS:
@@ -2163,7 +2166,7 @@ class ArbsRunner:
         price = lv.ticks.up(max(behind)) if behind else lv.ticks.lo
         if not self.deep_gap(price, main.price):
             return None, 0
-        n = pricing.depth_size(vs, j, b.payout, need, float(int(cap + _EPS)), at=price)
+        n = self.covered(b, vs, j, pricing.depth_size(vs, j, b.payout, need, float(int(cap + _EPS)), at=price), price)
         p = pricing.quote_leg(vs, j, b.payout, need, n) if n >= 1 else None
         if p is None or price > p.max_price + _EPS:
             return None, 0
@@ -2216,6 +2219,7 @@ class ArbsRunner:
             if price < lv.ticks.lo - _EPS:
                 continue
             total = pricing.depth_size(vy, k, y.payout, need, float(int(main.remaining + cap + _EPS)), at=price)
+            total = self.covered(y, vy, k, total, price)
             n = float(int(total - main.remaining + _EPS))
             p = pricing.quote_leg(vy, k, y.payout, need, total) if n >= least else None
             if p is not None and price <= p.max_price + _EPS:
@@ -2223,6 +2227,25 @@ class ArbsRunner:
                 return pricing.QuotePlan(leg=j, price=price, max_price=p.max_price, edge=edge,
                                          others_cost=p.others_cost), n
         return None, 0
+
+    def covered(self, b: Basket, vs, j: int, size: float, price: float) -> float:
+        """`size` for a quote on leg j at `price`: on a two-leg basket under
+        trading.second_level_size, at most what the other leg still completes
+        without a loss with its best level gone."""
+        if size < 1 or len(b.legs) != 2 or not self.cfg.trading.second_level_size:
+            return size
+        return min(size, pricing.second_level_size(vs, j, b.payout, size, price))
+
+    def cover_plan(self, b: Basket, vs, j: int, plan, size: float, need: float) -> tuple:
+        """(plan, size) with the size covered(), (None, 0.0) when that leaves
+        under one bundle. Every size up to depth_size's rests at the same
+        price, so the smaller plan keeps the price the cover was taken at."""
+        if plan is None:
+            return None, size
+        n = self.covered(b, vs, j, size, plan.price)
+        if n >= size:
+            return plan, size
+        return (pricing.quote_leg(vs, j, b.payout, need, n), n) if n >= 1 else (None, 0.0)
 
     def deep_cap(self, b: Basket, j: int, live: bool) -> float:
         """Most bundles a deep quote on leg j may rest: deep_quote_size, held to
@@ -2311,7 +2334,8 @@ class ArbsRunner:
                     self.quoted_elsewhere(b.basket_id, leg.ticker, leg.side) is None and \
                     (j not in mains or self.deep_gap(dq.price, mains[j].price)) and \
                     (p := pricing.quote_leg(vs, j, b.payout, need, dq.remaining)) is not None and \
-                    dq.price <= p.max_price + _EPS
+                    dq.price <= p.max_price + _EPS and \
+                    self.covered(b, vs, j, dq.remaining, dq.price) >= dq.remaining - _EPS
                 if keep:
                     dq.max_price = p.max_price
                 else:
@@ -2452,6 +2476,7 @@ class ArbsRunner:
             r = min(room, self.room_bundles(y), float(self.quote_size_by_dollars(y)))
             n = pricing.depth_size(vy, k, y.payout, need, float(int(r + _EPS)))
             p = pricing.quote_leg(vy, k, y.payout, need, n) if n >= 1 else None
+            p, n = self.cover_plan(y, vy, k, p, n, need)
             if p is not None and (best[0] is None or p.max_price > best[0].max_price + _EPS):
                 best, via = (dataclasses.replace(p, leg=j), n), y
         if searched:

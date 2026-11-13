@@ -99,6 +99,12 @@ class TradingParams:
                                "this long (an existing quote keeps its size); 0 = off. Live fills 11-02..10 "
                                "over 50 lots made +2.1c/lot when that depth (5 s) covered them, -3.0c/lot "
                                "(-$322, 87 arbs) when it didn't.", min=0.0, max=10.0, step=0.5)
+    second_level_size: bool = param("Two-leg baskets: hold every quote (arb, near, deep) to what the other leg "
+                                    "still completes, without a loss, with its best ask level gone. In a "
+                                    "two-outcome market the trader who fills the quote takes that level in "
+                                    "the same trade. Every sweep recorded 11-04..13 replayed: pre-game "
+                                    "two-leg quotes made -$179 as sized and +$399 held this way; baskets of "
+                                    "3+ legs lost $100-150 by it and are left alone.")
     max_bundles_per_basket: int = param("Most bundles held in one basket (complete or not).", min=0, max=100000,
                                         step=1)
     max_dollars: float = param("Most dollars in the strategy: cost paid on held baskets, plus per quoted "

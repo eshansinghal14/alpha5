@@ -235,6 +235,14 @@ def depth_size(legs: list[LegView], j: int, payout: float, required_edge: float,
     return best
 
 
+def second_level_size(legs: list[LegView], j: int, payout: float, cap: float, at: float) -> float:
+    """depth_size for leg j resting at `at` with every other leg's best ask
+    level gone and the completion asked only not to lose: what a fill there
+    still completes when the level it was sized on was taken with it."""
+    rest = [lv if i == j else dataclasses.replace(lv, asks=lv.asks[1:]) for i, lv in enumerate(legs)]
+    return depth_size(rest, j, payout, 0.0, cap, at=at)
+
+
 def touch_size(legs: list[LegView], j: int) -> float:
     """Contracts every leg but j offers at its best ask: what a fill on leg j
     can be completed with without walking past the touch."""

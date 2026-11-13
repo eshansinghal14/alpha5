@@ -20,6 +20,7 @@
     "near_min_size": 0,
     "deep_min_gap_ticks": 5,
     "depth_age_s": 5.0,
+    "second_level_size": false,
     "pull_drop": 0.5,
     "pull_window_s": 2.0,
     "pull_hold_s": 2.0,

@@ -123,3 +123,13 @@ def test_depth_size_grows_while_completion_through_the_book_meets_the_edge():
     assert pricing.depth_size([a, b], 0, 1.0, 0.03, 5.0) == 5.0
     a_low = pricing.LegView(asks=[(0.47, 100)], bid=0.30, taker_rate=0.07, maker_rate=0.0)
     assert pricing.depth_size([a_low, b], 0, 1.0, 0.03, 50.0) == 50.0    # 0.31 leaves room even at 0.60
+
+
+def test_second_level_size_is_what_the_other_legs_complete_without_their_best_level():
+    legs = [lv([], bid=0.45), lv([(0.55, 100), (0.56, 30), (0.70, 500)])]
+    # Without the 100 at 0.55, the 30 at 0.56 still complete a fill at 0.40; the 0.70 level loses.
+    assert pricing.second_level_size(legs, 0, 1.0, 100.0, at=0.40) == 30
+    assert pricing.second_level_size(legs, 0, 1.0, 20.0, at=0.40) == 20
+    assert pricing.second_level_size(legs, 0, 1.0, 1000.0, at=0.25) == 530     # at 0.25 the 0.70 level completes too
+    assert pricing.second_level_size(legs, 0, 1.0, 100.0, at=0.43) == 0        # 0.43 + 0.56 + its fee is over $1
+    assert pricing.second_level_size([lv([], bid=0.45), lv([(0.55, 100)])], 0, 1.0, 100.0, at=0.40) == 0
