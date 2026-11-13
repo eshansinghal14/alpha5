@@ -159,9 +159,14 @@ them where they differ.
     688 times: the level behind the best flickers on thin books. Two-leg
     writes 112 tokens/s against 90. Shard 0 (first 5 min): two-leg lots
     −10%, size cancels 87/min against 70, two-leg writes 53 tokens/s against
-    50, bucket ~full, hot list 599 → 658. Not built: a short grace before
-    cancelling on a dip that comes straight back, which would remove most of
-    the added churn.
+    50, bucket ~full, hot list 599 → 658.
+  - `COVER_GRACE_S` 1 s (`3a044ff`, deployed 18:30 UTC): a resting two-leg
+    arb quote over its cover goes only after being short that long; one the
+    best level itself no longer completes still goes at once. Shard 3 after
+    (18:44–18:49): size cancels 159/min, median life 28 s, 13% lived under
+    2 s (29% before), 17% re-placed at the same size (31%), two-leg writes
+    99 tokens/s. Shard 0: 78/min, median life 17 s. Deep quotes have no
+    grace; near quotes have their own (`NEAR_SHRINK`).
   - Why: 11-13 14:59 UTC shard 3 lost $118 on one pre-game fill (women's
     college basketball: a 2,356-lot sweep took our 200-lot NO bid and the one
     200-lot bid we planned to exit through; the price went from ~20c to
@@ -330,6 +335,11 @@ them where they differ.
    of prints in replay: widening is immediate, narrowing back from 20c takes
    2+ min a step. Finer bins above 10c, or narrowing straight to the pick
    after the hold, are the two things to test.
+   First full 2,000-lot fills: 11-13 18:12–18:13 UTC, 4,166 bundles of the
+   December Fed decision (NO on hold, +25 and >+25; our NO quote on >+25 at
+   85–86c filled 2,000 + 166 + 2,000), completed at plan for +$245.27 locked
+   (5.9c/lot). Cash read $8.1k lower for nine minutes until the next balance
+   read: Kalshi credits a NO set's guaranteed payout at once.
    **`quote_size` 2000 and near quotes on shard 0** (11-13): compare real
    fills over 1,000 lots, and real near fills (`near` quote rows, deep fills
    one tick under the arb fill), with the replay above before going to 3000;
@@ -382,6 +392,10 @@ them where they differ.
   shadows the stdlib). Strategies have priority for CPU and memory.
 - Tests: `python -m pytest -q strategies/ARBS` (231) and
   `infra/tests`. `test_slow_drift_keeps_resting` is flaky on Windows.
+- A new config key: add it to the three box configs before restarting
+  `alpha5-arbs` (loading rejects a missing key), and restart
+  `alpha5-dashboard` too: it keeps the old config class and its form then
+  shows "config.json is invalid ... unknown <key>" (11-13).
 
 ---
 
