@@ -2068,9 +2068,10 @@ class ArbsRunner:
 
     def near_plan(self, b: Basket, vs, j: int, main: Quote, need: float, resting: bool) -> tuple:
         """(plan, size) for a second quote one tick under leg j's resting arb
-        quote on a pre-game basket, sized to the bundles that price adds, up to
-        quote_size: the arb quote is sized to what the other legs complete at
-        exactly its price, often one level, and a tick lower takes in the next.
+        quote on a pre-game basket, sized to the bundles that price adds, within
+        what the arb quote leaves of quote_size: the arb quote is sized to what
+        the other legs complete at exactly its price, often one level, and a
+        tick lower takes in the next.
         (None, 0) unless that adds near_min_size. Sweeps that ran through our pre-game
         quotes where it would have been 1,000+ lots made it $3,245 on 23 fills
         with one loser, replayed on prints 11-05..12; smaller ones lost. Not
@@ -2091,8 +2092,10 @@ class ArbsRunner:
             need = edge_dollars(y.payout, t.min_edge + t.quote_edge_add)
         lv = vy[k]
         price = lv.ticks.down(main.price)
-        cap = min(float(t.quote_size), self.room_bundles(y, k) - main.remaining,
-                  float(self.quote_size_by_dollars(y)) - main.remaining)
+        # Only what the arb quote leaves of quote_size: with a quote_size of its
+        # own it sat under every arb quote already at quote_size, ~700 of them
+        # at 1,000 lots within 2 min, and emptied the write bucket (11-12 23:53).
+        cap = min(float(t.quote_size), self.room_bundles(y, k), float(self.quote_size_by_dollars(y))) - main.remaining
         least = max(1.0, t.near_min_size * (NEAR_KEEP if resting else 1.0))
         if price < lv.ticks.lo - _EPS or cap < least:
             return None, 0

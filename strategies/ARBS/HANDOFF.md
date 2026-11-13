@@ -76,10 +76,14 @@ them where they differ.
   is a sweep. Sweeps 20c+ under the touch lost 2–5c/lot for 2–5c quotes and
   made 6–10c/lot for 15–20c ones. The model picks 15–20c on 16% of prints;
   there 5c made +$2.1 on 76 fills, 15c +$11.2 on 40, 20c +$7.8 on 20.
-- **Near quote** (`ab3e647`; `trading.near_min_size`, 0 = off, 1000 is the
-  size that held up; capped at `quote_size` like any quote, so raising
-  `quote_size` raises it, the arb quote and non-live deep quotes together):
-  on a pre-game basket a second quote one tick under
+- **Near quote** (`ab3e647`; `trading.near_min_size`, 0 = off and off on
+  the box, 1000 is the size that held up). It takes only what the arb quote
+  leaves of `quote_size`, so at `quote_size` 1000 it never appears; with a
+  cap of its own it sat under every arb quote already at `quote_size`: on
+  for 3 min on 11-12 (23:53–23:56 UTC) it placed ~700 quotes of 1,000 lots
+  on the two shards, emptied shard 0's write bucket and cut the hot list
+  from 1,510 to 1,106 baskets; no fills.
+  On a pre-game basket a second quote one tick under
   each arb quote, in the deep quote's slot (journal `deep` + `near`, fills
   `fill_kind: deep`), sized to the bundles the other legs complete at that
   price beyond the arb quote's own. The arb quote is sized to the exit depth
@@ -108,6 +112,15 @@ them where they differ.
     5–10 write tokens/s on shard 0 (7–11% of quote writes sent, mostly
     amends). About what those tokens would earn on the next baskets; left as
     they are.
+- **`quote_size` replay** (pre-game prints that met our quote, shard 0,
+  11-05..12, extra $ over as quoted; the exits complete under 1,000 at the
+  arb quote's own price on 78% of them, so a higher `quote_size` only
+  changes the rest): 2000 +$970, 3000 +$1,458, 5000 +$2,148, each positive
+  in both halves and without its 3 best events (+$442/+$713/+$984), 94 fills
+  changed, 24 losing, worst −$181 (a pre-game CS2 fill; esports −$194 and
+  boxing −$67 in total at 3000, soccer +$1,168). The near quote on the rest
+  of it adds +$260/+$354/+$778, resting on 9–14% of quoted prints. No extra
+  orders for the bigger arb quote; the replay ignores `depth_age_s`.
 - **Live flag** (`ab3e647`): an unwind that doesn't lose ("at plan") no
   longer flags its markets live; a fast move still does. Real arbs within 5
   min of a profitable unwind made 3.8c/lot (225), −4.1c after a losing one.
@@ -179,11 +192,12 @@ them where they differ.
    of prints in replay: widening is immediate, narrowing back from 20c takes
    2+ min a step. Finer bins above 10c, or narrowing straight to the pick
    after the hold, are the two things to test.
-   **Near quotes**: once on, compare real near fills (`near` quote rows,
-   deep fills one tick under the arb fill) with the replay before raising
-   `quote_size`; a 5,000 total per side was the replay's $400/day, 2,000
-   (today's `quote_size` 1000 for each quote) its $170/day. Cash caps it:
-   4,000 bundles is ~$8k of shard 0's $16k.
+   **`quote_size` and near quotes**: raising `quote_size` (1000 on the box)
+   is the first step, see the replay above; then compare real fills over
+   1,000 lots with it. Near quotes after that: once on, compare real near
+   fills (`near` quote rows, deep fills one tick under the arb fill) with
+   the replay and watch their write cost. Cash caps both: 4,000 bundles is
+   ~$8k of shard 0's $16k.
    **Quote price flips between baskets** on pre-game soccer legs (2-leg vs
    3-leg basket, ~18c apart): about half of 11-12's amends on CONCACAF legs
    were jumps of 5c+. Costs writes and queue place; not looked into.

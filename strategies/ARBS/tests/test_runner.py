@@ -1373,6 +1373,9 @@ def test_near_quote_rests_a_tick_under_a_pre_game_arb_quote_with_the_size_that_t
     assert main.price == pytest.approx(0.40) and main.size == 10        # one level of B clears the edge at 0.40
     assert near.near and near.price == pytest.approx(0.39) and near.size == 500 and near.edge > main.edge
     assert (b.basket_id, 1, "deep") not in r.quotes                     # A has no second level for B's quote
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=310)
+    _b_depth(r, b, 500)
+    assert near.remaining == 300                                        # the two together stay within quote_size
     assert [x for x in rows if x["kind"] == "quote" and x.get("near")][0]["deep"] is True
 
 
@@ -1380,7 +1383,7 @@ def test_no_near_quote_when_off_too_small_or_live(arbs):
     r, b = arbs
     _near(r, b, 500, near_min_size=0)
     assert (b.basket_id, 0, "deep") not in r.quotes
-    _near(r, b, 500, quote_size=50)                 # the near quote is held to quote_size, like any quote
+    _near(r, b, 500, quote_size=300, near_min_size=300)     # 290 of quote_size left after the arb quote's 10
     assert (b.basket_id, 0, "deep") not in r.quotes
     _near(r, b, 500, near_min_size=1000)
     assert (b.basket_id, 0, "deep") not in r.quotes
