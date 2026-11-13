@@ -1,0 +1,9 @@
+[Unit]
+Description=alpha5: race constant-edge A/B, 30 s before each 15-min event
+
+[Timer]
+OnCalendar=*-*-* *:14,29,44,59:30
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

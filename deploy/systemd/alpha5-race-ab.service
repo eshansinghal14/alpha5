@@ -1,0 +1,12 @@
+[Unit]
+Description=alpha5: race constant-edge A/B, set the arm for the next event (strategies/KXCRYPTOLEAD15M/research/ab_edge.py)
+
+[Service]
+Type=oneshot
+# ubuntu owns the race's config.json.
+User=ubuntu
+WorkingDirectory=/opt/alpha5
+Environment=PYTHONPATH=/opt/alpha5
+ExecStart=/opt/alpha5/.venv/bin/python -W ignore strategies/KXCRYPTOLEAD15M/research/ab_edge.py
+Nice=10
+MemoryMax=300M
