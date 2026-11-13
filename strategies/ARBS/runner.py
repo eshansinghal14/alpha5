@@ -166,6 +166,15 @@ DEEP_REQUOTE_S = 10.0
 # once when what the exits take falls under NEAR_SHRINK of it, and grown or
 # repriced only every DEEP_REQUOTE_S: that depth changes on every print.
 NEAR_KEEP, NEAR_SHRINK, NEAR_GROW = 0.5, 0.8, 1.5
+# Near quotes come after everything else for writes: placed, repriced and grown
+# only with this share of the write cap left in the bucket, and not charged to
+# their basket's write cost. Charged and held only to write_reserve_tokens,
+# ~700 of them emptied shard 0's bucket and cut its hot list from 1,510 to
+# 1,106 baskets in 2 min (11-12 23:53). Cutting or pulling one is not held back.
+NEAR_RESERVE = 0.5
+# A leg with no near quote resting is checked for one at most this often: the
+# check prices the leg a second time on every pass.
+NEAR_EVAL_S = 2.0
 # Longest an eval pass runs before letting the websocket reader in: a fill that
 # lands mid-pass isn't even read until the pass yields (fill -> exit decision
 # p99 was 176 ms with whole passes, 10-30/31). A yield costs microseconds.
@@ -392,6 +401,7 @@ class ArbsRunner:
         # the market are unchanged.
         self._lv_cache: dict[tuple[str, str], tuple] = {}
         self._alt_pick: dict[tuple[str, int], tuple[float, str | None]] = {}   # (basket, leg) -> (searched at, via)
+        self._near_at: dict[tuple[str, int], float] = {}     # (basket, leg) -> last check for a near quote
         self._held_cache: dict[tuple, tuple] = {}
         self.exit_model: exit_cost.Model | None = None
         self._model_mtime: float | None = None
@@ -2078,6 +2088,9 @@ class ArbsRunner:
         held to depth_age_s: that ages the other legs' touch only, which the
         arb quote has already used."""
         t = self.cfg.trading
+        least = max(1.0, t.near_min_size * (NEAR_KEEP if resting else 1.0))
+        if t.quote_size - main.remaining < least:
+            return None, 0
         y, k, vy = b, j, vs
         via = self.via.get((b.basket_id, j))
         if via is not None:
@@ -2096,7 +2109,6 @@ class ArbsRunner:
         # own it sat under every arb quote already at quote_size, ~700 of them
         # at 1,000 lots within 2 min, and emptied the write bucket (11-12 23:53).
         cap = min(float(t.quote_size), self.room_bundles(y, k), float(self.quote_size_by_dollars(y))) - main.remaining
-        least = max(1.0, t.near_min_size * (NEAR_KEEP if resting else 1.0))
         if price < lv.ticks.lo - _EPS or cap < least:
             return None, 0
         total = pricing.depth_size(vy, k, y.payout, need, float(int(main.remaining + cap + _EPS)), at=price)
@@ -2145,6 +2157,7 @@ class ArbsRunner:
         0.1 s or 1 s after the print."""
         t, reserve, acts = self.cfg.trading, self.cfg.runtime.write_reserve_tokens, []
         near_on = on and not live and t.near_min_size >= 1
+        near_reserve = max(reserve, NEAR_RESERVE * self.write_budget())
         on = on and t.deep_quote_size >= 1
         for j, leg in enumerate(b.legs):
             dq = self.quotes.get((b.basket_id, j, "deep"))
@@ -2159,8 +2172,13 @@ class ArbsRunner:
             if dq is not None and dq.near and main is not None and main.pending:
                 continue                    # the arb quote is being re-placed: judge the near quote once it rests
             if near_on and j in mains and main is not None and not main.pending:
-                plan, size = self.near_plan(b, vs, j, main, need, dq is not None and dq.near)
-                near = plan is not None
+                resting = dq is not None and dq.near
+                if resting or now - self._near_at.get((b.basket_id, j), 0.0) >= NEAR_EVAL_S:
+                    if len(self._near_at) > 50000:
+                        self._near_at.clear()
+                    self._near_at[(b.basket_id, j)] = now
+                    plan, size = self.near_plan(b, vs, j, main, need, resting)
+                    near = plan is not None
             if plan is None and on and j in mains:
                 # A sweep fills both quotes: the deep one gets what the aged depth leaves.
                 aged = self.aged_room(b, j) - (main.remaining if main is not None else 0.0)
@@ -2189,17 +2207,21 @@ class ArbsRunner:
                 # overlapping baskets hand one side's arb quote back and forth
                 # every few 100 ms, and a deep quote followed each hop (10-30).
                 settled = main is not None and not main.pending and now - main.placed_at >= DEEP_REQUOTE_S
-                if settled and (not self.live or self.gw.can_afford(leg.ticker, "order", reserve)):
+                left = near_reserve if near else reserve
+                if settled and (not self.live or self.gw.can_afford(leg.ticker, "order", left)):
                     acts.append(self.place_quote(self.new_quote(b, plan, size, deep=True, near=near)))
                 continue
             past_limit = dq.price > plan.max_price + _EPS
             cooled = now - max(dq.moved_at, dq.placed_at) >= DEEP_REQUOTE_S
             stepped = vs[j].ticks.steps(plan.price, dq.price) >= t.requote_min_ticks
+            left = near_reserve if near else reserve
             if near and dq.near:
-                move = size < NEAR_SHRINK * dq.remaining or (cooled and (stepped or size >= NEAR_GROW * dq.remaining))
+                cut = size < NEAR_SHRINK * dq.remaining
+                move = cut or (cooled and (stepped or size >= NEAR_GROW * dq.remaining))
+                left = reserve if cut else near_reserve
             else:
                 move = cooled and (stepped or abs(dq.remaining - size) > _EPS)
-            if past_limit or (move and (not self.live or self.gw.can_afford(leg.ticker, "amend", reserve))):
+            if past_limit or (move and (not self.live or self.gw.can_afford(leg.ticker, "amend", left))):
                 dq.near = near
                 acts.append(self.move_quote(dq, plan, size))
             else:
@@ -2670,7 +2692,8 @@ class ArbsRunner:
     async def place_quote(self, q: Quote):
         b = self.baskets[q.basket_id]
         size = q.size
-        self.charge(q.basket_id, ORDER_TOKENS)
+        if not q.near:                  # see NEAR_RESERVE
+            self.charge(q.basket_id, ORDER_TOKENS)
         if not self.live:
             q.pending = False
             self.n["quotes_placed"] += 1
@@ -2893,13 +2916,15 @@ class ArbsRunner:
         q.price, q.edge, q.max_price = plan.price, plan.edge, plan.max_price
         q.size = q.filled + left
         self.n["quote_moves"] += 1
-        self.charge(q.basket_id, ORDER_TOKENS)
+        if not q.near:                  # see NEAR_RESERVE
+            self.charge(q.basket_id, ORDER_TOKENS)
         self.journal({"kind": "move", "basket_id": q.basket_id, "ticker": q.ticker, "from": old, "to": plan.price,
                       "size": q.size, **_deep(q)})
 
     async def cancel_quote(self, q: Quote, reason: str):
         self.n["quote_cancels"] += 1
-        self.charge(q.basket_id, CANCEL_TOKENS)
+        if not q.near:
+            self.charge(q.basket_id, CANCEL_TOKENS)
         if self.live and q.exchange_id:
             b = self.baskets.get(q.basket_id)
             t0, book = time.time(), self._last_book(b) if b else None

@@ -1417,8 +1417,43 @@ def test_resting_near_quote_stays_down_to_half_its_minimum_then_goes(arbs):
     assert r.quotes[(b.basket_id, 0, "deep")].remaining == 250
     _b_depth(r, b, 150)
     assert (b.basket_id, 0, "deep") not in r.quotes
+    r._near_at.clear()
     _b_depth(r, b, 250)                             # not enough to place a new one
     assert (b.basket_id, 0, "deep") not in r.quotes
+
+
+def test_a_leg_without_a_near_quote_is_checked_for_one_only_every_near_eval_s(arbs):
+    r, b = arbs
+    _near(r, b, 50)                                 # a tick lower adds too little
+    assert (b.basket_id, 0, "deep") not in r.quotes
+    _b_depth(r, b, 500)                             # now it adds enough, but the leg was just checked
+    assert (b.basket_id, 0, "deep") not in r.quotes
+    r._near_at[(b.basket_id, 0)] -= R.NEAR_EVAL_S
+    _b_depth(r, b, 500)
+    assert r.quotes[(b.basket_id, 0, "deep")].near
+
+
+def test_near_quote_waits_for_spare_write_tokens_and_is_not_charged_to_its_basket(arbs):
+    from infra.kalshi.orders import RestingAck
+    r, b = arbs
+    r.live = True
+    ids = iter(range(1000))
+
+    async def rest(ticker, side, price, size, cid, group=None):
+        return RestingAck(exchange_order_id=f"o{next(ids)}", fill=None), None, True
+    r.gw.rest = rest
+    spare = [r.cfg.runtime.write_reserve_tokens]    # what the bucket would have left after the write
+    r.gw.can_afford = lambda ticker, kind, reserve: reserve <= spare[0]
+    try:
+        _near(r, b, 500)
+        assert (b.basket_id, 0) in r.quotes and (b.basket_id, 0, "deep") not in r.quotes    # arb quotes go, it waits
+        charged = r.spend[b.basket_id].v
+        spare[0] = R.NEAR_RESERVE * r.write_budget()
+        r._near_at.clear()
+        _eval(r, b)
+        assert r.quotes[(b.basket_id, 0, "deep")].near and r.spend[b.basket_id].v == charged
+    finally:
+        r.live = False
 
 
 def test_near_quote_is_sized_through_the_basket_the_arb_quote_is_priced_through(arbs):
