@@ -2241,6 +2241,27 @@ def test_record_only_series_is_watched_but_never_traded(arbs):
     assert r.excluded(b)
 
 
+def test_a_null_watch_list_is_config_jsons_and_follows_its_edits(tmp_path, monkeypatch):
+    import json, os
+    from strategies.ARBS import SERIES
+    from strategies.ARBS.config import CONFIG_PATH
+    main = tmp_path / "config.json"
+    doc = json.load(open(CONFIG_PATH))
+    doc["watch"]["record_only"] = ["X"]
+    main.write_text(json.dumps(doc))
+    monkeypatch.setattr(R, "CONFIG_PATH", str(main))
+    monkeypatch.setattr(R, "LIVE_ROOT", str(tmp_path))
+    r = R.ArbsRunner(SERIES["ARBS3"], live_trading=False)
+    assert r.cfg.watch.record_only is None and r.record_only() == ["X"]
+    doc["watch"]["record_only"] = ["X", "Y"]
+    main.write_text(json.dumps(doc))
+    os.utime(main, (r.shared._mtime + 1, r.shared._mtime + 1))
+    r.shared.poll()
+    assert r.record_only() == ["X", "Y"]
+    r.cfg.watch = dataclasses.replace(r.cfg.watch, record_only=["Z"])
+    assert r.record_only() == ["Z"]                       # a list of its own still wins
+
+
 def test_model_pick_is_quick_to_cut_risk_and_slow_to_add_it(arbs, monkeypatch):
     import types
     r, b = arbs

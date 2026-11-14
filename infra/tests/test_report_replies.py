@@ -62,6 +62,27 @@ def test_resolve_skips_a_shard_that_already_has_it(series):
     assert [s.config_path for s, _, _ in targets] == [series[0].config_path]
 
 
+@section
+class _WatchNull:
+    record_only: list[str] | None = param("x")
+
+
+@section
+class _CfgNull:
+    watch: _WatchNull
+
+
+def test_resolve_leaves_a_null_list_that_follows_another_config(tmp_path, monkeypatch):
+    procs = []
+    for name, ro in (("config.json", ["A"]), ("config_shard3.json", None)):
+        path = tmp_path / name
+        path.write_text(json.dumps({"watch": {"record_only": ro}}))
+        procs.append(SimpleNamespace(config_cls=_CfgNull, config_path=str(path), config_key=None))
+    monkeypatch.setattr(rr, "_series", lambda name: procs)
+    targets = rr.resolve({"series": "ARBS", "changes": [{"key": "watch.record_only", "add": ["C"]}]})
+    assert [(s.config_path, new) for s, new, _ in targets] == [(procs[0].config_path, {"watch.record_only": ["A", "C"]})]
+
+
 @pytest.mark.parametrize("change", [
     {"key": "watch.missing", "set": 1},               # no new keys
     {"key": "watch.size", "set": "big"},              # type change

@@ -44,7 +44,7 @@
     "queue_window_s": 10800.0,
     "rank_interval_s": 10.0,
     "exclude": [],
-    "record_only": []
+    "record_only": null
   },
   "scan": {
     "enable": true,

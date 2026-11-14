@@ -45,7 +45,7 @@ from infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
 from infra.runtime.persist import LIVE_ROOT, day_dir
 from strategies.ARBS import exit_cost
 from strategies.ARBS import live_params as lparams, pricing, replay, scanner
-from strategies.ARBS.config import SPEC_PATH
+from strategies.ARBS.config import CONFIG_PATH, SPEC_PATH
 from strategies.ARBS.execution import Gateway
 from strategies.ARBS import venues
 from strategies.ARBS.venues import PM_SHARD, Feeds, is_pm
@@ -355,6 +355,9 @@ class ArbsRunner:
         self.S = series.ticker
         self.store = ConfigStore(series.config_cls, series.config_path, series.config_key)
         self.cfg = self.store.config
+        # Where a null watch.record_only (ARBS3) takes config.json's list from.
+        self.shared = (ConfigStore(series.config_cls, CONFIG_PATH)
+                       if os.path.abspath(series.config_path) != os.path.abspath(CONFIG_PATH) else None)
         self.root = os.path.join(LIVE_ROOT, self.S)
         os.makedirs(self.root, exist_ok=True)
         self.meta: dict[str, Meta] = {}
@@ -866,7 +869,7 @@ class ArbsRunner:
         if ex and (b.basket_id in ex or b.relationship_id in ex or b.cluster in ex
                    or b.relationship_id.split(":", 1)[-1] in ex):
             return True
-        ro = self.cfg.watch.record_only
+        ro = self.record_only()
         if ro:
             group, series, event = self._lp_path(b.legs[0].ticker)
             if series in ro or group in ro or event in ro or b.cluster in ro:
@@ -876,6 +879,12 @@ class ArbsRunner:
         if b.basket_id not in self.hand_ids and (s := self.basket_shard(b)) is not None                 and s not in self.cfg.scan.shards:
             return True
         return b.settles is not None and b.settles > self.horizon()
+
+    def record_only(self) -> list[str]:
+        ro = self.cfg.watch.record_only
+        if ro is None and self.shared is not None:
+            ro = self.shared.config.watch.record_only
+        return ro or []
 
     def horizon(self) -> pd.Timestamp:
         """Latest settlement traded, refreshed once a second: evaluate asks
@@ -3471,6 +3480,11 @@ class ArbsRunner:
                 self.dirty |= set(self.baskets)
             for c in self.store.apply_pending():
                 _log(f"config: {c}")
+            if self.shared is not None:
+                for c in self.shared.poll():
+                    if c.startswith("watch.record_only") and self.cfg.watch.record_only is None:
+                        _log(f"config.json: {c}")
+                        self.dirty |= set(self.baskets)
             if (reason := stopper.poll()) is not None:
                 _log(f"STOP: {reason}")
                 stop.set()

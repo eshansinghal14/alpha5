@@ -131,6 +131,8 @@ def _resolve_one(s, changes: list[dict]):
         if "set" in ch:
             val = ch["set"]
         elif "add" in ch or "remove" in ch:
+            if cur is None:
+                continue                  # a null list follows another config's (ARBS3's watch.record_only)
             if not isinstance(cur, list):
                 raise ConfigError(f"{key} is not a list; use set")
             val = list(cur) + [x for x in ch.get("add", []) if x not in cur]
