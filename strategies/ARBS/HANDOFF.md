@@ -295,6 +295,18 @@ them where they differ.
   Test, women's T20/ODI) and tennis doubles (ITF, ITF women's, Challenger,
   WTA): their prints build data to test them under the model. The user
   manages these lists by hand (declined an automated quarantine 11-12).
+  **One watch-only list for both Kalshi shards since 11-14 00:07 UTC
+  (`56ead2e`, the user's call):** it lives in the box `config.json`; shard 3's
+  `watch.record_only` is `null`, meaning config.json's list, re-read when that
+  file changes (ARBS3 logs "config: watch.record_only ..." only for its own
+  file). Edit config.json only. The hand-edited lists had drifted (Valorant on
+  shard 0 only, ITF singles on shard 3 only) while Kalshi picks each event's
+  shard; merged to 18 series. ARBSPM keeps its own list (`[]`). Report
+  proposals that add to the list skip a null one. Checked 11-13 over 11-05..13
+  (real arbs and the sweep replay under today's rules): only Valorant in-play
+  (−$98 real, 18 of 19 games) and ITF singles pre-game keep losing; in-play
+  series that lost on half their events made +$27..+$77 on the other half, so
+  nothing else was added.
   **ITF singles (KXITFMATCH, KXITFWMATCH) record-only on shard 3 since 11-13
   06:46 UTC** (box config, the user's call; 144 quotes came off on the
   reload, no restart). Pre-game ITF made −$79.35 on 48 arbs 11-11..13, all of
@@ -400,7 +412,7 @@ them where they differ.
 - Bulk research on the box: `sudo systemd-run --uid=ubuntu --gid=ubuntu
   -p MemoryMax=2G -p Nice=19 …`, scripts in `~/scratch` (`/tmp/re.py`
   shadows the stdlib). Strategies have priority for CPU and memory.
-- Tests: `python -m pytest -q strategies/ARBS` (231) and
+- Tests: `python -m pytest -q strategies/ARBS` (232) and
   `infra/tests`. `test_slow_drift_keeps_resting` is flaky on Windows.
 - A new config key: add it to the three box configs before restarting
   `alpha5-arbs` (loading rejects a missing key), and restart
