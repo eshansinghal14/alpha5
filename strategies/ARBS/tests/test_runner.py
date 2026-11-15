@@ -1098,6 +1098,38 @@ def test_quote_holds_a_small_move_up_but_follows_down(arbs):
     assert q.price == pytest.approx(0.32)
 
 
+def test_move_held_by_cooldown_is_rechecked_when_it_ends(arbs):
+    # A bid that leaves inside the cooldown, then a quiet book: the basket is
+    # evaluated again once the cooldown ends, not at the next book update.
+    r, b = arbs
+    _no_deep(r)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, requote_cooldown_s=0.0, requote_hold_up=0.01)
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    _eval(r, b)
+    book(r, "X-A", [(0.32, 10)], [(0.35, 10)])
+    _eval(r, b)
+    q = r.quotes[(b.basket_id, 0)]
+    assert q.price == pytest.approx(0.33)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, requote_cooldown_s=0.2)
+    q.moved_at = time.time()
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])          # the bid we followed leaves
+
+    async def go():
+        r.dirty.clear()
+        r.evaluate(b)
+        r.evaluate(b)                                   # one wake-up, not one per evaluation
+        await drain(r)
+        assert q.price == pytest.approx(0.33) and b.basket_id not in r.dirty
+        await asyncio.sleep(0.3)
+        assert b.basket_id in r.dirty
+        r.dirty.clear()
+        r.evaluate(b)
+        await drain(r)
+    asyncio.run(go())
+    assert q.price == pytest.approx(0.31)
+
+
 def test_write_cost_skips_top_changes_quotes_hold(arbs):
     r, b = arbs
     hold = r._moves_quotes

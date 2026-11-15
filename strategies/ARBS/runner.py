@@ -47,7 +47,6 @@ from infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
 from infra.runtime.persist import LIVE_ROOT, day_dir
 from strategies.ARBS import exit_cost
 from strategies.ARBS import live_params as lparams, pricing, replay, scanner
-from strategies.ARBS.config import SPEC_PATH
 from strategies.ARBS.execution import Gateway
 from strategies.ARBS import venues
 from strategies.ARBS.venues import PM_SHARD, Feeds, is_pm
@@ -55,7 +54,7 @@ from strategies.ARBS.ledger import Ledger
 from strategies.ARBS.depth import MoveWatch, PullWatch, TopHistory
 from strategies.ARBS.liquidity import Liquidity
 from strategies.ARBS.prints import AFTER_S, Prints, top as prints_top
-from strategies.ARBS.spec import Basket, Leg, basket_from_dict, basket_to_dict, load_spec, merge, parse_spec
+from strategies.ARBS.spec import Basket, Leg, basket_from_dict, basket_to_dict, load_spec, parse_spec
 
 _EPS = 1e-9
 OTHER = {"yes": "no", "no": "yes"}
@@ -398,13 +397,10 @@ class ArbsRunner:
         self._commit_cache: float | None = None
         self.hot: list[str] = []
         self.ranking: list[dict] = []
-        with open(SPEC_PATH, encoding="utf-8") as fh:
-            self.hand_doc = json.load(fh)
-        self.hand = load_spec(SPEC_PATH) if self.cfg.scan.hand_spec else []
-        self.hand_ids = {b.basket_id for b in self.hand}
         self.scan_path = os.path.join(self.root, scanner.SELECTED)
         self.scan_status: dict = {}
-        self.set_baskets(merge(self.hand, self.scanned()))
+        self.listed: set[str] = set()
+        self.set_baskets(self.scanned())
         for led in (self.real_ledger, self.shadow_ledger):
             for bid, pos in led.baskets.items():
                 if pos.spec is None and bid in self.baskets:
@@ -472,6 +468,7 @@ class ArbsRunner:
         self.regime: dict[tuple[str, str], float] = {}   # (event, signal) -> wall time its shadow hold ends
         self.pulled: dict[tuple[str, str], float] = {}   # (ticker, side) -> monotonic time its pull ends
         self.pull_wake: dict[str, float] = {}            # basket_id -> pull end its re-evaluation is set for
+        self.cool_wake: dict[str, float] = {}            # basket_id -> requote cooldown end its re-evaluation is set for
         # (basket_id, leg) -> the other basket its quote is priced through, and
         # ticker -> baskets priced through a basket on it: their quotes move
         # with that basket's books too.
@@ -673,14 +670,16 @@ class ArbsRunner:
         try:
             return load_spec(self.scan_path)
         except Exception as e:
-            self.alert("warn", None, f"scanned spec unreadable ({e!r}); hand spec only")
+            self.alert("warn", None, f"scanned spec unreadable ({e!r})")
             return []
 
     def set_baskets(self, baskets: list[Basket]) -> list[str]:
         """Trade `baskets` from now on; returns the tickers new to us. A
         basket dropped from the list is kept while it has a position, quote
-        or task: completion, settlement and cancels look it up by id."""
+        or task (completion, settlement and cancels look it up by id), only
+        to finish: excluded() stops new quotes and takes on it."""
         new = {b.basket_id: b for b in baskets}
+        self.listed = set(new)
         # Quotes are keyed by leg index, and the scan orders a mecnet's legs by
         # price under an id that doesn't change: a reorder moved one leg's quote
         # to another leg's price (NCX/TIJ 0.34<->0.65, 11-06), so keep the old order.
@@ -738,7 +737,7 @@ class ArbsRunner:
 
     async def reload_spec(self):
         loop = asyncio.get_running_loop()
-        new = self.set_baskets(merge(self.hand, await loop.run_in_executor(self.pool, self.scanned)))
+        new = self.set_baskets(await loop.run_in_executor(self.pool, self.scanned))
         if not new:
             return
         await loop.run_in_executor(self.pool, self.load_meta)
@@ -2271,6 +2270,8 @@ class ArbsRunner:
                 acts.append(self.move_quote(q, plan, size if grow else None))
             else:
                 q.edge, q.max_price = plan.edge, plan.max_price
+                if not cooled and ((ticks >= t.requote_min_ticks and not held) or size >= 2.0 * q.remaining):
+                    self.wake_when_cooled(b.basket_id, max(q.moved_at, q.placed_at) + t.requote_cooldown_s)
         acts += self.manage_deep(b, vs, mains, quote_need, now, want, live, pulled)
         if acts:
             async def run(acts=acts):
@@ -2508,7 +2509,21 @@ class ArbsRunner:
                 acts.append(self.move_quote(dq, plan, size))
             else:
                 dq.edge, dq.max_price = plan.edge, plan.max_price
+                if not cooled and stepped:
+                    self.wake_when_cooled(b.basket_id, max(dq.moved_at, dq.placed_at) + DEEP_REQUOTE_S)
         return acts
+
+    def wake_when_cooled(self, basket_id: str, due: float):
+        """Re-evaluate a basket once a quote's requote cooldown ends. A move
+        held only by the cooldown otherwise waits for the next book update on
+        one of its legs: a quote that followed a flickering bid up to its cap
+        stayed there 25 s after the bid left, on a quiet book (11-15 20:41)."""
+        if self.cool_wake.get(basket_id, 0.0) >= due - _EPS:
+            return
+        if len(self.cool_wake) > 50000:
+            self.cool_wake.clear()
+        self.cool_wake[basket_id] = due
+        self.later(basket_id, max(0.0, due - time.time()) + 0.01)
 
     def may_quote(self, b: Basket, now: pd.Timestamp) -> bool:
         return (b.quoting_allowed(now) and (self.cfg.trading.quote_live_events or not self.live_now(b, now))
