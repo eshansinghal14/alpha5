@@ -2264,6 +2264,20 @@ def test_record_only_series_is_watched_but_never_traded(arbs):
     assert r.excluded(b)
 
 
+def test_a_watch_only_entry_can_cover_just_pre_game_or_just_in_play(arbs):
+    r, b = arbs
+    series = r._lp_path(b.legs[0].ticker)[1]
+    live = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
+    pre = dataclasses.replace(b, live_from=pd.Timestamp("2099-01-01", tz="UTC"))
+    r.cfg.watch = dataclasses.replace(r.cfg.watch, record_only=[f"{series}:pre"])
+    assert r.excluded(pre) and not r.excluded(live)
+    r.cfg.watch = dataclasses.replace(r.cfg.watch, record_only=[f"{series}:live"])
+    assert r.excluded(live) and not r.excluded(pre)
+    r.flagged = {t: time.time() for t in pre.tickers}           # a fast move doesn't make pre-game in-play
+    r.cfg.watch = dataclasses.replace(r.cfg.watch, record_only=[f"{series}:pre"])
+    assert r.excluded(pre)
+
+
 def test_shard3_takes_sizes_and_watch_list_from_config_json_and_follows_its_edits(tmp_path, monkeypatch):
     import json, os
     from strategies.ARBS import SERIES

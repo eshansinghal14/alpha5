@@ -531,6 +531,7 @@ class ArbsRunner:
         self.flagged: dict[str, float] = {}
         self.unpriced_alert_at: dict[str, float | None] = {}
         self._horizon: tuple[float, pd.Timestamp] | None = None
+        self._now: tuple[float, pd.Timestamp] | None = None
         # Live order round trips, flushed with the liquidity log (orders_*.jsonl.gz).
         self.order_times: list[dict] = []
 
@@ -892,7 +893,10 @@ class ArbsRunner:
         ro = self.record_only()
         if ro:
             group, series, event = self._lp_path(b.legs[0].ticker)
-            if series in ro or group in ro or event in ro or b.cluster in ro:
+            # NAME:pre / NAME:live cover one phase, by the scheduled start: a fast
+            # move's live flag must not open a watch-only pre-game basket.
+            phase = "live" if b.is_live(self.now_ts()) else "pre"
+            if any(k in ro or f"{k}:{phase}" in ro for k in (series, group, event, b.cluster) if k):
                 return True
         # A scanned basket on a shard this process no longer scans (another
         # process's, ARBS3) stays only to finish its position, not to quote.
@@ -902,6 +906,13 @@ class ArbsRunner:
 
     def record_only(self) -> list[str]:
         return self.cfg.watch.record_only or []
+
+    def now_ts(self) -> pd.Timestamp:
+        """UTC now, refreshed once a second (see horizon)."""
+        now = time.monotonic()
+        if self._now is None or now - self._now[0] > 1.0:
+            self._now = (now, _utc())
+        return self._now[1]
 
     def horizon(self) -> pd.Timestamp:
         """Latest settlement traded, refreshed once a second: evaluate asks

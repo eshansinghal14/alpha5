@@ -159,6 +159,8 @@ class WatchParams:
     record_only: list[str] | None = param("Series, events or groups (S:Hockey) still scanned and watched, so "
                                           "their prints are recorded for the shadow check and the exit model, "
                                           "but never quoted or taken. Unlike exclude, they take scan budget. "
+                                          "A name covers pre-game and in-play; NAME:pre or NAME:live only that "
+                                          "phase (in-play from the event's scheduled start, scan.live_*). "
                                           "null: none, or config.json's list in ARBS3's file (its $base), so "
                                           "both Kalshi shards watch the same markets.", editable=False)
 
