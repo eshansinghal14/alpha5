@@ -849,7 +849,8 @@ class ArbsRunner:
                 continue
             st = venues.pm_status(m)
             if st in SETTLED and not mt.result:
-                mt.result, mt.value = venues.pm_result(venues.pm_settlement(t))
+                v = venues.pm_settlement(t)
+                mt.result, mt.value = venues.pm_result(v if v is not None else venues.pm_resolved_price(m))
                 # No settlement price yet: not settled for our books until there is one.
                 st = st if mt.result else "closed"
             if mt.status != st and mt.status != "unknown":

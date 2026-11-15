@@ -308,3 +308,41 @@ def test_fill_for_an_unlisted_basket_alerts_without_marking_it_booked(pm_arbs):
     assert r.real_ledger.net_by_ticker() == {} and "o7:t7" not in r.real_ledger.seen_trades
     assert not r.real_ledger.quote_ids["o7"].get("booked")
     assert any("no longer listed" in a["msg"] for a in r.alerts)
+
+
+def test_resolved_market_settles_from_its_outcome_prices():
+    from strategies.ARBS.venues import pm_resolved_price
+    m = {"status": "MARKET_STATUS_RESOLVED", "outcomes": '["Yes","No"]', "outcomePrices": '["0","1"]'}
+    assert pm_resolved_price(m) == 0.0 and pm_result(pm_resolved_price(m)) == ("no", 0.0)
+    assert pm_resolved_price({**m, "outcomePrices": '["0.33","0.67"]'}) == 0.33
+    # Open: outcomePrices are live prices, not a result.
+    assert pm_resolved_price({**m, "status": "MARKET_STATUS_OPEN", "outcomePrices": '["0.42","0.58"]'}) is None
+
+
+def test_polymarket_cancels_wait_for_the_bucket_then_go(monkeypatch):
+    from strategies.ARBS import execution
+    monkeypatch.setattr(execution, "PM_CANCEL_WAIT_S", 0.2)
+    calls = []
+
+    class C:
+        shard = 100
+
+        def allow_now(self, kind, force=False, reason=""):
+            calls.append(force)
+            return force or len(calls) > 3       # refused 3 times, then the bucket has room
+
+        def cancel(self, oid, ticker):
+            return True
+    gw = execution.Gateway.__new__(execution.Gateway)
+    gw.client = lambda t: C()
+
+    async def write(fn, *a):
+        return fn(*a)
+    gw.write = write
+    got, exc, sent = asyncio.run(gw.cancel("pm-a", "o1", "test"))
+    assert got is True and exc is None and calls == [False, False, False, False]
+
+    calls.clear()
+    C.allow_now = lambda self, kind, force=False, reason="": calls.append(force) or force   # never room
+    asyncio.run(gw.cancel("pm-a", "o1", "test"))
+    assert calls[-1] is True                     # sent anyway after the wait

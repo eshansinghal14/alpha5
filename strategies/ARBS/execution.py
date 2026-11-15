@@ -18,6 +18,8 @@ from backtest.core import Order
 from infra.kalshi.orders import KalshiOrderClient, http_status
 from infra.polymarket.orders import PM_SHARD, PolymarketOrderClient
 
+PM_CANCEL_WAIT_S = 2.0
+
 
 class Gateway:
     def __init__(self, pool, write_pool=None):
@@ -147,7 +149,18 @@ class Gateway:
         c = self.client(ticker)
         if c is None:
             return None, RuntimeError(f"no order client for {ticker}"), False
-        c.allow_now("cancel", force=True, reason=reason)
+        if c.shard == PM_SHARD:
+            # Paced on Polymarket's per-IP bucket: pulling a game's quotes at
+            # once sent dozens of cancels in a second and 2,023 drew 429s
+            # (11-15 19:40-19:56). Sent anyway after PM_CANCEL_WAIT_S.
+            end = asyncio.get_running_loop().time() + PM_CANCEL_WAIT_S
+            while not c.allow_now("cancel", reason=reason):
+                if asyncio.get_running_loop().time() >= end:
+                    c.allow_now("cancel", force=True, reason=reason)
+                    break
+                await asyncio.sleep(0.05)
+        else:
+            c.allow_now("cancel", force=True, reason=reason)
         try:
             return await self.write(c.cancel, exchange_id, ticker), None, True
         except Exception as e:

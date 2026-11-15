@@ -6,6 +6,8 @@ ARBS keys clients and cash by shard.
 """
 from __future__ import annotations
 
+import json
+
 
 from infra.polymarket.limits import gateway_get
 from infra.polymarket.feed import PolyFeed
@@ -127,6 +129,22 @@ def pm_settlement(slug: str) -> float | None:
     return None if v is None else float(v)
 
 
+def pm_resolved_price(m: dict) -> float | None:
+    """A resolved market's YES settlement price from its own record
+    (outcomePrices, aligned with outcomes). Polymarket pays positions out at
+    resolution but its /settlement endpoint can lag minutes behind (11-15
+    19:55: resolved and paid, "Settlement not found"), and until then the
+    audit saw our positions gone from a market not yet settled for us. Before
+    resolution outcomePrices are live prices, so only a resolved one counts."""
+    if m.get("status") != "MARKET_STATUS_RESOLVED":
+        return None
+    try:
+        outs = [str(o).lower() for o in json.loads(m["outcomes"])]
+        return float(json.loads(m["outcomePrices"])[outs.index("yes")])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def pm_status(m: dict) -> str:
     """Kalshi's status words, which ARBS's TRADEABLE and SETTLED test."""
     st = m.get("status") or ""
@@ -155,4 +173,4 @@ def pm_event(m: dict) -> str:
 
 
 __all__ = ["PM_SHARD", "PM_TAKER_RATE", "PM_MAKER_RATE", "Feeds", "is_pm", "venue", "pm_markets",
-           "pm_settlement", "pm_status", "pm_result", "pm_event", "ticks"]
+           "pm_settlement", "pm_resolved_price", "pm_status", "pm_result", "pm_event", "ticks"]
