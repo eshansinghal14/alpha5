@@ -668,6 +668,10 @@ class KalshiOrderClient:
             self._spent, self._refused, self._429 = {}, {}, {}
             self._t0 = time.monotonic()
 
+    # Every token this client has spent, never reset (unlike usage()): a
+    # cheap read for callers measuring their own spend rate.
+    spent_total = 0.0
+
     # Optional cap on THIS client's spend, tokens/s, on top of the shared
     # bucket (quoting.max_write_tokens_per_s, read live). None = uncapped.
     cap_fn = None
@@ -721,6 +725,7 @@ class KalshiOrderClient:
             rec = self._spent.setdefault((kind, reason), [0, 0.0])
             rec[0] += 1
             rec[1] += cost
+            self.spent_total += cost
             return True
 
     def amend(self, exchange_order_id: str, order: Order, new_size: float, filled: float,

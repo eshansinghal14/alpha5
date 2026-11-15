@@ -105,6 +105,7 @@ def test_per_series_cap_limits_creates_never_cancels():
     assert c.allow_now("order") and c.allow_now("order") and not c.allow_now("order")
     assert c.allow_now("cancel", force=True)
     assert c.tokens_now() < 0                                     # the cap's own bucket went negative
+    assert c.spent_total == 22.0                                  # two orders and a cancel; the refusal is free
     cap["v"] = None
     assert c.allow_now("order")                                   # cap off: shared bucket only
 

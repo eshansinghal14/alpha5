@@ -1046,6 +1046,27 @@ def test_hot_list_fills_the_write_budget_keeping_incumbents(arbs):
     assert r.pick_hot(["a", "x", "y", "b", "q"], 100.0, cost) == ["a", "b", "q"]
 
 
+def test_plan_budget_follows_real_write_spend(arbs):
+    r, b = arbs
+    import types
+    c = types.SimpleNamespace(spent_total=0.0)
+    r.gw.clients = {0: c, 100: object()}                 # a client without spent_total is left alone
+    r.hot_cost_by_shard = {"0": 300.0}
+    t0 = 1000.0
+    r.update_plan_scale(t0)
+    assert r.plan_scale == {}                            # held at 1 until the hot list has filled
+    r.hot_ready = True
+    for i in range(0, 1801, 5):                          # planned 300 tokens/s, really spent 100
+        c.spent_total = 100.0 * i
+        r.update_plan_scale(t0 + i)
+    assert abs(r.spend_tps[0] - 100.0) < 1e-6
+    assert abs(r.plan_scale[0] - 0.85 * 300 / 100) < 0.01 and 100 not in r.plan_scale
+    for i in range(1805, 3601, 5):                       # now spending more than planned: scale floors at 0.5
+        c.spent_total += 5 * 1000.0
+        r.update_plan_scale(t0 + i)
+    assert abs(r.plan_scale[0] - 0.5) < 0.01
+
+
 def test_write_cost_counts_top_of_book_changes(arbs):
     r, b = arbs
     now = time.time()

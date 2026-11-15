@@ -163,6 +163,14 @@ class _Dirty(set):
 WRITE_COST_TAU_S = 300.0
 # Write tokens per order or move, per cancel (Kalshi's write budget).
 ORDER_TOKENS, CANCEL_TOKENS = 10.0, 2.0
+# write_cost's estimates ran 2.3-2.5x what the same baskets really spent
+# (11-15 20:07 UTC, top-ranked hot baskets: 139 est vs 60 real tokens/s on
+# shard 0), so both shards stopped adding baskets at ~half the real rate limit.
+# Each shard's plan budget is scaled so real spend comes to WRITE_TARGET of
+# the write budget, leaving room for bursts and exits.
+WRITE_TARGET = 0.85
+SPEND_WINDOW_S = 120.0
+PLAN_SCALE_MIN, PLAN_SCALE_MAX = 0.5, 3.0
 # Startup sweep: retries per cancel on a 429, and the gap between cancels
 # (~100/s, under the 150/s our cancel tokens allow at the 300/s shard bucket).
 SWEEP_RETRIES, SWEEP_PACING_S = 5, 0.01
@@ -520,6 +528,10 @@ class ArbsRunner:
         self.hot_churn: collections.deque = collections.deque()   # (time, entered, left) per hot-list change
         self.hot_cost = 0.0                       # estimated write tokens/s of quoting the hot list
         self.hot_cost_by_shard: dict[str, float] = {}
+        self.plan_scale: dict[int, float] = {}    # shard -> plan budget over write budget (update_plan_scale)
+        self.spend_tps: dict[int, float] = {}     # shard -> real write tokens/s over SPEND_WINDOW_S
+        self._spend_hist: dict[int, collections.deque] = {}
+        self._scale_at: dict[int, float] = {}
         # Quote ids are saved by ledger_flush_loop, not per placement: a
         # synchronous write per quote held the loop ~200 ms each and queued a
         # live exit 7 s behind a burst of placements (FURIABB-2 10-29). Dirty
@@ -3313,6 +3325,36 @@ class ArbsRunner:
         cap = self.write_cap()
         return cap if cap is not None else write_budget_tokens_per_s()
 
+    def update_plan_scale(self, now: float):
+        """Per Kalshi shard: moves the plan scale toward the one that puts
+        real write spend at WRITE_TARGET of the write budget, from what the
+        hot list's estimated cost really spent over SPEND_WINDOW_S, smoothed
+        over the same span. Held at 1 until the hot list has filled and a
+        full window is in."""
+        for s, c in self.gw.clients.items():
+            spent = getattr(c, "spent_total", None)
+            if spent is None:
+                continue
+            h = self._spend_hist.setdefault(s, collections.deque())
+            h.append((now, spent, self.hot_cost_by_shard.get(str(s), 0.0)))
+            while len(h) > 1 and now - h[1][0] >= SPEND_WINDOW_S:
+                h.popleft()
+            span = now - h[0][0]
+            if not self.hot_ready or span < SPEND_WINDOW_S - 1e-6:
+                continue
+            rate = (spent - h[0][1]) / span
+            self.spend_tps[s] = rate
+            planned = sum(x[2] for x in h) / len(h)
+            if planned <= 0:
+                continue
+            # Real spend runs `rate / planned` of the estimates: a plan budget of
+            # WRITE_TARGET * budget * planned / rate spends WRITE_TARGET of the budget.
+            want = min(PLAN_SCALE_MAX, max(PLAN_SCALE_MIN, WRITE_TARGET * planned / max(rate, 1e-9)))
+            cur = self.plan_scale.get(s, 1.0)
+            dt = now - self._scale_at.get(s, now)
+            self._scale_at[s] = now
+            self.plan_scale[s] = cur + (want - cur) * min(1.0, dt / SPEND_WINDOW_S)
+
     def pick_hot(self, quotable: list[str], budget: float, cost: dict[str, float]) -> list[str]:
         """The best-ranked baskets whose write cost fits `budget` (tokens/s).
         A basket already quoted keeps its place while the quoted ones ranked
@@ -3353,8 +3395,9 @@ class ArbsRunner:
                 for bid in quotable:
                     by_shard[self.basket_shard(self.baskets[bid])].append(bid)
                 picked = set()
+                budget = self.write_budget()
                 for s, bids in by_shard.items():
-                    picked |= set(self.pick_hot(bids, self.write_budget(), cost))
+                    picked |= set(self.pick_hot(bids, budget * self.plan_scale.get(s, 1.0), cost))
                 hot = [bid for bid in quotable if bid in picked]
                 self.poll_model()
                 self.hot_cost = round(sum(cost[bid] for bid in hot), 1)
@@ -3362,6 +3405,7 @@ class ArbsRunner:
                                           for s, bids in by_shard.items()}
                 if _utc() - self.started > pd.Timedelta(minutes=2):
                     self.hot_ready = True
+                self.update_plan_scale(time.time())
                 if hot != self.hot:
                     entered, left = set(hot) - set(self.hot), set(self.hot) - set(hot)
                     if self.hot_ready and (entered or left):
@@ -3713,6 +3757,8 @@ class ArbsRunner:
             "hot_churn": {f"{m}m": sum(e for t, e, _ in self.hot_churn if t >= time.time() - 60 * m)
                           for m in (1, 10, 60)},
             "hot_cost_tps": self.hot_cost, "hot_cost_by_shard": self.hot_cost_by_shard,
+            "write_plan_scale": {str(s): round(v, 3) for s, v in self.plan_scale.items()},
+            "write_spend_tps": {str(s): round(v, 1) for s, v in self.spend_tps.items()},
             "write_budget_tps": self.write_budget(),
             "order_groups": {e: {"id": g["id"], "tripped": g["tripped_at"] is not None}
                              for e, g in self.groups.items()},
