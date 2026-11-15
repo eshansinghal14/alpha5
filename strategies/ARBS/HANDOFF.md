@@ -527,6 +527,24 @@ them where they differ.
         runner's `event_spend.json` (fed by `charge()`).
       - A new map starts from the hash split and rebalances at once.
     - Each process scans and selects up to `scan.max_markets` of its own events.
+      Box config.json has 5,000 since 23:45 UTC (was 1,500; ARBS0B inherits it).
+      In each half, the top 1,500 markets held 98.3–99.5% of 24h volume, the
+      top 5,000 99.9%. Of ~34k listed markets per half, ~8.7k traded at all.
+    - **Measured 11-15:**
+
+      | Shard 0 | Hot baskets | Baskets with resting quotes |
+      |---|---|---|
+      | One process, 3x ceiling (20:37) | ~1,515 | |
+      | Hash split (22:53) | ~1,437 | ~790 |
+      | Cost split, 1,500 markets (23:47) | 2,135 | 1,149 |
+      | 5,000 markets (23:50) | 3,767 | 1,538 |
+
+      - At 5,000 markets each half watches ~5,000 markets and ~8,150 baskets.
+      - CPU over 20 s windows: ARBS 76–78%, ARBS0B 67–78%, ARBS3 75–86%,
+        race ~40%. Load ~4.3 on 8 cores; summaries every 2.02–2.15 s.
+      - No 429s.
+      - Next limit: a single process's core. Add a third shard 0 process
+        (`parts.PROCS`) if one nears 100%.
     - **What a process trades:** only relationships its own scan lists. A
       basket of an event the other process owns, or of a relationship no longer
       listed, is only finished (completions and settlement), never quoted.
