@@ -17,6 +17,8 @@ import heapq
 import json
 import os
 
+from infra.runtime import disk
+
 DEPTH = 5
 MERGE_S = 0.05
 # 0.1: about when our completion lands (fill -> exit decision 35/62 ms p50/p90
@@ -72,7 +74,7 @@ class Prints:
         return done
 
     def write(self, rows: list[dict], day: str):
-        if not rows:
+        if not rows or not disk.recording_ok():
             return
         os.makedirs(self.dir, exist_ok=True)
         text = "".join(json.dumps(r, separators=(",", ":")) + "\n" for r in rows)

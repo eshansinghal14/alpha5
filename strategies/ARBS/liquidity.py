@@ -15,6 +15,8 @@ import json
 import os
 import statistics
 
+from infra.runtime import disk
+
 _EPS = 1e-9
 # A worsened ask not back within this long counts as unrefilled: past it a
 # completion has had to pay up anyway.
@@ -105,6 +107,8 @@ class Liquidity:
 
     def write(self, rows: list[dict], day: str):
         """Blocking."""
+        if not disk.recording_ok():
+            return
         os.makedirs(self.dir, exist_ok=True)
         with gzip.open(os.path.join(self.dir, f"{day}.jsonl.gz"), "at", encoding="utf-8") as fh:
             for r in rows:

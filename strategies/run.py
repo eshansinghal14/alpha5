@@ -35,6 +35,7 @@ import urllib3
 import strategies
 from infra import REPO_ROOT
 from infra.config import load
+from infra.runtime import disk
 from infra.kalshi.orders import WRITE_SHARE_ENV
 
 # Silences InsecureRequestWarning spam seen on the user's terminal (source not
@@ -297,6 +298,8 @@ def launch_many(units: list[list[str]], args) -> int:
 
 def main(argv=None):
     _treat_break_as_interrupt()
+    # A full disk must not turn a log line into an exception inside trading code.
+    disk.quiet_streams()
     fmap = folders()
     reg = registry()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)

@@ -133,6 +133,8 @@ def _write_journal(ev: _Event):
 
 def _main(q: mp.Queue, series: str):
     import signal
+    from infra.runtime import disk
+    disk.quiet_streams()
     # Ctrl-C reaches every process on the console. The trading process owns
     # shutdown (it sends "stop" after pulling quotes); a writer killed by the
     # same Ctrl-C left the parent blocked on its queue at exit (2026-10-09).

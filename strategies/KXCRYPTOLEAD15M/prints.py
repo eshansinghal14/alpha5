@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 from infra import DATA_ROOT as _DATA_ROOT
+from infra.runtime import disk
 
 PRINTS_ROOT = Path(_DATA_ROOT) / "kalshi_crypto" / "prints"
 WINDOW_S = 1.0
@@ -504,7 +505,7 @@ class TripLog:
 
     def write(self, rows: list[dict]) -> int:
         """Off the loop."""
-        if not rows:
+        if not rows or not disk.recording_ok():
             return 0
         df = pd.DataFrame(rows)
         day = pd.Timestamp(df.recv_ts.iloc[0], unit="s", tz="UTC").strftime("%Y-%m-%d")

@@ -412,8 +412,18 @@ them where they differ.
 - Bulk research on the box: `sudo systemd-run --uid=ubuntu --gid=ubuntu
   -p MemoryMax=2G -p Nice=19 …`, scripts in `~/scratch` (`/tmp/re.py`
   shadows the stdlib). Strategies have priority for CPU and memory.
-- Tests: `python -m pytest -q strategies/ARBS` (232) and
+- Tests: `python -m pytest -q strategies/ARBS` (233) and
   `infra/tests`. `test_slow_drift_keeps_resting` is flaky on Windows.
+- **Disk** (11-15, after it hit 99%: the race's decision log grew to
+  2–3.6 GB/day from 11-09 and ARBS files were never archived). Recording
+  stops, trading doesn't: under 3 GB free (`infra/runtime/disk.py`) every
+  journal and recorder skips its writes (ARBS `journal()` also drops a row
+  the disk refuses and counts `journal_dropped`), and `strategies.run`'s
+  stdout/stderr drop a refused log line instead of raising; ledgers, configs
+  and snapshots still write. `deploy/archive_s3.sh` (07:30 UTC) now also
+  ships ARBS* `prints/ liquidity/ fill_context/` days older than 5 days to
+  S3, and the journals too, leaving each on the box as its non-quote rows
+  (~1%, what the dashboard P&L reads) with an `.archived` marker.
 - A new config key: add it to the three box configs before restarting
   `alpha5-arbs` (loading rejects a missing key), and restart
   `alpha5-dashboard` too: it keeps the old config class and its form then

@@ -33,6 +33,7 @@ import websockets
 
 from infra import DATA_ROOT
 from infra.polymarket import GATEWAY, WS, auth
+from infra.runtime import disk
 
 ROOT = os.path.join(DATA_ROOT, "polymarket_us")
 WS_PATH = "/v1/ws/markets"
@@ -236,7 +237,7 @@ class Recorder:
 
     @staticmethod
     def write(kind: str, rows: list[dict]):
-        if not rows:
+        if not rows or not disk.recording_ok():
             return
         df = pd.DataFrame(rows)
         ms = int(time.time() * 1000)

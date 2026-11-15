@@ -2489,3 +2489,24 @@ def test_quote_is_not_priced_through_a_two_leg_basket_with_nothing_behind_its_be
     _eval(r, b)
     q = r.quotes[(b.basket_id, 0)]
     assert (b.basket_id, 0) not in r.via and q.max_price == pytest.approx(through_c - 0.10, abs=0.005)
+
+
+def test_a_full_disk_drops_journal_rows_instead_of_raising_into_trading(arbs, monkeypatch):
+    import os
+    from infra.runtime import disk
+    r, _ = arbs
+    path = os.path.join(r.journal_dir, f"{R._utc():%Y-%m-%d}.jsonl")
+    r.journal({"kind": "x"})
+    assert sum(1 for _ in open(path)) == 1
+    with monkeypatch.context() as m:
+        m.setattr(disk, "recording_ok", lambda path=None: False)
+        r.journal({"kind": "x"})                            # under the floor: skipped
+
+    def full(*a, **k):
+        raise OSError(28, "No space left on device")
+    with monkeypatch.context() as m:
+        m.setattr(disk, "recording_ok", lambda path=None: True)
+        m.setattr("builtins.open", full)
+        r.journal({"kind": "x"})                            # the disk refuses: dropped, not raised
+    assert sum(1 for _ in open(path)) == 1
+    assert r.n["journal_dropped"] == 2

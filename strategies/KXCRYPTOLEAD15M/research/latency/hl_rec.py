@@ -20,13 +20,14 @@ import pandas as pd
 import websockets
 
 from infra import DATA_ROOT
+from infra.runtime import disk
 
 URL = "wss://api.hyperliquid.xyz/ws"
 FLUSH_S = 60.0
 
 
 def _flush(rows: list[dict]):
-    if not rows:
+    if not rows or not disk.recording_ok():
         return
     df = pd.DataFrame(rows)
     day = pd.Timestamp(df.recv_ns.iloc[0], unit="ns", tz="UTC").strftime("%Y-%m-%d")

@@ -17,6 +17,8 @@ import gzip
 import json
 import os
 
+from infra.runtime import disk
+
 HIST_S = 10.0
 COALESCE_S = 0.01
 
@@ -144,7 +146,7 @@ class TopHistory:
         return rows
 
     def write(self, rows: list[dict], day: str):
-        if not rows:
+        if not rows or not disk.recording_ok():
             return
         os.makedirs(self.dir, exist_ok=True)
         text = "".join(json.dumps(r, separators=(",", ":")) + "\n" for r in rows)

@@ -16,6 +16,7 @@ import atexit
 import os
 import time
 
+from infra.runtime import disk
 from strategies.KXCRYPTOLEAD15M.cf_index import CfIndex
 from strategies.KXCRYPTOLEAD15M.composite import CompositeBus
 from strategies.KXCRYPTOLEAD15M.perp_nowcast import LEAD, PERPS, SHADOW, PerpNowcast
@@ -64,6 +65,8 @@ def venue_plan(coins=COINS) -> dict[str, list[str]]:
 
 def _write_touch(rows: list[tuple]):
     """One part per flush under data/kalshi_crypto/touch_rec/{day}/."""
+    if not disk.recording_ok():
+        return
     import pandas as pd
     from infra import DATA_ROOT
     df = pd.DataFrame(rows, columns=["recv_ts", "venue", "coin", "bid", "ask", "bid_sz", "ask_sz", "our_mid"])

@@ -41,6 +41,7 @@ from infra.kalshi.orders import (RealFill, error_code, http_status, is_market_pa
                                         is_post_only_reject)
 from infra.kalshi.orders import KEEPALIVE_S, ReadBudgetLow, read_stats, write_budget_tokens_per_s
 from infra.trading.engine import MARKET_PAUSE_RETRY_S
+from infra.runtime import disk
 from infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
 from infra.runtime.persist import LIVE_ROOT, day_dir
 from strategies.ARBS import exit_cost
@@ -563,10 +564,18 @@ class ArbsRunner:
         _log(f"{level.upper()} {basket_id or ''} {msg}")
 
     def journal(self, row: dict):
-        os.makedirs(self.journal_dir, exist_ok=True)
+        """Called inside fill and order handling, so it never raises: a row
+        the disk can't take is dropped and counted (journal_dropped)."""
+        if not disk.recording_ok():
+            self.n["journal_dropped"] = self.n.get("journal_dropped", 0) + 1
+            return
         row = {"t": time.time(), "live": self.live, **row}
-        with open(os.path.join(self.journal_dir, f"{_utc():%Y-%m-%d}.jsonl"), "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(row, default=str) + "\n")
+        try:
+            os.makedirs(self.journal_dir, exist_ok=True)
+            with open(os.path.join(self.journal_dir, f"{_utc():%Y-%m-%d}.jsonl"), "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, default=str) + "\n")
+        except OSError:
+            self.n["journal_dropped"] = self.n.get("journal_dropped", 0) + 1
 
     def spawn(self, coro, basket_id: str | None = None):
         if basket_id is not None:

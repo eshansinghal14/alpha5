@@ -19,6 +19,7 @@ import warnings
 
 import pandas as pd
 
+from infra.runtime import disk
 from infra.runtime.persist import LIVE_ROOT
 
 # "orders": our order lifecycle (create/amend/cancel sent and answered, with
@@ -192,7 +193,7 @@ def write(captured: dict | None) -> None:
     created once and never updated, so a torn write can only be a trailing
     file that a reader skips -- whereas the snapshot's files are overwritten
     in place, where a torn write would destroy the previous good copy."""
-    if not captured:
+    if not captured or not disk.recording_ok():
         return
     for stream, rows in captured["rows"].items():
         out_dir = os.path.join(captured["dir"], stream)

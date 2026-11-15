@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 
 from infra import DATA_ROOT
+from infra.runtime import disk
 from strategies.KXCRYPTOLEAD15M.series import CF_CONSTITUENTS, COINS
 from strategies.KXCRYPTOLEAD15M.spot_feed.coinbase import CoinbaseAdapter
 from strategies.KXCRYPTOLEAD15M.spot_feed.venues import ADAPTERS, LEADING_VENUES
@@ -115,6 +116,8 @@ class Recorder:
 
     @staticmethod
     def _write_prints(rows):
+        if not disk.recording_ok():
+            return
         df = pd.DataFrame(rows)
         day = pd.Timestamp(df.recv_ts.iloc[0], unit="s", tz="UTC").strftime("%Y-%m-%d")
         d = ROOT.parent / "venue_prints" / day
@@ -123,6 +126,8 @@ class Recorder:
 
     @staticmethod
     def _write(rows):
+        if not disk.recording_ok():
+            return
         df = pd.DataFrame(rows)
         df["hour"] = pd.to_datetime(df.ts, unit="s", utc=True).dt.floor("h")
         for hour, chunk in df.groupby("hour"):

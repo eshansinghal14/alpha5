@@ -64,6 +64,9 @@ PERP_FLUSH_S = 30.0
 def _write_perp_prints(rows: list[dict]):
     """Append-only part per flush under data/kalshi_crypto/perp_prints/{day}/,
     same layout as the recorder's venue_prints, so a crash loses one part."""
+    from infra.runtime import disk
+    if not disk.recording_ok():
+        return
     import pandas as pd
     from infra import DATA_ROOT
     df = pd.DataFrame(rows)
@@ -121,6 +124,8 @@ def _child_main(plan: dict[str, list[str]]):
     # which the parent leaves on the console/run log.
     out = os.fdopen(os.dup(sys.stdout.fileno()), "wb")
     sys.stdout = sys.stderr
+    from infra.runtime import disk
+    disk.quiet_streams()                # a full disk drops log lines, not the feed
     # CME's touch is shipped from Databento's reader thread (CmeFuturesAdapter.
     # direct): frame writes and the `latest` batch share this lock, so a batch
     # can't carry a CME touch older than one already sent.
