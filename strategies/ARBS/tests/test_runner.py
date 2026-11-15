@@ -18,6 +18,7 @@ def arbs(tmp_path, monkeypatch):
     monkeypatch.setattr(R, "LIVE_ROOT", str(tmp_path))
     from strategies.ARBS import SERIES
     r = R.ArbsRunner(SERIES["ARBS"], live_trading=False)
+    r.part = None                                         # a whole process, not one half of shard 0
     b = Basket(basket_id="t:b", relationship_id="t", type="complete_set", cluster="t",
                legs=(Leg("X-A", "yes"), Leg("X-B", "yes")), payout=1.0, quote_until=None, resume_quoting=None)
     r.all_baskets, r.baskets, r.tickers = [b], {b.basket_id: b}, ["X-A", "X-B"]
@@ -2283,6 +2284,18 @@ def test_record_only_series_is_watched_but_never_traded(arbs):
     r.series_group = {series: "S:Hockey"}
     r.cfg.watch = dataclasses.replace(r.cfg.watch, record_only=["S:Hockey"])
     assert r.excluded(b)
+
+
+def test_a_basket_of_the_other_half_of_shard_0_is_only_finished(arbs):
+    r, b = arbs
+    from strategies.ARBS import scanner
+    mine, theirs = (next(f"mecnet:E{i}:no:A+B" for i in range(100)
+                         if scanner.in_part(f"E{i}", scanner.PARTS["ARBS"]) == want) for want in (True, False))
+    r.part = scanner.PARTS["ARBS"]
+    assert not r.excluded(dataclasses.replace(b, basket_id=mine))
+    assert r.excluded(dataclasses.replace(b, basket_id=theirs))
+    r.part = None                                          # an unsplit process (ARBS3) quotes both
+    assert not r.excluded(dataclasses.replace(b, basket_id=theirs))
 
 
 def test_a_watch_only_entry_can_cover_just_pre_game_or_just_in_play(arbs):

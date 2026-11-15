@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import zlib
 
 import pandas as pd
 
@@ -40,6 +41,15 @@ from infra.config import atomic_write_json
 
 UP = ("greater", "greater_or_equal")
 DOWN = ("less", "less_or_equal")
+
+# Kalshi shard 0 runs as two processes, each a fixed half of its events (n,
+# index): one Python loop tops out at a core, and ARBS used ~85% of one at
+# ~1,500 hot baskets (11-15).
+PARTS = {"ARBS": (2, 0), "ARBS0B": (2, 1)}
+
+
+def in_part(event: str, part: tuple[int, int] | None) -> bool:
+    return part is None or zlib.crc32(event.encode()) % part[0] == part[1]
 
 
 def fetch_events() -> list[dict]:
@@ -211,9 +221,10 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
          complete_set_exclude: list[str], overrides: dict[str, str], shards=(0,),
          skip_series: set[str] = frozenset(), starts: dict[str, str] | None = None,
          freqs: dict[str, str] | None = None, live_windows: dict[str, list[str]] | None = None,
-         settle_lead: pd.Timedelta | None = None, early_h: dict[str, float] | None = None) -> dict:
+         settle_lead: pd.Timedelta | None = None, early_h: dict[str, float] | None = None,
+         part: tuple[int, int] | None = None) -> dict:
     """Every relationship found, each with its event's expected settlement,
-    24h volume for `select`. `starts`: event -> when it goes live
+    24h volume for `select`. `part`: only events in_part. `starts`: event -> when it goes live
     (fetch_starts); `freqs`: series -> frequency (fetch_frequencies);
     `live_windows`: Kalshi category -> [from, until], its events live from
     `from` while the scan runs before `until`; `settle_lead`: an event
@@ -222,7 +233,7 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
     rels, tickers = [], set()
     for e in events:
         if e.get("collateral_return_type") not in ("MECNET", "DIRECNET") or e.get("series_ticker") in skip_series \
-                or e.get("exchange_index") not in shards:
+                or e.get("exchange_index") not in shards or not in_part(e.get("event_ticker") or "", part):
             continue
         ms = [m for m in e.get("markets") or []
               if m.get("status") == "active" and m.get("market_type", "binary") == "binary"]
@@ -305,12 +316,13 @@ def other_series() -> set[str]:
     return {t for t, s in registry().items() if t != "ARBS"}
 
 
-def run(cfg, hand_doc: dict, spec_path: str, held: set[str] = frozenset()) -> dict:
+def run(cfg, hand_doc: dict, spec_path: str, held: set[str] = frozenset(),
+        part: tuple[int, int] | None = None) -> dict:
     """Blocking: fetch, scan, write the file; returns the doc. Relationships
     of the previous file holding a basket in `held` are carried over, so a
     position the scan no longer lists survives a restart."""
     now = pd.Timestamp.now(tz="UTC")
-    doc = scan(fetch_events(), now=now, mecnet_max_legs=cfg.scan.mecnet_max_legs,
+    doc = scan(fetch_events(), now=now, mecnet_max_legs=cfg.scan.mecnet_max_legs, part=part,
                ladder_span=cfg.scan.ladder_span, complete_set_exclude=cfg.scan.complete_set_exclude,
                shards=set(cfg.scan.shards), skip_series=other_series(), starts=fetch_starts(now),
                freqs=fetch_frequencies(), live_windows=cfg.scan.live_windows,
@@ -360,7 +372,8 @@ def scan_and_select(root: str, config_path: str | None = None) -> dict:
     if PM_SHARD in cfg.scan.shards:
         from strategies.ARBS import pm_scan
         return pm_scan.scan_and_select(root, cfg, held)
-    doc = run(cfg, hand, os.path.join(root, "scanned_spec.json"), held)
+    doc = run(cfg, hand, os.path.join(root, "scanned_spec.json"), held,
+              part=PARTS.get(os.path.basename(os.path.normpath(root))))
     sel = select(doc, now=pd.Timestamp.now(tz="UTC"), days=cfg.trading.days_till_expiry,
                  max_markets=cfg.scan.max_markets, known_tickers=known,
                  held=held, exclude=set(cfg.watch.exclude))

@@ -1,0 +1,80 @@
+{
+  "$base": "config.json",
+  "trading": {
+    "enable_takes": null,
+    "enable_quoting": null,
+    "min_edge": null,
+    "quote_edge_add": null,
+    "min_exit_edge": null,
+    "exit_ref_days": null,
+    "days_till_expiry": null,
+    "quote_size": null,
+    "quote_live_events": null,
+    "take_live_events": null,
+    "live_edge_add": null,
+    "late_quote_cutoff_min": null,
+    "live_quote_size": null,
+    "model_series": null,
+    "live_take_size": null,
+    "live_order_groups": null,
+    "near_min_size": null,
+    "deep_min_gap_ticks": null,
+    "depth_age_s": null,
+    "second_level_size": null,
+    "pull_drop": null,
+    "pull_window_s": null,
+    "pull_hold_s": null,
+    "max_bundles_per_basket": null,
+    "max_dollars": null,
+    "max_dollars_auto": null,
+    "cash_reserve": null,
+    "requote_min_ticks": null,
+    "requote_hold_up": null,
+    "requote_cooldown_s": null,
+    "take_cooldown_s": null
+  },
+  "completion": {
+    "chase_ticks": null,
+    "chase_window_s": null,
+    "max_exit_misses": null,
+    "max_broken_baskets": null
+  },
+  "watch": {
+    "queue_window_s": null,
+    "rank_interval_s": null,
+    "exclude": null,
+    "record_only": null
+  },
+  "scan": {
+    "enable": null,
+    "max_markets": null,
+    "shards": [
+      0
+    ],
+    "interval_s": null,
+    "mecnet_max_legs": null,
+    "ladder_span": null,
+    "complete_set_exclude": null,
+    "hand_spec": false,
+    "live_before_settle_h": null,
+    "live_early_h": null,
+    "live_windows": null
+  },
+  "runtime": {
+    "control_poll_s": null,
+    "max_write_tokens_per_s": null,
+    "max_write_tokens_per_s_solo": null,
+    "write_priority_series": null,
+    "write_reserve_tokens": null,
+    "audit_s": null,
+    "fill_poll_s": null,
+    "balance_poll_s": null,
+    "meta_refresh_s": null,
+    "max_order_errors": null,
+    "liquidity_log_s": null,
+    "feed_down_pull_s": null,
+    "record_prints": null,
+    "live_params_shadow": null,
+    "regime_shadow": null
+  }
+}

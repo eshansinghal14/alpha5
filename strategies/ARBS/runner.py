@@ -81,7 +81,7 @@ FOREIGN_POSITIONS = "foreign_positions.json"
 # Every ARBS process trading on this one Kalshi account. A process's audit
 # takes the others' ledgers off Kalshi's positions: the Polymarket process's
 # cross-exchange legs sit on markets ARBS trades too.
-ARBS_PROCESSES = ("ARBS", "ARBS3", "ARBSPM")
+ARBS_PROCESSES = ("ARBS", "ARBS0B", "ARBS3", "ARBSPM")
 # Cash is tracked from our own fills and settlements between balance reads
 # (runtime.balance_poll_s): two processes reading every 30 s had about half
 # their reads 429 (11-12). A failed read retries after 60 s, doubling to this.
@@ -170,7 +170,9 @@ ORDER_TOKENS, CANCEL_TOKENS = 10.0, 2.0
 # the write budget, leaving room for bursts and exits.
 WRITE_TARGET = 0.85
 SPEND_WINDOW_S = 120.0
-PLAN_SCALE_MIN, PLAN_SCALE_MAX = 0.5, 3.0
+# The ceiling only guards a runaway estimate: at 3 shard 0 stopped at ~1,515
+# hot baskets spending ~170 of 255 target tokens/s (11-15 20:37 UTC).
+PLAN_SCALE_MIN, PLAN_SCALE_MAX = 0.5, 10.0
 # Startup sweep: retries per cancel on a 429, and the gap between cancels
 # (~100/s, under the 150/s our cancel tokens allow at the 300/s shard bucket).
 SWEEP_RETRIES, SWEEP_PACING_S = 5, 0.01
@@ -369,6 +371,7 @@ class Meta:
 class ArbsRunner:
     def __init__(self, series, *, live_trading: bool):
         self.S = series.ticker
+        self.part = scanner.PARTS.get(self.S)
         self.store = ConfigStore(series.config_cls, series.config_path, series.config_key)
         self.cfg = self.store.config
         self.root = os.path.join(LIVE_ROOT, self.S)
@@ -912,8 +915,12 @@ class ArbsRunner:
             if any(k in ro or f"{k}:{phase}" in ro for k in (series, group, event, b.cluster) if k):
                 return True
         # A scanned basket on a shard this process no longer scans (another
-        # process's, ARBS3) stays only to finish its position, not to quote.
+        # process's, ARBS3), or of the other half of shard 0 (scanner.PARTS),
+        # stays only to finish its position, not to quote.
         if b.basket_id not in self.hand_ids and (s := self.basket_shard(b)) is not None                 and s not in self.cfg.scan.shards:
+            return True
+        if (self.part is not None and b.basket_id not in self.hand_ids and ":" in b.basket_id
+                and not scanner.in_part(b.basket_id.split(":")[1], self.part)):
             return True
         return b.settles is not None and b.settles > self.horizon()
 

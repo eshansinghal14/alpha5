@@ -116,6 +116,15 @@ def test_scan_lists_everything_and_select_keeps_held():
     assert [r["relationship_id"] for r in got["relationships"]] == ["mecnet:FAR-1"]
 
 
+def test_shard_0_halves_split_every_event_between_them():
+    evs = [event(f"EV{i}-1", "MECNET", [mkt(f"EV{i}-1-A"), mkt(f"EV{i}-1-B")]) for i in range(40)]
+    args = dict(now=NOW, mecnet_max_legs=6, ladder_span=3, complete_set_exclude=[], overrides={})
+    halves = [{r["relationship_id"] for r in scanner.scan(evs, part=scanner.PARTS[s], **args)["relationships"]}
+              for s in ("ARBS", "ARBS0B")]
+    whole = {r["relationship_id"] for r in scanner.scan(evs, **args)["relationships"]}
+    assert halves[0] and halves[1] and not halves[0] & halves[1] and halves[0] | halves[1] == whole
+
+
 def test_series_override_sets_settlement():
     e = event("KXMIDTERMMOV-X", "DIRECNET", [mkt("KXMIDTERMMOV-X-P1", strike_type="greater", floor_strike=1,
                                                  expected_expiration_time="2027-11-03T15:00:00Z"),
