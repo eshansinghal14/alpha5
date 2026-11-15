@@ -11,7 +11,9 @@
     "quote_live_events": false,
     "take_live_events": false,
     "live_edge_add": 0.01,
-    "late_quote_cutoff_min": {"S:Soccer": 75.0},
+    "late_quote_cutoff_min": {
+      "S:Soccer": 75.0
+    },
     "live_quote_size": 5,
     "model_series": [],
     "live_take_size": 1,
@@ -47,21 +49,29 @@
   "scan": {
     "enable": true,
     "max_markets": 1000,
-    "shards": [0],
+    "shards": [
+      0
+    ],
     "interval_s": 120.0,
     "mecnet_max_legs": 6,
     "ladder_span": 3,
     "complete_set_exclude": [],
-    "hand_spec": true,
     "live_before_settle_h": 6.0,
-    "live_early_h": {"KXITFMATCH": 2.0, "KXITFWMATCH": 2.0, "KXATPCHALLENGERMATCH": 2.0, "KXWTACHALLENGERMATCH": 2.0},
+    "live_early_h": {
+      "KXITFMATCH": 2.0,
+      "KXITFWMATCH": 2.0,
+      "KXATPCHALLENGERMATCH": 2.0,
+      "KXWTACHALLENGERMATCH": 2.0
+    },
     "live_windows": {}
   },
   "runtime": {
     "control_poll_s": 1.0,
     "max_write_tokens_per_s": 50.0,
     "max_write_tokens_per_s_solo": null,
-    "write_priority_series": ["KXINXU"],
+    "write_priority_series": [
+      "KXINXU"
+    ],
     "write_reserve_tokens": 20.0,
     "audit_s": 30.0,
     "fill_poll_s": 5.0,

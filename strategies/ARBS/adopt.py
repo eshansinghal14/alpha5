@@ -16,7 +16,6 @@ import time
 
 from infra.kalshi.orders import KalshiOrderClient
 from infra.runtime.persist import LIVE_ROOT
-from strategies.ARBS.config import SPEC_PATH
 from strategies.ARBS.ledger import Ledger
 from strategies.ARBS.spec import load_spec
 
@@ -26,7 +25,8 @@ def main():
     ap.add_argument("basket_id")
     ap.add_argument("--write", action="store_true")
     a = ap.parse_args()
-    b = {x.basket_id: x for x in load_spec(SPEC_PATH)}[a.basket_id]
+    # The basket as ARBS's last scan listed it (the hand spec it used to read is retired).
+    b = {x.basket_id: x for x in load_spec(os.path.join(LIVE_ROOT, "ARBS", "scanned_spec.json"))}[a.basket_id]
     led = Ledger(os.path.join(LIVE_ROOT, "ARBS", "ledger.json"))
     c = KalshiOrderClient.from_account(shard=None)
     held = led.net_by_ticker()

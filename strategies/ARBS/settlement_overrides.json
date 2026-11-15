@@ -1,0 +1,37 @@
+{
+  "note": "Series whose markets list an expiration far past the real result (certified results, a ceremony): the scanner settles their events at the end of expected_settlement_month instead. Moved from the retired hand spec 11-15.",
+  "settlement_basis_by_series": {
+    "KXGENERALCOUNTY": {
+      "expected_settlement_month": "2026-11",
+      "basis": "county winner"
+    },
+    "KXVOTECOUNTY": {
+      "expected_settlement_month": "2026-11",
+      "basis": "certified county results; TX county canvass deadline 2026-11-17"
+    },
+    "KXGENERALMOV": {
+      "expected_settlement_month": "2026-12",
+      "basis": "certified results; TX Senate state canvass 2026-11-21..12-07; TX Gov canvassed by legislature after 2027-01-12; FL certification Nov"
+    },
+    "KXMIDTERMMOV": {
+      "expected_settlement_month": "2026-12",
+      "basis": "certified results; TX state canvass 2026-11-21..12-07"
+    },
+    "KXVOTEGENERAL": {
+      "expected_settlement_month": "2026-12",
+      "basis": "certified results; TX Senate by 2026-12-07; TX Gov share after legislature canvass (2027-01-12+)"
+    },
+    "KXBRRATECUT": {
+      "expected_settlement_month": "2026-12",
+      "basis": "last 2026 Copom decision 2026-12-09; listed expiration 2027-01-08"
+    },
+    "KXSTREAMERAWARDS": {
+      "expected_settlement_month": "2026-11",
+      "basis": "ceremony mid-Nov 2026 per listed expiration"
+    },
+    "KXSTRMRSOTY": {
+      "expected_settlement_month": "2026-12",
+      "basis": "listed expiration 2027-01-01"
+    }
+  }
+}

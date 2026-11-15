@@ -1,6 +1,6 @@
 """Kalshi-wide basket scan: every open event Kalshi flags as MECNET (at most
 one market resolves YES) or DIRECNET (a ladder of "above X" strikes) becomes
-relationships in the hand spec's format, written to scanned_spec.json.
+relationships in spec.py's format, written to scanned_spec.json.
 
   MECNET     NO on the k likeliest markets pays at least k-1, for k = 2 up to
              scan.mecnet_max_legs. Any subset is safe; ranked by YES price at
@@ -32,24 +32,16 @@ from __future__ import annotations
 
 import json
 import os
-import zlib
+import time
 
 import pandas as pd
 
 from infra.kalshi.api import kalshi_get
 from infra.config import atomic_write_json
+from strategies.ARBS import parts
 
 UP = ("greater", "greater_or_equal")
 DOWN = ("less", "less_or_equal")
-
-# Kalshi shard 0 runs as two processes, each a fixed half of its events (n,
-# index): one Python loop tops out at a core, and ARBS used ~85% of one at
-# ~1,500 hot baskets (11-15).
-PARTS = {"ARBS": (2, 0), "ARBS0B": (2, 1)}
-
-
-def in_part(event: str, part: tuple[int, int] | None) -> bool:
-    return part is None or zlib.crc32(event.encode()) % part[0] == part[1]
 
 
 def fetch_events() -> list[dict]:
@@ -222,9 +214,10 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
          skip_series: set[str] = frozenset(), starts: dict[str, str] | None = None,
          freqs: dict[str, str] | None = None, live_windows: dict[str, list[str]] | None = None,
          settle_lead: pd.Timedelta | None = None, early_h: dict[str, float] | None = None,
-         part: tuple[int, int] | None = None) -> dict:
+         owns=None) -> dict:
     """Every relationship found, each with its event's expected settlement,
-    24h volume for `select`. `part`: only events in_part. `starts`: event -> when it goes live
+    24h volume for `select`. `owns(event)`: only the events it accepts (shard
+    0's split, parts.py). `starts`: event -> when it goes live
     (fetch_starts); `freqs`: series -> frequency (fetch_frequencies);
     `live_windows`: Kalshi category -> [from, until], its events live from
     `from` while the scan runs before `until`; `settle_lead`: an event
@@ -232,8 +225,7 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
     `early_h`: series -> hours before its start an event turns live."""
     rels, tickers = [], set()
     for e in events:
-        if e.get("collateral_return_type") not in ("MECNET", "DIRECNET") or e.get("series_ticker") in skip_series \
-                or e.get("exchange_index") not in shards or not in_part(e.get("event_ticker") or "", part):
+        if not tradeable_event(e, shards, skip_series) or (owns is not None and not owns(e.get("event_ticker") or "")):
             continue
         ms = [m for m in e.get("markets") or []
               if m.get("status") == "active" and m.get("market_type", "binary") == "binary"]
@@ -311,25 +303,38 @@ def select(doc: dict, *, now: pd.Timestamp, days: float, max_markets: int, known
     return {**doc, "relationships": out}
 
 
+def settlement_overrides() -> dict[str, str]:
+    """series -> the month its events settle by (settlement_overrides.json)."""
+    from strategies.ARBS.config import OVERRIDES_PATH
+    with open(OVERRIDES_PATH, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    return {s: v["expected_settlement_month"] for s, v in (doc.get("settlement_basis_by_series") or {}).items()}
+
+
 def other_series() -> set[str]:
     from strategies.run import registry
     return {t for t, s in registry().items() if t != "ARBS"}
 
 
-def run(cfg, hand_doc: dict, spec_path: str, held: set[str] = frozenset(),
-        part: tuple[int, int] | None = None) -> dict:
-    """Blocking: fetch, scan, write the file; returns the doc. Relationships
-    of the previous file holding a basket in `held` are carried over, so a
-    position the scan no longer lists survives a restart."""
+def tradeable_event(e: dict, shards, skip_series) -> bool:
+    return (e.get("collateral_return_type") in ("MECNET", "DIRECNET") and e.get("series_ticker") not in skip_series
+            and e.get("exchange_index") in shards)
+
+
+def run(cfg, spec_path: str, held: set[str] = frozenset(), owns=None, events: list[dict] | None = None) -> dict:
+    """Blocking: fetch (unless `events` are given), scan, write the file;
+    returns the doc. Relationships of the previous file holding a basket in
+    `held` are carried over, so a position the scan no longer lists survives
+    a restart."""
     now = pd.Timestamp.now(tz="UTC")
-    doc = scan(fetch_events(), now=now, mecnet_max_legs=cfg.scan.mecnet_max_legs, part=part,
+    doc = scan(fetch_events() if events is None else events, now=now, mecnet_max_legs=cfg.scan.mecnet_max_legs,
+               owns=owns,
                ladder_span=cfg.scan.ladder_span, complete_set_exclude=cfg.scan.complete_set_exclude,
                shards=set(cfg.scan.shards), skip_series=other_series(), starts=fetch_starts(now),
                freqs=fetch_frequencies(), live_windows=cfg.scan.live_windows,
                settle_lead=pd.Timedelta(hours=cfg.scan.live_before_settle_h) if cfg.scan.live_before_settle_h > 0 else None,
                early_h=cfg.scan.live_early_h,
-               overrides={s: v["expected_settlement_month"]
-                          for s, v in (hand_doc.get("settlement_basis_by_series") or {}).items()})
+               overrides=settlement_overrides())
     have = {r["relationship_id"] for r in doc["relationships"]}
     try:
         with open(spec_path, encoding="utf-8") as fh:
@@ -354,13 +359,9 @@ def scan_and_select(root: str, config_path: str | None = None) -> dict:
     (`select` under today's config, held baskets kept) to SELECTED, which is
     all the runner reads. Returns counts."""
     from infra.config import ConfigStore
-    from strategies.ARBS.config import CONFIG_PATH, SPEC_PATH, ArbsConfig
-    from strategies.ARBS.spec import load_spec
+    from strategies.ARBS.config import CONFIG_PATH, ArbsConfig
 
     cfg = ConfigStore(ArbsConfig, config_path or CONFIG_PATH, None).config
-    with open(SPEC_PATH, encoding="utf-8") as fh:
-        hand = json.load(fh)
-    known = {t for b in load_spec(SPEC_PATH) for t in b.tickers} if cfg.scan.hand_spec else set()
     held = set()
     for name in ("ledger.json", "ledger_shadow.json"):
         try:
@@ -372,13 +373,25 @@ def scan_and_select(root: str, config_path: str | None = None) -> dict:
     if PM_SHARD in cfg.scan.shards:
         from strategies.ARBS import pm_scan
         return pm_scan.scan_and_select(root, cfg, held)
-    doc = run(cfg, hand, os.path.join(root, "scanned_spec.json"), held,
-              part=PARTS.get(os.path.basename(os.path.normpath(root))))
+    owns, events, info = None, None, {}
+    name = os.path.basename(os.path.normpath(root))
+    if name in parts.PROCS:
+        events = fetch_events()
+        st = parts.load()
+        if name == parts.PROCS[0]:
+            # The one writer of the owners map: assigns new events, rebalances daily.
+            listed = [e["event_ticker"] for e in events if tradeable_event(e, set(cfg.scan.shards), other_series())]
+            moves = parts.update(st, listed, time.time(), parts.spend())
+            parts.save(st)
+            info = {"moved": len(moves), "load": st.get("load")}
+        idx = parts.PROCS.index(name)
+        owns = lambda ev: parts.owner(st, ev) == idx  # noqa: E731
+    doc = run(cfg, os.path.join(root, "scanned_spec.json"), held, owns=owns, events=events)
     sel = select(doc, now=pd.Timestamp.now(tz="UTC"), days=cfg.trading.days_till_expiry,
-                 max_markets=cfg.scan.max_markets, known_tickers=known,
+                 max_markets=cfg.scan.max_markets,
                  held=held, exclude=set(cfg.watch.exclude))
     atomic_write_json(os.path.join(root, SELECTED), sel, indent=None)
-    return {"listed_markets": doc["n_markets"], "selected_relationships": len(sel["relationships"])}
+    return {"listed_markets": doc["n_markets"], "selected_relationships": len(sel["relationships"]), **info}
 
 
 if __name__ == "__main__":

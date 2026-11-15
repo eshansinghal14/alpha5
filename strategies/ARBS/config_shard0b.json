@@ -55,7 +55,6 @@
     "mecnet_max_legs": null,
     "ladder_span": null,
     "complete_set_exclude": null,
-    "hand_spec": false,
     "live_before_settle_h": null,
     "live_early_h": null,
     "live_windows": null

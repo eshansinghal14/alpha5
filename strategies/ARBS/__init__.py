@@ -29,7 +29,7 @@ def _unused(*_a, **_k):
 
 SERIES = {"ARBS": Series(ticker="ARBS", config_cls=ArbsConfig, config_path=CONFIG_PATH, config_key=None,
                          pick_event=_unused, build_model=_unused, runner=_runner),
-          # The other half of shard 0's events (scanner.PARTS) in its own process: one loop
+          # Half of shard 0's events by write cost (parts.py) in its own process: one loop
           # tops out at a core. Shares shard 0's write bucket and cash with ARBS; its
           # config is config.json's but for its scan.
           "ARBS0B": Series(ticker="ARBS0B", config_cls=ArbsConfig, config_path=CONFIG0B_PATH, config_key=None,

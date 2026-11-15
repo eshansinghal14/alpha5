@@ -1,22 +1,26 @@
 import json
 
-from strategies.ARBS.config import SPEC_PATH
 from strategies.ARBS.ledger import Ledger
 from strategies.ARBS.spec import load_spec
 
+SPEC = {"relationships": [
+    {"relationship_id": "complete_set:E", "type": "complete_set", "cluster": "c1", "baskets": [
+        {"basket_id": "complete_set:E:buy_all_yes", "payout": 1, "exact": False, "payout_in_tie_or_rounding_case": 0,
+         "legs": [{"ticker": "E-A", "side": "yes"}, {"ticker": "E-B", "side": "yes"}]},
+        {"basket_id": "complete_set:E:buy_all_no", "payout": 1,
+         "legs": [{"ticker": "E-A", "side": "no"}, {"ticker": "E-B", "side": "no"}]}]},
+    {"relationship_id": "mecnet:F", "type": "mutually_exclusive_no", "cluster": "c2", "baskets": [
+        {"basket_id": "mecnet:F:no:A+B", "payout": 1,
+         "legs": [{"ticker": "F-A", "side": "no"}, {"ticker": "F-B", "side": "no"}]}]}]}
 
-def test_spec_loads_and_inexact_baskets_use_worst_payout():
-    bs = {b.basket_id: b for b in load_spec(SPEC_PATH)}
-    assert len(bs) > 100
-    assert bs["complete_set:GOVPARTYFL-26:buy_all_yes"].payout == 0.0
-    assert bs["complete_set:KXGENERALMOV-SENATETX-26:buy_all_no"].payout == 8.0
-    assert bs["complete_set:SENATETX-26:buy_all_yes"].payout == 1.0
 
-
-def test_exclude_by_cluster(tmp_path):
-    n_all = len(load_spec(SPEC_PATH))
-    n = len(load_spec(SPEC_PATH, exclude=["tx_county"]))
-    assert 0 < n < n_all
+def test_spec_loads_and_inexact_baskets_use_worst_payout(tmp_path):
+    p = tmp_path / "spec.json"
+    p.write_text(json.dumps(SPEC))
+    bs = {b.basket_id: b for b in load_spec(str(p))}
+    assert bs["complete_set:E:buy_all_yes"].payout == 0.0 and not bs["complete_set:E:buy_all_yes"].exact
+    assert bs["complete_set:E:buy_all_no"].payout == 1.0 and bs["complete_set:E:buy_all_no"].exact
+    assert [b.basket_id for b in load_spec(str(p), exclude=["c1"])] == ["mecnet:F:no:A+B"]
 
 
 def test_ledger_roundtrip_bundles_and_broken(tmp_path):

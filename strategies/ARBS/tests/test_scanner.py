@@ -4,7 +4,7 @@ import json
 import pandas as pd
 
 from strategies.ARBS import scanner
-from strategies.ARBS.spec import Basket, Leg, merge, parse_spec
+from strategies.ARBS.spec import Basket, Leg, parse_spec
 
 NOW = pd.Timestamp("2026-10-28", tz="UTC")
 
@@ -116,13 +116,11 @@ def test_scan_lists_everything_and_select_keeps_held():
     assert [r["relationship_id"] for r in got["relationships"]] == ["mecnet:FAR-1"]
 
 
-def test_shard_0_halves_split_every_event_between_them():
-    evs = [event(f"EV{i}-1", "MECNET", [mkt(f"EV{i}-1-A"), mkt(f"EV{i}-1-B")]) for i in range(40)]
+def test_scan_lists_only_the_events_its_process_owns():
+    evs = [event(f"EV{i}-1", "MECNET", [mkt(f"EV{i}-1-A"), mkt(f"EV{i}-1-B")]) for i in range(6)]
     args = dict(now=NOW, mecnet_max_legs=6, ladder_span=3, complete_set_exclude=[], overrides={})
-    halves = [{r["relationship_id"] for r in scanner.scan(evs, part=scanner.PARTS[s], **args)["relationships"]}
-              for s in ("ARBS", "ARBS0B")]
-    whole = {r["relationship_id"] for r in scanner.scan(evs, **args)["relationships"]}
-    assert halves[0] and halves[1] and not halves[0] & halves[1] and halves[0] | halves[1] == whole
+    got = scanner.scan(evs, owns=lambda ev: ev in ("EV1-1", "EV4-1"), **args)
+    assert {r["relationship_id"] for r in got["relationships"]} == {"mecnet:EV1-1", "mecnet:EV4-1"}
 
 
 def test_series_override_sets_settlement():
@@ -132,15 +130,6 @@ def test_series_override_sets_settlement():
     assert not run([e])["relationships"]
     b = next(iter(baskets(run([e], overrides={"KXMIDTERMMOV": "2026-12"})).values()))
     assert b.settles == pd.Timestamp("2026-12-31 23:59:59.999999999", tz="UTC")
-
-
-def test_merge_keeps_hand_spec_basket_with_same_legs():
-    hand = Basket("hand:x", "hand", "mutual_exclusion", "c", (Leg("A", "no"), Leg("B", "no")), 1.0, None, None)
-    scan = Basket("mecnet:E:no:B+A", "mecnet:E", "mutually_exclusive_no", "E", (Leg("B", "no"), Leg("A", "no")),
-                  1.0, None, None)
-    other = Basket("mecnet:E:no:A+C", "mecnet:E", "mutually_exclusive_no", "E", (Leg("A", "no"), Leg("C", "no")),
-                   1.0, None, None)
-    assert [b.basket_id for b in merge([hand], [scan, other])] == ["hand:x", "mecnet:E:no:A+C"]
 
 
 def test_run_carries_over_held_relationships(tmp_path, monkeypatch):
@@ -154,12 +143,12 @@ def test_run_carries_over_held_relationships(tmp_path, monkeypatch):
     monkeypatch.setattr(scanner, "fetch_frequencies", lambda: {})
     monkeypatch.setattr(scanner, "fetch_events",
                         lambda: [event("EV-1", "MECNET", [mkt("EV-1-A"), mkt("EV-1-B")])])
-    scanner.run(cfg, {}, spec)
+    scanner.run(cfg, spec)
     monkeypatch.setattr(scanner, "fetch_events", lambda: [])
-    scanner.run(cfg, {}, spec, held={"mecnet:EV-1:no:A+B"})
+    scanner.run(cfg, spec, held={"mecnet:EV-1:no:A+B"})
     with open(spec) as fh:
         assert [r["relationship_id"] for r in json.load(fh)["relationships"]] == ["mecnet:EV-1"]
-    scanner.run(cfg, {}, spec)
+    scanner.run(cfg, spec)
     with open(spec) as fh:
         assert json.load(fh)["relationships"] == []
 

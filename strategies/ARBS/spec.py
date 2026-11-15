@@ -106,18 +106,3 @@ def parse_spec(doc: dict, exclude: list[str] | None = None) -> list[Basket]:
                               resume_quoting=_ts(rel.get("resume_quoting_utc")), settles=_settles(rel),
                               live_from=_ts(rel.get("live_from_utc")), exact=b.get("exact") is not False))
     return out
-
-
-def merge(first: list[Basket], *more: list[Basket]) -> list[Basket]:
-    """Baskets of `first`, then those of `more` not already listed under the
-    same basket_id or the same legs (the scan re-finds hand-spec baskets)."""
-    out = list(first)
-    ids = {b.basket_id for b in out}
-    legs = {frozenset(b.legs) for b in out}
-    for bs in more:
-        for b in bs:
-            if b.basket_id not in ids and frozenset(b.legs) not in legs:
-                out.append(b)
-                ids.add(b.basket_id)
-                legs.add(frozenset(b.legs))
-    return out

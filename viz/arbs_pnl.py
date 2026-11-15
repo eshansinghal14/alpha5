@@ -17,11 +17,9 @@ _EPS = 1e-9
 
 
 def basket_info(root: str) -> dict[str, tuple[float, int]]:
-    """basket_id -> (payout, legs) from the hand spec, the last scan and the
-    ledger's saved definitions."""
-    from strategies.ARBS.config import SPEC_PATH
-    from strategies.ARBS.spec import load_spec
-    out = {b.basket_id: (b.payout, len(b.legs)) for b in load_spec(SPEC_PATH)}
+    """basket_id -> (payout, legs) from the last scan and the ledger's saved
+    definitions."""
+    out: dict[str, tuple[float, int]] = {}
     try:
         with open(os.path.join(root, "scanned_spec.json"), encoding="utf-8") as fh:
             for r in json.load(fh)["relationships"]:
@@ -41,9 +39,7 @@ def basket_info(root: str) -> dict[str, tuple[float, int]]:
 
 def basket_settles(root: str) -> dict[str, pd.Timestamp]:
     """basket_id -> expected settlement, from the same sources as basket_info."""
-    from strategies.ARBS.config import SPEC_PATH
-    from strategies.ARBS.spec import load_spec
-    out = {b.basket_id: b.settles for b in load_spec(SPEC_PATH) if b.settles is not None}
+    out: dict[str, pd.Timestamp] = {}
     try:
         with open(os.path.join(root, "scanned_spec.json"), encoding="utf-8") as fh:
             for r in json.load(fh)["relationships"]:

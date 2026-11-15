@@ -18,11 +18,14 @@ def arbs(tmp_path, monkeypatch):
     monkeypatch.setattr(R, "LIVE_ROOT", str(tmp_path))
     from strategies.ARBS import SERIES
     r = R.ArbsRunner(SERIES["ARBS"], live_trading=False)
-    r.part = None                                         # a whole process, not one half of shard 0
+    r.part_idx = None                                     # a whole process, not one half of shard 0
     b = Basket(basket_id="t:b", relationship_id="t", type="complete_set", cluster="t",
                legs=(Leg("X-A", "yes"), Leg("X-B", "yes")), payout=1.0, quote_until=None, resume_quoting=None)
     r.all_baskets, r.baskets, r.tickers = [b], {b.basket_id: b}, ["X-A", "X-B"]
+    r.listed = {b.relationship_id}
     r.by_ticker = {"X-A": [b.basket_id], "X-B": [b.basket_id]}
+    r.feed.add(r.tickers)                                 # a feed with no markets reads as down
+    r.feed.kalshi._new = []                               # as subscribed already
     from backtest.book import L2Book
     r.feed._books = {t: L2Book(t) for t in r.tickers}
     r.feed.up = True
@@ -2274,9 +2277,8 @@ def test_shard3_process_trades_only_its_scan(tmp_path, monkeypatch):
     monkeypatch.setattr(R, "LIVE_ROOT", str(tmp_path))
     from strategies.ARBS import SERIES
     r = R.ArbsRunner(SERIES["ARBS3"], live_trading=False)
-    assert r.cfg.scan.shards == [3] and not r.cfg.scan.hand_spec
-    assert r.hand == [] and r.root.endswith("ARBS3")
-    assert R.ArbsRunner(SERIES["ARBS"], live_trading=False).hand            # the first keeps the hand spec
+    assert r.cfg.scan.shards == [3] and r.root.endswith("ARBS3") and r.part_idx is None
+    assert R.ArbsRunner(SERIES["ARBS0B"], live_trading=False).part_idx == 1
 
 
 def test_a_scanned_basket_on_another_processes_shard_is_not_traded(arbs):
@@ -2302,6 +2304,7 @@ def test_feed_with_no_markets_yet_waits_for_its_first_scan():
 def test_an_excluded_event_covers_its_baskets(arbs):
     r, b = arbs
     b = dataclasses.replace(b, basket_id="mecnet:EV1:no:A+B", relationship_id="mecnet:EV1", cluster="SER")
+    r.listed = {b.relationship_id}
     assert not r.excluded(b)
     r.cfg.watch = dataclasses.replace(r.cfg.watch, exclude=["EV1"])
     assert r.excluded(b)
@@ -2318,16 +2321,32 @@ def test_record_only_series_is_watched_but_never_traded(arbs):
     assert r.excluded(b)
 
 
-def test_a_basket_of_the_other_half_of_shard_0_is_only_finished(arbs):
+def test_a_basket_of_an_event_the_other_shard0_process_owns_is_only_finished(arbs):
     r, b = arbs
-    from strategies.ARBS import scanner
-    mine, theirs = (next(f"mecnet:E{i}:no:A+B" for i in range(100)
-                         if scanner.in_part(f"E{i}", scanner.PARTS["ARBS"]) == want) for want in (True, False))
-    r.part = scanner.PARTS["ARBS"]
-    assert not r.excluded(dataclasses.replace(b, basket_id=mine))
-    assert r.excluded(dataclasses.replace(b, basket_id=theirs))
-    r.part = None                                          # an unsplit process (ARBS3) quotes both
-    assert not r.excluded(dataclasses.replace(b, basket_id=theirs))
+    mine, theirs, new = (dataclasses.replace(b, basket_id=f"mecnet:{e}:no:A+B", relationship_id=f"mecnet:{e}")
+                         for e in ("E1", "E2", "E3"))
+    r.listed = {x.relationship_id for x in (mine, theirs, new)}
+    r.part_idx, r.owners = 0, {"owners": {"E1": 0, "E2": 1}}
+    assert not r.excluded(mine) and r.excluded(theirs)
+    assert not r.excluded(new)                             # not in the map yet: its own scan listed it
+    r.part_idx = None                                      # a process that shares nothing (ARBS3)
+    assert not r.excluded(theirs)
+
+
+def test_a_basket_its_scan_no_longer_lists_is_only_finished(arbs):
+    r, b = arbs
+    assert not r.excluded(b)
+    r.listed = set()                                       # e.g. the retired hand spec's, or delisted
+    assert r.excluded(b)
+
+
+def test_write_spend_is_kept_per_event(arbs):
+    r, b = arbs
+    r.charge("mecnet:EV1:no:A+B", 10.0)
+    r.charge("ladder:EV1:T2=>T1", 2.0)
+    r.charge("t:b", 10.0)                                  # not a scanned id: no event
+    snap = r.event_spend.snapshot()
+    assert list(snap.values()) == [{"EV1": 12.0}]
 
 
 def test_a_watch_only_entry_can_cover_just_pre_game_or_just_in_play(arbs):

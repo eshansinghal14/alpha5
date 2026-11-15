@@ -8,12 +8,15 @@ them where they differ.
 
 ## Where it stands (11-12 ~17:40 UTC)
 
-- **Two processes, one service.** `alpha5-arbs` runs `run.py --series ARBS`,
-  which starts each registered series as its own child: **ARBS** (Kalshi shard
-  0, hand spec + scan, `config.json`, `data/live/ARBS`) and **ARBS3** (shard 3:
-  tennis, basketball, baseball; scan only, `config_shard3.json`,
-  `data/live/ARBS3`). Same code and rules; separate configs that are kept in
-  step by hand (`scan.shards`, `scan.hand_spec`, `scan.max_markets` differ).
+- **Four processes, one service** (since 11-15; see Ops). `alpha5-arbs` runs
+  `run.py --series ARBS`, which starts each registered series as its own child:
+  - **ARBS** and **ARBS0B**: Kalshi shard 0, its events split between them by
+    write cost (`parts.py`);
+  - **ARBS3**: shard 3, tennis and basketball;
+  - **ARBSPM**: Polymarket.
+
+  All are scan only (the hand spec was retired 11-15). ARBS0B's and ARBS3's
+  configs take config.json's values through `$base` wherever they hold null.
   The dashboard shows both on one ARBS page (`DASHBOARD_MERGED`).
 - **PnL** (summary.json): ARBS settled +$2,273, locked +$1,173; ARBS3
   settled −$67 (two ITF tennis fills, −$44 each, see below), locked +$10.
@@ -485,6 +488,62 @@ them where they differ.
   bound once in 2.7 days, so in practice the change is mostly its near quotes
   switching on. Shard 0's +$878 on nine 1,000+ lot arbs came from soccer,
   economics and elections, which shard 3 doesn't trade.
+- **Bigger box and shard 0 in two processes** (11-15, the user: "get the
+  larger instance ... see how many more markets we quote").
+  - **Box:** c7g.2xlarge (8 vCPU, 15 GB) since 22:31 UTC. It has no Elastic IP
+    (the user's call), so the public IP changed to 13.185.15.92 and changes on
+    every stop/start; `review_agent_loop.ec2_host()` looks it up by Name tag.
+  - **Why:** on 4 cores every trading loop waited 12–14% of the time for a
+    core (load ~5). After the resize the waits are ~0.5%, and the race fell
+    from 42% to 24% CPU.
+  - **After a reboot:** `alpha5-hl-rec` is a transient unit, so start it by hand:
+    `sudo systemd-run --unit=alpha5-hl-rec --uid=ubuntu --gid=ubuntu -p Nice=10
+    -p MemoryMax=419430400 --setenv=PYTHONPATH=/opt/alpha5
+    --working-directory=/opt/alpha5 /opt/alpha5/.venv/bin/python -u -m
+    strategies.KXCRYPTOLEAD15M.research.latency.hl_rec --coins HYPE,BTC`.
+  - **Before a stop:** check nothing rests on Kalshi or Polymarket
+    (`~/scratch/rest_check.py`). 0 and 0 at 22:30.
+  - **Split** (`692450a`, live 22:36, ARBS0B armed 22:42 UTC). One Python loop
+    tops out at a core, and ARBS was at ~85% of one with the planner at its 3x
+    ceiling.
+    - **First split was by hash** (crc32 of the event ticker). It left the
+      halves unequal, 22:43–53 UTC:
+
+      | | ARBS | ARBS0B |
+      |---|---|---|
+      | Spend | at its 150 cap | ~95 tokens/s |
+      | Hot baskets | ~250 | ~1,190 |
+
+    - **Now split by measured write cost** (`parts.py`, the user: "partition
+      ... based on how much token budget they require so its roughly equal").
+      - `data/live/ARBS/shard0_owners.json` maps event -> process. Only ARBS's
+        scan writes it; ARBS0B's scan and both runners read it.
+      - A new event goes to the process whose listed events cost less, priced
+        at its series' mean.
+      - Once a day, events move from the costlier process to the other while
+        the two differ by more than 10%. Each move picks the event that best
+        closes the gap.
+      - Costs are write tokens per event over the last two UTC days, from each
+        runner's `event_spend.json` (fed by `charge()`).
+      - A new map starts from the hash split and rebalances at once.
+    - Each process scans and selects up to `scan.max_markets` of its own events.
+    - **What a process trades:** only relationships its own scan lists. A
+      basket of an event the other process owns, or of a relationship no longer
+      listed, is only finished (completions and settlement), never quoted.
+    - **Hand spec retired at the same time** (the user: "remove impl for the
+      hand spec markets now that we are automating market selection"). Its
+      754 cross-market election relationships had made +$251 over 11-02..15,
+      all on election night. Its 36 held baskets ($3,823 cost) settle from
+      their ledger definitions. Its settlement months for the election
+      series moved to `settlement_overrides.json`, which the scanner reads.
+    - ARBS0B's `config_shard0b.json` takes all of config.json via `$base`
+      except its scan.
+    - The two share shard 0's machine-wide write bucket and cash, and the audit
+      counts each other's ledger (`ARBS_PROCESSES`).
+    - Write caps on the box: config.json `max_write_tokens_per_s_solo` 150 and
+      `max_write_tokens_per_s` 75, so each half plans for half of shard 0.
+      Shard 3 holds its own 300/150 (not inherited).
+    - `PLAN_SCALE_MAX` 3 -> 10.
 - **Only the write rate limits how many baskets are quoted** (11-15, the
   user: "only limiting factor should just be rate limit"). Box
   `runtime.max_write_tokens_per_s_solo` is 300, Kalshi's refill rate per

@@ -46,8 +46,7 @@ from infra.runtime import disk
 from infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
 from infra.runtime.persist import LIVE_ROOT, day_dir
 from strategies.ARBS import exit_cost
-from strategies.ARBS import live_params as lparams, pricing, replay, scanner
-from strategies.ARBS.config import SPEC_PATH
+from strategies.ARBS import live_params as lparams, parts, pricing, replay, scanner
 from strategies.ARBS.execution import Gateway
 from strategies.ARBS import venues
 from strategies.ARBS.venues import PM_SHARD, Feeds, is_pm
@@ -55,7 +54,7 @@ from strategies.ARBS.ledger import Ledger
 from strategies.ARBS.depth import MoveWatch, PullWatch, TopHistory
 from strategies.ARBS.liquidity import Liquidity
 from strategies.ARBS.prints import AFTER_S, Prints, top as prints_top
-from strategies.ARBS.spec import Basket, Leg, basket_from_dict, basket_to_dict, load_spec, merge, parse_spec
+from strategies.ARBS.spec import Basket, Leg, basket_from_dict, basket_to_dict, load_spec, parse_spec
 
 _EPS = 1e-9
 OTHER = {"yes": "no", "no": "yes"}
@@ -371,7 +370,10 @@ class Meta:
 class ArbsRunner:
     def __init__(self, series, *, live_trading: bool):
         self.S = series.ticker
-        self.part = scanner.PARTS.get(self.S)
+        # This process's index among shard 0's (parts.py), or None for one that shares nothing.
+        self.part_idx = parts.PROCS.index(self.S) if self.S in parts.PROCS else None
+        self.owners = parts.load() if self.part_idx is not None else {"owners": {}}
+        self._owners_mtime = 0.0
         self.store = ConfigStore(series.config_cls, series.config_path, series.config_key)
         self.cfg = self.store.config
         self.root = os.path.join(LIVE_ROOT, self.S)
@@ -398,13 +400,10 @@ class ArbsRunner:
         self._commit_cache: float | None = None
         self.hot: list[str] = []
         self.ranking: list[dict] = []
-        with open(SPEC_PATH, encoding="utf-8") as fh:
-            self.hand_doc = json.load(fh)
-        self.hand = load_spec(SPEC_PATH) if self.cfg.scan.hand_spec else []
-        self.hand_ids = {b.basket_id for b in self.hand}
         self.scan_path = os.path.join(self.root, scanner.SELECTED)
         self.scan_status: dict = {}
-        self.set_baskets(merge(self.hand, self.scanned()))
+        self.listed: set[str] = set()                # relationship ids this process's own scan lists
+        self.set_baskets(self.scanned())
         for led in (self.real_ledger, self.shadow_ledger):
             for bid, pos in led.baskets.items():
                 if pos.spec is None and bid in self.baskets:
@@ -504,6 +503,7 @@ class ArbsRunner:
         self.liq = Liquidity(self.root)
         self.prints = Prints(self.root)
         self.top_hist = TopHistory(self.root)
+        self.event_spend = parts.EventSpend(self.root)
         # Shadow live edges (live_params_shadow). lp and lp_seen belong to the
         # pool thread running _shadow_live; the loop reads only lp_view.
         self.lp = lparams.LiveParams(list(lparams.DEFAULT_LEVELS), z=lparams.DEFAULT_Z,
@@ -674,14 +674,16 @@ class ArbsRunner:
         try:
             return load_spec(self.scan_path)
         except Exception as e:
-            self.alert("warn", None, f"scanned spec unreadable ({e!r}); hand spec only")
+            self.alert("warn", None, f"scanned spec unreadable ({e!r})")
             return []
 
     def set_baskets(self, baskets: list[Basket]) -> list[str]:
         """Trade `baskets` from now on; returns the tickers new to us. A
         basket dropped from the list is kept while it has a position, quote
-        or task: completion, settlement and cancels look it up by id."""
+        or task (completion, settlement and cancels look it up by id), only
+        to finish: excluded() stops new quotes and takes on it."""
         new = {b.basket_id: b for b in baskets}
+        self.listed = {b.relationship_id for b in baskets}
         # Quotes are keyed by leg index, and the scan orders a mecnet's legs by
         # price under an id that doesn't change: a reorder moved one leg's quote
         # to another leg's price (NCX/TIJ 0.34<->0.65, 11-06), so keep the old order.
@@ -739,7 +741,7 @@ class ArbsRunner:
 
     async def reload_spec(self):
         loop = asyncio.get_running_loop()
-        new = self.set_baskets(merge(self.hand, await loop.run_in_executor(self.pool, self.scanned)))
+        new = self.set_baskets(await loop.run_in_executor(self.pool, self.scanned))
         if not new:
             return
         await loop.run_in_executor(self.pool, self.load_meta)
@@ -781,8 +783,8 @@ class ArbsRunner:
                     counts = json.loads(out.decode().strip().splitlines()[-1])
                     await self.reload_spec()
                     self.scan_status = {"at": _utc().isoformat(), "secs": round(time.monotonic() - t0, 1),
-                                        **counts, "baskets": len(self.all_baskets) - len(self.hand), "error": None}
-                elif len(self.all_baskets) > len(self.hand):
+                                        **counts, "baskets": len(self.listed), "error": None}
+                elif self.listed:
                     await self.reload_spec()
             except Exception as e:
                 self.scan_status["error"] = repr(e)
@@ -915,15 +917,32 @@ class ArbsRunner:
             phase = "live" if b.is_live(self.now_ts()) else "pre"
             if any(k in ro or f"{k}:{phase}" in ro for k in (series, group, event, b.cluster) if k):
                 return True
-        # A scanned basket on a shard this process no longer scans (another
-        # process's, ARBS3), or of the other half of shard 0 (scanner.PARTS),
-        # stays only to finish its position, not to quote.
-        if b.basket_id not in self.hand_ids and (s := self.basket_shard(b)) is not None                 and s not in self.cfg.scan.shards:
+        # Only relationships this process's own scan lists are traded (a subset
+        # built from today's books belongs to its event's). A held basket of
+        # one it no longer lists (the retired hand spec's, another shard's, a
+        # delisted one) is only finished: completions and settlement still run.
+        if b.relationship_id not in self.listed:
             return True
-        if (self.part is not None and b.basket_id not in self.hand_ids and ":" in b.basket_id
-                and not scanner.in_part(b.basket_id.split(":")[1], self.part)):
+        if (s := self.basket_shard(b)) is not None and s not in self.cfg.scan.shards:
             return True
+        # The scan carries a held basket's relationship over even after its
+        # event moved to shard 0's other process (parts.py): that one owns it now.
+        if self.part_idx is not None:
+            o = parts.owner(self.owners, parts.event_of(b.basket_id))
+            if o is not None and o != self.part_idx:
+                return True
         return b.settles is not None and b.settles > self.horizon()
+
+    def reload_owners(self):
+        """parts.py's owners map, re-read when ARBS's scan rewrites it."""
+        try:
+            m = os.path.getmtime(parts.owners_path())
+        except OSError:
+            return
+        if m != self._owners_mtime:
+            self._owners_mtime = m
+            self.owners = parts.load()
+            self.dirty |= set(self.baskets)
 
     def record_only(self) -> list[str]:
         return self.cfg.watch.record_only or []
@@ -1422,6 +1441,7 @@ class ArbsRunner:
                 day = f"{_utc():%Y-%m-%d}"
                 await loop.run_in_executor(self.pool, self.prints.write, rows, day)
                 await loop.run_in_executor(self.pool, self.top_hist.write, self.top_hist.take(time.time()), day)
+                await loop.run_in_executor(self.write_pool, self.event_spend.write, self.event_spend.snapshot())
             except Exception as e:
                 _log(f"WARN: print log failed ({e!r})")
 
@@ -3334,6 +3354,7 @@ class ArbsRunner:
 
     def charge(self, basket_id: str, tokens: float):
         self.spend.setdefault(basket_id, _Rate()).add(tokens, time.time())
+        self.event_spend.add(parts.event_of(basket_id), tokens)
 
     def write_cost(self, b: Basket, now: float) -> float:
         """Write tokens/s quoting `b` takes: what its quotes spent lately, or
@@ -3675,6 +3696,8 @@ class ArbsRunner:
                 self.dirty |= set(self.baskets)
             for c in self.store.apply_pending():
                 _log(f"config: {c}")
+            if self.part_idx is not None:
+                self.reload_owners()
             if (reason := stopper.poll()) is not None:
                 _log(f"STOP: {reason}")
                 stop.set()
