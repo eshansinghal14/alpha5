@@ -192,6 +192,19 @@ def _usd0(v: float) -> str:
     return "$0" if r == 0 else f"${r:+,}"
 
 
+def by_venue(procs: list[dict]) -> list[dict]:
+    """The process rows summed per venue, Kalshi (K) and Polymarket (PM): a
+    venue's real processes, or all of them while none is real."""
+    out = []
+    for label, rows in (("K", [r for r in procs if r["label"].startswith("K")]),
+                        ("PM", [r for r in procs if not r["label"].startswith("K")])):
+        if not rows:
+            continue
+        real = [r for r in rows if r["real"]]
+        out.append({"label": label, "real": bool(real), "pnl": sum(r["pnl"] for r in real or rows)})
+    return out
+
+
 def _split(rows, fmt) -> str | None:
     """'xx (K0), yy (K3), zz (PM)': one entry per process or shard, the
     parts of the headline. Shadow ones (not in the headline) follow apart, so
@@ -212,7 +225,7 @@ def _metrics(s: dict):
     n_broken = sum(1 for h in s.get("holdings") or [] if h.get("unhedged"))
     settled = p.get("settled") or 0.0
     unrealized = (p.get("locked") or 0.0) + broken
-    c[0].metric("Total PnL", _usd(settled + unrealized), _split(procs, lambda r: _usd0(r['pnl'])),
+    c[0].metric("Total PnL", _usd(settled + unrealized), _split(by_venue(procs), lambda r: _usd0(r['pnl'])),
                 delta_color="off",
                 help="Settled (payouts and unwound contracts, minus everything paid incl. fees) plus expected "
                      "unrealized, over the processes trading real money. A shadow process's figure is "
@@ -241,9 +254,11 @@ def _metrics(s: dict):
     live_procs = [r for r in procs if r["real"]] or procs
     c[3].metric("Baskets quoting / watching",
                 f"{sum(r['quoting'] for r in live_procs):,} / {sum(r['watching'] for r in live_procs):,}",
-                _split(procs, lambda r: f"{r['quoting']:,}/{r['watching']:,}"), delta_color="off",
                 help="Baskets with a resting quote of ours now, of the baskets each process watches (its "
-                     "scan and hand spec). The total counts processes trading real money.")
+                     "scan). The total counts processes trading real money.")
+    # One process a line: on one line the subtext was cut off at four processes.
+    c[3].caption("  \n".join(f"{r['quoting']:,} / {r['watching']:,} ({r['label']}"
+                             f"{'' if r['real'] else ', shadow, not in total'})" for r in procs))
     n = s.get("counts") or {}
     c[4].metric("Quote fills / takes", f"{n.get('quote_fills', 0)} / {n.get('takes', 0)}",
                 f"{n.get('completions', 0)} completions", delta_color="off")
