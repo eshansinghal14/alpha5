@@ -19,7 +19,7 @@ from backtest.book import BookView, L2Book
 from backtest.core import Trade
 from backtest.data import MAX_SNAPSHOT_AGE_S
 from infra.polymarket import WS, auth
-from infra.polymarket.orders import parse_execution
+from infra.polymarket.orders import _amt, order_side, parse_execution
 
 MARKETS_PATH = "/v1/ws/markets"
 PRIVATE_PATH = "/v1/ws/private"
@@ -29,7 +29,10 @@ RECV_TIMEOUT_S = 5.0
 # A book that hasn't changed resends nothing; resubscribing a batch brings
 # fresh books, well inside BookView's MAX_SNAPSHOT_AGE_S staleness guard.
 RESYNC_INTERVAL_S = 600.0
-SUBSCRIBE_BATCH = 500
+# One subscription has taken 2,000+ slugs (recorder, 11-12); the server allows
+# 10 subscriptions per connection, and each batch costs two (books, trades).
+SUBSCRIBE_BATCH = 2000
+MAX_SUBS = 10
 assert RESYNC_INTERVAL_S < MAX_SNAPSHOT_AGE_S
 # Executions that end an order without our cancel being the reason we care:
 # a post-only cross is REJECTED, an unfunded order is cancelled unsolicited.
@@ -119,6 +122,10 @@ class PolyFeed:
     async def run(self):
         await asyncio.gather(self._markets(), self._private())
 
+    @staticmethod
+    def _subs_for(n: int) -> int:
+        return 2 * -(-n // SUBSCRIBE_BATCH)
+
     async def _subscribe(self, ws, slugs, tag: str):
         for i in range(0, len(slugs), SUBSCRIBE_BATCH):
             batch = slugs[i:i + SUBSCRIBE_BATCH]
@@ -136,13 +143,20 @@ class PolyFeed:
                     self._new = []
                     n_sub = 0
                     await self._subscribe(ws, list(self._tickers), f"s{n_sub}")
+                    subs = self._subs_for(len(self._tickers))
                     self._set_up(True)
                     resync_at = time.monotonic() + RESYNC_INTERVAL_S
                     while True:
                         if self._new:
+                            if subs + self._subs_for(len(self._new)) > MAX_SUBS:
+                                # Past the server's 10 the new markets would get no
+                                # books: reconnect, which subscribes everything at once.
+                                self.n_refreshes += 1
+                                break
                             new, self._new = self._new, []
                             n_sub += 1
                             await self._subscribe(ws, new, f"s{n_sub}")
+                            subs += self._subs_for(len(new))
                         if time.monotonic() >= resync_at:
                             # A repeat subscription answers with every book again; the
                             # server allows 10 per connection, so reconnect instead.
@@ -204,6 +218,16 @@ class PolyFeed:
             if "error" in m and self._on_error:
                 self._on_error(f"polymarket private ws error: {m['error']}")
             return
+        try:
+            self._dispatch(ex)
+        except Exception as e:
+            # A handler error must not end the private stream: every later fill
+            # and cancel echo would be lost with it.
+            print(f"[{self.label}] polymarket private handler error ({e!r})", flush=True)
+            if self._on_error:
+                self._on_error(f"polymarket private handler error ({e!r})")
+
+    def _dispatch(self, ex: dict):
         f = parse_execution(ex)
         if f is not None:
             self.n_fills += 1
@@ -212,5 +236,10 @@ class PolyFeed:
         if ex.get("type") in GONE and self._on_gone is not None:
             o = ex.get("order") or {}
             if o.get("id"):
+                # The order's final filled quantity and average price (own side's terms).
+                avg = _amt(o.get("avgPx"))
+                if avg is not None and order_side(o) == "no":
+                    avg = round(1.0 - avg, 6)
                 self._on_gone(o["id"], ex.get("type"),
-                              ex.get("orderRejectReason") or ex.get("unsolicitedCancelReason") or ex.get("text"))
+                              ex.get("orderRejectReason") or ex.get("unsolicitedCancelReason") or ex.get("text"),
+                              cum=_amt(o.get("cumQuantity")), avg=avg)

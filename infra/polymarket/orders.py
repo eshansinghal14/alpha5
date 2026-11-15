@@ -18,15 +18,16 @@ import uuid
 import requests
 
 from backtest.core import Order
-from infra.kalshi.orders import KalshiOrderClient, RealFill, RestingAck, WriteBudget, _raise_with_body
-from infra.polymarket import API, auth
+from infra.kalshi.orders import KalshiOrderClient, RealFill, RestingAck, _raise_with_body
+from infra.polymarket import API, auth, limits
 
 PM_SHARD = 100            # ARBS keys order clients and cash by shard; Polymarket is one
 ORDER_TIMEOUT_S = 10.0
-# Requests per second for one key across every endpoint (orders overview and
-# changelog, 11-12; the rate-limits page says 25/s per IP). ARBS's token units
-# are 10 per write, so 20/s is 200 tokens/s; reads come out of the same 20.
-KEY_REQUESTS_PER_S = 20.0
+# Order ids reconcile reads one by one per call (each a request): the
+# private websocket's fill and cancel messages are the record, this only
+# catches what it missed. Unbounded, it read every quote retired in 10 min
+# each 10 s and drew Polymarket's IP-wide 429 (11-15 18:21).
+RECONCILE_READS = 5
 # An IOC waits this long for its executions in the create response (max 5).
 IOC_BLOCK_S = "2"
 INTENT = {"yes": "ORDER_INTENT_BUY_LONG", "no": "ORDER_INTENT_BUY_SHORT"}
@@ -72,21 +73,22 @@ def parse_execution(ex: dict) -> dict | None:
 
 
 class PolymarketOrderClient(KalshiOrderClient):
-    """Reuses KalshiOrderClient's token bucket, cap and usage accounting; every
-    request is new. Blocking: call off the event loop."""
+    """Reuses KalshiOrderClient's cap and usage accounting on the machine-wide
+    Polymarket bucket (limits.py): writes pay through allow_now, reads here.
+    Blocking: call off the event loop."""
 
     price_dp = 4
     # One request each; a move is a cancel and a create (see amend).
     COST = {"order": 10, "amend": 20, "cancel": 10}
 
-    def __init__(self, tokens_per_s: float = KEY_REQUESTS_PER_S * 10 * 0.6, timeout_s: float = ORDER_TIMEOUT_S):
+    def __init__(self, timeout_s: float = ORDER_TIMEOUT_S):
         self._session = requests.Session()
         self._cancel_session = requests.Session()
         for s in (self._session, self._cancel_session):
             s.trust_env = False
             s.mount("https://", requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=16))
         self._lock = threading.Lock()
-        self.budget = WriteBudget(tokens_per_s)
+        self.budget = limits.budget()
         self.tokens_per_s = self.budget.tokens_per_s
         self._rate = self.budget.rate
         self.timeout_s = timeout_s
@@ -113,11 +115,24 @@ class PolymarketOrderClient(KalshiOrderClient):
     # ---------------------------------------------------------------- http
 
     def _req(self, method: str, path: str, body: dict | None = None, params: dict | None = None,
-             session=None, headers: dict | None = None):
+             session=None, headers: dict | None = None, pay: str = "read"):
+        """pay: "read" takes a request from the bucket or raises
+        limits.PMBudgetLow; "force" always takes it; "paid" was taken by
+        the caller's allow_now."""
+        if pay == "read":
+            limits.pay()
+        elif pay == "force":
+            limits.pay(force=True)
+        else:
+            limits._note()
         # Signed over the path alone: a query string isn't part of the message (probe 11-12).
         h = {**auth.headers(method, path), "Content-Type": "application/json", **(headers or {})}
-        return (session or self._session).request(method, API + path, headers=h, json=body, params=params,
-                                                  timeout=self.timeout_s)
+        r = (session or self._session).request(method, API + path, headers=h, json=body, params=params,
+                                               timeout=self.timeout_s)
+        if r.status_code == 429:
+            limits.note_status(429, "write" if pay == "paid" else method.lower())
+            self.note_rate_limited("http")
+        return r
 
     def _json(self, method: str, path: str, **kw) -> dict:
         r = self._req(method, path, **kw)
@@ -141,7 +156,7 @@ class PolymarketOrderClient(KalshiOrderClient):
         self._bodies[cid] = body
         while len(self._bodies) > 5000:
             self._bodies.popitem(last=False)
-        return self._json("POST", "/v1/orders", body=body, headers={"Idempotency-Key": cid})
+        return self._json("POST", "/v1/orders", body=body, headers={"Idempotency-Key": cid}, pay="paid")
 
     def place_ioc(self, order: Order) -> RealFill | None:
         body = self._body(order, "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL", False)
@@ -152,7 +167,7 @@ class PolymarketOrderClient(KalshiOrderClient):
         fills = [f for f in (parse_execution(e) for e in exs or []) if f is not None]
         if exs is None:
             # No executions block at all: read the order rather than call it unfilled.
-            o = self.order(oid)
+            o = self.order(oid, pay="force")
             cum, avg = _amt(o.get("cumQuantity")) or 0.0, _amt(o.get("avgPx"))
             if cum <= 0:
                 return None
@@ -191,7 +206,7 @@ class PolymarketOrderClient(KalshiOrderClient):
 
     def cancel(self, exchange_order_id: str, market_ticker: str | None = None) -> bool:
         r = self._req("POST", f"/v1/order/{exchange_order_id}/cancel", body={"marketSlug": market_ticker},
-                      session=self._cancel_session)
+                      session=self._cancel_session, pay="paid")
         if r.status_code == 404:
             return False
         _raise_with_body(r)
@@ -201,40 +216,63 @@ class PolymarketOrderClient(KalshiOrderClient):
         body = self._bodies.get(client_order_id)
         if body is None:
             return None
-        resp = self._json("POST", "/v1/orders", body=body, headers={"Idempotency-Key": client_order_id})
+        resp = self._json("POST", "/v1/orders", body=body, headers={"Idempotency-Key": client_order_id},
+                          pay="force")
         return (resp["id"], body["marketSlug"]) if resp.get("id") else None
 
+    def cancel_all(self) -> list[str]:
+        """Every open order on the account in one request (Polymarket's
+        cancel-all); the ids cancelled. ARBSPM is the account's only trader."""
+        r = self._json("POST", "/v1/orders/open/cancel", body={}, session=self._cancel_session, pay="force")
+        return list(r.get("canceledOrderIds") or [])
+
     def open_orders(self) -> list[dict]:
-        return self._json("GET", "/v1/orders/open").get("orders") or []
+        # One request per 10 s fill poll, and the arm and audit need it: paid
+        # even when low (pay="force"), like a cancel.
+        return self._json("GET", "/v1/orders/open", pay="force").get("orders") or []
 
     def _resting(self, event_ticker: str = "", max_pages: int = 10) -> list[tuple[str, str, str | None]]:
         return [(o["id"], o.get("marketSlug") or "", None) for o in self.open_orders()
                 if o.get("id") and (o.get("marketSlug") or "").startswith(event_ticker)]
 
-    def order(self, order_id: str) -> dict:
-        return self._json("GET", f"/v1/order/{order_id}").get("order") or {}
+    def order(self, order_id: str, pay: str = "read") -> dict:
+        return self._json("GET", f"/v1/order/{order_id}", pay=pay).get("order") or {}
 
-    def reconcile(self, order_ids: list[str]) -> list[dict]:
-        """Fill dicts carrying each order's whole filled quantity (`cum`) and
-        average price, for ARBS to book what the websocket didn't. One read
-        for the open orders, one per order no longer open."""
-        open_ = {o["id"]: o for o in self.open_orders() if o.get("id")}
+    def reconcile(self, open_ids: list[str], closed_ids: list[str], max_reads: int = RECONCILE_READS) -> list[dict]:
+        """Each order's state and whole filled quantity (`cum`; `avg` in its
+        own side's terms) for ARBS to book what the websocket missed: one
+        read for every open order, then up to `max_reads` of `closed_ids`
+        (orders we no longer track as open) one request each, oldest first.
+        Stops early when the bucket is low or Polymarket says 429; the rest
+        wait for the next call. `done`: its state can't change any more."""
         out = []
-        for oid in order_ids:
-            o = open_.get(oid)
-            if o is None:
-                try:
-                    o = self.order(oid)
-                except requests.HTTPError:
-                    continue
-            cum, avg = _amt(o.get("cumQuantity")) or 0.0, _amt(o.get("avgPx"))
-            if cum <= 0 or avg is None:
-                continue
+
+        def row(oid, o):
+            avg = _amt(o.get("avgPx"))
             side = order_side(o)
             out.append({"ticker": o.get("marketSlug"), "side": side,
-                        "avg": avg if side == "yes" else round(1.0 - avg, 6), "cum": cum,
-                        "fee_total": _amt(o.get("commissionNotionalTotalCollected")) or 0.0,
-                        "order_id": oid, "state": o.get("state")})
+                        "avg": None if avg is None else (avg if side == "yes" else round(1.0 - avg, 6)),
+                        "cum": _amt(o.get("cumQuantity")) or 0.0, "order_id": oid, "state": o.get("state"),
+                        "done": o.get("state") in DONE})
+
+        open_ = {o["id"]: o for o in self.open_orders() if o.get("id")}
+        gone = []
+        for oid in open_ids:
+            if oid in open_:
+                row(oid, open_[oid])
+            else:
+                gone.append(oid)
+        for oid in (gone + list(closed_ids))[:max_reads]:
+            try:
+                o = self.order(oid)
+            except limits.PMBudgetLow:
+                break
+            except requests.HTTPError as e:
+                if e.response is not None and e.response.status_code == 404:
+                    out.append({"order_id": oid, "done": True, "cum": 0.0, "avg": None, "state": "not found"})
+                    continue
+                break
+            row(oid, o)
         return out
 
     def fills(self, event_ticker: str = "", max_pages: int = 20, min_ts: int | None = None) -> list[dict]:
@@ -248,7 +286,8 @@ class PolymarketOrderClient(KalshiOrderClient):
         """slug -> signed YES contracts (negative = NO)."""
         out, cursor = {}, None
         for _ in range(max_pages):
-            d = self._json("GET", "/v1/portfolio/positions", params={"limit": 100, **({"cursor": cursor} if cursor else {})})
+            d = self._json("GET", "/v1/portfolio/positions", pay="force",
+                           params={"limit": 100, **({"cursor": cursor} if cursor else {})})
             for slug, p in (d.get("positions") or {}).items():
                 v = _amt(p.get("netPositionDecimal"))
                 if v is None:
@@ -263,7 +302,7 @@ class PolymarketOrderClient(KalshiOrderClient):
     def shard_balances(self, reserve: float = 0.0) -> tuple[dict[int, float], float]:
         """({PM_SHARD: buying power}, value of positions). An account that was
         never funded lists no balance at all: 0."""
-        bs = self._json("GET", "/v1/account/balances").get("balances") or []
+        bs = self._json("GET", "/v1/account/balances", pay="force").get("balances") or []
         b = bs[0] if bs else {}
         cash = _amt(b.get("buyingPower"))
         if cash is None:

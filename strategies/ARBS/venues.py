@@ -6,11 +6,8 @@ ARBS keys clients and cash by shard.
 """
 from __future__ import annotations
 
-import json
-import urllib.parse
-import urllib.request
 
-from infra.polymarket import GATEWAY
+from infra.polymarket.limits import gateway_get
 from infra.polymarket.feed import PolyFeed
 from infra.polymarket.orders import PM_SHARD
 from strategies.ARBS import pricing
@@ -104,10 +101,7 @@ class Feeds:
 
 
 def _get(path: str, query: dict | None = None) -> dict:
-    url = GATEWAY + path + ("?" + urllib.parse.urlencode(query, doseq=True) if query else "")
-    req = urllib.request.Request(url, headers={"User-Agent": "alpha5-arbs"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read())
+    return gateway_get(path, query, agent="alpha5-arbs")
 
 
 def ticks(step: float | None) -> pricing.Ticks:

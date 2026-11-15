@@ -40,6 +40,7 @@ from infra.kalshi import fees as kfees
 from infra.kalshi.orders import (RealFill, error_code, http_status, is_market_paused, is_order_group_reject,
                                         is_post_only_reject)
 from infra.kalshi.orders import KEEPALIVE_S, ReadBudgetLow, read_stats, write_budget_tokens_per_s
+from infra.polymarket import limits as pm_limits
 from infra.trading.engine import MARKET_PAUSE_RETRY_S
 from infra.runtime import disk
 from infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
@@ -228,6 +229,12 @@ ORDER_GROUP_WINDOW_S = 15.0
 # A group with nothing resting in it this long is deleted.
 ORDER_GROUP_IDLE_S = 600.0
 PULL_BATCH = 20
+# Polymarket rejects an order it couldn't process within 5 s with one of these
+# texts (the second is the old wording); resubmitting is fine.
+PM_LATENCY_REJECTS = ("Order Processing Max Delay Exceeded", "Global Rate Limit Exceeded")
+# Retired Polymarket orders reconcile may still read: their cancel echo
+# normally marks them final within a second; this bounds the backlog.
+PM_RECONCILE_WINDOW_S = 3600.0
 # Most other baskets sharing a quote's market side priced per leg per pass:
 # MECNET subsets put one market in dozens of baskets.
 MAX_ALTS = 8
@@ -436,6 +443,9 @@ class ArbsRunner:
         self.cash_at = 0.0
         self._cash_reread_at: float | None = None
         self.foreign = _load_foreign()
+        # Set while apply_real_fill books: a real fill goes in the real ledger
+        # even when it lands disarmed (a failed arm, a fill racing a disarm).
+        self._booking_real = False
         self._cash_read_total = 0.0
         self._pos_read = 0.0
         self.pos_value: dict[int, float] = {}     # shard -> Kalshi's value of our positions
@@ -550,7 +560,7 @@ class ArbsRunner:
 
     @property
     def ledger(self) -> Ledger:
-        return self.real_ledger if self.live else self.shadow_ledger
+        return self.real_ledger if self.live or self._booking_real else self.shadow_ledger
 
     def alert(self, level: str, basket_id: str | None, msg: str):
         row = {"time": _utc().isoformat(), "level": level, "basket_id": basket_id, "msg": msg,
@@ -621,6 +631,10 @@ class ArbsRunner:
     def _order_err(self, basket_id, what, exc, ticker: str):
         st, code = http_status(exc), error_code(exc)
         if st == 429:
+            return
+        if any(m in str(exc) for m in PM_LATENCY_REJECTS):
+            # Polymarket's 5 s processing stopgap: a transient reject, not an error (docs, rate limits).
+            self.n["pm_latency_rejects"] = self.n.get("pm_latency_rejects", 0) + 1
             return
         if is_market_paused(exc):
             # Held like the engine does: Kalshi's Thursday maintenance pauses
@@ -1414,7 +1428,7 @@ class ArbsRunner:
         self._cash_move(ticker, size - cost)
         row = {"basket_id": b.basket_id, "type": b.type, "settled_at": _utc().isoformat(), "bundles": 0.0,
                "payout": round(size - cost, 4), "cost": round(basis, 4), "pnl": round(size - cost - basis, 4),
-               "results": {ticker: f"unwound {size:g} ({kind})"}, "live": self.live}
+               "results": {ticker: f"unwound {size:g} ({kind})"}, "live": self.live or self._booking_real}
         self.ledger.settled.append(row)
         self.ledger.save(now)
         self.journal({"kind": "fill", "fill_kind": kind, "basket_id": b.basket_id, "ticker": ticker, "side": side,
@@ -1579,6 +1593,15 @@ class ArbsRunner:
         info = self.real_ledger.quote_ids.get(oid)
         if info is None:
             return False
+        if info["basket_id"] not in self.baskets:
+            # _book needs the basket; left unbooked (not marked seen) so the audit
+            # shows it and a later read can book it once the basket is back.
+            key = f"unlisted:{oid}"
+            if key not in self.unbooked:
+                self.unbooked.add(key)
+                self.alert("error", info["basket_id"], f"real fill on {info['ticker']} for a basket no longer "
+                                                       f"listed; not booked, check by hand")
+            return True
         key = f"{oid}:{tid}"
         if key in self.real_ledger.seen_trades:
             return True
@@ -1598,25 +1621,39 @@ class ArbsRunner:
         b = self.baskets.get(info["basket_id"])
         leg = b.tickers.index(info["ticker"]) if b is not None and info["ticker"] in b.tickers else -1
         q = self.quotes.get((info["basket_id"], leg, "deep") if info.get("deep") else (info["basket_id"], leg))
-        if q is not None and q.exchange_id == oid:
-            ts = f.get("time")
-            self._quote_fill(q, size, cost, tid, source, exch_t=pd.Timestamp(ts).timestamp() if ts else None)
-        else:
-            self.n["quote_fills"] += 1
-            self._book(info["basket_id"], info["ticker"], info["side"], size, cost,
-                       "deep" if info.get("deep") else "quote", source=source, order_id=oid, trade_id=tid, late=True)
+        self._booking_real = True
+        try:
+            if self.live and q is not None and q.exchange_id == oid:
+                ts = f.get("time")
+                self._quote_fill(q, size, cost, tid, source, exch_t=pd.Timestamp(ts).timestamp() if ts else None)
+            else:
+                self.n["quote_fills"] += 1
+                if not self.live:
+                    self.alert("warn", info["basket_id"], f"real fill while disarmed: {info['ticker']} "
+                                                          f"{info['side']} {size:g}; booked, not completed")
+                self._book(info["basket_id"], info["ticker"], info["side"], size, cost,
+                           "deep" if info.get("deep") else "quote", source=source, order_id=oid, trade_id=tid,
+                           late=True)
+        finally:
+            self._booking_real = False
         return True
 
     def _on_fill(self, f: dict):
-        if not self.live or f.get("liquidity") != "maker":
+        if f.get("liquidity") != "maker":
             return
-        if not self.apply_real_fill(f, "ws") and f.get("ticker") in self.meta:
+        # Booked armed or not: a fill of one of our real orders is real money.
+        if not self.apply_real_fill(f, "ws") and self.live and f.get("ticker") in self.meta:
             # Fill can beat the create's ack; replayed once the id is known.
             self.orphans.append((time.monotonic(), f))
 
-    def _on_gone(self, oid: str, why: str, reason):
-        """A Polymarket order ended on the exchange's side: a post-only cross is
-        rejected, an order no longer funded after a fill is cancelled."""
+    def _on_gone(self, oid: str, why: str, reason, cum: float | None = None, avg: float | None = None):
+        """A Polymarket order ended: our own cancel's echo, a post-only cross
+        rejected, an order no longer funded after a fill. Its filled quantity
+        then is final: books any fill the websocket missed, and reconcile
+        need not read the order again."""
+        info = self.real_ledger.quote_ids.get(oid)
+        if info is not None:
+            self._pm_final(oid, info, cum, avg, "ws_gone")
         for q in [q for q in self.quotes.values() if q.exchange_id == oid]:
             if why == "EXECUTION_TYPE_REJECTED":
                 self.n["post_only_rejects"] += 1
@@ -1664,24 +1701,49 @@ class ArbsRunner:
         self.real_ledger.last_fill_ts = newest
         self.real_ledger.save(time.time())
 
+    def _pm_final(self, oid: str, info: dict, cum: float | None, avg: float | None, source: str):
+        """A Polymarket order's final filled quantity: book what isn't yet,
+        and mark it so reconcile stops reading it."""
+        if cum is not None and avg is not None and cum - info.get("booked", 0.0) > _EPS:
+            new = cum - info.get("booked", 0.0)
+            px = (avg * cum - info.get("booked_px", 0.0)) / new
+            self.apply_real_fill({"ticker": info["ticker"], "side": info["side"], "price": px, "size": new,
+                                  "fee": 0.0, "liquidity": "maker", "order_id": oid,
+                                  "trade_id": f"cum:{cum}", "cum": cum}, source)
+        # Final only once all of it is booked: a snapshot with a quantity but no
+        # average price books nothing, and reconcile must read it again.
+        if cum is not None and cum - info.get("booked", 0.0) <= _EPS and not info.get("final"):
+            info["final"] = True
+            self.real_ledger.note_quote_id(oid)
+
     async def reconcile_pm(self, c):
-        """Polymarket fills the private websocket didn't deliver, from each
-        quote's filled quantity: open orders in one read, others one each
-        (quotes retired in the last 10 min)."""
+        """Polymarket fills the private websocket didn't deliver: every open
+        order's filled quantity in one read, then a few orders retired in the
+        last hour whose final state we haven't seen, oldest first (the client
+        caps the reads per call; the cancel echo usually makes them final)."""
         now = time.time()
-        ids = [oid for oid, v in self.real_ledger.quote_ids.items() if is_pm(v.get("ticker", ""))
-               and (v.get("retired_at") is None or now - v["retired_at"] < 600)]
-        if not ids:
-            return
-        for r in await self.gw.call(c.reconcile, ids):
-            info = self.real_ledger.quote_ids.get(r["order_id"])
-            if info is None or r["cum"] - info.get("booked", 0.0) <= _EPS:
+        open_ids, closed = [], []
+        for oid, v in self.real_ledger.quote_ids.items():
+            if not is_pm(v.get("ticker", "")) or v.get("final"):
                 continue
-            new = r["cum"] - info.get("booked", 0.0)
-            px = (r["avg"] * r["cum"] - info.get("booked_px", 0.0)) / new
-            self.apply_real_fill({"ticker": r["ticker"], "side": r["side"], "price": px, "size": new, "fee": 0.0,
-                                  "liquidity": "maker", "order_id": r["order_id"],
-                                  "trade_id": f"cum:{r['cum']}", "cum": r["cum"]}, "reconcile")
+            if v.get("retired_at") is None:
+                open_ids.append(oid)
+            elif now - v["retired_at"] < PM_RECONCILE_WINDOW_S:
+                closed.append((v["retired_at"], oid))
+        if not open_ids and not closed:
+            return
+        for r in await self.gw.call(c.reconcile, open_ids, [oid for _, oid in sorted(closed)]):
+            info = self.real_ledger.quote_ids.get(r["order_id"])
+            if info is None:
+                continue
+            if r.get("done"):
+                self._pm_final(r["order_id"], info, r["cum"], r["avg"], "reconcile")
+            elif r["avg"] is not None and r["cum"] - info.get("booked", 0.0) > _EPS:
+                new = r["cum"] - info.get("booked", 0.0)
+                px = (r["avg"] * r["cum"] - info.get("booked_px", 0.0)) / new
+                self.apply_real_fill({"ticker": info["ticker"], "side": info["side"], "price": px, "size": new,
+                                      "fee": 0.0, "liquidity": "maker", "order_id": r["order_id"],
+                                      "trade_id": f"cum:{r['cum']}", "cum": r["cum"]}, "reconcile")
 
     # ------------------------------------------------------------------ limits
 
@@ -3133,6 +3195,12 @@ class ArbsRunner:
 
     async def pull_all(self, reason: str):
         qs = [q for q in self.quotes.values() if not q.pending]
+        if self.live and any(is_pm(q.ticker) and q.exchange_id for q in qs) and await self.pm_cancel_all(reason):
+            for q in [q for q in qs if is_pm(q.ticker)]:
+                self._retire(q)
+                self.journal({"kind": "cancel", "basket_id": q.basket_id, "ticker": q.ticker, "reason": reason,
+                              **_deep(q)})
+            qs = [q for q in qs if not is_pm(q.ticker)]
         # In batches: ~1000 cancels at once drew 429s (feed drop 10-30 06:25 ET).
         for i in range(0, len(qs), PULL_BATCH):
             await asyncio.gather(*(self.cancel_quote(q, reason) for q in qs[i:i + PULL_BATCH]),
@@ -3140,6 +3208,29 @@ class ArbsRunner:
             await asyncio.sleep(PULL_BATCH * SWEEP_PACING_S)
         if self.live:
             await self.sweep(reason)
+
+    async def pm_cancel_all(self, reason: str, raise_: bool = False) -> bool:
+        """Every open Polymarket order in one request (ARBSPM is the account's
+        only trader): a pull of hundreds of quotes one cancel each drew an
+        IP-wide 429 (11-15 18:21). Retires whatever it cancelled."""
+        c = self.gw.clients.get(PM_SHARD)
+        if c is None:
+            return False
+        try:
+            ids = set(await self.gw.write(c.cancel_all))
+        except Exception as e:
+            if raise_:
+                raise
+            self.alert("warn", None, f"polymarket cancel-all ({reason}) failed ({e!r}); cancelling one by one")
+            return False
+        for q in [q for q in self.quotes.values() if q.exchange_id in ids]:
+            self._retire(q)
+            self.dirty.add(q.basket_id)
+        for oid in ids & set(self.real_ledger.quote_ids):
+            self.real_ledger.quote_ids[oid]["retired_at"] = self.real_ledger.quote_ids[oid].get("retired_at") or time.time()
+            self.real_ledger.note_quote_id(oid)
+        self.journal({"kind": "pm_cancel_all", "reason": reason, "n": len(ids)})
+        return True
 
     async def sweep(self, reason: str):
         """Cancel anything of ours resting: on our tickers, or placed by us on a
@@ -3150,6 +3241,9 @@ class ArbsRunner:
         ours = set(self.tickers)
         resting = []
         for c in self.gw.venue_clients():
+            if c.shard == PM_SHARD:
+                await self.pm_cancel_all(f"sweep/{reason}", raise_=True)
+                continue
             resting += await self.gw.call(c._resting, "")
         for oid, ticker, cid in resting:
             if ticker not in ours and oid not in self.real_ledger.quote_ids:
@@ -3456,27 +3550,33 @@ class ArbsRunner:
             return False
         self.set_cash(bal, value)
         await self.pull_all("arm")        # shadow quotes
-        self.live = True
+        # Live only once the checks pass: while live, the quoter places real
+        # orders, and a failed arm left them resting untracked (594 on 11-15
+        # after ten failed arms).
         try:
             await self.poll_fills()
             await self.sweep("arm")
             await self.poll_fills()
             ok = await self.audit()
         except Exception as e:
-            self.live = False
             self.alert("error", None, f"arm failed ({e!r})")
             return False
         if not ok:
-            self.live = False
             self.alert("error", None, f"arm refused: ledger disagrees with Kalshi {self.audit_diff}")
             return False
+        self.quotes.clear()               # shadow quotes placed while the checks ran
+        self.live = True
         self.order_errors = 0
         self.dirty |= set(self.baskets)
         self.alert("info", None, f"REAL TRADING ON (balances {bal})")
         return True
 
     async def disarm(self, reason: str):
-        await self.pull_all(reason)
+        try:
+            await self.pull_all(reason)
+        except Exception as e:
+            # Still disarm: an exception here used to leave live=True and end the calling loop.
+            self.alert("error", None, f"disarm: pulling quotes failed ({e!r}); check resting orders by hand")
         if self.live:
             try:
                 await self.poll_fills()
@@ -3578,7 +3678,7 @@ class ArbsRunner:
             "session_started": self.started.isoformat(), "live_trading": self.live, "arm_requested": self.arm_want,
             "ledger": "real" if led is self.real_ledger else "shadow",
             "halted": self.halt is not None, "halt_reason": self.halt, "blocked_reason": self.blocked(),
-            "reads": read_stats(),
+            "reads": read_stats(), "pm_requests": pm_limits.stats(),
             "feed": {"up": self.feed.up, "reconnects": self.feed.n_reconnects, "seq_gaps": self.feed.n_seq_gaps,
                      "ws_errors": self.feed.n_errors, "refreshes": self.feed.n_refreshes, "last_msg_s": self.feed.seconds_since_message()},
             "n_baskets": len(self.all_baskets), "n_tickers": len(self.tickers),

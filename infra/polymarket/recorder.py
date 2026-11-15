@@ -25,14 +25,13 @@ import hashlib
 import json
 import os
 import time
-import urllib.parse
-import urllib.request
 
 import pandas as pd
 import websockets
 
 from infra import DATA_ROOT
-from infra.polymarket import GATEWAY, WS, auth
+from infra.polymarket import WS, auth
+from infra.polymarket.limits import gateway_get
 from infra.runtime import disk
 
 ROOT = os.path.join(DATA_ROOT, "polymarket_us")
@@ -49,10 +48,7 @@ EVENTS_PAGE = 100
 
 
 def _get(path: str, query: dict) -> dict:
-    url = f"{GATEWAY}{path}?{urllib.parse.urlencode(query)}"
-    req = urllib.request.Request(url, headers={"User-Agent": "alpha5-recorder"})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return json.loads(r.read())
+    return gateway_get(path, query, agent="alpha5-recorder", timeout_s=60.0)
 
 
 def _slim(ev: dict, m: dict) -> dict:

@@ -206,3 +206,105 @@ def test_selection_ranks_by_recorded_volume(tmp_path):
     from strategies.ARBS.scanner import select
     sel = select(doc, now=now, days=3, max_markets=2)
     assert [r["relationship_id"] for r in sel["relationships"]] == ["busy"]
+
+
+def test_fill_while_disarmed_is_booked_real(pm_arbs):
+    r, b = pm_arbs
+    assert not r.live
+    r.real_ledger.quote_ids["o2"] = {"basket_id": b.basket_id, "ticker": "pm-ev-a", "side": "no", "retired_at": None}
+    r._on_fill({"ticker": "pm-ev-a", "side": "no", "price": 0.40, "size": 2.0, "fee": 0.0, "liquidity": "maker",
+                "order_id": "o2", "trade_id": "t2", "cum": 2.0})
+    assert r.real_ledger.net_by_ticker() == {"pm-ev-a": -2.0}
+    assert r.shadow_ledger.net_by_ticker() == {}
+
+
+def test_cancel_echo_books_the_final_fill_and_ends_reads(pm_arbs):
+    r, b = pm_arbs
+    r.live = True
+    r.real_ledger.quote_ids["o3"] = {"basket_id": b.basket_id, "ticker": "pm-ev-a", "side": "no",
+                                     "retired_at": time.time()}
+    r.real_ledger.quote_ids["o4"] = {"basket_id": b.basket_id, "ticker": "pm-ev-a", "side": "no",
+                                     "retired_at": time.time()}
+    r._on_gone("o3", "EXECUTION_TYPE_CANCELED", None, cum=2.0, avg=0.4)
+    assert r.real_ledger.net_by_ticker() == {"pm-ev-a": -2.0} and r.real_ledger.quote_ids["o3"]["final"]
+    asked = []
+
+    class Poly:
+        def reconcile(self, open_ids, closed_ids):
+            asked.append((open_ids, closed_ids))
+            return [{"order_id": "o4", "done": True, "cum": 0.0, "avg": None, "state": "ORDER_STATE_CANCELED"}]
+
+    async def call(fn, *a):
+        return fn(*a)
+    r.gw.call = call
+    asyncio.run(r.reconcile_pm(Poly()))
+    asyncio.run(r.reconcile_pm(Poly()))
+    assert asked == [([], ["o4"])]           # o3 final from its echo; o4 final after one read
+
+
+def test_failed_arm_stays_disarmed(pm_arbs):
+    r, b = pm_arbs
+    r.gw.clients = {100: object()}
+
+    async def balances():
+        return {100: 5000.0}, 0.0
+
+    async def boom():
+        assert not r.live                    # nothing real is quoted while the arm checks run
+        raise RuntimeError("429")
+    r.shard_balances, r.poll_fills = balances, boom
+    assert not asyncio.run(r.arm()) and not r.live
+
+
+def test_client_reconcile_reads_few_closed_orders_and_stops_when_low(monkeypatch, tmp_path):
+    from infra.kalshi.orders import SharedWriteBudget
+    from infra.polymarket import limits
+    from infra.polymarket.orders import PolymarketOrderClient
+    monkeypatch.setattr(limits, "_BUDGET", SharedWriteBudget(1000.0, 0, path=str(tmp_path / "b")))
+    c = PolymarketOrderClient()
+    read = []
+    c.open_orders = lambda: [{"id": "a", "cumQuantity": "1", "avgPx": {"value": "0.3"}, "state": "ORDER_STATE_NEW",
+                              "intent": "ORDER_INTENT_BUY_LONG", "marketSlug": "m"}]
+
+    def order(oid, pay="read"):
+        read.append(oid)
+        if oid == "c3":
+            raise limits.PMBudgetLow("low")
+        return {"cumQuantity": "0", "state": "ORDER_STATE_CANCELED", "intent": "ORDER_INTENT_BUY_LONG"}
+    c.order = order
+    out = c.reconcile(["a"], [f"c{i}" for i in range(10)], max_reads=5)
+    assert read == ["c0", "c1", "c2", "c3"]
+    assert [o["order_id"] for o in out] == ["a", "c0", "c1", "c2"] and out[1]["done"] and not out[0]["done"]
+
+
+def test_reads_refused_below_the_keep_and_429_empties(monkeypatch, tmp_path):
+    from infra.kalshi.orders import SharedWriteBudget
+    from infra.polymarket import limits
+    monkeypatch.setattr(limits, "_BUDGET", SharedWriteBudget(25.0, 0, path=str(tmp_path / "b")))
+    limits.pay(keep=10.0)
+    with pytest.raises(limits.PMBudgetLow):
+        limits.pay(keep=10.0)
+    limits.pay(force=True)
+    limits.note_status(429, "get")
+    assert limits.budget().tokens_now() <= 0.5 and limits.stats()["http_429"]["get"] >= 1
+
+
+def test_echo_without_a_price_is_not_final(pm_arbs):
+    r, b = pm_arbs
+    r.real_ledger.quote_ids["o5"] = {"basket_id": b.basket_id, "ticker": "pm-ev-a", "side": "no",
+                                     "retired_at": time.time()}
+    r._on_gone("o5", "EXECUTION_TYPE_CANCELED", None, cum=2.0, avg=None)
+    assert not r.real_ledger.quote_ids["o5"].get("final")      # reconcile still reads it
+    r._on_gone("o6", "EXECUTION_TYPE_CANCELED", None, cum=0.0, avg=None)   # not ours: ignored
+
+
+def test_fill_for_an_unlisted_basket_alerts_without_marking_it_booked(pm_arbs):
+    r, b = pm_arbs
+    r.real_ledger.quote_ids["o7"] = {"basket_id": "gone:basket", "ticker": "pm-ev-a", "side": "no",
+                                     "retired_at": None}
+    f = {"ticker": "pm-ev-a", "side": "no", "price": 0.4, "size": 1.0, "fee": 0.0, "liquidity": "maker",
+         "order_id": "o7", "trade_id": "t7", "cum": 1.0}
+    assert r.apply_real_fill(f, "ws")
+    assert r.real_ledger.net_by_ticker() == {} and "o7:t7" not in r.real_ledger.seen_trades
+    assert not r.real_ledger.quote_ids["o7"].get("booked")
+    assert any("no longer listed" in a["msg"] for a in r.alerts)
