@@ -19,6 +19,15 @@ from infra.kalshi.orders import KalshiOrderClient, http_status
 from infra.polymarket.orders import PM_SHARD, PolymarketOrderClient
 
 PM_CANCEL_WAIT_S = 2.0
+# Polymarket cancels that may wait PM_CANCEL_WAIT_S for the bucket: the quote
+# still has its edge (dropped from the hot list, another basket's duplicate).
+# These came in the bursts that drew the 429s (up to 93 not_hot in one
+# second, 11-15). Every other cancel leaves a price we no longer want and
+# goes now: broken-basket cancels waited the whole 2 s (p50 2,087 ms, 11-15).
+PM_ROUTINE_CANCELS = frozenset({"not_hot", "duplicate", "deep_off", "excluded", "venue", "whole"})
+# An urgent cancel may overdraw the bucket by this much: 5 requests, the gap
+# between our 20/s and Polymarket's documented 25/s per IP.
+PM_URGENT_OVERDRAW = 50.0
 
 
 class Gateway:
@@ -153,9 +162,10 @@ class Gateway:
             # Paced on Polymarket's per-IP bucket: pulling a game's quotes at
             # once sent dozens of cancels in a second and 2,023 drew 429s
             # (11-15 19:40-19:56). Sent anyway after PM_CANCEL_WAIT_S.
+            routine = reason in PM_ROUTINE_CANCELS
             end = asyncio.get_running_loop().time() + PM_CANCEL_WAIT_S
             while not c.allow_now("cancel", reason=reason):
-                if asyncio.get_running_loop().time() >= end:
+                if (not routine and c.tokens_now() > -PM_URGENT_OVERDRAW) or                         asyncio.get_running_loop().time() >= end:
                     c.allow_now("cancel", force=True, reason=reason)
                     break
                 await asyncio.sleep(0.05)

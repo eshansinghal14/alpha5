@@ -331,6 +331,9 @@ def test_polymarket_cancels_wait_for_the_bucket_then_go(monkeypatch):
             calls.append(force)
             return force or len(calls) > 3       # refused 3 times, then the bucket has room
 
+        def tokens_now(self):
+            return -100.0                        # overdrawn: even urgent cancels wait
+
         def cancel(self, oid, ticker):
             return True
     gw = execution.Gateway.__new__(execution.Gateway)
@@ -339,10 +342,47 @@ def test_polymarket_cancels_wait_for_the_bucket_then_go(monkeypatch):
     async def write(fn, *a):
         return fn(*a)
     gw.write = write
-    got, exc, sent = asyncio.run(gw.cancel("pm-a", "o1", "test"))
+    got, exc, sent = asyncio.run(gw.cancel("pm-a", "o1", "not_hot"))
     assert got is True and exc is None and calls == [False, False, False, False]
 
     calls.clear()
     C.allow_now = lambda self, kind, force=False, reason="": calls.append(force) or force   # never room
-    asyncio.run(gw.cancel("pm-a", "o1", "test"))
+    asyncio.run(gw.cancel("pm-a", "o1", "not_hot"))
     assert calls[-1] is True                     # sent anyway after the wait
+
+
+def test_urgent_polymarket_cancels_go_now_within_the_overdraw(monkeypatch):
+    from strategies.ARBS import execution
+    monkeypatch.setattr(execution, "PM_CANCEL_WAIT_S", 5.0)
+    calls, tokens = [], [0.0]
+
+    class C:
+        shard = 100
+
+        def allow_now(self, kind, force=False, reason=""):
+            calls.append(force)
+            return force                         # never room without force
+
+        def tokens_now(self):
+            return tokens[0]
+
+        def cancel(self, oid, ticker):
+            return True
+    gw = execution.Gateway.__new__(execution.Gateway)
+    gw.client = lambda t: C()
+
+    async def write(fn, *a):
+        return fn(*a)
+    gw.write = write
+    t0 = time.monotonic()
+    for reason in ("pull", "no_edge", "move_refused", "2 broken baskets", "exit"):
+        calls.clear()
+        asyncio.run(gw.cancel("pm-a", "o1", reason))
+        assert calls == [False, True], reason    # forced on the first refusal
+    assert time.monotonic() - t0 < 1.0
+
+    calls.clear()
+    tokens[0] = -60.0                            # past the overdraw: waits like a routine one
+    monkeypatch.setattr(execution, "PM_CANCEL_WAIT_S", 0.2)
+    asyncio.run(gw.cancel("pm-a", "o1", "pull"))
+    assert len(calls) > 2 and calls[-1] is True
