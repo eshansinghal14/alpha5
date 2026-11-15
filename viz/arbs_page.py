@@ -193,8 +193,14 @@ def _usd0(v: float) -> str:
 
 
 def _split(rows, fmt) -> str | None:
-    """'xx (K0), yy (K3), zz (PM shadow)': one entry per process or shard."""
-    return ", ".join(f"{fmt(r)} ({r['label']}{'' if r['real'] else ' shadow'})" for r in rows) or None
+    """'xx (K0), yy (K3), zz (PM)': one entry per process or shard, the
+    parts of the headline. Shadow ones (not in the headline) follow apart, so
+    the listed parts always add up to it."""
+    real = ", ".join(f"{fmt(r)} ({r['label']})" for r in rows if r["real"])
+    shadow = ", ".join(f"{fmt(r)} ({r['label']} shadow)" for r in rows if not r["real"])
+    if not real:
+        return shadow or None              # all shadow: they are the headline
+    return " · ".join(x for x in (real, shadow and f"not in total: {shadow}") if x)
 
 
 def _metrics(s: dict):

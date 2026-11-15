@@ -125,7 +125,9 @@ def test_dashboard_merges_the_arbs_processes():
     assert not sh["100"]["real"] and sh["100"]["label"] == "PM"
     pr = m["by_process"]
     assert pr["ARBS"]["quoting"] == 1 and pr["ARBS"]["pnl"] == 12.0 and not pr["ARBSPM"]["real"]
-    assert ap._split(list(pr.values()), lambda r: ap._usd0(r["pnl"])) == "$+12 (K0), $0 (K3), $+5 (PM shadow)"
+    # The listed parts add up to the headline; a shadow process follows apart.
+    assert ap._split(list(pr.values()), lambda r: ap._usd0(r["pnl"])) ==         "$+12 (K0), $0 (K3) · not in total: $+5 (PM shadow)"
+    assert ap._split([pr["ARBSPM"]], lambda r: ap._usd0(r["pnl"])) == "$+5 (PM shadow)"
 
 
 def test_dashboard_pnl_history_adds_the_processes():
