@@ -501,6 +501,34 @@ them where they differ.
   - the 3-broken-basket gate fired twice in 11-12..15, momentarily;
   - `scan.max_markets` binds on shard 0 only (1,500 most traded of its
     markets) and sets which baskets are candidates, not how many get quotes.
+- **The hot list is planned on real write spend** (`6d7a59b`, live 11-15
+  20:16 UTC, the user: "lets impl option 1").
+  - **The problem:** `write_cost`'s per-basket estimates ran 2.3–2.5x real
+    spend, so both shards stopped adding baskets at about half the rate limit
+    with their buckets near full: shard 0 planned ~330 and spent ~175
+    tokens/s, shard 3 spent ~135.
+  - **The fix:** `update_plan_scale` compares each Kalshi shard's real spend
+    (`KalshiOrderClient.spent_total`) with the hot list's estimated cost over
+    120 s, and scales the plan budget toward 0.85 × planned / real, smoothed
+    over 120 s, within 0.5–3x. It is held at 1 for the first ~4 min after a
+    start. Summary fields: `write_plan_scale`, `write_spend_tps`.
+  - **Where the spend went** (19:43–19:59 UTC): moves 45–54%, new quotes
+    38–42% (most re-placing quotes the pull rule or a lost edge cancelled:
+    44–55% of quotes live under 10 s), cancels 7–9%. In-play baskets cost
+    4–7 tokens/s each.
+  - **First 20 min (20:16–20:37 UTC):**
+    - Shard 0 reached the 3x ceiling: ~1,515 of ~3,660 baskets hot (was
+      ~500–700), ~1,400 quotes resting, real spend 150–197 tokens/s.
+    - Shard 3 settled at 2.2x and quotes every basket it may (~690 of
+      ~1,700), at ~95 tokens/s.
+    - No 429s; refusals only in the startup burst.
+    - The next limit is CPU: the box is at load ~5 on 4 cores, and shard 0's
+      process at ~87% of a core, though its loop keeps up (summary every
+      2.03–2.08 s).
+    - Raise `PLAN_SCALE_MAX` only with CPU room (move the dashboard or perf
+      off the box, or split shard 0 the way shard 3 was).
+  - **Next levers, not built:** rank by value per token; judge the pull rule
+    (about 24% of shard 0's spend) on fill_context.
 - Kalshi GETs (`kalshi_get`) retry 5xx with backoff up to ~90 s (11-15:
   a 500 on ARBS3's startup market load exited the shard, and `strategies.run`
   restarts services, not strategy units). After any restart, check every
