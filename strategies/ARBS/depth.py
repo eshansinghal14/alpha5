@@ -5,7 +5,9 @@ Each market keeps HIST_S of (time, yes bid, others' yes bid depth, yes ask,
 others' depth at the yes ask) -- our own resting size taken out -- one
 sample per top price change, depth changes at most one per COALESCE_S. At
 every real quote fill the history of the basket's markets is logged, with
-Kalshi's own fill time (exch_t) when the fill carried one; at each print-log
+Kalshi's own fill time (exch_t) when the fill carried one, and at any other
+fill of ours (take, exit) when no fill row of its basket is still collecting;
+at each print-log
 flush (10 s) one resting quote's basket is logged the same way with no fill,
 the base rate a pull signal is judged against. Each row also collects the
 same markets' samples for AFTER_S after it and is written once that has
@@ -161,6 +163,10 @@ class TopHistory:
         self.pending.append((row["t"] + AFTER_S, row, list(tickers)))
         for t in tickers:
             self.watch.setdefault(t, []).append(row)
+
+    def collecting(self, basket_id: str) -> bool:
+        """A fill row of this basket is still inside its AFTER_S."""
+        return any(r["kind"] == "fill" and r["basket_id"] == basket_id for _, r, _ in self.pending)
 
     def take(self, now: float) -> list[dict]:
         """Rows whose AFTER_S has passed by `now`."""

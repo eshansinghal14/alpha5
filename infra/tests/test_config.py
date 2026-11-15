@@ -106,6 +106,24 @@ def test_update_file_validates_before_write(tmp_path):
     assert load(Top, p, "S").inner.size == 4.0
 
 
+def test_a_null_in_a_file_with_a_base_is_the_bases_value(tmp_path):
+    base, own = str(tmp_path / "config.json"), str(tmp_path / "config_b.json")
+    _write(base, RAW)
+    _write(own, {"$base": "config.json", "inner": {"size": None, "cap": 7, "scope": None}, "enabled": False})
+    cfg = load(Top, own)
+    assert (cfg.inner.size, cfg.inner.cap, cfg.inner.scope, cfg.enabled) == (1.0, 7, 5, False)
+
+    store = ConfigStore(Top, own)
+    _write(base, {**RAW, "inner": {**RAW["inner"], "size": 2.5, "cap": 1}})
+    assert store.poll() == ["inner.size 1.0 -> 2.5"]                # the base's edit reaches it; cap stays its own
+
+    update_file(Top, own, None, {"inner.scope": 8})
+    on_disk = json.load(open(own))
+    assert on_disk["$base"] == "config.json" and on_disk["inner"]["size"] is None
+    with pytest.raises(ConfigError):
+        update_file(Top, own, None, {"inner.size": -1})
+
+
 @section
 class WithDict:
     by_coin: dict[str, float] | None = param("per-coin")

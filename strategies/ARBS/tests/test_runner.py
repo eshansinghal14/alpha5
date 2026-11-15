@@ -1900,6 +1900,23 @@ def test_fill_logs_top_of_book_history_without_our_own_size(arbs):
     assert r.top_hist.h["X-A"][-1][2] == 12 - 3                   # our 3 left resting at 0.40 taken out
 
 
+def test_a_fill_outside_any_fill_window_opens_its_own(arbs):
+    r, b = arbs
+    from strategies.ARBS.depth import AFTER_S, TopHistory
+    r.top_hist = TopHistory(str(r.root))
+    q = R.Quote(basket_id=b.basket_id, leg=0, ticker="X-A", side="yes", price=0.40, size=5, cid="c", edge=0.05,
+                max_price=0.40, pending=False, exchange_id="oid")
+    r._log_quote_context("control", q)                              # a control row doesn't count as one
+    r._book(b.basket_id, "X-A", "yes", 5, 2.0, "take")
+    r._book(b.basket_id, "X-B", "yes", 5, 2.5, "take")              # inside the first take's window
+    rows = r.top_hist.take(time.time() + AFTER_S)
+    fills = [x for x in rows if x["kind"] == "fill"]
+    assert len(rows) == 2 and len(fills) == 1
+    assert fills[0]["fill_kind"] == "take" and fills[0]["ticker"] == "X-A" and fills[0]["price"] == 0.4
+    r._book(b.basket_id, "X-B", "yes", 5, 2.5, "complete")          # the window has closed: a new one
+    assert [p[1]["fill_kind"] for p in r.top_hist.pending] == ["complete"]
+
+
 def test_top_history_keeps_price_moves_in_a_busy_book(tmp_path):
     from strategies.ARBS.depth import TopHistory
     h = TopHistory(str(tmp_path))
@@ -2247,25 +2264,25 @@ def test_record_only_series_is_watched_but_never_traded(arbs):
     assert r.excluded(b)
 
 
-def test_a_null_watch_list_is_config_jsons_and_follows_its_edits(tmp_path, monkeypatch):
+def test_shard3_takes_sizes_and_watch_list_from_config_json_and_follows_its_edits(tmp_path, monkeypatch):
     import json, os
     from strategies.ARBS import SERIES
-    from strategies.ARBS.config import CONFIG_PATH
-    main = tmp_path / "config.json"
+    from strategies.ARBS.config import CONFIG_PATH, CONFIG3_PATH
+    main, own = tmp_path / "config.json", tmp_path / "config_shard3.json"
     doc = json.load(open(CONFIG_PATH))
     doc["watch"]["record_only"] = ["X"]
+    doc["trading"]["quote_size"] = 3000
     main.write_text(json.dumps(doc))
-    monkeypatch.setattr(R, "CONFIG_PATH", str(main))
+    own.write_text(open(CONFIG3_PATH).read())
     monkeypatch.setattr(R, "LIVE_ROOT", str(tmp_path))
-    r = R.ArbsRunner(SERIES["ARBS3"], live_trading=False)
-    assert r.cfg.watch.record_only is None and r.record_only() == ["X"]
+    r = R.ArbsRunner(dataclasses.replace(SERIES["ARBS3"], config_path=str(own)), live_trading=False)
+    assert r.record_only() == ["X"] and r.cfg.trading.quote_size == 3000 and r.cfg.scan.shards == [3]
     doc["watch"]["record_only"] = ["X", "Y"]
+    doc["trading"]["quote_size"] = 4000
     main.write_text(json.dumps(doc))
-    os.utime(main, (r.shared._mtime + 1, r.shared._mtime + 1))
-    r.shared.poll()
-    assert r.record_only() == ["X", "Y"]
-    r.cfg.watch = dataclasses.replace(r.cfg.watch, record_only=["Z"])
-    assert r.record_only() == ["Z"]                       # a list of its own still wins
+    os.utime(main, (r.store._mtime + 1, r.store._mtime + 1))
+    r.store.poll()
+    assert r.record_only() == ["X", "Y"] and r.cfg.trading.quote_size == 4000
 
 
 def test_model_pick_is_quick_to_cut_risk_and_slow_to_add_it(arbs, monkeypatch):

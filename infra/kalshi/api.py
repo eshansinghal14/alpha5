@@ -69,15 +69,21 @@ HOURLY_SERIES_TICKERS = [
 _load_private_key = auth.load_private_key
 _auth_headers = auth.rest_headers
 
+# Kalshi's 5xx come in short bursts: one 500 on ARBS3's startup market load
+# (11-15 17:50 UTC) exited the shard, and nothing restarts a strategy unit.
+RETRY_5XX = (500, 502, 503, 504)
+
 
 def kalshi_get(path: str, params: dict = None, auth: bool = False, max_retries: int = 8) -> dict:
     """GET with built-in 429 backoff -- Kalshi's rate-limit cooldown can
     outlast a few seconds of naive exponential backoff (confirmed directly:
     a caller doing 5 attempts capped at ~15s cumulative wait still hit 429
     on every attempt), so this honors Retry-After when Kalshi sends it and
-    otherwise backs off up to 60s."""
-    headers = _auth_headers("GET", path) if auth else {"accept": "application/json"}
+    otherwise backs off up to 60s. A 5xx is retried too, backing off up to
+    30s (~90s in all), before it raises."""
     for attempt in range(max_retries):
+        # Signed per attempt: a retry can come a minute after the first try.
+        headers = _auth_headers("GET", path) if auth else {"accept": "application/json"}
         resp = requests.get(BASE_URL + path, headers=headers, params=params, timeout=10)
         if resp.status_code == 429 and attempt < max_retries - 1:
             retry_after = resp.headers.get("Retry-After")
@@ -86,6 +92,9 @@ def kalshi_get(path: str, params: dict = None, auth: bool = False, max_retries: 
             else:
                 delay = min(2 ** attempt, 60)
             time.sleep(delay)
+            continue
+        if resp.status_code in RETRY_5XX and attempt < max_retries - 1:
+            time.sleep(min(2 ** attempt, 30))
             continue
         resp.raise_for_status()
         return resp.json()

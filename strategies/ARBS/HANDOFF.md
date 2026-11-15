@@ -412,7 +412,7 @@ them where they differ.
 - Bulk research on the box: `sudo systemd-run --uid=ubuntu --gid=ubuntu
   -p MemoryMax=2G -p Nice=19 …`, scripts in `~/scratch` (`/tmp/re.py`
   shadows the stdlib). Strategies have priority for CPU and memory.
-- Tests: `python -m pytest -q strategies/ARBS` (233) and
+- Tests: `python -m pytest -q strategies/ARBS` (235) and
   `infra/tests`. `test_slow_drift_keeps_resting` is flaky on Windows.
 - **Disk** (11-15, after it hit 99%: the race's decision log grew to
   2–3.6 GB/day from 11-09 and ARBS files were never archived). Recording
@@ -426,13 +426,35 @@ them where they differ.
   (~1%, what the dashboard P&L reads) with an `.archived` marker.
 - **fill_context rows carry 10 s after the fill** (11-15): `after` holds each
   basket market's top-of-book samples for `depth.AFTER_S` past the row, in
-  `context`'s columns, and a row is written once that has passed. Why: a
+  `context`'s columns, and a row is written once that has passed. Every fill
+  of ours gets one: quote fills always, and a take, exit or late quote fill
+  when no fill row of its basket is still collecting (`fill_kind` says which).
+  The 10 s before comes from the rolling in-memory history every market
+  keeps, dropped unless a fill comes. Why: a
   study of the 1,236 fast-move exits of 11-05..15 found no sign at exit time
   that tells a sweep that refills (CS2 EXZ–PHA 11-15 03:50, −$97) from a
   real move. Waiting 1–15 min didn't pay either (within noise after the
   ~2.3c/lot depth the exits pay). Only a wait of a few seconds is untested;
   read these rows after about a week. Work files are in
   `data/research_tmp/fast_move/`.
+- **Shard 3 sizes are config.json's** (11-15, the user: "update shard 3
+  sizing to just use shard 0"). `config_shard3.json` names `"$base":
+  "config.json"`, and a null in it is that file's value, re-read when either
+  file changes (`infra/config.py`). Null on the box: `watch.record_only` and
+  trading `quote_size`, `live_quote_size`, `live_take_size`, `near_min_size`,
+  `max_bundles_per_basket`, `max_dollars`, `max_dollars_auto`, `cash_reserve`
+  (dollar caps still apply to each shard's own cash). So edit sizes in
+  config.json only; editing one on the ARBS3 form writes a value of its own
+  there and ends the link for that key. Before: shard 3 had quote_size 1000,
+  near quotes off and max_bundles 5000, against 3000 / 1000 / 10000. Since
+  11-13 shard 3 is 78% basketball and 21% tennis by lots. Its 1,000-lot cap
+  bound once in 2.7 days, so in practice the change is mostly its near quotes
+  switching on. Shard 0's +$878 on nine 1,000+ lot arbs came from soccer,
+  economics and elections, which shard 3 doesn't trade.
+- Kalshi GETs (`kalshi_get`) retry 5xx with backoff up to ~90 s (11-15:
+  a 500 on ARBS3's startup market load exited the shard, and `strategies.run`
+  restarts services, not strategy units). After any restart, check every
+  shard's `summary.json` is fresh with `live_trading` true.
 - A new config key: add it to the three box configs before restarting
   `alpha5-arbs` (loading rejects a missing key), and restart
   `alpha5-dashboard` too: it keeps the old config class and its form then

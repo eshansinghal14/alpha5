@@ -46,7 +46,7 @@ from infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
 from infra.runtime.persist import LIVE_ROOT, day_dir
 from strategies.ARBS import exit_cost
 from strategies.ARBS import live_params as lparams, pricing, replay, scanner
-from strategies.ARBS.config import CONFIG_PATH, SPEC_PATH
+from strategies.ARBS.config import SPEC_PATH
 from strategies.ARBS.execution import Gateway
 from strategies.ARBS import venues
 from strategies.ARBS.venues import PM_SHARD, Feeds, is_pm
@@ -356,9 +356,6 @@ class ArbsRunner:
         self.S = series.ticker
         self.store = ConfigStore(series.config_cls, series.config_path, series.config_key)
         self.cfg = self.store.config
-        # Where a null watch.record_only (ARBS3) takes config.json's list from.
-        self.shared = (ConfigStore(series.config_cls, CONFIG_PATH)
-                       if os.path.abspath(series.config_path) != os.path.abspath(CONFIG_PATH) else None)
         self.root = os.path.join(LIVE_ROOT, self.S)
         os.makedirs(self.root, exist_ok=True)
         self.meta: dict[str, Meta] = {}
@@ -890,10 +887,7 @@ class ArbsRunner:
         return b.settles is not None and b.settles > self.horizon()
 
     def record_only(self) -> list[str]:
-        ro = self.cfg.watch.record_only
-        if ro is None and self.shared is not None:
-            ro = self.shared.config.watch.record_only
-        return ro or []
+        return self.cfg.watch.record_only or []
 
     def horizon(self) -> pd.Timestamp:
         """Latest settlement traded, refreshed once a second: evaluate asks
@@ -1175,16 +1169,18 @@ class ArbsRunner:
         if len(self.regime) > 5000:
             self.regime = {k: v for k, v in self.regime.items() if v > now}
 
-    def _log_context(self, kind: str, q: Quote, **kw):
-        b = self.baskets.get(q.basket_id)
-        tickers = b.tickers if b else [q.ticker]
+    def _log_context(self, kind: str, basket_id: str, ticker: str, side: str, price: float, **kw):
+        b = self.baskets.get(basket_id)
+        tickers = b.tickers if b else [ticker]
         now = time.time()
-        ev = self.meta[q.ticker].event if q.ticker in self.meta else None
-        self.top_hist.add({"t": now, "kind": kind, "basket_id": q.basket_id, "ticker": q.ticker, "side": q.side,
-                           "price": q.price, "edge": round(q.edge, 4), "deep": q.deep,
-                           "live": bool(b and self.live_now(b, _utc())),
+        ev = self.meta[ticker].event if ticker in self.meta else None
+        self.top_hist.add({"t": now, "kind": kind, "basket_id": basket_id, "ticker": ticker, "side": side,
+                           "price": price, "live": bool(b and self.live_now(b, _utc())),
                            "shadow_edge": self.lp_view["events"].get(ev, "none"),
                            "context": self.top_hist.context(tickers, now), **kw}, tickers)
+
+    def _log_quote_context(self, kind: str, q: Quote, **kw):
+        self._log_context(kind, q.basket_id, q.ticker, q.side, q.price, edge=round(q.edge, 4), deep=q.deep, **kw)
 
     def _best_ask(self, ticker: str, side: str) -> float | None:
         bk = self.feed.ladder(ticker)
@@ -1376,7 +1372,7 @@ class ArbsRunner:
                 # The no-fill base rate: one resting quote's basket per flush.
                 resting = [q for q in self.quotes.values() if not q.pending and q.remaining > 0]
                 if resting and self.cfg.runtime.record_prints:
-                    self._log_context("control", random.choice(resting))
+                    self._log_quote_context("control", random.choice(resting))
                 day = f"{_utc():%Y-%m-%d}"
                 await loop.run_in_executor(self.pool, self.prints.write, rows, day)
                 await loop.run_in_executor(self.pool, self.top_hist.write, self.top_hist.take(time.time()), day)
@@ -1387,6 +1383,13 @@ class ArbsRunner:
 
     def _book(self, basket_id: str, ticker: str, side: str, size: float, cost: float, kind: str, **kw):
         b = self.baskets[basket_id]
+        if self.cfg.runtime.record_prints and not self.top_hist.collecting(basket_id):
+            # A fill no quote fill's window covers: a take, a late exit or a late quote fill.
+            try:
+                self._log_context("fill", basket_id, ticker, side, round(cost / size, 4) if size else 0.0,
+                                  fill_kind=kind, size=size)
+            except Exception:
+                self.n["print_errors"] = self.n.get("print_errors", 0) + 1
         if any(l.ticker == ticker and l.side != side for l in b.legs):
             self._book_unwind(b, ticker, side, size, cost, kind, **kw)
             return
@@ -1528,7 +1531,8 @@ class ArbsRunner:
         q.filled += size
         if self.cfg.runtime.record_prints:
             try:
-                self._log_context("fill", q, size=size, source=source, exch_t=exch_t)
+                self._log_quote_context("fill", q, fill_kind="deep" if q.deep else "quote", size=size,
+                                        source=source, exch_t=exch_t)
             except Exception:
                 self.n["print_errors"] = self.n.get("print_errors", 0) + 1
         if q.group:
@@ -3491,11 +3495,6 @@ class ArbsRunner:
                 self.dirty |= set(self.baskets)
             for c in self.store.apply_pending():
                 _log(f"config: {c}")
-            if self.shared is not None:
-                for c in self.shared.poll():
-                    if c.startswith("watch.record_only") and self.cfg.watch.record_only is None:
-                        _log(f"config.json: {c}")
-                        self.dirty |= set(self.baskets)
             if (reason := stopper.poll()) is not None:
                 _log(f"STOP: {reason}")
                 stop.set()

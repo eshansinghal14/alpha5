@@ -262,10 +262,43 @@ def _section_raw(doc: dict, key: str | None, path: str) -> dict:
     return doc[key]
 
 
+# A file may name a sibling file under BASE_KEY; a null in it is then that
+# file's value, so two processes share a setting without hand syncing
+# (ARBS3's sizes and watch list are config.json's).
+BASE_KEY = "$base"
+
+
+def base_of(path: str) -> str | None:
+    base = read_json(path).get(BASE_KEY)
+    return None if base is None else os.path.join(os.path.dirname(path), base)
+
+
+def _inherit(doc: dict, path: str) -> dict:
+    """`doc` with its nulls filled from its $base file, minus the $base key."""
+    base = doc.get(BASE_KEY)
+    if base is None:
+        return doc
+    return _fill(read_json(os.path.join(os.path.dirname(path), base)),
+                 {k: v for k, v in doc.items() if k != BASE_KEY})
+
+
+def _fill(base, own: dict) -> dict:
+    out = {}
+    for k, v in own.items():
+        b = base.get(k) if isinstance(base, dict) else None
+        if v is None:
+            out[k] = b
+        elif isinstance(v, dict) and isinstance(b, dict):
+            out[k] = _fill(b, v)
+        else:
+            out[k] = v
+    return out
+
+
 def load(cls, path: str, key: str | None = None):
     """Strictly load `cls` from `path` (optionally the top-level `key`
     section, for files that hold several series)."""
-    return build(cls, _section_raw(read_json(path), key, path), key or "")
+    return build(cls, _section_raw(_inherit(read_json(path), path), key, path), key or "")
 
 
 def update_file(cls, path: str, key: str | None, changes: dict[str, object]):
@@ -282,7 +315,7 @@ def update_file(cls, path: str, key: str | None, changes: dict[str, object]):
         if parts[-1] not in node:
             raise ConfigError(f"unknown field {dotted}")
         node[parts[-1]] = value
-    cfg = build(cls, raw, key or "")
+    cfg = build(cls, _section_raw(_inherit(doc, path), key, path), key or "")
     atomic_write_json(path, doc)
     return cfg
 
@@ -303,17 +336,23 @@ class ConfigStore:
         self.path = path
         self.key = key
         self.config = load(cls, path, key)
-        self._mtime = os.path.getmtime(path)
+        self.base = base_of(path)
+        self._mtime = self._stamp()
         self.pending: dict[str, object] = {}
         self.last_error: str | None = None
         self.last_applied: dict[str, tuple] = {}
 
+    def _stamp(self) -> float:
+        """Newest mtime of the file and its $base: an edit to either reloads."""
+        return max(os.path.getmtime(self.path), os.path.getmtime(self.base) if self.base else 0.0)
+
     def poll(self) -> list[str]:
-        """Re-read the file if it changed. Live fields are applied now,
-        next_event fields are queued. An invalid file is rejected whole and
-        the running config is left untouched. Returns change descriptions."""
+        """Re-read the file if it or its $base changed. Live fields are
+        applied now, next_event fields are queued. An invalid file is rejected
+        whole and the running config is left untouched. Returns change
+        descriptions."""
         try:
-            mtime = os.path.getmtime(self.path)
+            mtime = self._stamp()
         except OSError as e:
             self.last_error = f"cannot stat config: {e}"
             return []
@@ -321,6 +360,7 @@ class ConfigStore:
             return []
         try:
             new = load(self.cls, self.path, self.key)
+            self.base = base_of(self.path)
         except (ConfigError, json.JSONDecodeError, OSError) as e:
             # A half-written file looks like a JSONDecodeError; don't advance
             # mtime so the next poll retries it.

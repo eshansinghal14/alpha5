@@ -1,4 +1,5 @@
 {
+  "$base": "config.json",
   "trading": {
     "enable_takes": true,
     "enable_quoting": true,
@@ -7,28 +8,28 @@
     "min_exit_edge": 0.01,
     "exit_ref_days": 30.0,
     "days_till_expiry": 90.0,
-    "quote_size": 5,
+    "quote_size": null,
     "quote_live_events": false,
     "take_live_events": false,
     "live_edge_add": 0.01,
     "late_quote_cutoff_min": {
       "S:Soccer": 75.0
     },
-    "live_quote_size": 5,
+    "live_quote_size": null,
     "model_series": [],
-    "live_take_size": 1,
+    "live_take_size": null,
     "live_order_groups": false,
-    "near_min_size": 0,
+    "near_min_size": null,
     "deep_min_gap_ticks": 5,
     "depth_age_s": 5.0,
     "second_level_size": false,
     "pull_drop": 0.5,
     "pull_window_s": 2.0,
     "pull_hold_s": 2.0,
-    "max_bundles_per_basket": 50,
-    "max_dollars": 500.0,
-    "max_dollars_auto": true,
-    "cash_reserve": 1000.0,
+    "max_bundles_per_basket": null,
+    "max_dollars": null,
+    "max_dollars_auto": null,
+    "cash_reserve": null,
     "requote_min_ticks": 1,
     "requote_hold_up": 0.01,
     "requote_cooldown_s": 2.0,
@@ -58,7 +59,12 @@
     "complete_set_exclude": [],
     "hand_spec": false,
     "live_before_settle_h": 6.0,
-    "live_early_h": {"KXITFMATCH": 2.0, "KXITFWMATCH": 2.0, "KXATPCHALLENGERMATCH": 2.0, "KXWTACHALLENGERMATCH": 2.0},
+    "live_early_h": {
+      "KXITFMATCH": 2.0,
+      "KXITFWMATCH": 2.0,
+      "KXATPCHALLENGERMATCH": 2.0,
+      "KXWTACHALLENGERMATCH": 2.0
+    },
     "live_windows": {}
   },
   "runtime": {
