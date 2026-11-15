@@ -17,13 +17,14 @@ Change details with measurements are in `docs/CHANGES.md` (2026-10-19/20 entries
 
 ## Box and access
 
-- Live box moved 2026-10-19 to **us-east-2**, `i-0474a645b0354d5c1`, c7g.xlarge
-  (4 vCPU, 7.7 GB), `ubuntu@3.131.100.179`, key `~/.ssh/alpha5-live-key.pem`.
+- Live box moved 2026-10-19 to **us-east-2**, `i-0474a645b0354d5c1`, c7g.2xlarge
+  (8 vCPU, 15 GB since 2026-11-15 22:31 UTC; no Elastic IP, so the address changes on
+  every stop/start), `ubuntu@13.185.15.92`, key `~/.ssh/alpha5-live-key.pem`.
   Old us-east-1 box terminated. AWS CLI default region is us-east-2.
 - SG `sg-0216e64cd58ee302c` allows SSH from `73.13.41.0/24` and `165.123.0.0/16`.
   Your IP changes; add a /32 with `aws ec2 authorize-security-group-ingress
   --group-id sg-0216e64cd58ee302c --protocol tcp --port 22 --cidr <ip>/32`.
-- Dashboard: `ssh -i $env:USERPROFILE\.ssh\alpha5-live-key.pem -N -L 8502:127.0.0.1:8502 ubuntu@3.131.100.179`.
+- Dashboard: `ssh -i $env:USERPROFILE\.ssh\alpha5-live-key.pem -N -L 8502:127.0.0.1:8502 ubuntu@13.185.15.92`.
 - Box code: `ec2-live` at `bf09f77`. Deploy = push, then on the box
   `git fetch && git merge --ff-only origin/ec2-live` **after confirming
   origin has the new sha** (twice a pull ran before GitHub had the push and

@@ -34,7 +34,7 @@ EC2_KEY = os.path.join(os.path.expanduser("~"), ".ssh", "alpha5-live-key.pem")
 # an us-east-2 ELB): order RTT p50 19ms -> 8ms vs us-east-1.
 EC2_REGION, EC2_SG, EC2_NAME = "us-east-2", "sg-0216e64cd58ee302c", "alpha5-live"
 # Fallback only: the box has no Elastic IP, so its address changes on every stop/start.
-EC2_IP_FALLBACK = "3.131.100.179"
+EC2_IP_FALLBACK = "13.185.15.92"
 
 
 def ec2_host() -> str:

@@ -425,7 +425,7 @@ them where they differ.
 
 ## Ops (current practice; supersedes the 11-04 deploy recipe below)
 
-- Box `ubuntu@3.131.100.179`, key `~/.ssh/alpha5-live-key.pem`, `/opt/alpha5`,
+- Box `ubuntu@13.185.15.92`, key `~/.ssh/alpha5-live-key.pem`, `/opt/alpha5`,
   `.venv/bin/python`. Log `data/live/arbs.out.log` (both processes print
   `[ARBS]`).
 - **Deploy code by file path**, never `git pull`/checkout of strategy configs.
@@ -640,7 +640,7 @@ the election-night section below supersedes it where they differ.
 
 ## Box, deploy, monitoring
 
-- Box `ubuntu@3.131.100.179`, key `~/.ssh/alpha5-live-key.pem`, repo `/opt/alpha5`.
+- Box `ubuntu@13.185.15.92`, key `~/.ssh/alpha5-live-key.pem`, repo `/opt/alpha5`.
   Units: `alpha5-arbs` (stdout → `data/live/arbs.out.log`), `alpha5-dashboard`.
 - **Config-safe deploy** (the box's `strategies/ARBS/config.json` holds
   dashboard edits — never let ARBS see repo defaults):
