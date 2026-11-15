@@ -184,3 +184,25 @@ def test_feeds_route_by_venue():
     assert f.ladder("pm-a") is f.pm._books["pm-a"] and f.ladder("K-A") is f.kalshi._books["K-A"]
     f.add(["pm-b", "K-B"])
     assert "pm-b" in f.pm._books and "K-B" in f.kalshi._books
+
+
+def test_selection_ranks_by_recorded_volume(tmp_path):
+    now = pd.Timestamp("2026-11-15T18:00Z")
+    d = tmp_path / "trades" / "2026-11-15"
+    d.mkdir(parents=True)
+    ms = now.value // 10**6
+    pd.DataFrame({"recv_ns": [now.value - 10**9] * 3 + [now.value - 25 * 3600 * 10**9],
+                  "slug": ["busy-a", "busy-b", "quiet-a", "quiet-a"], "qty": [50.0, 50.0, 1.0, 999.0]}
+                 ).to_parquet(d / f"{ms}.parquet")
+    pd.DataFrame({"recv_ns": [1], "slug": ["quiet-a"], "qty": [999.0]}).to_parquet(d / f"{ms - 26 * 3600 * 1000}.parquet")
+    vol = pm_scan.volume_24h(now, root=str(tmp_path))
+    assert vol == {"busy-a": 50.0, "busy-b": 50.0, "quiet-a": 1.0}
+
+    def rel(rid, a, b):
+        return {"relationship_id": rid, "expected_settlement_utc": "2026-11-16T14:00Z", "cluster": "pm:soccer",
+                "baskets": [{"basket_id": f"{rid}:x", "legs": [{"ticker": a, "side": "yes"}, {"ticker": b, "side": "yes"}]}]}
+    doc = {"relationships": [rel("quiet", "quiet-a", "quiet-b"), rel("busy", "busy-a", "busy-b")]}
+    pm_scan.add_volume(doc, vol)
+    from strategies.ARBS.scanner import select
+    sel = select(doc, now=now, days=3, max_markets=2)
+    assert [r["relationship_id"] for r in sel["relationships"]] == ["busy"]

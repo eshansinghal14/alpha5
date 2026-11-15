@@ -24,7 +24,8 @@ import unicodedata
 import pandas as pd
 
 from infra.config import atomic_write_json
-from infra.polymarket.recorder import list_open
+from infra.polymarket.recorder import ROOT as REC_ROOT, list_open
+from strategies.ARBS.venues import is_pm
 
 GAME_SETTLE = pd.Timedelta(hours=3)
 # Kalshi series -> Polymarket weather slug city. Same station on both: KNYC is
@@ -290,50 +291,56 @@ def scan(pm: dict[str, dict], kalshi_events: list[dict], *, now: pd.Timestamp, c
             rels.append(r)
             n_cross += 1
     for r in rels:
-        r.update(quote_until_utc=None, resume_quoting_utc=None, volume_24h=None)
+        r.update(quote_until_utc=None, resume_quoting_utc=None, volume_24h=0.0)
     tickers = {l["ticker"] for r in rels for b in r["baskets"] for l in b["legs"]}
     return {"generated_at_utc": now.isoformat(), "source": "strategies.ARBS.pm_scan",
             "n_events": len({r["relationship_id"].split(":", 1)[1] for r in rels}), "n_markets": len(tickers),
             "n_cross": n_cross, "relationships": rels}
 
 
-def select(doc: dict, *, now: pd.Timestamp, days: float, max_markets: int, held: set[str],
-           exclude: set[str]) -> dict:
-    """Soonest first (no volume to rank by), within `days`, until max_markets;
-    relationships holding a basket in `held` always."""
-    horizon = now + pd.Timedelta(days=days)
-    out, used = [], set()
+def volume_24h(now: pd.Timestamp, root: str = REC_ROOT) -> dict[str, float]:
+    """slug -> contracts traded in the last 24 h, from the recorder's trade
+    files (Polymarket's listing has no volume). Each file is named by the ms
+    it was written, so older files are skipped unread."""
+    cut = now - pd.Timedelta(hours=24)
+    files = []
+    for day in {cut.strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d")}:
+        d = os.path.join(root, "trades", day)
+        if os.path.isdir(d):
+            files += [os.path.join(d, f) for f in os.listdir(d)
+                      if f.endswith(".parquet") and int(f.split(".")[0]) >= cut.value // 10**6]
+    if not files:
+        return {}
+    df = pd.concat([pd.read_parquet(f, columns=["recv_ns", "slug", "qty"]) for f in files])
+    df = df[df.recv_ns >= cut.value]
+    return df.groupby("slug").qty.sum().to_dict()
 
-    def soon(r):
-        s = r.get("expected_settlement_utc")
-        return pd.Timestamp(s) if s else pd.Timestamp.max.tz_localize("UTC")
 
-    for r in sorted(doc["relationships"], key=soon):
-        ts = {l["ticker"] for b in r["baskets"] for l in b["legs"]}
-        if any(b["basket_id"] in held for b in r["baskets"]):
-            out.append(r)
-            used |= ts
-            continue
-        if soon(r) > horizon or soon(r) < now - pd.Timedelta(hours=6) or r.get("cluster") in exclude \
-                or r["relationship_id"].split(":", 1)[-1] in exclude or r.get("type") in exclude:
-            continue
-        if len(used | ts) <= max_markets:
-            out.append(r)
-            used |= ts
-    return {**doc, "relationships": out}
+def add_volume(doc: dict, vol: dict[str, float]):
+    """Each relationship's volume_24h for scanner.select: its Polymarket legs'
+    contracts traded. A cross basket counts only its Polymarket leg, the
+    side this process quotes."""
+    for r in doc["relationships"]:
+        ts = {l["ticker"] for b in r["baskets"] for l in b["legs"] if is_pm(l["ticker"])}
+        r["volume_24h"] = round(sum(vol.get(t, 0.0) for t in ts), 2)
 
 
 def scan_and_select(root: str, cfg, held: set[str]) -> dict:
-    from strategies.ARBS.scanner import SELECTED, fetch_events
+    from strategies.ARBS.scanner import SELECTED, fetch_events, select
     now = pd.Timestamp.now(tz="UTC")
     pm = list_open()
     doc = scan(pm, fetch_events(), now=now)
+    add_volume(doc, volume_24h(now))
     path = os.path.join(root, "scanned_spec.json")
     try:
         with open(path, encoding="utf-8") as fh:
             prev = json.load(fh)["relationships"]
     except (OSError, ValueError, KeyError):
         prev = []
+    # Polymarket leaves a game open for up to two weeks after it ends; Kalshi
+    # closes it, so the shared select has no such filter.
+    stale = now - pd.Timedelta(hours=6)
+    doc["relationships"] = [r for r in doc["relationships"] if pd.Timestamp(r["expected_settlement_utc"]) >= stale]
     have = {r["relationship_id"] for r in doc["relationships"]}
     doc["relationships"] += [r for r in prev if r["relationship_id"] not in have
                              and any(b["basket_id"] in held for b in r["baskets"])]
