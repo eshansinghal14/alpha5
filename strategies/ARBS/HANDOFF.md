@@ -21,33 +21,44 @@ them where they differ.
   $3k + $6k). Quote room = shard cash − `cash_reserve` $1k.
 - Both armed (`--resume-arm`). No halts.
 
-## Polymarket US: third process ARBSPM (b965106, deployed 11-13 00:20 UTC, shadow)
+## Polymarket US: third process ARBSPM (live since 11-15 19:04 UTC, 6a0b867)
 
 - **What it trades** (`pm_scan.py`, `config_pm.json`, `data/live/ARBSPM`):
-  Polymarket three-way soccer (complete set both ways, NO pairs), weather
-  buckets for the six stations both exchanges list (NYC hi/lo, Chicago MDW hi/lo,
-  MIA, LAX, SFO, PHL highs), and `cross_venue` baskets: one outcome on both
-  exchanges (PM YES + Kalshi NO and the reverse, payout 1). Soccer games pair by
-  both team names + date (~230 games/week); weather by station and bucket edges.
-- **Plumbing**: Polymarket is shard `PM_SHARD` (100); a lowercase ticker is a
-  slug (`venues.is_pm`). `infra/polymarket/orders.py` (client behind
-  KalshiOrderClient's interface; NO = BUY_SHORT at 1 − p; a move is cancel +
-  create), `infra/polymarket/feed.py` (whole books, offers → NO bids; private
-  websocket for our fills and rejected/unfunded orders). Polymarket fills book
-  up to each order's `cumQuantity` (websocket and reconcile can't double-book).
-- **Rules that differ**: ARBSPM rests quotes on Polymarket legs only (a quote
-  of its own on a Kalshi market ARBS trades could meet an ARBS IOC, which
-  self-trade prevention cancels); a cross basket's Kalshi leg is taken. Each
-  process's audit subtracts the other processes' Kalshi ledgers
-  (`ARBS_PROCESSES`). $300 max, 5 lots, 3 days out, no live events, 100 write
-  tokens/s = 10 of the key's 20 requests/s. Fee: taker 0.095·p(1−p), maker 0.
-- **Not yet**: the Polymarket account has no funds (the 11-12 $8,000 deposit
-  shows REJECTED), so arming refuses (zero balance). Unconfirmed in the docs and
-  only checkable live: whether a modify keeps the id (we cancel + create
-  instead), whether an IOC's synchronous executions always come back, how a
-  post-only cross is reported, settlement timing for sports, and any in-play
-  order delay. Arm with a small first session and watch `order_gone` rows,
-  fills and the audit.
+  Polymarket three-way soccer (complete set both ways, NO pairs; includes
+  eBattles virtual soccer), weather buckets for the six stations both
+  exchanges list, and `cross_venue` baskets (one outcome on both exchanges).
+  **Live**: Polymarket-only soccer. **Watch-only** (box config
+  `watch.record_only`): `cross:soccer`, `cross:weather`, `pm:weather`.
+- **Same as Kalshi ARBS, by the user's rule** (ask before any PM-specific
+  divergence): selection is `scanner.select` (24h volume per market, from the
+  recorder's trade files: the listing has none); config matches config.json
+  (live events on, live_edge_add 0.02, min_edge 0.03, quote_edge_add 0,
+  days 120, scan 120 s, live_before_settle_h 6) except fixed edges
+  (model_series empty: the exit model is fitted on Kalshi only), $300 cap,
+  5 lots, max_markets 1000.
+- **Plumbing**: shard `PM_SHARD` (100); lowercase ticker = slug. Orders
+  client `infra/polymarket/orders.py` (NO = BUY_SHORT at 1 − p; a move is
+  cancel + create), feed `infra/polymarket/feed.py` (private websocket: fills
+  and cancel echoes, whose cumQuantity is the order's final fill). Fills book
+  up to each order's `cumQuantity`.
+- **Rate limit (11-15 incident)**: Polymarket limits the retail API to 25/s
+  **per source IP**. `infra/polymarket/limits.py` is one shared bucket for
+  every Polymarket request from the box (orders, reads, gateway, scan,
+  recorder) at 20/s; a 429 empties it; summary `pm_requests`. Before it,
+  reconcile read every retired order each 10 s, a restart drew an IP-wide
+  429, ten failed arms left 594 orders resting and disarmed fills were
+  dropped. Now: arm goes live only after its checks; pulls and sweeps use
+  one cancel-all; real fills book while disarmed; reconcile reads ≤ 5 closed
+  orders per poll. First live minutes peaked at 23 requests in one second:
+  tighten REQUESTS_PER_S if 429s show up.
+- **Held orphans**: `atc-ligaf-dep-bar-2026-11-15-bar` YES 10 and
+  `atc-ligaf-vcf-gcf-2026-11-15-vcf` NO 2.57 from the incident are in
+  `data/live/ARBS/foreign_positions.json`; remove after they settle.
+- **No order groups** on Polymarket (only cancel-all and FIX
+  cancel-on-disconnect), so live-event fills rely on our own cancels.
+  Confirmed live: an IOC's synchronous executions come back in the create
+  response. Still unconfirmed: whether modify keeps the id, how a post-only
+  cross is reported, sports settlement timing, any in-play order delay.
 
 ## What changed 11-05 → 11-12
 
