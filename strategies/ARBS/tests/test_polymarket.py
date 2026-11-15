@@ -386,3 +386,63 @@ def test_urgent_polymarket_cancels_go_now_within_the_overdraw(monkeypatch):
     monkeypatch.setattr(execution, "PM_CANCEL_WAIT_S", 0.2)
     asyncio.run(gw.cancel("pm-a", "o1", "pull"))
     assert len(calls) > 2 and calls[-1] is True
+
+
+def test_polymarket_move_is_one_modify_unless_partly_filled(monkeypatch, tmp_path):
+    from backtest.core import Order
+    from infra.kalshi.orders import SharedWriteBudget
+    from infra.polymarket import limits
+    from infra.polymarket.orders import PolymarketOrderClient
+    monkeypatch.setattr(limits, "_BUDGET", SharedWriteBudget(limits.TOKENS_PER_S, 0, path=str(tmp_path / "b")))
+    c = PolymarketOrderClient()
+    sent = []
+    c._json = lambda method, path, **kw: sent.append((method, path, kw.get("body"))) or {}
+    c.cancel = lambda oid, t: sent.append(("cancel", oid)) or True
+    c.place_resting = lambda o: sent.append(("create", o.price, o.size)) or type("A", (), {"exchange_order_id": "new"})()
+    o = Order(order_id=1, ticker="pm-a", side="no", order_type="limit", price=0.40, size=5.0,
+              decision_time=pd.Timestamp.now(tz="UTC"), intent="quote")
+    assert c.amend("o1", o, 5.0, 0.0, price=0.40) == {"order": {"order_id": "o1"}}
+    ((method, path, body),) = sent
+    assert path == "/v1/order/o1/modify" and body["price"]["value"] == "0.6000" and body["quantity"] == 5.0
+    assert body["participateDontInitiate"] is True
+    sent.clear()
+    assert c.amend("o1", o, 3.0, 2.0, price=0.40) == {"order": {"order_id": "new"}}
+    assert sent == [("cancel", "o1"), ("create", 0.40, 3.0)]
+
+
+def test_replace_execution_reaches_on_replace_in_own_side_terms():
+    from infra.polymarket.feed import PolyFeed
+    got = []
+    f = PolyFeed(["pm-a"], lambda b: None, lambda t, tr: None, label="t", on_fill=lambda f: None,
+                 on_replace=lambda oid, px: got.append((oid, px)))
+    f.handle_private({"orderSubscriptionUpdate": {"execution": {
+        "type": "EXECUTION_TYPE_REPLACE", "order": {"id": "o1", "marketSlug": "pm-a", "state": "ORDER_STATE_REPLACED",
+                                                    "intent": "ORDER_INTENT_BUY_SHORT",
+                                                    "price": {"value": "0.62", "currency": "USD"}}}}})
+    assert got == [("o1", 0.38)]
+
+
+def test_unconfirmed_polymarket_move_goes_back_to_its_old_price(pm_arbs, monkeypatch):
+    from strategies.ARBS import pricing
+    r, b = pm_arbs
+    r.live = True
+    monkeypatch.setattr(R, "PM_MODIFY_ECHO_S", 0.1)
+
+    async def amend(*a):
+        return {"order": {"order_id": "o1"}}, None, True
+    r.gw.amend = amend
+    plan = pricing.QuotePlan(leg=0, price=0.42, max_price=0.45, edge=0.03, others_cost=0.5)
+
+    async def go(echo):
+        q = R.Quote(basket_id=b.basket_id, leg=0, ticker="pm-ev-a", side="no", price=0.40, size=5.0, cid="c",
+                    edge=0.03, max_price=0.45, exchange_id="o1", pending=False)
+        r.quotes[q.key] = q
+        await r.move_quote(q, plan)
+        assert q.price == pytest.approx(0.42)
+        if echo:
+            r._on_replace("o1", 0.42)
+        await asyncio.sleep(0.2)
+        return q
+    assert asyncio.run(go(True)).price == pytest.approx(0.42)      # confirmed
+    q = asyncio.run(go(False))
+    assert q.price == pytest.approx(0.40) and r.n["pm_moves_unconfirmed"] == 1   # silently not made

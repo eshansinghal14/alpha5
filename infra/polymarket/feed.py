@@ -75,11 +75,13 @@ def trade_of(t: dict, now: pd.Timestamp) -> list[Trade]:
 
 
 class PolyFeed:
-    def __init__(self, tickers, on_quote, on_trade, *, label, on_fill=None, on_gone=None, on_error=None):
+    def __init__(self, tickers, on_quote, on_trade, *, label, on_fill=None, on_gone=None, on_error=None,
+                 on_replace=None):
         self._tickers = list(tickers)
         self._books: dict[str, L2Book] = {t: L2Book(t, 4) for t in self._tickers}
         self._on_quote, self._on_trade = on_quote, on_trade
         self._on_fill, self._on_gone, self._on_error = on_fill, on_gone, on_error
+        self._on_replace = on_replace
         self.label = label
         self._new: list[str] = []
         self.up = False
@@ -232,6 +234,12 @@ class PolyFeed:
         if f is not None:
             self.n_fills += 1
             self._on_fill(f)
+            return
+        if ex.get("type") == "EXECUTION_TYPE_REPLACE" and self._on_replace is not None:
+            o = ex.get("order") or {}
+            px = _amt(o.get("price"))
+            if o.get("id") and px is not None:
+                self._on_replace(o["id"], round(px if order_side(o) == "yes" else 1.0 - px, 4))
             return
         if ex.get("type") in GONE and self._on_gone is not None:
             o = ex.get("order") or {}

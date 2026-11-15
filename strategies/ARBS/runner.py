@@ -129,6 +129,7 @@ class Quote:
     group: str | None = None    # Kalshi order group it rests in (live events, live_order_groups)
     booked_to: str | None = None  # basket its last fill was booked into (see book_target)
     short_at: float | None = None  # since when its second-level cover has been under it (COVER_GRACE_S)
+    pm_from: tuple | None = None   # a Polymarket move not yet confirmed: (price before it, its moved_at)
 
     @property
     def remaining(self) -> float:
@@ -244,6 +245,10 @@ PM_LATENCY_REJECTS = ("Order Processing Max Delay Exceeded", "Global Rate Limit 
 # Retired Polymarket orders reconcile may still read: their cancel echo
 # normally marks them final within a second; this bounds the backlog.
 PM_RECONCILE_WINDOW_S = 3600.0
+# A Polymarket move unconfirmed by its REPLACE execution after this long is
+# taken as not made: a modify that would cross is dropped silently, the order
+# left at its old price (probe 11-15). The echo came 11 ms after the answer.
+PM_MODIFY_ECHO_S = 2.0
 # Most other baskets sharing a quote's market side priced per leg per pass:
 # MECNET subsets put one market in dozens of baskets.
 MAX_ALTS = 8
@@ -416,7 +421,8 @@ class ArbsRunner:
         self.write_pool = concurrent.futures.ThreadPoolExecutor(max_workers=16, thread_name_prefix="arbs-write")
         self.gw = Gateway(self.pool, self.write_pool)
         self.feed = Feeds(self.tickers, self._on_quote, self._on_trade, label=self.S, on_fill=self._on_fill,
-                          on_gone=self._on_gone, on_error=lambda m: self.alert("warn", None, m))
+                          on_gone=self._on_gone, on_error=lambda m: self.alert("warn", None, m),
+                          on_replace=self._on_replace)
         # The Polymarket process rests quotes on Polymarket legs only: a resting
         # quote of its own on a Kalshi market ARBS also trades could meet an ARBS
         # IOC, which self-trade prevention cancels.
@@ -1697,6 +1703,22 @@ class ArbsRunner:
         if not self.apply_real_fill(f, "ws") and self.live and f.get("ticker") in self.meta:
             # Fill can beat the create's ack; replayed once the id is known.
             self.orphans.append((time.monotonic(), f))
+
+    def _on_replace(self, oid: str, price: float):
+        """A Polymarket modify took effect: its quote's move is confirmed."""
+        for q in [q for q in self.quotes.values() if q.exchange_id == oid]:
+            if q.pm_from is not None and abs(q.price - price) <= _EPS:
+                q.pm_from = None
+
+    def _pm_unconfirmed(self, q: Quote, moved_at: float):
+        """No REPLACE for a Polymarket move: the order kept its old price."""
+        if q.pm_from is None or q.pm_from[1] != moved_at or self.quotes.get(q.key) is not q:
+            return
+        self.n["pm_moves_unconfirmed"] = self.n.get("pm_moves_unconfirmed", 0) + 1
+        self.journal({"kind": "move_unconfirmed", "basket_id": q.basket_id, "ticker": q.ticker, "to": q.price,
+                      "back_to": q.pm_from[0], **_deep(q)})
+        q.price, q.pm_from = q.pm_from[0], None
+        self.mark(q.basket_id)
 
     def _on_gone(self, oid: str, why: str, reason, cum: float | None = None, avg: float | None = None):
         """A Polymarket order ended: our own cancel's echo, a post-only cross
@@ -3233,6 +3255,9 @@ class ArbsRunner:
                 self.quotes[q.key] = q
                 self._commit_cache = None
                 self._register(q, new_id)
+            elif is_pm(q.ticker) and abs(plan.price - old) > _EPS:
+                q.pm_from = (old, q.moved_at)
+                asyncio.get_running_loop().call_later(PM_MODIFY_ECHO_S, self._pm_unconfirmed, q, q.moved_at)
         q.price, q.edge, q.max_price = plan.price, plan.edge, plan.max_price
         q.size = q.filled + left
         self.n["quote_moves"] += 1

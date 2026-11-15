@@ -34,11 +34,13 @@ class Feeds:
     """MultiFeed for Kalshi markets and PolyFeed for Polymarket ones, routed by
     ticker. Up only while every venue with markets is up."""
 
-    def __init__(self, tickers, on_quote, on_trade, *, label, on_fill=None, on_gone=None, on_error=None):
+    def __init__(self, tickers, on_quote, on_trade, *, label, on_fill=None, on_gone=None, on_error=None,
+                 on_replace=None):
         k = [t for t in tickers if not is_pm(t)]
         p = [t for t in tickers if is_pm(t)]
         self.kalshi = MultiFeed(k, on_quote, on_trade, label=label, on_fill=on_fill, on_error=on_error)
-        self.pm = PolyFeed(p, on_quote, on_trade, label=label, on_fill=on_fill, on_gone=on_gone, on_error=on_error)
+        self.pm = PolyFeed(p, on_quote, on_trade, label=label, on_fill=on_fill, on_gone=on_gone, on_error=on_error,
+                           on_replace=on_replace)
 
     def _of(self, ticker: str):
         return self.pm if is_pm(ticker) else self.kalshi

@@ -78,8 +78,8 @@ class PolymarketOrderClient(KalshiOrderClient):
     Blocking: call off the event loop."""
 
     price_dp = 4
-    # One request each; a move is a cancel and a create (see amend).
-    COST = {"order": 10, "amend": 20, "cancel": 10}
+    # One request each: a move is one modify (see amend).
+    COST = {"order": 10, "amend": 10, "cancel": 10}
 
     def __init__(self, timeout_s: float = ORDER_TIMEOUT_S):
         self._session = requests.Session()
@@ -190,9 +190,23 @@ class PolymarketOrderClient(KalshiOrderClient):
 
     def amend(self, exchange_order_id: str, order: Order, new_size: float, filled: float,
               price: float | None = None) -> dict:
-        """Cancel, then a new post-only order for `new_size` at `price`. The
-        docs don't say whether /modify keeps the order id, so a move gets an
-        id we know. Returns {"order": {"order_id": new id}} like Kalshi's amend."""
+        """One /modify: the exchange cancel-replaces it under the same id
+        (probe 11-15: state REPLACED, still open, one REPLACE execution on
+        the order stream). Returns {"order": {"order_id": id}} like Kalshi's.
+
+        A modify that would cross (post-only) or names an order already gone
+        still answers 200 {} and leaves the order as it was, with no stream
+        message: the caller confirms a move by its REPLACE execution. With a
+        partial fill it cancels and creates instead: whether a modify's
+        quantity counts the filled part isn't documented."""
+        if filled <= 1e-9:
+            px = order.price if price is None else price
+            yes = px if order.side == "yes" else 1.0 - px
+            self._json("POST", f"/v1/order/{exchange_order_id}/modify", pay="paid",
+                       body={"marketSlug": order.ticker, "quantity": round(float(new_size), 2),
+                             "price": {"value": f"{round(yes, self.price_dp):.4f}", "currency": "USD"},
+                             "tif": "TIME_IN_FORCE_GOOD_TILL_CANCEL", "participateDontInitiate": True})
+            return {"order": {"order_id": exchange_order_id}}
         if not self.cancel(exchange_order_id, order.ticker):
             resp = requests.Response()
             resp.status_code = 404
