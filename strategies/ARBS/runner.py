@@ -3591,6 +3591,10 @@ class ArbsRunner:
                     "held_cost": round(sum(h["cost"] for h in holdings), 4),
                     "committed": round(self.committed(), 4), "max_dollars": self.cfg.trading.max_dollars,
                     "cash": round(sum(self.cash_now().values()), 2) if self.cash_base else None,
+                    "cash_by_shard": {str(s): round(v, 2) for s, v in self.cash_now().items()},
+                    # What positions may spend: the balance less the reserve kept back.
+                    "cash_room_by_shard": {str(s): round(v - self.cfg.trading.cash_reserve, 2)
+                                           for s, v in self.cash_now().items()},
                     "positions_value": round(sum(self.pos_value.values()), 2) if self.pos_value else None,
                     "cash_room": None if (cr := self.cash_room(None)) is None else round(cr, 2)},
             "holdings": holdings, "quotes": quotes, "hot": self.hot, "ranking": self.ranking[:60],

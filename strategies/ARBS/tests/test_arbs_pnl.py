@@ -97,20 +97,35 @@ def test_capital_is_the_shards_positions_from_balance_rows(tmp_path, monkeypatch
     assert df.total.iloc[-1] == pytest.approx(df.total.iloc[2])
 
 
-def test_dashboard_merges_both_arbs_processes():
+def test_dashboard_merges_the_arbs_processes():
     from viz import arbs_page as ap
-    a = {"live_trading": True, "pnl": {"settled": 10.0, "locked": 2.0, "cash": 900.0, "cash_room": 800.0,
-                                       "positions_value": 500.0}, "counts": {"quote_fills": 3},
-         "quotes": [{"basket_id": "x"}], "feed": {"up": True}, "n_baskets": 10, "blocked_reason": None}
-    b = {"live_trading": False, "pnl": {"settled": -1.0, "locked": 0.5, "cash": 300.0, "cash_room": 200.0,
-                                        "positions_value": 500.0}, "counts": {"quote_fills": 1},
-         "quotes": [{"basket_id": "y"}], "feed": {"up": False}, "n_baskets": 4, "blocked_reason": "feed_down"}
-    m = ap.merge({"ARBS": a, "ARBS3": b})
-    assert m["pnl"]["settled"] == 9.0 and m["pnl"]["cash"] == 1200.0
+    a = {"live_trading": True, "ledger": "real",
+         "pnl": {"settled": 10.0, "locked": 2.0, "cash": 900.0, "cash_room": 800.0, "positions_value": 500.0,
+                 "cash_by_shard": {"0": 900.0}, "cash_room_by_shard": {"0": 800.0}},
+         "counts": {"quote_fills": 3}, "quotes": [{"basket_id": "x"}, {"basket_id": "x"}], "feed": {"up": True},
+         "n_baskets": 10, "blocked_reason": None}
+    b = {"live_trading": True, "ledger": "real",
+         "pnl": {"settled": -1.0, "locked": 0.5, "cash": 300.0, "cash_room": 200.0, "positions_value": 500.0,
+                 "cash_by_shard": {"3": 300.0}, "cash_room_by_shard": {"3": 200.0}},
+         "counts": {"quote_fills": 1}, "quotes": [{"basket_id": "y"}], "feed": {"up": False}, "n_baskets": 4,
+         "blocked_reason": "feed_down"}
+    # Polymarket in shadow: its PnL is simulated, and it reads shard 0's balance too.
+    c = {"live_trading": False, "ledger": "shadow",
+         "pnl": {"settled": 5.0, "cash_by_shard": {"0": 905.0, "100": 50.0},
+                 "cash_room_by_shard": {"0": 805.0, "100": 40.0}},
+         "quotes": [{"basket_id": "z"}], "feed": {"up": True}, "n_baskets": 3}
+    m = ap.merge({"ARBS": a, "ARBS3": b, "ARBSPM": c})
+    assert m["pnl"]["settled"] == 9.0 and m["pnl"]["cash"] == 1200.0  # the shadow process left out
     assert m["pnl"]["positions_value"] == 500.0                    # the account's, not summed
-    assert m["counts"]["quote_fills"] == 4 and m["n_baskets"] == 14
-    assert [q["shard"] for q in m["quotes"]] == ["shard 0", "shard 3"]
+    assert m["counts"]["quote_fills"] == 4 and m["n_baskets"] == 17
+    assert [q["shard"] for q in m["quotes"]] == ["shard 0", "shard 0", "shard 3", "Polymarket"]
     assert m["blocked_reason"] == "shard 3: feed_down" and not m["feed"]["up"]
+    sh = m["by_shard"]
+    assert list(sh) == ["0", "3", "100"] and sh["0"]["room"] == 800.0 and sh["0"]["real"]   # shard 0 once
+    assert not sh["100"]["real"] and sh["100"]["label"] == "PM"
+    pr = m["by_process"]
+    assert pr["ARBS"]["quoting"] == 1 and pr["ARBS"]["pnl"] == 12.0 and not pr["ARBSPM"]["real"]
+    assert ap._split(list(pr.values()), lambda r: ap._usd0(r["pnl"])) == "$+12 (K0), $0 (K3), $+5 (PM shadow)"
 
 
 def test_dashboard_pnl_history_adds_the_processes():

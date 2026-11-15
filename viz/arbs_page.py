@@ -12,6 +12,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
+from infra.polymarket.orders import PM_SHARD
 from infra.runtime.persist import LIVE_ROOT
 from viz import arbs_pnl
 from viz.arbs_pnl import combine  # noqa: F401  (tests use arbs_page.combine)
@@ -21,6 +22,9 @@ from viz.data import latest_summary, read_summary, summary_age_s
 
 STALE_S = 15.0
 SHARD_OF = {"ARBS": "shard 0", "ARBS3": "shard 3", "ARBSPM": "Polymarket"}
+# Short labels for the headline tiles' breakdowns, by process and by shard.
+SHORT = {"ARBS": "K0", "ARBS3": "K3", "ARBSPM": "PM"}
+SHARD_SHORT = {"0": "K0", "3": "K3", str(PM_SHARD): "PM"}
 
 
 def parts(series: str) -> list[str]:
@@ -34,13 +38,39 @@ def _num_sum(vals):
     return sum(vals) if vals else None
 
 
+def _real(x: dict) -> bool:
+    return x.get("ledger") == "real"
+
+
+def _breakdown(ss: dict[str, dict]) -> dict:
+    """Per process (PnL, baskets quoting and watching) and per shard (cash
+    positions may spend), for the headline tiles. A shard's cash is taken once,
+    from a live process first: ARBSPM also reads shard 0's balance."""
+    procs = {}
+    for n, x in ss.items():
+        p = x.get("pnl") or {}
+        procs[n] = {"label": SHORT.get(n, n), "real": _real(x),
+                    "pnl": (p.get("settled") or 0.0) + (p.get("locked") or 0.0) + (p.get("broken") or 0.0),
+                    "quoting": len({q.get("basket_id") for q in x.get("quotes") or []}),
+                    "watching": x.get("n_baskets") or 0}
+    shards: dict[str, dict] = {}
+    for n, x in sorted(ss.items(), key=lambda kv: not _real(kv[1])):
+        p = x.get("pnl") or {}
+        for sh, room in (p.get("cash_room_by_shard") or {}).items():
+            shards.setdefault(sh, {"label": SHARD_SHORT.get(sh, sh), "real": _real(x), "room": room,
+                                   "cash": (p.get("cash_by_shard") or {}).get(sh)})
+    return {"by_process": procs, "by_shard": shards}
+
+
 def merge(ss: dict[str, dict]) -> dict:
     """Summaries of several processes as one. Positions' value is Kalshi's
-    for the whole account, so it is taken once, not summed."""
+    for the whole account, so it is taken once, not summed. PnL sums only
+    processes on the real ledger (a shadow one's is simulated), unless none
+    is."""
     xs = list(ss.values())
     if len(xs) == 1:
-        return xs[0]
-    pn = [x.get("pnl") or {} for x in xs]
+        return {**xs[0], **_breakdown(ss)}
+    pn = [x.get("pnl") or {} for x in xs if _real(x)] or [x.get("pnl") or {} for x in xs]
     pnl = {k: _num_sum(p.get(k) for p in pn)
            for k in ("settled", "locked", "broken", "upside", "held_cost", "committed", "cash", "cash_room")}
     pnl["positions_value"] = next((p["positions_value"] for p in pn if p.get("positions_value") is not None), None)
@@ -66,10 +96,8 @@ def merge(ss: dict[str, dict]) -> dict:
         "config_status": {"error": cfg_err or None},
         "audit_diff": {k: v for x in xs for k, v in (x.get("audit_diff") or {}).items()} or None,
         "feed": {"up": all(f.get("up") for f in feeds), "by_process": dict(zip(ss, feeds))},
-        "pnl": pnl, "counts": counts,
-        "n_tradeable": _num_sum(x.get("n_tradeable") for x in xs),
+        "pnl": pnl, "counts": counts, **_breakdown(ss),
         "n_baskets": _num_sum(x.get("n_baskets") for x in xs),
-        "n_tickers": _num_sum(x.get("n_tickers") for x in xs),
         "holdings": tagged("holdings"), "quotes": tagged("quotes"),
         "alerts": sorted(tagged("alerts"), key=lambda a: a.get("time") or ""),
         "settled": sorted(tagged("settled"), key=lambda a: a.get("settled_at") or ""),
@@ -159,16 +187,30 @@ def _alerts(series: str, s: dict):
                 st.rerun(scope="fragment")
 
 
+def _usd0(v: float) -> str:
+    r = round(v)
+    return "$0" if r == 0 else f"${r:+,}"
+
+
+def _split(rows, fmt) -> str | None:
+    """'xx (K0), yy (K3), zz (PM shadow)': one entry per process or shard."""
+    return ", ".join(f"{fmt(r)} ({r['label']}{'' if r['real'] else ' shadow'})" for r in rows) or None
+
+
 def _metrics(s: dict):
     p = s.get("pnl") or {}
+    procs = list((s.get("by_process") or {}).values())
+    shards = list((s.get("by_shard") or {}).values())
     c = st.columns(5)
     broken = p.get("broken") or 0.0
     n_broken = sum(1 for h in s.get("holdings") or [] if h.get("unhedged"))
     settled = p.get("settled") or 0.0
     unrealized = (p.get("locked") or 0.0) + broken
-    c[0].metric("Total PnL", _usd(settled + unrealized),
+    c[0].metric("Total PnL", _usd(settled + unrealized), _split(procs, lambda r: _usd0(r['pnl'])),
+                delta_color="off",
                 help="Settled (payouts and unwound contracts, minus everything paid incl. fees) plus expected "
-                     "unrealized.")
+                     "unrealized, over the processes trading real money. A shadow process's figure is "
+                     "simulated and not in the total.")
     upside = p.get("upside") or 0.0
     note = [f"{_usd(upside)} upside"] if upside >= 0.005 else []
     if n_broken:
@@ -178,16 +220,24 @@ def _metrics(s: dict):
                      "what they'd sell for now. Upside (not in the totals): what bundles that can pay more than "
                      "their locked payout (a draw, an unlisted winner, a ladder between rungs) are expected to "
                      "add, at mid prices.")
-    if p.get("cash_room") is not None:
-        c[2].metric("Shard cash", f"${p['cash']:,.2f}", f"${p['cash_room']:,.0f} free to size on", delta_color="off",
-                    help="Kalshi's available balance on the traded shards (net of resting orders); quotes are "
-                         "sized against it less cash_reserve (trading.max_dollars_auto). Positions on the shard "
-                         f"(Kalshi's value): ${p.get('positions_value') or 0:,.0f}.")
+    live_shards = [r for r in shards if r["real"]]
+    if live_shards:
+        balance = sum(r["cash"] or 0.0 for r in live_shards)
+        c[2].metric("Shard cash", f"${sum(r['room'] for r in live_shards):,.2f}",
+                    _split(shards, lambda r: f"${r['room']:,.0f}"), delta_color="off",
+                    help="Cash positions may spend on the shards trading real money: each shard's available "
+                         "balance (Kalshi's doesn't drop for resting orders) less trading.cash_reserve, what "
+                         f"quotes are sized against. Balance ${balance:,.0f}; positions held (Kalshi's value) "
+                         f"${p.get('positions_value') or 0:,.0f}.")
     else:
         c[2].metric("Capital used", f"${p.get('committed', 0):,.2f}", f"of ${p.get('max_dollars', 0):,.0f}",
                     delta_color="off", help="Cost of held baskets (resting quotes aren't counted; each is sized to fit what's left).")
-    c[3].metric("Baskets tradeable", f"{s.get('n_tradeable')}/{s.get('n_baskets')}",
-                f"{s.get('n_tickers')} markets", delta_color="off")
+    live_procs = [r for r in procs if r["real"]] or procs
+    c[3].metric("Baskets quoting / watching",
+                f"{sum(r['quoting'] for r in live_procs):,} / {sum(r['watching'] for r in live_procs):,}",
+                _split(procs, lambda r: f"{r['quoting']:,}/{r['watching']:,}"), delta_color="off",
+                help="Baskets with a resting quote of ours now, of the baskets each process watches (its "
+                     "scan and hand spec). The total counts processes trading real money.")
     n = s.get("counts") or {}
     c[4].metric("Quote fills / takes", f"{n.get('quote_fills', 0)} / {n.get('takes', 0)}",
                 f"{n.get('completions', 0)} completions", delta_color="off")
