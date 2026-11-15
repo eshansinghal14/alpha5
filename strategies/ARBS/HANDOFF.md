@@ -318,6 +318,28 @@ them where they differ.
   (−$98 real, 18 of 19 games) and ITF singles pre-game keep losing; in-play
   series that lost on half their events made +$27..+$77 on the other half, so
   nothing else was added.
+  **Pre-game and in-play are separate on the list since 11-15 19:11 UTC**
+  (`cb149f2`, the user: "treat pre game and in game as separate markets").
+  `NAME:pre` or `NAME:live` covers one phase. The phase is set by the event's
+  scheduled start (`Basket.is_live`), not by a fast move's live flag. A name
+  alone still covers both. Set then on the box config.json:
+  - `KXNCAAWBGAME:pre`;
+  - `KXITFMATCH:pre` and `KXITFWMATCH:pre`, which were whole names before.
+
+  ITF singles still aren't quoted in play: `late_quote_cutoff_min` S:Tennis 0
+  stops all live tennis quoting. Only in-play takes reopen.
+  Why: shard 3's real quote fills 11-11..15 by phase were:
+
+  | Series | Pre-game | In-play |
+  |---|---|---|
+  | KXNCAAWBGAME | −$165 (−4.7c/lot, 96 arbs), mostly 3 pick-offs | positive |
+  | ITF pre-game | −$74 | |
+  | NBA | +$27 | |
+  | WTA | +$33 | |
+
+  A replay (`data/research_tmp/shard3_size/`) showed shard 0's sizing (cap
+  3000, near quotes) barely changes shard 3's fills on its thin books: the
+  median depth at the top is 5 lots.
   **ITF singles (KXITFMATCH, KXITFWMATCH) record-only on shard 3 since 11-13
   06:46 UTC** (box config, the user's call; 144 quotes came off on the
   reload, no restart). Pre-game ITF made −$79.35 on 48 arbs 11-11..13, all of
