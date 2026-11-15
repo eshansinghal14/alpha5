@@ -82,14 +82,16 @@ def spend(days: int = 2, root: str | None = None) -> dict[str, float]:
 
 def _costs(events: list[str], spent: dict[str, float]) -> dict[str, float]:
     """Each event's cost: its own measured spend, else its series' mean over
-    measured events, else the median of the series means."""
-    by_series: dict[str, list[float]] = {}
-    for ev, t in spent.items():
-        by_series.setdefault(series_of(ev), []).append(t)
-    means = {s: sum(v) / len(v) for s, v in by_series.items()}
-    vals = sorted(means.values())
-    default = vals[len(vals) // 2] if vals else 1.0
-    return {ev: spent[ev] if ev in spent else means.get(series_of(ev), default) for ev in events}
+    all its listed events, unspent ones counting 0. Over measured events
+    alone, the ~13k shard-0 events never quoted took the quoted ones' mean
+    and swamped the real loads (11-15 seed)."""
+    tot: dict[str, float] = {}
+    n: dict[str, int] = {}
+    for ev in events:
+        s = series_of(ev)
+        tot[s] = tot.get(s, 0.0) + spent.get(ev, 0.0)
+        n[s] = n.get(s, 0) + 1
+    return {ev: spent[ev] if ev in spent else tot[series_of(ev)] / n[series_of(ev)] for ev in events}
 
 
 def update(st: dict, events: list[str], now: float, spent: dict[str, float]) -> list[tuple[str, int, int]]:

@@ -14,9 +14,9 @@ def test_a_new_event_goes_to_the_process_with_less_cost():
     st = fresh()
     st["owners"] = {"SER-1": 0, "SER-2": 1}
     st["rebalanced_at"] = 1000.0                       # not due
-    spent = {"SER-1": 100.0, "SER-2": 10.0}            # series mean 55: SER-3 is priced at it
+    spent = {"SER-1": 100.0, "SER-2": 10.0}            # SER-3 is priced at its series' mean, 110 / 3
     assert parts.update(st, ["SER-1", "SER-2", "SER-3"], 1000.0, spent) == []
-    assert st["owners"]["SER-3"] == 1 and st["load"] == [100.0, 65.0]
+    assert st["owners"]["SER-3"] == 1 and st["load"] == [100.0, 46.7]
 
 
 def test_the_first_update_starts_from_the_hash_split_then_balances():
