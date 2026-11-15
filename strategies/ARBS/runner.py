@@ -47,6 +47,7 @@ from infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
 from infra.runtime.persist import LIVE_ROOT, day_dir
 from strategies.ARBS import exit_cost
 from strategies.ARBS import live_params as lparams, pricing, replay, scanner
+from strategies.ARBS.config import SPEC_PATH
 from strategies.ARBS.execution import Gateway
 from strategies.ARBS import venues
 from strategies.ARBS.venues import PM_SHARD, Feeds, is_pm
@@ -54,7 +55,7 @@ from strategies.ARBS.ledger import Ledger
 from strategies.ARBS.depth import MoveWatch, PullWatch, TopHistory
 from strategies.ARBS.liquidity import Liquidity
 from strategies.ARBS.prints import AFTER_S, Prints, top as prints_top
-from strategies.ARBS.spec import Basket, Leg, basket_from_dict, basket_to_dict, load_spec, parse_spec
+from strategies.ARBS.spec import Basket, Leg, basket_from_dict, basket_to_dict, load_spec, merge, parse_spec
 
 _EPS = 1e-9
 OTHER = {"yes": "no", "no": "yes"}
@@ -397,10 +398,13 @@ class ArbsRunner:
         self._commit_cache: float | None = None
         self.hot: list[str] = []
         self.ranking: list[dict] = []
+        with open(SPEC_PATH, encoding="utf-8") as fh:
+            self.hand_doc = json.load(fh)
+        self.hand = load_spec(SPEC_PATH) if self.cfg.scan.hand_spec else []
+        self.hand_ids = {b.basket_id for b in self.hand}
         self.scan_path = os.path.join(self.root, scanner.SELECTED)
         self.scan_status: dict = {}
-        self.listed: set[str] = set()
-        self.set_baskets(self.scanned())
+        self.set_baskets(merge(self.hand, self.scanned()))
         for led in (self.real_ledger, self.shadow_ledger):
             for bid, pos in led.baskets.items():
                 if pos.spec is None and bid in self.baskets:
@@ -670,16 +674,14 @@ class ArbsRunner:
         try:
             return load_spec(self.scan_path)
         except Exception as e:
-            self.alert("warn", None, f"scanned spec unreadable ({e!r})")
+            self.alert("warn", None, f"scanned spec unreadable ({e!r}); hand spec only")
             return []
 
     def set_baskets(self, baskets: list[Basket]) -> list[str]:
         """Trade `baskets` from now on; returns the tickers new to us. A
         basket dropped from the list is kept while it has a position, quote
-        or task (completion, settlement and cancels look it up by id), only
-        to finish: excluded() stops new quotes and takes on it."""
+        or task: completion, settlement and cancels look it up by id."""
         new = {b.basket_id: b for b in baskets}
-        self.listed = set(new)
         # Quotes are keyed by leg index, and the scan orders a mecnet's legs by
         # price under an id that doesn't change: a reorder moved one leg's quote
         # to another leg's price (NCX/TIJ 0.34<->0.65, 11-06), so keep the old order.
@@ -737,7 +739,7 @@ class ArbsRunner:
 
     async def reload_spec(self):
         loop = asyncio.get_running_loop()
-        new = self.set_baskets(await loop.run_in_executor(self.pool, self.scanned))
+        new = self.set_baskets(merge(self.hand, await loop.run_in_executor(self.pool, self.scanned)))
         if not new:
             return
         await loop.run_in_executor(self.pool, self.load_meta)
