@@ -440,10 +440,11 @@ them where they differ.
 - **Shard 3 sizes are config.json's** (11-15, the user: "update shard 3
   sizing to just use shard 0"). `config_shard3.json` names `"$base":
   "config.json"`, and a null in it is that file's value, re-read when either
-  file changes (`infra/config.py`). Null on the box: `watch.record_only` and
+  file changes (`infra/config.py`). Null on the box: `watch.record_only`,
   trading `quote_size`, `live_quote_size`, `live_take_size`, `near_min_size`,
   `max_bundles_per_basket`, `max_dollars`, `max_dollars_auto`, `cash_reserve`
-  (dollar caps still apply to each shard's own cash). So edit sizes in
+  (dollar caps still apply to each shard's own cash), and runtime
+  `max_write_tokens_per_s` and `_solo`. So edit sizes in
   config.json only; editing one on the ARBS3 form writes a value of its own
   there and ends the link for that key. Before: shard 3 had quote_size 1000,
   near quotes off and max_bundles 5000, against 3000 / 1000 / 10000. Since
@@ -451,6 +452,22 @@ them where they differ.
   bound once in 2.7 days, so in practice the change is mostly its near quotes
   switching on. Shard 0's +$878 on nine 1,000+ lot arbs came from soccer,
   economics and elections, which shard 3 doesn't trade.
+- **Only the write rate limits how many baskets are quoted** (11-15, the
+  user: "only limiting factor should just be rate limit"). Box
+  `runtime.max_write_tokens_per_s_solo` is 300, Kalshi's refill rate per
+  shard. It was 250, while only ARBS writes to shards 0 and 3: the race is on
+  shard 2 and KXINXU, which the 150 `max_write_tokens_per_s` makes room for, has
+  no running service. Lower it again if KXINXU or another shard 0/3 writer
+  comes back. Not null: with no cap, `write_budget()` asks Kalshi's API on
+  every call. Checked the same day:
+  - the hot list's write cost sits at the budget on both shards
+    (256 of 3,535 baskets hot on shard 0, 895 of 1,766 on shard 3);
+  - `max_bundles_per_basket` (10,000, per leg net of held) has room: the
+    largest position is 4,166;
+  - dollar room is the shard's cash;
+  - the 3-broken-basket gate fired twice in 11-12..15, momentarily;
+  - `scan.max_markets` binds on shard 0 only (1,500 most traded of its
+    markets) and sets which baskets are candidates, not how many get quotes.
 - Kalshi GETs (`kalshi_get`) retry 5xx with backoff up to ~90 s (11-15:
   a 500 on ARBS3's startup market load exited the shard, and `strategies.run`
   restarts services, not strategy units). After any restart, check every
@@ -624,7 +641,8 @@ the election-night section below supersedes it where they differ.
   taken/quoted up to held bundles when its gap ≥ `exit_need`: full edge within
   `exit_ref_days`, scaled by ref_days/days beyond, floor `min_exit_edge`.
 - **Write budget**: cap `max_write_tokens_per_s` 150 while KXINXU is in its
-  session, `..._solo` 250 otherwise (reads KXINXU's summary.json).
+  session, `..._solo` otherwise (reads KXINXU's summary.json); `_solo` 300
+  since 11-15, see Ops.
 - **Feed**: one websocket; snapshots refreshed in rolling batches of 50
   (delete+add on the orderbook sid) instead of reconnecting every 15 min.
   Feed down > 5 s pulls every quote (in batches of 20) then sweeps.
