@@ -424,6 +424,15 @@ them where they differ.
   ships ARBS* `prints/ liquidity/ fill_context/` days older than 5 days to
   S3, and the journals too, leaving each on the box as its non-quote rows
   (~1%, what the dashboard P&L reads) with an `.archived` marker.
+- **fill_context rows carry 10 s after the fill** (11-15): `after` holds each
+  basket market's top-of-book samples for `depth.AFTER_S` past the row, in
+  `context`'s columns, and a row is written once that has passed. Why: a
+  study of the 1,236 fast-move exits of 11-05..15 found no sign at exit time
+  that tells a sweep that refills (CS2 EXZ–PHA 11-15 03:50, −$97) from a
+  real move. Waiting 1–15 min didn't pay either (within noise after the
+  ~2.3c/lot depth the exits pay). Only a wait of a few seconds is untested;
+  read these rows after about a week. Work files are in
+  `data/research_tmp/fast_move/`.
 - A new config key: add it to the three box configs before restarting
   `alpha5-arbs` (loading rejects a missing key), and restart
   `alpha5-dashboard` too: it keeps the old config class and its form then

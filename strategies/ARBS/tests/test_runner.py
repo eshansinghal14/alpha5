@@ -1874,7 +1874,7 @@ def test_top_history_lookup_and_pull_ratio(tmp_path):
 def test_fill_logs_top_of_book_history_without_our_own_size(arbs):
     r, b = arbs
     import types
-    from strategies.ARBS.depth import TopHistory
+    from strategies.ARBS.depth import AFTER_S, TopHistory
     r.top_hist = TopHistory(str(r.root))
     t0 = time.time()
     r.top_hist.on_book("X-B", t0 - 30.0, 0.40, 99, 0.6, 99)       # ages out
@@ -1885,10 +1885,16 @@ def test_fill_logs_top_of_book_history_without_our_own_size(arbs):
                 max_price=0.40, pending=False, exchange_id="oid")
     r.quotes[q.key] = q
     r._quote_fill(q, 2, 0.8, None, "ws", exch_t=t0 - 0.004)
-    row = r.top_hist.take()[0]
+    t1 = r.top_hist.pending[0][1]["t"]
+    r.top_hist.on_book("X-B", t1 + 2.0, 0.45, 5, 0.6, 30)          # the ask moves after the fill
+    r.top_hist.on_book("X-B", t1 + 2.005, 0.45, 9, 0.6, 30)        # depth only, within 10 ms: replaces it
+    r.top_hist.on_book("X-B", t1 + AFTER_S + 1, 0.45, 9, 0.5, 30)  # past the window: not collected
+    assert r.top_hist.take(t1 + 5.0) == []                         # held until the window has passed
+    row = r.top_hist.take(t1 + AFTER_S)[0]
     assert row["kind"] == "fill" and row["size"] == 2 and row["ticker"] == "X-A" and row["exch_t"] == t0 - 0.004
     assert [s[2] for s in row["context"]["X-B"]] == [99, 35, 5]     # the book before the window, then changes
     assert row["context"]["X-B"][0][0] >= 30.0
+    assert row["after"] == {"X-B": [[2.005, 0.45, 9, 0.6, 30]]} and not r.top_hist.watch
     bk = types.SimpleNamespace(ticker="X-A", bid=0.4, bid_depth=12, ask=0.45, ask_depth=8)
     r._note_top(bk)
     assert r.top_hist.h["X-A"][-1][2] == 12 - 3                   # our 3 left resting at 0.40 taken out

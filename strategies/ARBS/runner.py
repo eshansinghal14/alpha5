@@ -1175,14 +1175,16 @@ class ArbsRunner:
         if len(self.regime) > 5000:
             self.regime = {k: v for k, v in self.regime.items() if v > now}
 
-    def _context_row(self, kind: str, q: Quote, **kw) -> dict:
+    def _log_context(self, kind: str, q: Quote, **kw):
         b = self.baskets.get(q.basket_id)
+        tickers = b.tickers if b else [q.ticker]
         now = time.time()
         ev = self.meta[q.ticker].event if q.ticker in self.meta else None
-        return {"t": now, "kind": kind, "basket_id": q.basket_id, "ticker": q.ticker, "side": q.side,
-                "price": q.price, "edge": round(q.edge, 4), "deep": q.deep,
-                "live": bool(b and self.live_now(b, _utc())), "shadow_edge": self.lp_view["events"].get(ev, "none"),
-                "context": self.top_hist.context(b.tickers if b else [q.ticker], now), **kw}
+        self.top_hist.add({"t": now, "kind": kind, "basket_id": q.basket_id, "ticker": q.ticker, "side": q.side,
+                           "price": q.price, "edge": round(q.edge, 4), "deep": q.deep,
+                           "live": bool(b and self.live_now(b, _utc())),
+                           "shadow_edge": self.lp_view["events"].get(ev, "none"),
+                           "context": self.top_hist.context(tickers, now), **kw}, tickers)
 
     def _best_ask(self, ticker: str, side: str) -> float | None:
         bk = self.feed.ladder(ticker)
@@ -1374,10 +1376,10 @@ class ArbsRunner:
                 # The no-fill base rate: one resting quote's basket per flush.
                 resting = [q for q in self.quotes.values() if not q.pending and q.remaining > 0]
                 if resting and self.cfg.runtime.record_prints:
-                    self.top_hist.add(self._context_row("control", random.choice(resting)))
+                    self._log_context("control", random.choice(resting))
                 day = f"{_utc():%Y-%m-%d}"
                 await loop.run_in_executor(self.pool, self.prints.write, rows, day)
-                await loop.run_in_executor(self.pool, self.top_hist.write, self.top_hist.take(), day)
+                await loop.run_in_executor(self.pool, self.top_hist.write, self.top_hist.take(time.time()), day)
             except Exception as e:
                 _log(f"WARN: print log failed ({e!r})")
 
@@ -1526,7 +1528,7 @@ class ArbsRunner:
         q.filled += size
         if self.cfg.runtime.record_prints:
             try:
-                self.top_hist.add(self._context_row("fill", q, size=size, source=source, exch_t=exch_t))
+                self._log_context("fill", q, size=size, source=source, exch_t=exch_t)
             except Exception:
                 self.n["print_errors"] = self.n.get("print_errors", 0) + 1
         if q.group:
