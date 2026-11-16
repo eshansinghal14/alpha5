@@ -163,18 +163,23 @@ class Gateway:
             return None, e
 
     async def cancel(self, ticker, exchange_id, reason: str):
-        """Always sent (force): a refused cancel leaves risk on the book."""
+        """Always sent, forced past the bucket if it must (Polymarket: only
+        while the overdraw allows): a refused cancel leaves risk on the book."""
         c = self.client(ticker)
         if c is None:
             return None, RuntimeError(f"no order client for {ticker}"), False
         if c.shard == PM_SHARD:
             # Paced on Polymarket's per-IP bucket: pulling a game's quotes at
             # once sent dozens of cancels in a second and 2,023 drew 429s
-            # (11-15 19:40-19:56). Sent anyway after PM_CANCEL_WAIT_S.
+            # (11-15 19:40-19:56). Never forced past PM_URGENT_OVERDRAW: a
+            # 2,000-quote stop forced each after its wait, drew 15,708 429s and
+            # left the bucket at -64k, blocking quotes and the scan ~30 min
+            # (11-16 05:55). A 429'd cancel cancels nothing anyway.
             routine = reason in PM_ROUTINE_CANCELS
-            end = asyncio.get_running_loop().time() + PM_CANCEL_WAIT_S
+            loop = asyncio.get_running_loop()
+            end = loop.time() + PM_CANCEL_WAIT_S
             while not c.allow_now("cancel", reason=reason):
-                if (not routine and c.tokens_now() > -PM_URGENT_OVERDRAW) or                         asyncio.get_running_loop().time() >= end:
+                if c.tokens_now() > -PM_URGENT_OVERDRAW and (not routine or loop.time() >= end):
                     c.allow_now("cancel", force=True, reason=reason)
                     break
                 await asyncio.sleep(0.05)

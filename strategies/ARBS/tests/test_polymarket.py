@@ -347,6 +347,7 @@ def test_polymarket_cancels_wait_for_the_bucket_then_go(monkeypatch):
 
     calls.clear()
     C.allow_now = lambda self, kind, force=False, reason="": calls.append(force) or force   # never room
+    C.tokens_now = lambda self: -10.0            # within the overdraw
     asyncio.run(gw.cancel("pm-a", "o1", "not_hot"))
     assert calls[-1] is True                     # sent anyway after the wait
 
@@ -381,11 +382,24 @@ def test_urgent_polymarket_cancels_go_now_within_the_overdraw(monkeypatch):
         assert calls == [False, True], reason    # forced on the first refusal
     assert time.monotonic() - t0 < 1.0
 
-    calls.clear()
-    tokens[0] = -60.0                            # past the overdraw: waits like a routine one
-    monkeypatch.setattr(execution, "PM_CANCEL_WAIT_S", 0.2)
-    asyncio.run(gw.cancel("pm-a", "o1", "pull"))
-    assert len(calls) > 2 and calls[-1] is True
+    # Past the overdraw nothing is forced, however long it waits: forcing
+    # each of a stop's 2,000 cancels drew 15,708 429s (11-16).
+    monkeypatch.setattr(execution, "PM_CANCEL_WAIT_S", 0.05)
+    for reason in ("pull", "not_hot"):
+        calls.clear()
+        tokens[0] = -60.0
+
+        async def go():
+            async def refill():
+                await asyncio.sleep(0.3)
+                tokens[0] = -10.0
+            t = asyncio.get_running_loop().create_task(refill())
+            t1 = time.monotonic()
+            await gw.cancel("pm-a", "o1", reason)
+            await t
+            return time.monotonic() - t1
+        assert asyncio.run(go()) >= 0.3, reason
+        assert calls[-1] is True and calls.count(True) == 1
 
 
 def test_polymarket_move_is_one_modify_unless_partly_filled(monkeypatch, tmp_path):
@@ -475,3 +489,31 @@ def test_cross_venue_take_sends_polymarket_first_and_kalshi_only_for_its_fill(pm
     pm_fill[0] = 3.0
     asyncio.run(r._take(b, plan, []))
     assert sent == [("pm-ev-a", 5.0), ("K-A", 3.0)]
+
+
+def test_a_stop_takes_polymarket_quotes_down_with_one_cancel_all(pm_arbs):
+    r, b = pm_arbs
+    calls = []
+
+    async def cancel_all(reason, raise_=False):
+        calls.append(reason)
+        await asyncio.sleep(0.05)
+        return True
+    r.pm_cancel_all = cancel_all
+
+    async def go():
+        assert r._pm_stop_all("2 broken baskets") and r._pm_stop_all("2 broken baskets")   # in flight: skip PM
+        await asyncio.sleep(0.1)
+        assert not r._pm_stop_all("2 broken baskets")      # done: leftovers one by one
+        assert r._pm_stop_all("3 broken baskets")          # a new stop sends another
+        await asyncio.sleep(0.1)
+    asyncio.run(go())
+    assert calls == ["2 broken baskets", "3 broken baskets"]
+
+
+def test_polymarket_closed_market_reject_is_held_like_a_pause(pm_arbs):
+    r, b = pm_arbs
+    exc = Exception('400 Bad Request for https://api.polymarket.us/v1/orders: '
+                    '{"code":9, "message":"This market is closed for trading.", "details":[]}')
+    r._order_err(b.basket_id, "complete IOC pm-ev-a", exc, "pm-ev-a")
+    assert r.order_errors == 0 and r.market_paused("pm-ev-a")

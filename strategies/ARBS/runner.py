@@ -257,6 +257,9 @@ PULL_BATCH = 20
 # Polymarket rejects an order it couldn't process within 5 s with one of these
 # texts (the second is the old wording); resubmitting is fine.
 PM_LATENCY_REJECTS = ("Order Processing Max Delay Exceeded", "Global Rate Limit Exceeded")
+# Polymarket's reject for a market past its close (code 9; eBattles closes
+# before it settles, 11-16): held like Kalshi's pause codes.
+PM_CLOSED_REJECTS = ("This market is closed for trading",)
 # Retired Polymarket orders reconcile may still read: their cancel echo
 # normally marks them final within a second; this bounds the backlog.
 PM_RECONCILE_WINDOW_S = 3600.0
@@ -500,6 +503,7 @@ class ArbsRunner:
         self._balance_retry_at = 0.0
         self._balance_fails = 0
         self.paused_until: dict[str, float] = {}  # ticker -> monotonic time Kalshi's pause is next retried
+        self.pm_stop: tuple | None = None          # (blocked() reason, its Polymarket cancel-all task)
         self.exchange_paused = False              # Kalshi's exchange-wide trading_active is off
         self.priority_trading: list[str] = []     # write_priority_series in session now
         self.last_exit: dict[str, tuple] = {}
@@ -694,7 +698,7 @@ class ArbsRunner:
             # Polymarket's 5 s processing stopgap: a transient reject, not an error (docs, rate limits).
             self.n["pm_latency_rejects"] = self.n.get("pm_latency_rejects", 0) + 1
             return
-        if is_market_paused(exc):
+        if is_market_paused(exc) or any(m in str(exc) for m in PM_CLOSED_REJECTS):
             # Held like the engine does: Kalshi's Thursday maintenance pauses
             # every market, and retrying each pass sent 1563 rejected orders
             # in 8 min (10-29 07:00).
@@ -2239,7 +2243,11 @@ class ArbsRunner:
             self.rank_at[b.basket_id] = now
             self.rank_row(b, vs)
         blocked = self.blocked()
+        if not blocked:
+            self.pm_stop = None
         if vs is None or blocked or self.excluded(b):
+            if blocked and self.live and any(is_pm(q.ticker) for q in live_qs) and self._pm_stop_all(blocked):
+                live_qs = [q for q in live_qs if not is_pm(q.ticker)]
             if live_qs:
                 self.spawn(self.cancel_quotes(live_qs, blocked or ("excluded" if self.excluded(b) else "untradeable")),
                            b.basket_id)
@@ -3366,6 +3374,17 @@ class ArbsRunner:
             await asyncio.sleep(PULL_BATCH * SWEEP_PACING_S)
         if self.live:
             await self.sweep(reason)
+
+    def _pm_stop_all(self, reason: str) -> bool:
+        """A stop takes Polymarket quotes down with one cancel-all, not one
+        cancel each: 2,000 at once drew 15,708 429s (11-16 05:55). True while
+        it is in flight (skip them); after, what's left goes one by one."""
+        if self.pm_stop is None or self.pm_stop[0] != reason:
+            task = asyncio.get_running_loop().create_task(self.pm_cancel_all(reason))
+            self.tasks.add(task)
+            task.add_done_callback(self.tasks.discard)
+            self.pm_stop = (reason, task)
+        return not self.pm_stop[1].done()
 
     async def pm_cancel_all(self, reason: str, raise_: bool = False) -> bool:
         """Every open Polymarket order in one request (ARBSPM is the account's
