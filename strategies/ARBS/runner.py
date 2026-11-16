@@ -2801,6 +2801,13 @@ class ArbsRunner:
         # round trip, so every leg goes at once.
         live = self.live_now(b, _utc())
         first = min(range(len(b.legs)), key=lambda j: self.book_time.get(b.legs[j].ticker, 0.0)) if live else None
+        venues = {is_pm(l.ticker) for l in b.legs}
+        if len(venues) == 2:
+            # Across venues the Polymarket leg goes first, live or not: sent
+            # together, a Polymarket miss left the Kalshi leg to complete on
+            # Polymarket, where half of such IOCs missed by the time they
+            # arrived (Kalshi quote fills 11-13..15 replayed on its book).
+            first = next(j for j, l in enumerate(b.legs) if is_pm(l.ticker))
         self.n["takes"] += 1
         self.journal({"kind": "take", "basket_id": b.basket_id, "size": plan.size, "limits": plan.limits,
                       "edge": round(plan.edge, 4), "first": None if first is None else b.legs[first].ticker})

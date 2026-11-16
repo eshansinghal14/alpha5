@@ -446,3 +446,32 @@ def test_unconfirmed_polymarket_move_goes_back_to_its_old_price(pm_arbs, monkeyp
     assert asyncio.run(go(True)).price == pytest.approx(0.42)      # confirmed
     q = asyncio.run(go(False))
     assert q.price == pytest.approx(0.40) and r.n["pm_moves_unconfirmed"] == 1   # silently not made
+
+
+def test_cross_venue_take_sends_polymarket_first_and_kalshi_only_for_its_fill(pm_arbs):
+    from strategies.ARBS import pricing
+    from strategies.ARBS.runner import RealFill
+    r, b = pm_arbs                                   # legs: pm-ev-a NO, K-A YES; not a live event
+    r.feed._books = {"pm-ev-a": L2Book("pm-ev-a", 4), "K-A": L2Book("K-A", 4)}
+    r.feed.up = True
+    now = pd.Timestamp.now(tz="UTC")
+    for t, yes, no in (("pm-ev-a", [(0.55, 50)], [(0.40, 50)]), ("K-A", [(0.35, 50)], [(0.30, 50)])):
+        r.feed.ladder(t).apply_snapshot("yes", yes, time=now)
+        r.feed.ladder(t).apply_snapshot("no", no, time=now)
+    for t in b.tickers:
+        r.meta[t] = R.Meta(ticker=t, event="e", status="active", shard=100 if is_pm(t) else 0, taker_rate=0.07,
+                           maker_rate=0.0)
+    sent, pm_fill = [], [0.0]
+
+    async def ioc(ticker, side, limit, size, why, view):
+        sent.append((ticker, size))
+        got = pm_fill[0] if is_pm(ticker) else size
+        return (RealFill(size=got, price=limit, fee=0.0, exchange_order_id="x") if got else None), None
+    r._ioc = ioc
+    plan = pricing.TakePlan(size=5.0, limits=[0.45, 0.50], edge=0.05, cost=4.75)
+    asyncio.run(r._take(b, plan, []))
+    assert sent == [("pm-ev-a", 5.0)]                # Polymarket missed: Kalshi never sent
+    sent.clear()
+    pm_fill[0] = 3.0
+    asyncio.run(r._take(b, plan, []))
+    assert sent == [("pm-ev-a", 5.0), ("K-A", 3.0)]
