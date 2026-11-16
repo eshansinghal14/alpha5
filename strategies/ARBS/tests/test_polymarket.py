@@ -551,3 +551,79 @@ def test_futures_scan_quotes_no_on_the_likeliest_like_kalshis_mecnet():
     assert got == {"mecnet:afc:no:buf+kc": (1, ["tec-afc-kc", "tec-afc-buf"]),
                    "mecnet:afc:no:buf+kc+ne": (2, ["tec-afc-kc", "tec-afc-buf", "tec-afc-ne"])}
     assert all(l["side"] == "no" for b in rel["baskets"] for l in b["legs"])
+
+
+def test_replace_that_beats_the_modify_answer_still_confirms_the_move(pm_arbs, monkeypatch):
+    from strategies.ARBS import pricing
+    r, b = pm_arbs
+    r.live = True
+    monkeypatch.setattr(R, "PM_MODIFY_ECHO_S", 0.1)
+
+    async def amend(*a):
+        r._on_replace("o1", 0.42)                 # the stream echo, before the HTTP answer
+        return {"order": {"order_id": "o1"}}, None, True
+    r.gw.amend = amend
+    plan = pricing.QuotePlan(leg=0, price=0.42, max_price=0.45, edge=0.03, others_cost=0.5)
+
+    async def go():
+        q = R.Quote(basket_id=b.basket_id, leg=0, ticker="pm-ev-a", side="no", price=0.40, size=5.0, cid="c",
+                    edge=0.03, max_price=0.45, exchange_id="o1", pending=False)
+        r.quotes[q.key] = q
+        await r.move_quote(q, plan)
+        await asyncio.sleep(0.2)
+        return q
+    q = asyncio.run(go())
+    assert q.price == pytest.approx(0.42) and r.n.get("pm_moves_unconfirmed", 0) == 0
+    assert "o1" not in r.pm_replaced
+
+
+def test_a_feed_drop_pulls_only_that_venues_quotes(pm_arbs):
+    r, b = pm_arbs                                   # legs: pm-ev-a NO, K-A YES
+    r.live = True
+    r.feed.kalshi._tickers, r.feed.pm._tickers = ["K-A"], ["pm-ev-a"]
+    r.feed.kalshi.up, r.feed.kalshi.down_since = False, 0.0
+    r.feed.pm.up, r.feed.pm.down_since = True, None
+    assert r.feed.down_venues(5.0, 100.0) == {"kalshi"}
+    assert not r.feed.up_for(["K-A"]) and r.feed.up_for(["pm-ev-a"])
+    assert r.blocked() is None                       # not a stop for every basket
+    for leg, t in ((0, "pm-ev-a"), (1, "K-A")):
+        q = R.Quote(basket_id=b.basket_id, leg=leg, ticker=t, side="no", price=0.4, size=5.0, cid=f"c{leg}",
+                    edge=0.03, max_price=0.45, exchange_id=f"o{leg}", pending=False)
+        r.quotes[q.key] = q
+    pulled, swept = [], []
+
+    async def cancel_quote(q, reason):
+        pulled.append(q.ticker)
+        r._retire(q)
+
+    async def pm_cancel_all(reason, raise_=False):
+        raise AssertionError("polymarket quotes pulled for a kalshi drop")
+
+    async def sweep(reason, venues=None):
+        swept.append(venues)
+    r.cancel_quote, r.pm_cancel_all, r.sweep = cancel_quote, pm_cancel_all, sweep
+    asyncio.run(r.pull_all("feed_down", venues={"kalshi"}))
+    assert pulled == ["K-A"] and swept == [{"kalshi"}]
+    assert [q.ticker for q in r.quotes.values()] == ["pm-ev-a"]
+
+
+def test_a_polymarket_feed_drop_takes_its_quotes_down_with_one_cancel_all(pm_arbs):
+    r, b = pm_arbs
+    r.live = True
+    r.feed.kalshi._tickers, r.feed.pm._tickers = ["K-A"], ["pm-ev-a"]
+    r.feed.kalshi.up, r.feed.pm.up = True, False
+    q = R.Quote(basket_id=b.basket_id, leg=0, ticker="pm-ev-a", side="no", price=0.4, size=5.0, cid="c",
+                edge=0.03, max_price=0.45, exchange_id="o1", pending=False)
+    r.quotes[q.key] = q
+    stops, cancels = [], []
+    r._pm_stop_all = lambda reason: stops.append(reason) or True
+
+    async def cancel_quotes(qs, reason):
+        cancels.append(reason)
+    r.cancel_quotes = cancel_quotes
+
+    async def go():
+        r.evaluate(b)
+        await asyncio.sleep(0)
+    asyncio.run(go())
+    assert stops == ["feed_down"] and cancels == []

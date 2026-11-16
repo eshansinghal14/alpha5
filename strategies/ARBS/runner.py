@@ -49,7 +49,7 @@ from strategies.ARBS import exit_cost
 from strategies.ARBS import live_params as lparams, parts, pricing, replay, scanner
 from strategies.ARBS.execution import Gateway
 from strategies.ARBS import venues
-from strategies.ARBS.venues import PM_SHARD, Feeds, is_pm
+from strategies.ARBS.venues import PM_SHARD, Feeds, is_pm, venue
 from strategies.ARBS.ledger import Ledger
 from strategies.ARBS.depth import MoveWatch, PullWatch, TopHistory
 from strategies.ARBS.liquidity import Liquidity
@@ -509,6 +509,7 @@ class ArbsRunner:
         self._balance_fails = 0
         self.paused_until: dict[str, float] = {}  # ticker -> monotonic time Kalshi's pause is next retried
         self.pm_stop: tuple | None = None          # (blocked() reason, its Polymarket cancel-all task)
+        self.pm_replaced: dict[str, tuple[float, float]] = {}   # order id -> (price, monotonic) of its last REPLACE
         self.exchange_paused = False              # Kalshi's exchange-wide trading_active is off
         self.priority_trading: list[str] = []     # write_priority_series in session now
         self.last_exit: dict[str, tuple] = {}
@@ -681,7 +682,7 @@ class ArbsRunner:
             return f"halted: {self.halt}"
         if self.order_errors >= self.cfg.runtime.max_order_errors:
             return "order_error_breaker"
-        if not self.feed.up:
+        if not self.feed.up and not self.feed.pm._tickers:
             return "feed_down"
         if self.exchange_paused:
             return "Kalshi trading paused"
@@ -1774,10 +1775,16 @@ class ArbsRunner:
             self.orphans.append((time.monotonic(), f))
 
     def _on_replace(self, oid: str, price: float):
-        """A Polymarket modify took effect: its quote's move is confirmed."""
+        """A Polymarket modify took effect: its quote's move is confirmed, or
+        kept for move_quote when it beat the modify's answer."""
         for q in [q for q in self.quotes.values() if q.exchange_id == oid]:
             if q.pm_from is not None and abs(q.price - price) <= _EPS:
                 q.pm_from = None
+                return
+        now = time.monotonic()
+        self.pm_replaced[oid] = (price, now)
+        if len(self.pm_replaced) > 2000:
+            self.pm_replaced = {k: v for k, v in self.pm_replaced.items() if now - v[1] < 2 * PM_MODIFY_ECHO_S}
 
     def _pm_unconfirmed(self, q: Quote, moved_at: float):
         """No REPLACE for a Polymarket move: the order kept its old price."""
@@ -2250,14 +2257,18 @@ class ArbsRunner:
             self.rank_at[b.basket_id] = now
             self.rank_row(b, vs)
         blocked = self.blocked()
-        if not blocked:
+        # With both venues, a feed drop stops only the baskets trading on it:
+        # a Kalshi websocket drop pulled every Polymarket quote (11-16).
+        feed_down = not blocked and not self.feed.up_for(b.tickers)
+        pm_all = blocked or ("feed_down" if self.feed.pm._tickers and not self.feed.pm.up else None)
+        if not pm_all:
             self.pm_stop = None
-        if vs is None or blocked or self.excluded(b):
-            if blocked and self.live and any(is_pm(q.ticker) for q in live_qs) and self._pm_stop_all(blocked):
+        if vs is None or blocked or feed_down or self.excluded(b):
+            if pm_all and self.live and any(is_pm(q.ticker) for q in live_qs) and self._pm_stop_all(pm_all):
                 live_qs = [q for q in live_qs if not is_pm(q.ticker)]
             if live_qs:
-                self.spawn(self.cancel_quotes(live_qs, blocked or ("excluded" if self.excluded(b) else "untradeable")),
-                           b.basket_id)
+                why = blocked or ("feed_down" if feed_down else "excluded" if self.excluded(b) else "untradeable")
+                self.spawn(self.cancel_quotes(live_qs, why), b.basket_id)
             return
         t = self.cfg.trading
         if (t.enable_takes and (t.take_live_events or not self.live_now(b, _utc()))
@@ -3336,8 +3347,12 @@ class ArbsRunner:
                 self._commit_cache = None
                 self._register(q, new_id)
             elif is_pm(q.ticker) and abs(plan.price - old) > _EPS:
-                q.pm_from = (old, q.moved_at)
-                asyncio.get_running_loop().call_later(PM_MODIFY_ECHO_S, self._pm_unconfirmed, q, q.moved_at)
+                # The REPLACE often lands before the HTTP answer: unconfirmed
+                # moves were 0.1% of answers under 25 ms and 24-70% past 50 ms (11-16).
+                echo = self.pm_replaced.pop(q.exchange_id, None)
+                if echo is None or abs(echo[0] - plan.price) > _EPS:
+                    q.pm_from = (old, q.moved_at)
+                    asyncio.get_running_loop().call_later(PM_MODIFY_ECHO_S, self._pm_unconfirmed, q, q.moved_at)
         q.price, q.edge, q.max_price = plan.price, plan.edge, plan.max_price
         q.size = q.filled + left
         self.n["quote_moves"] += 1
@@ -3366,8 +3381,9 @@ class ArbsRunner:
         self._retire(q)
         self.journal({"kind": "cancel", "basket_id": q.basket_id, "ticker": q.ticker, "reason": reason, **_deep(q)})
 
-    async def pull_all(self, reason: str):
-        qs = [q for q in self.quotes.values() if not q.pending]
+    async def pull_all(self, reason: str, venues: set[str] | None = None):
+        """Every quote off (on `venues` only, if given), then a sweep of them."""
+        qs = [q for q in self.quotes.values() if not q.pending and (venues is None or venue(q.ticker) in venues)]
         if self.live and any(is_pm(q.ticker) and q.exchange_id for q in qs) and await self.pm_cancel_all(reason):
             for q in [q for q in qs if is_pm(q.ticker)]:
                 self._retire(q)
@@ -3380,7 +3396,7 @@ class ArbsRunner:
                                  return_exceptions=True)
             await asyncio.sleep(PULL_BATCH * SWEEP_PACING_S)
         if self.live:
-            await self.sweep(reason)
+            await self.sweep(reason, venues)
 
     def _pm_stop_all(self, reason: str) -> bool:
         """A stop takes Polymarket quotes down with one cancel-all, not one
@@ -3416,7 +3432,7 @@ class ArbsRunner:
         self.journal({"kind": "pm_cancel_all", "reason": reason, "n": len(ids)})
         return True
 
-    async def sweep(self, reason: str):
+    async def sweep(self, reason: str, venues: set[str] | None = None):
         """Cancel anything of ours resting: on our tickers, or placed by us on a
         market since dropped from the scan (KXYTVIEWSW quotes sat 19 h, 10-29).
         The ground truth after a restart."""
@@ -3425,6 +3441,8 @@ class ArbsRunner:
         ours = set(self.tickers)
         resting = []
         for c in self.gw.venue_clients():
+            if venues is not None and ("polymarket" if c.shard == PM_SHARD else "kalshi") not in venues:
+                continue
             if c.shard == PM_SHARD:
                 await self.pm_cancel_all(f"sweep/{reason}", raise_=True)
                 continue
@@ -3718,10 +3736,10 @@ class ArbsRunner:
     async def guard_loop(self):
         while True:
             await asyncio.sleep(1.0)
-            ds = self.feed.down_since
-            if ds is not None and time.monotonic() - ds > self.cfg.runtime.feed_down_pull_s and self.quotes:
-                self.alert("warn", None, "Kalshi websocket down; pulling every quote")
-                await self.pull_all("feed_down")
+            down = self.feed.down_venues(self.cfg.runtime.feed_down_pull_s, time.monotonic())
+            if down and any(venue(q.ticker) in down for q in self.quotes.values()):
+                self.alert("warn", None, f"{', '.join(sorted(down))} websocket down; pulling its quotes")
+                await self.pull_all("feed_down", venues=down)
 
     async def audit_loop(self):
         while True:

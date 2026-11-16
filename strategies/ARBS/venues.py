@@ -72,6 +72,15 @@ class Feeds:
         ds = [f.down_since for f in self._active() if f.down_since is not None]
         return min(ds) if ds else None
 
+    def up_for(self, tickers) -> bool:
+        """Every venue `tickers` trade on is up."""
+        return all(self._of(t).up for t in tickers)
+
+    def down_venues(self, longer_than_s: float, now: float) -> set[str]:
+        """Venues whose feed has been down longer than `longer_than_s`."""
+        return {venue(f._tickers[0]) for f in self._active()
+                if f.down_since is not None and now - f.down_since > longer_than_s}
+
     def add(self, tickers):
         k = [t for t in tickers if not is_pm(t)]
         p = [t for t in tickers if is_pm(t)]
