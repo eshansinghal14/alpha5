@@ -1114,6 +1114,32 @@ def test_hot_list_fills_the_write_budget_keeping_incumbents(arbs):
     assert r.pick_hot(["a", "x", "y", "b", "q"], 100.0, cost) == ["a", "b", "q"]
 
 
+def test_a_shards_write_rate_is_shared_with_the_other_processes_planning_on_it(arbs):
+    import types
+    r, b = arbs
+    now = time.time()
+
+    def spend(p, t, tps, plans):
+        os.makedirs(os.path.join(R.LIVE_ROOT, p), exist_ok=True)
+        json.dump({"t": t, "tps": tps, "plans": plans}, open(os.path.join(R.LIVE_ROOT, p, R.WRITE_SPEND), "w"))
+    spend("ARBS0B", now, {"0": 150.0}, [0])
+    spend("ARBS0C", now, {"0": 50.0}, [0])
+    spend("ARBSPM", now, {"0": 0.0, "100": 40.0}, [100])       # rests no Kalshi quotes: not a sharer
+    spend("ARBS3", now - 60, {"3": 200.0}, [3])                 # stale: not counted
+    r.write_budget = lambda: 300.0
+    c = types.SimpleNamespace(budget=types.SimpleNamespace(tokens_per_s=300.0))
+    T = R.WRITE_TARGET * 300
+    assert r.spend_target(0, 25.0, c) == pytest.approx(25 + (T - 225) / 3)     # its spend + a third of what's left
+    assert r.spend_target(3, 25.0, c) == pytest.approx(T)                       # alone on shard 3: the whole target
+    spend("ARBS0B", now, {"0": 250.0}, [0])
+    r._sib_at = 0.0
+    assert r.spend_target(0, 25.0, c) == pytest.approx(R.PLAN_SPEND_FLOOR * T)  # oversubscribed: down to the floor
+    r.spend_tps, r.hot_cost_by_shard = {0: 25.0}, {"0": 100.0, "None": 3.0}
+    r.gw.clients = {}
+    r.update_plan_scale(now)
+    assert json.load(open(os.path.join(r.root, R.WRITE_SPEND))) == {"t": now, "tps": {"0": 25.0}, "plans": [0]}
+
+
 def test_plan_budget_follows_real_write_spend(arbs):
     r, b = arbs
     import types

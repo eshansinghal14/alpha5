@@ -188,6 +188,11 @@ LOOP_CPU_BAND, MARKETS_STEP, MARKETS_MIN = 0.05, 0.25, 1000
 # The ceiling only guards a runaway estimate: at 3 shard 0 stopped at ~1,515
 # hot baskets spending ~170 of 255 target tokens/s (11-15 20:37 UTC).
 PLAN_SCALE_MIN, PLAN_SCALE_MAX = 0.5, 10.0
+# Processes planning quotes on one shard share its write rate: each aims for
+# its own spend plus an even share of what the others leave, from their
+# WRITE_SPEND files. Fixed thirds of shard 0 left 116 of 300 tokens/s unspent
+# while ARBS0B sat at its cap (11-16 06:46). Each keeps PLAN_SPEND_FLOOR.
+WRITE_SPEND, WRITE_SPEND_EVERY_S, WRITE_SPEND_STALE_S, PLAN_SPEND_FLOOR = "write_spend.json", 5.0, 15.0, 0.1
 # Startup sweep: retries per cancel on a 429, and the gap between cancels
 # (~100/s, under the 150/s our cancel tokens allow at the 300/s shard bucket).
 SWEEP_RETRIES, SWEEP_PACING_S = 5, 0.01
@@ -576,6 +581,8 @@ class ArbsRunner:
         self.plan_scale: dict[int, float] = self.last_plan_scale()   # shard -> plan budget over write budget
         self.spend_tps: dict[int, float] = {}     # shard -> real write tokens/s over SPEND_WINDOW_S
         self._spend_hist: dict[int, collections.deque] = {}
+        self._sib: dict[int, list[float]] = {}         # sibling_spend, read every WRITE_SPEND_EVERY_S
+        self._sib_at = self._spend_written_at = 0.0
         self._scale_at: dict[int, float] = {}
         # Quote ids are saved by ledger_flush_loop, not per placement: a
         # synchronous write per quote held the loop ~200 ms each and queued a
@@ -3544,12 +3551,48 @@ class ArbsRunner:
             if planned <= 0:
                 continue
             # Real spend runs `rate / planned` of the estimates: a plan budget of
-            # WRITE_TARGET * budget * planned / rate spends WRITE_TARGET of the budget.
-            want = min(PLAN_SCALE_MAX, max(PLAN_SCALE_MIN, WRITE_TARGET * planned / max(rate, 1e-9)))
+            # target * planned / rate spends `target`.
+            target = self.spend_target(s, rate, c)
+            want = min(PLAN_SCALE_MAX, max(PLAN_SCALE_MIN, target / self.write_budget() * planned / max(rate, 1e-9)))
             cur = self.plan_scale.get(s, 1.0)
             dt = now - self._scale_at.get(s, now)
             self._scale_at[s] = now
             self.plan_scale[s] = cur + (want - cur) * min(1.0, dt / SPEND_WINDOW_S)
+        if self.spend_tps and now - self._spend_written_at >= WRITE_SPEND_EVERY_S:
+            self._spend_written_at = now
+            plans = [int(k) for k, v in self.hot_cost_by_shard.items() if v > 0 and k.lstrip("-").isdigit()]
+            atomic_write_json(os.path.join(self.root, WRITE_SPEND), {
+                "t": now, "tps": {str(k): round(v, 1) for k, v in self.spend_tps.items()}, "plans": plans}, indent=None)
+
+    def spend_target(self, s: int, rate: float, c) -> float:
+        """Real write tokens/s to aim for on shard `s`: WRITE_TARGET of this
+        process's cap, or, while other processes plan quotes on the shard,
+        its own spend plus an even share of what they leave of WRITE_TARGET
+        of the shard's rate (never over the cap's share, nor under
+        PLAN_SPEND_FLOOR of the shard's)."""
+        own = WRITE_TARGET * self.write_budget()
+        others = self.sibling_spend().get(s)
+        if not others:
+            return own
+        shard = WRITE_TARGET * c.budget.tokens_per_s
+        left = shard - rate - sum(others)
+        return max(PLAN_SPEND_FLOOR * shard, min(own, rate + left / (len(others) + 1)))
+
+    def sibling_spend(self) -> dict[int, list[float]]:
+        """shard -> real write tokens/s of each other ARBS process planning
+        quotes on it, from their fresh WRITE_SPEND files."""
+        now = time.time()
+        if now - self._sib_at < WRITE_SPEND_EVERY_S:
+            return self._sib
+        self._sib_at, out = now, {}
+        for p in ARBS_PROCESSES:
+            d = None if p == self.S else _read_json(os.path.join(LIVE_ROOT, p, WRITE_SPEND))
+            if not d or now - d.get("t", 0.0) > WRITE_SPEND_STALE_S:
+                continue
+            for sh in d.get("plans") or []:
+                out.setdefault(int(sh), []).append(float((d.get("tps") or {}).get(str(sh), 0.0)))
+        self._sib = out
+        return out
 
     def pick_hot(self, quotable: list[str], budget: float, cost: dict[str, float]) -> list[str]:
         """The best-ranked baskets whose write cost fits `budget` (tokens/s).
