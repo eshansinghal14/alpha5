@@ -545,6 +545,31 @@ them where they differ.
       - No 429s.
       - Next limit: a single process's core. Add a third shard 0 process
         (`parts.PROCS`) if one nears 100%.
+      - **Event-loop thread, per second, 25 min (11-16 00:16–00:41, Sunday
+        night games):**
+
+        | Process | Mean | p99 | Busiest 60 s | Seconds at ≥95% |
+        |---|---|---|---|---|
+        | ARBS | 79% | 97% | 86% | 2.5% (up to 3 s) |
+        | ARBS0B | 70% | 97% | 81% | 3.1% (up to 4 s) |
+        | ARBS3 | 73% | 93% | 88% | 0.5% |
+
+        - The busiest second runs 20–27 points over the mean.
+        - The busiest minute runs 7–15 points over the mean.
+    - **Write tokens (`9875de2`, live 11-16 00:06):**
+      - At the 0.85 target the shards spent 84–88% of Kalshi's 300/s.
+      - Our one-second bucket refused 4–5% of creates and moves in bursts.
+      - Kalshi buckets now hold Kalshi's 900 tokens (`full_burst`; ARBS
+        only, the race keeps one second).
+      - The plan targets 0.95.
+      - Account tier is "advanced" (manual grant). Only Kalshi can raise
+        the 300/s.
+    - **Restart speed (`6f15dac`):**
+      - Kalshi processes armed 5–7.5 min after a restart (11-16 00:06),
+        reading each event's series, shard and fee changes (3 reads an
+        event) on the shared 30 reads/s.
+      - Each process now keeps these in `event_meta.json` for a day.
+      - The plan scale starts from the last summary's.
     - **What a process trades:** only relationships its own scan lists. A
       basket of an event the other process owns, or of a relationship no longer
       listed, is only finished (completions and settlement), never quoted.
