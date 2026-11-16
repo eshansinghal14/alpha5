@@ -38,7 +38,7 @@ them where they differ.
   (live events on, live_edge_add 0.02, min_edge 0.03, quote_edge_add 0,
   days 120, scan 120 s, live_before_settle_h 6) except fixed edges
   (model_series empty: the exit model is fitted on Kalshi only), $300 cap,
-  5 lots, max_markets 1000.
+  5 lots; its market count is CPU-held like the rest (from 1,000 on 11-16).
 - **Plumbing**: shard `PM_SHARD` (100); lowercase ticker = slug. Orders
   client `infra/polymarket/orders.py` (NO = BUY_SHORT at 1 − p; a move is
   cancel + create), feed `infra/polymarket/feed.py` (private websocket: fills
@@ -287,7 +287,7 @@ them where they differ.
   hot budget (Kalshi bills a shard's writes to that shard), cash only from the
   scanned shards, one unscoped balance read for every shard (`5937f88`; a
   second per-shard read 429'd every poll). ARBS excludes baskets on shards it
-  doesn't scan. `scan.max_markets` 3700 on ARBS3 (watches ~2,800, every shard-3
+  doesn't scan. `scan.max_markets` (removed 11-16) was 3700 on ARBS3 (watches ~2,800, every shard-3
   market that forms a basket); ARBS stays at 1500 because shard 0 is
   **write-bound** (hot list 250/250 tokens/s, ~360 quote creates refused a
   day) — more markets there only add candidates.
@@ -526,8 +526,9 @@ them where they differ.
       - Costs are write tokens per event over the last two UTC days, from each
         runner's `event_spend.json` (fed by `charge()`).
       - A new map starts from the hash split and rebalances at once.
-    - Each process scans and selects up to `scan.max_markets` of its own events.
-      Box config.json has 5,000 since 23:45 UTC (was 1,500; ARBS0B inherits it).
+    - Each process scans and selects its most traded events up to its
+      CPU-held market count (see **Market count held on CPU**).
+      Before that: `scan.max_markets` 5,000 from 23:45 UTC (was 1,500).
       In each half, the top 1,500 markets held 98.3–99.5% of 24h volume, the
       top 5,000 99.9%. Of ~34k listed markets per half, ~8.7k traded at all.
     - **Measured 11-15:**
@@ -564,12 +565,32 @@ them where they differ.
       - The plan targets 0.95.
       - Account tier is "advanced" (manual grant). Only Kalshi can raise
         the 300/s.
+    - **Market count held on CPU** (`819477b`, live 11-16 01:31; the user:
+      "build at 70% then we can remove market cap"):
+      - `scan.max_markets` is gone. Box config backups are in
+        `/tmp/before_cpu_markets`.
+      - Each process steers its own count so its event-loop thread averages
+        `LOOP_CPU_TARGET` 70% of a core over each 10-min window.
+      - Steps are at most ±25% a window. It holds within 5 points of the
+        target and stays between 1,000 and what its scan lists.
+      - The count starts from the last summary's `scan_markets`; the summary
+        also shows `loop_cpu`.
+      - At the first deploy: ARBS 5,096, ARBS0B 4,999, ARBS3 2,556,
+        ARBSPM 1,000.
     - **Restart speed (`6f15dac`):**
       - Kalshi processes armed 5–7.5 min after a restart (11-16 00:06),
         reading each event's series, shard and fee changes (3 reads an
         event) on the shared 30 reads/s.
       - Each process now keeps these in `event_meta.json` for a day.
       - The plan scale starts from the last summary's.
+      - First live quote after the 11-16 01:31 restart (caches full):
+
+        | Process | Before | After |
+        |---|---|---|
+        | ARBSPM | 61 s | 30 s |
+        | ARBS3 | 384 s | 65 s |
+        | ARBS0B | 412 s | 90 s |
+        | ARBS | 431 s | 152 s |
     - **What a process trades:** only relationships its own scan lists. A
       basket of an event the other process owns, or of a relationship no longer
       listed, is only finished (completions and settlement), never quoted.
@@ -601,8 +622,8 @@ them where they differ.
     largest position is 4,166;
   - dollar room is the shard's cash;
   - the 3-broken-basket gate fired twice in 11-12..15, momentarily;
-  - `scan.max_markets` binds on shard 0 only (1,500 most traded of its
-    markets) and sets which baskets are candidates, not how many get quotes.
+  - the market count (then `scan.max_markets`, 1,500 on shard 0) sets
+    which baskets are candidates, not how many get quotes.
 - **The hot list is planned on real write spend** (`6d7a59b`, live 11-15
   20:16 UTC, the user: "lets impl option 1").
   - **The problem:** `write_cost`'s per-basket estimates ran 2.3–2.5x real
@@ -776,7 +797,8 @@ the election-night section below supersedes it where they differ.
 - **Baskets**: hand spec (`Kalshi arb baskets spec.json`) + scanner. Scanner
   lists every MECNET (NO on k likeliest pays k−1; complete sets) and DIRECNET
   (ladders, `ladder_span` 3) event on shard 0 every 120 s; selection keeps
-  `days_till_expiry` ≤ 90 and the top `scan.max_markets` (1000) by 24h volume.
+  `days_till_expiry` ≤ 90 and the most traded per market (24h volume) up
+  to the process's market count.
   Held baskets keep their definition in the ledger.
 - **Live window** (`Basket.live_from`): sports/esports kickoff from Kalshi
   milestones (Sports + Esports categories); **daily/hourly series** (Kalshi
@@ -908,7 +930,7 @@ the budget); settled baskets. Times are America/New_York.
 | 5c | Soccer late-game quoting | **Stopgap** (`trading.late_quote_cutoff_min` {S:Soccer: 75}) | 11-01..04 soccer fills 75–120 min after kickoff: 1,110 arbs, −$47, the rest of the game positive; both 11-04 goal sweeps (−$34) fell there. Live soccer baskets stop quoting 75 min after `live_from`; exits and takes unchanged. Meant to be replaced by the live estimator learning game phase (a phase level did worse out of sample on 4 days; retry with more). |
 | 6 | Per-event dollar cap | Open | ~$1.9k on TX Senate identities. |
 | 7 | Generalize early exit to baskets without an exact flip | Deferred | Only ~$3 locked in such baskets; would need valuing their extra upside. |
-| 8 | Scan everything (`scan.max_markets` removal) | Open (user ask) | Needs multi-connection websocket and series-level fee caching first. |
+| 8 | Scan everything (`scan.max_markets` removal) | Done 11-16 | Replaced by a CPU-held market count (`819477b`). |
 | 9 | Separate LIP market-making strategy | Idea | RT scores / Trump / Truth Social pools ~$100/day each; inventory risk. |
 | 10 | Automated per-market size/edge (replace the sports exclude list) | Next (user ask, 11-05) | Size 100 lost return in close counts (AZ05 −$10.15, MN01 −$1.98); sports lost live. Score markets on recent fills/sweeps and set size + edge per market instead of hand lists. |
 | 11 | Pull rule (others' depth at our bid −50%) | **Live, tracking** | See election-night section. Judge on journal `pull` rows vs fill_context after a few days; sports is where it should pay. |
