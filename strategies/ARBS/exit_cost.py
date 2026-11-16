@@ -148,6 +148,10 @@ class Stats:
         self.n = 0
         self.reach = {"live": np.zeros(MAX_REACH + 1), "not_live": np.zeros(MAX_REACH + 1)}
         self.vol = {"live": np.zeros(len(VOL_EDGES) - 1), "not_live": np.zeros(len(VOL_EDGES) - 1)}
+        # fill_prob/expected_fill answers: the runner's stats only change at a
+        # model reload, and recomputing per leg priced was ~5% of ARBS's busy
+        # loop (py-spy 11-16). Cleared by anything that adds to the counts.
+        self._memo: dict = {}
 
     def add(self, f: dict, y: float):
         x = row(f)
@@ -156,13 +160,16 @@ class Stats:
         self.n += 1
 
     def add_reach(self, live: bool, ticks: float):
+        self._memo.clear()
         self.reach["live" if live else "not_live"][int(min(MAX_REACH, max(0, round(ticks))))] += 1
 
     def add_vol(self, live: bool, contracts: float):
+        self._memo.clear()
         i = next(i for i in range(len(VOL_EDGES) - 1) if contracts < VOL_EDGES[i + 1])
         self.vol["live" if live else "not_live"][i] += 1
 
     def merge(self, o: Stats):
+        self._memo.clear()
         self.xtx += o.xtx
         self.xty += o.xty
         self.n += o.n
@@ -195,22 +202,29 @@ class Stats:
 
     def fill_prob(self, live: bool, ticks: float) -> float:
         """Share of prints that swept at least `ticks` below the touch."""
-        h = self.reach["live" if live else "not_live"]
-        tot = h.sum()
-        if tot <= 0:
-            return 0.0
-        return float(h[int(min(MAX_REACH, max(0, math.ceil(ticks - 1e-9)))):].sum() / tot)
+        k = ("p", live, int(min(MAX_REACH, max(0, math.ceil(ticks - 1e-9)))))
+        got = self._memo.get(k)
+        if got is None:
+            h = self.reach["live" if live else "not_live"]
+            tot = h.sum()
+            got = self._memo[k] = 0.0 if tot <= 0 else float(h[k[2]:].sum() / tot)
+        return got
 
     def expected_fill(self, live: bool, size: float) -> float:
         """Contracts a filled quote of `size` can expect: min(size, the print's
         volume), each bin at its lower edge (1 for the first). `size` itself
         with no volumes recorded, as the replay scored before this existed."""
-        h = self.vol["live" if live else "not_live"]
-        tot = h.sum()
-        if tot <= 0:
-            return size
-        lo = [max(1.0, VOL_EDGES[i]) for i in range(len(h))]
-        return float(sum(c * min(size, v) for c, v in zip(h, lo)) / tot)
+        k = ("f", live, size)
+        got = self._memo.get(k)
+        if got is None:
+            h = self.vol["live" if live else "not_live"]
+            tot = h.sum()
+            lo = [max(1.0, VOL_EDGES[i]) for i in range(len(h))]
+            got = size if tot <= 0 else float(sum(c * min(size, v) for c, v in zip(h, lo)) / tot)
+            if len(self._memo) > 100_000:
+                self._memo.clear()
+            self._memo[k] = got
+        return got
 
 
 class Model:

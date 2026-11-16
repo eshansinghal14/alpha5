@@ -1953,12 +1953,16 @@ class ArbsRunner:
         return v
 
     def _committed(self) -> float:
-        held = sum(b.cost() for b in self.ledger.baskets.values())
+        led = self.ledger.baskets
+        held = sum(b.cost() for b in led.values())
         # Kalshi credits $1 per YES/NO pair at once, so bundles held in both a
         # basket and its flip are cash already back, not capital tied up.
-        for bid, fid in self.flip.items():
-            pa, pb = self.ledger.baskets.get(bid), self.ledger.baskets.get(fid)
-            if bid < fid and pa and pb:
+        # Over held baskets, not every flip pair: ARBSPM's thousands of pairs
+        # were 30% of its busy loop (py-spy 11-16).
+        for bid, pa in led.items():
+            fid = self.flip.get(bid)
+            pb = led.get(fid) if fid is not None else None
+            if pb is not None and bid < fid:
                 b, f = self.baskets[bid], self.baskets[fid]
                 held -= min(pa.bundles(b.tickers), pb.bundles(f.tickers)) * len(b.legs)
         # Resting quotes aren't counted: reserving each one's worst case left

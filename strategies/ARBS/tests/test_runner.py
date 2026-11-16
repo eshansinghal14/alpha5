@@ -2722,3 +2722,14 @@ def test_a_full_disk_drops_journal_rows_instead_of_raising_into_trading(arbs, mo
         r.journal({"kind": "x"})                            # the disk refuses: dropped, not raised
     assert sum(1 for _ in open(path)) == 1
     assert r.n["journal_dropped"] == 2
+
+
+def test_fill_stats_answers_are_cached_until_the_counts_change():
+    from strategies.ARBS.exit_cost import Stats
+    s = Stats()
+    s.add_reach(True, 2)
+    s.add_vol(True, 3.0)
+    p, f = s.fill_prob(True, 1), s.expected_fill(True, 10.0)
+    assert (s.fill_prob(True, 1), s.expected_fill(True, 10.0)) == (p, f)
+    s.add_reach(True, 0)                          # a new count clears them
+    assert s.fill_prob(True, 1) == pytest.approx(0.5)
