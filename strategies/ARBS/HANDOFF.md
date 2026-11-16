@@ -597,6 +597,20 @@ them where they differ.
         the shard's rate, never under 10%.
       - Box caps: solo 300, priority 50 per process.
       - Shard 0 total rose to 275–297 tokens/s (06:55–07:03).
+    - **Shard 0's bucket ran empty** (11-16):
+      - With three processes near the rate, the shared bucket sat at ~30 of
+        900 tokens.
+      - Forced writes then drew Kalshi 429s: 4,486 cancels over 06:51–15:50
+        (most at shutdown pulls). Steady trading, 15:52–16:00: 19
+        completions in 8 min on ARBS0B.
+      - Box config.json `write_reserve_tokens` 20 -> 150 (16:02; ARBS0B/0C
+        inherit, ARBS3/ARBSPM keep 20). New quotes and moves now leave 150
+        tokens for completions and cancels.
+      - Measured 16:03–16:11: 0 completion and 0 cancel 429s; bucket held
+        at ~145; shard 0 still spent ~300 tokens/s.
+      - `d513410`: a Kalshi cancel is forced only to 10 tokens below empty,
+        then waits for refill (~7 ms a cancel). Staged on the box 16:02;
+        live at the next alpha5-arbs restart.
     - **Shard 3 quotes all it can** (11-16, ~670 of 1,607 baskets hot):
       - 306 are pre-game watch-only (NCAAWB, ITF).
       - 631 have a leg with no ask: nobody bids YES on a NO leg, as in NBA
