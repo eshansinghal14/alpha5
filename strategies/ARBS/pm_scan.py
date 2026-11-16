@@ -5,6 +5,10 @@ relationships in the scanner's format, so the runner trades them unchanged.
               complete set both ways, and NO on any two pays 1.
   pm weather  a city's daily high or low in 2F buckets from a "<= x" tail to
               a ">= y" tail: complete set both ways, NO on any two pays 1.
+  pm futures  a futures event (league champion, award, election winner)
+              whose markets can't both resolve YES: NO on the k likeliest
+              pays k-1, like Kalshi's mecnet. No complete set: a listing
+              needn't name every possible winner.
   cross       the same outcome on both exchanges: Polymarket YES + Kalshi NO,
               and Polymarket NO + Kalshi YES, each pays 1. Soccer games paired
               by both teams' names and the date; weather by station
@@ -28,6 +32,7 @@ from infra.polymarket.recorder import ROOT as REC_ROOT, list_open
 from strategies.ARBS.venues import is_pm
 
 GAME_SETTLE = pd.Timedelta(hours=3)
+FUTURE = "SPORTS_MARKET_TYPE_FUTURE"
 # Kalshi series -> Polymarket weather slug city. Same station on both: KNYC is
 # Kalshi's CLINYC, KMDW CLIMDW, KMIA CLIMIA, KLAX CLILAX, KSFO CLISFO, KPHL CLIPHL.
 WEATHER = {"KXHIGHNY": "nychigh", "KXLOWTNYC": "nyclow", "KXHIGHMIA": "miahigh", "KXHIGHCHI": "mdwhigh",
@@ -110,6 +115,65 @@ def soccer_games(pm: dict[str, dict]) -> list[dict]:
             out.append({"event": ev, "teams": teams, "abbr": abbr, "start": pd.Timestamp(start), "markets": mk,
                         "league": pm[mk[0]].get("series")})
     return out
+
+
+# Polymarket US has no flag for "at most one market resolves YES", so an
+# event qualifies by its title (one winner) and every market's rules: TIME
+# Person of the Year pays each named person in full, award markets split a
+# tie's dollar ("$1.00 divided by the number of tied players"), which keeps
+# NO baskets whole. Nominee/seed/top-N/threshold events have many YESes.
+SINGLE_TITLE = re.compile(r"\b(champions?|championship|winner|wins?|mvp|of the year|trophy|no\. ?1|#1|best|"
+                          r"nominee|next|leader)\b", re.I)
+MULTI_TITLE = re.compile(r"(nominees|seeds|finishers|\bteams\b|\bplayers\b|\btop[- ]?\d|\d\+|\bwhich\b|\bwhat\b|"
+                         r"\bhow\b|margin|\branks?\b|ranking|total|announce|qualif|make the|advance|\bby\b)", re.I)
+MULTI_RULE = re.compile(r"(\btie|\bmultiple\b|each such|jointly|\bshared?\b|\bco-)", re.I)
+SPLIT_RULE = re.compile(r"divided by the number of", re.I)
+
+
+def exclusive(rs: list[dict]) -> bool:
+    """At most one of an event's markets can resolve YES (or a tie splits $1)."""
+    title = rs[0].get("event_title") or ""
+    if not SINGLE_TITLE.search(title) or MULTI_TITLE.search(title):
+        return False
+    return all(not MULTI_RULE.search(r.get("rules") or "") or SPLIT_RULE.search(r.get("rules") or "") for r in rs)
+
+
+def _mid(r: dict) -> float:
+    b, a = r.get("bid"), r.get("ask")
+    if b is not None and a is not None:
+        return (b + a) / 2
+    return a if a is not None else (b or 0.0)
+
+
+def futures_events(pm: dict[str, dict]) -> list[dict]:
+    """{event, category, ranked [slugs, likeliest first], settles}: every
+    open futures event of 2+ markets that passes exclusive()."""
+    by_ev = collections.defaultdict(list)
+    for r in pm.values():
+        by_ev[r["event"]].append(r)
+    out = []
+    for ev, rs in by_ev.items():
+        if len(rs) < 2 or any(r.get("sports_type") != FUTURE for r in rs) or not exclusive(rs):
+            continue
+        ends = [pd.Timestamp(r["end"]) for r in rs if r.get("end")]
+        if not ends:
+            continue
+        out.append({"event": ev, "category": rs[0].get("category") or "other",
+                    "ranked": [r["slug"] for r in sorted(rs, key=lambda r: (-_mid(r), r["slug"]))],
+                    "settles": max(ends)})
+    return out
+
+
+def futures_mecnet(event: str, cluster: str, ranked: list[str], max_legs: int) -> list[dict]:
+    """NO on the k likeliest (k = 2..max_legs) pays k-1: as scanner.mecnet.
+    Legs sorted in the id, so a set keeps its id when prices reorder."""
+    sfx = lambda s: s[len(event) + 1:] if s.startswith(event + "-") else s.rsplit(event + "-", 1)[-1]
+    baskets = [{"basket_id": f"mecnet:{event}:no:" + "+".join(sorted(sfx(s) for s in ranked[:k])), "payout": k - 1,
+                "legs": _legs(*((s, "no") for s in ranked[:k]))}
+               for k in range(2, min(len(ranked), max_legs) + 1)]
+    return [{"relationship_id": f"mecnet:{event}", "type": "mutually_exclusive_no", "cluster": cluster,
+             "description": f"{event}: at most one market resolves YES; NO on any k of them pays k-1.",
+             "baskets": baskets}] if baskets else []
 
 
 def _bucket(key: str) -> tuple[float, float] | None:
@@ -247,8 +311,14 @@ def pair_weather(events: list[dict], days: list[dict]) -> dict[str, str]:
     return out
 
 
-def scan(pm: dict[str, dict], kalshi_events: list[dict], *, now: pd.Timestamp, cross_venue: bool = True) -> dict:
+def scan(pm: dict[str, dict], kalshi_events: list[dict], *, now: pd.Timestamp, cross_venue: bool = True,
+         max_legs: int = 6) -> dict:
     rels = []
+    for f in futures_events(pm):
+        rs = futures_mecnet(f["event"], f"pm:futures:{f['category']}", f["ranked"], max_legs)
+        for r in rs:
+            r.update(expected_settlement_utc=f["settles"].isoformat(), live_from_utc=None)
+        rels += rs
     games = soccer_games(pm)
     for g in games:
         rs = outcome_set(g["event"], f"pm:soccer:{g['league']}",
@@ -328,8 +398,8 @@ def add_volume(doc: dict, vol: dict[str, float]):
 def scan_and_select(root: str, cfg, held: set[str], markets: int | None = None) -> dict:
     from strategies.ARBS.scanner import SELECTED, fetch_events, select
     now = pd.Timestamp.now(tz="UTC")
-    pm = list_open()
-    doc = scan(pm, fetch_events(), now=now)
+    pm = list_open(prices=True)
+    doc = scan(pm, fetch_events(), now=now, max_legs=cfg.scan.mecnet_max_legs)
     add_volume(doc, volume_24h(now))
     path = os.path.join(root, "scanned_spec.json")
     try:

@@ -517,3 +517,37 @@ def test_polymarket_closed_market_reject_is_held_like_a_pause(pm_arbs):
                     '{"code":9, "message":"This market is closed for trading.", "details":[]}')
     r._order_err(b.basket_id, "complete IOC pm-ev-a", exc, "pm-ev-a")
     assert r.order_errors == 0 and r.market_paused("pm-ev-a")
+
+
+def _fut(ev, title, name, rule, bid=None, ask=None):
+    return {"slug": f"tec-{ev}-{name}", "event": ev, "event_title": title, "category": "sports", "rules": rule,
+            "sports_type": "SPORTS_MARKET_TYPE_FUTURE", "end": "2027-02-15T00:00:00Z", "bid": bid, "ask": ask}
+
+
+def test_futures_event_is_traded_only_when_one_market_can_win():
+    from strategies.ARBS import pm_scan
+    split = "If X ties with one or more other players, Yes contract holders receive $1.00 divided by the number of tied players."
+    assert pm_scan.exclusive([_fut("e", "NBA MVP", "a", split), _fut("e", "NBA MVP", "b", split)])
+    assert pm_scan.exclusive([_fut("e", "AFC Champion", "a", "If Buffalo are the AFC Champions, Yes.")])
+    # each named person pays in full; many nominees; a separate tie market
+    assert not pm_scan.exclusive([_fut("e", "TIME Person of the Year 2026", "a",
+                                       "If multiple persons are named, each such person will be considered.")])
+    assert not pm_scan.exclusive([_fut("e", "Oscar Nominees: Best Director", "a", "If X is nominated, Yes.")])
+    assert not pm_scan.exclusive([_fut("e", "2027 Ryder Cup Winner", "tie", "Yes if the 2027 Ryder Cup ends in a tie.")])
+    assert not pm_scan.exclusive([_fut("e", "NBA Teams 50+ Regular Season Wins", "a", "")])
+
+
+def test_futures_scan_quotes_no_on_the_likeliest_like_kalshis_mecnet():
+    from strategies.ARBS import pm_scan
+    pm = {r["slug"]: r for r in (_fut("afc", "AFC Champion", "buf", "", 0.30, 0.32),
+                                 _fut("afc", "AFC Champion", "kc", "", 0.40, 0.42),
+                                 _fut("afc", "AFC Champion", "mia", "", 0.01, 0.02),
+                                 _fut("afc", "AFC Champion", "ne", "", 0.10, 0.12))}
+    doc = pm_scan.scan(pm, [], now=pd.Timestamp("2026-11-16", tz="UTC"), cross_venue=False, max_legs=3)
+    (rel,) = doc["relationships"]
+    assert rel["type"] == "mutually_exclusive_no" and rel["cluster"] == "pm:futures:sports"
+    assert rel["expected_settlement_utc"].startswith("2027-02-15") and rel["live_from_utc"] is None
+    got = {b["basket_id"]: (b["payout"], [l["ticker"] for l in b["legs"]]) for b in rel["baskets"]}
+    assert got == {"mecnet:afc:no:buf+kc": (1, ["tec-afc-kc", "tec-afc-buf"]),
+                   "mecnet:afc:no:buf+kc+ne": (2, ["tec-afc-kc", "tec-afc-buf", "tec-afc-ne"])}
+    assert all(l["side"] == "no" for b in rel["baskets"] for l in b["legs"])

@@ -67,10 +67,11 @@ def _slim(ev: dict, m: dict) -> dict:
             "updated": m.get("updatedAt")}
 
 
-def list_open() -> dict[str, dict]:
+def list_open(prices: bool = False) -> dict[str, dict]:
     """slug -> slim record for every open market. Paged by event, so a page's
     raw JSON (images, team data) is dropped before the next; the full listing
-    is ~120 MB raw."""
+    is ~120 MB raw. `prices` adds the listing's best bid/ask (left out of the
+    recorder's meta, which writes a row each time a record changes)."""
     out: dict[str, dict] = {}
     off = 0
     while True:
@@ -83,6 +84,18 @@ def list_open() -> dict[str, dict]:
             for m in ev.get("markets") or []:
                 if m.get("status") == "MARKET_STATUS_OPEN" and not m.get("closed"):
                     out[m["slug"]] = _slim(ev, m)
+                    if prices:
+                        out[m["slug"]].update(bid=_quote_px(m.get("bestBidQuote")),
+                                              ask=_quote_px(m.get("bestAskQuote")))
+
+
+def _quote_px(q) -> float | None:
+    if isinstance(q, str):
+        try:
+            q = json.loads(q)
+        except ValueError:
+            return None
+    return _px(q) if isinstance(q, dict) else None
 
 
 def _px(a: dict | None) -> float | None:
