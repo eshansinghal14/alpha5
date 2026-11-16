@@ -21,9 +21,9 @@ from viz.perf_panel import time_axis
 from viz.data import latest_summary, read_summary, summary_age_s
 
 STALE_S = 15.0
-SHARD_OF = {"ARBS": "shard 0", "ARBS0B": "shard 0 (b)", "ARBS3": "shard 3", "ARBSPM": "Polymarket"}
+SHARD_OF = {"ARBS": "shard 0", "ARBS0B": "shard 0 (b)", "ARBS0C": "shard 0 (c)", "ARBS3": "shard 3", "ARBSPM": "Polymarket"}
 # Short labels for the headline tiles' breakdowns, by process and by shard.
-SHORT = {"ARBS": "K0", "ARBS0B": "K0b", "ARBS3": "K3", "ARBSPM": "PM"}
+SHORT = {"ARBS": "K0", "ARBS0B": "K0b", "ARBS0C": "K0c", "ARBS3": "K3", "ARBSPM": "PM"}
 SHARD_SHORT = {"0": "K0", "3": "K3", str(PM_SHARD): "PM"}
 
 

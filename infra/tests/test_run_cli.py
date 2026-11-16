@@ -16,7 +16,7 @@ def _resolve(fmap, series=None, only=None):
 
 def test_folder_expands_to_all_its_series(fmap):
     s, svc = _resolve(fmap, ["ARBS"])
-    assert s == ["ARBS", "ARBS0B", "ARBS3", "ARBSPM"] and svc == []
+    assert s == ["ARBS", "ARBS0B", "ARBS0C", "ARBS3", "ARBSPM"] and svc == []
 
 
 def test_only_runs_one_series(fmap):
@@ -36,10 +36,10 @@ def test_series_ticker_is_not_a_folder(fmap):
 
 def test_dedup_and_case(fmap):
     s, _ = _resolve(fmap, ["arbs", "ARBS"])
-    assert s == ["ARBS", "ARBS0B", "ARBS3", "ARBSPM"]
+    assert s == ["ARBS", "ARBS0B", "ARBS0C", "ARBS3", "ARBSPM"]
 
 
 def test_series_without_a_write_group_run_apart(fmap):
     reg = run.registry()
     s, _ = _resolve(fmap, ["ARBS", "KXCRYPTOLEAD15M"])
-    assert run.units_of(s, reg) == [["ARBS"], ["ARBS0B"], ["ARBS3"], ["ARBSPM"], ["KXCRYPTOLEAD15M"]]
+    assert run.units_of(s, reg) == [["ARBS"], ["ARBS0B"], ["ARBS0C"], ["ARBS3"], ["ARBSPM"], ["KXCRYPTOLEAD15M"]]

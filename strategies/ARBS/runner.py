@@ -80,7 +80,7 @@ FOREIGN_POSITIONS = "foreign_positions.json"
 # Every ARBS process trading on this one Kalshi account. A process's audit
 # takes the others' ledgers off Kalshi's positions: the Polymarket process's
 # cross-exchange legs sit on markets ARBS trades too.
-ARBS_PROCESSES = ("ARBS", "ARBS0B", "ARBS3", "ARBSPM")
+ARBS_PROCESSES = ("ARBS", "ARBS0B", "ARBS0C", "ARBS3", "ARBSPM")
 # Cash is tracked from our own fills and settlements between balance reads
 # (runtime.balance_poll_s): two processes reading every 30 s had about half
 # their reads 429 (11-12). A failed read retries after 60 s, doubling to this.
@@ -427,6 +427,8 @@ class ArbsRunner:
         # evaluated (its books changed), so the rank pass only sorts.
         self.rank_rows: dict[str, dict] = {}
         self._in_pass = False
+        self._broken_cache: int | None = None
+        self._ro_sets: tuple = (None, frozenset(), {})
         self._commit_cache: float | None = None
         self.hot: list[str] = []
         self.ranking: list[dict] = []
@@ -672,7 +674,11 @@ class ArbsRunner:
             return "feed_down"
         if self.exchange_paused:
             return "Kalshi trading paused"
-        broken = sum(1 for b in self.ledger.baskets.values() if b.broken_since is not None)
+        # Counted once per eval pass (a pass is at most EVAL_SLICE_S and doesn't
+        # yield): per basket evaluated, the walk over the ledger was ~3% of the loop.
+        broken = self._broken_cache if self._in_pass and self._broken_cache is not None else             sum(1 for b in self.ledger.baskets.values() if b.broken_since is not None)
+        if self._in_pass:
+            self._broken_cache = broken
         if broken >= self.cfg.completion.max_broken_baskets:
             return f"{broken} broken baskets"
         return None
@@ -955,13 +961,13 @@ class ArbsRunner:
         if ex and (b.basket_id in ex or b.relationship_id in ex or b.cluster in ex
                    or b.relationship_id.split(":", 1)[-1] in ex):
             return True
-        ro = self.record_only()
-        if ro:
+        every, by_phase = self.record_only_sets()
+        if every or by_phase:
             group, series, event = self._lp_path(b.legs[0].ticker)
             # NAME:pre / NAME:live cover one phase, by the scheduled start: a fast
             # move's live flag must not open a watch-only pre-game basket.
-            phase = "live" if b.is_live(self.now_ts()) else "pre"
-            if any(k in ro or f"{k}:{phase}" in ro for k in (series, group, event, b.cluster) if k):
+            ph = by_phase.get("live" if b.is_live(self.now_ts()) else "pre", ())
+            if any(k in every or k in ph for k in (series, group, event, b.cluster) if k):
                 return True
         # Only relationships this process's own scan lists are traded (a subset
         # built from today's books belongs to its event's). A held basket of
@@ -992,6 +998,18 @@ class ArbsRunner:
 
     def record_only(self) -> list[str]:
         return self.cfg.watch.record_only or []
+
+    def record_only_sets(self) -> tuple[frozenset, dict[str, frozenset]]:
+        """record_only as (names for both phases, phase -> names for that
+        phase alone), rebuilt when the config's list changes."""
+        ro = self.cfg.watch.record_only
+        if self._ro_sets[0] is not ro:
+            names = ro or []
+            by_phase = {ph: frozenset(k[: -len(ph) - 1] for k in names if k.endswith(f":{ph}"))
+                        for ph in ("pre", "live")}
+            every = frozenset(k for k in names if not k.endswith((":pre", ":live")))
+            self._ro_sets = (ro, every, {ph: v for ph, v in by_phase.items() if v})
+        return self._ro_sets[1], self._ro_sets[2]
 
     def now_ts(self) -> pd.Timestamp:
         """UTC now, refreshed once a second (see horizon)."""
@@ -2174,7 +2192,7 @@ class ArbsRunner:
             await self.wake.wait()
             self.wake.clear()
             self._replay_orphans()
-            self._in_pass, self._commit_cache = True, None
+            self._in_pass, self._commit_cache, self._broken_cache = True, None, None
             if len(self._lv_cache) > 20000:
                 self._lv_cache.clear()
             # One basket at a time off the sets (no sort or copy of thousands
@@ -2198,7 +2216,7 @@ class ArbsRunner:
                     break
             if self.urgent or self.dirty:
                 self.wake.set()
-            self._in_pass, self._commit_cache = False, None
+            self._in_pass, self._commit_cache, self._broken_cache = False, None, None
             # Let the websocket reader run before the next pass.
             await asyncio.sleep(0)
 

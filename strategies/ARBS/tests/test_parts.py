@@ -1,16 +1,23 @@
 import json
 import zlib
 
+import pytest
+
 from strategies.ARBS import parts
 
 DAY = parts.REBALANCE_S
+
+
+@pytest.fixture
+def two(monkeypatch):
+    monkeypatch.setattr(parts, "PROCS", ("ARBS", "ARBS0B"))
 
 
 def fresh():
     return parts.load("/nonexistent/owners.json")
 
 
-def test_a_new_event_goes_to_the_process_with_less_cost():
+def test_a_new_event_goes_to_the_process_with_less_cost(two):
     st = fresh()
     st["owners"] = {"SER-1": 0, "SER-2": 1}
     st["rebalanced_at"] = 1000.0                       # not due
@@ -19,18 +26,18 @@ def test_a_new_event_goes_to_the_process_with_less_cost():
     assert st["owners"]["SER-3"] == 1 and st["load"] == [100.0, 46.7]
 
 
-def test_the_first_update_starts_from_the_hash_split_then_balances():
+def test_the_first_update_starts_from_the_hash_split_then_balances(two):
     evs = [f"S{i}-E" for i in range(40)]
     spent = {e: float(1 + i % 7) * (10 if i % 3 == 0 else 1) for i, e in enumerate(evs)}
     st = fresh()
     moves = parts.update(st, evs, 5000.0, spent)
-    hashed = {e: zlib.crc32(e.encode()) % 2 for e in evs}
+    hashed = {e: zlib.crc32(e.encode()) % len(parts.PROCS) for e in evs}
     assert all(hashed[e] == f for e, f, _ in moves)    # moves start from the old split
     lo, hi = sorted(st["load"])
     assert hi - lo <= parts.GAP * (lo + hi) and len(moves) < len(evs) // 2
 
 
-def test_rebalance_runs_once_a_day_and_moves_until_within_the_gap():
+def test_rebalance_runs_once_a_day_and_moves_until_within_the_gap(two):
     evs = ["A-1", "A-2", "A-3", "B-1"]
     st = fresh()
     st["owners"] = {"A-1": 0, "A-2": 0, "A-3": 0, "B-1": 1}
@@ -40,6 +47,19 @@ def test_rebalance_runs_once_a_day_and_moves_until_within_the_gap():
     assert moves and sorted(st["load"]) == [50.0, 60.0]
     st["owners"]["A-1"] = 0                             # a fresh imbalance the same day: left alone
     assert parts.update(st, evs, DAY + 3600, spent) == []
+
+
+def test_a_new_process_gets_its_share_at_once():
+    evs = [f"S{i}-E" for i in range(30)]
+    spent = {e: float(1 + i % 5) for i, e in enumerate(evs)}
+    st = fresh()
+    st["owners"] = {e: i % 2 for i, e in enumerate(evs)}   # a map built for two processes
+    st["rebalanced_at"] = 1000.0                             # not due
+    moves = parts.update(st, evs, 1000.0, spent)
+    assert moves and all(to == 2 for _, _, to in moves) and st["procs"] == len(parts.PROCS)
+    lo, hi = min(st["load"]), max(st["load"])
+    assert hi - lo <= parts.GAP * sum(st["load"])
+    assert parts.update(st, evs, 1001.0, spent) == []       # sized now: back to once a day
 
 
 def test_an_event_long_unlisted_is_forgotten():

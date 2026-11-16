@@ -11,6 +11,7 @@ from infra.config import param, section
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 CONFIG3_PATH = os.path.join(os.path.dirname(__file__), "config_shard3.json")
 CONFIG0B_PATH = os.path.join(os.path.dirname(__file__), "config_shard0b.json")
+CONFIG0C_PATH = os.path.join(os.path.dirname(__file__), "config_shard0c.json")
 CONFIGPM_PATH = os.path.join(os.path.dirname(__file__), "config_pm.json")
 OVERRIDES_PATH = os.path.join(os.path.dirname(__file__), "settlement_overrides.json")
 

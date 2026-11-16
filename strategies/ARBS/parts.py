@@ -4,9 +4,10 @@ split left ARBS at its 150 tokens/s cap on ~250 hot baskets while ARBS0B
 spent ~95 on ~1,190 (11-15 22:43-53 UTC).
 
 The first process's scan is the only writer (update): a new event goes to
-the process whose listed events cost less, priced by its series' measured
-cost per event; once every REBALANCE_S, events move from the costlier
-process to the other while the two differ by more than GAP of their total.
+the process whose listed events cost least, priced by its series' measured
+cost per event; once every REBALANCE_S, or at once when PROCS changes,
+events move from the costliest process to the cheapest while they differ
+by more than GAP of the total.
 Costs are write tokens spent per event over the last two UTC days, from
 each process's event_spend.json (EventSpend). A process holding a basket of
 an event the other owns only finishes it.
@@ -21,7 +22,9 @@ import zlib
 from infra.config import atomic_write_json
 from infra.runtime.persist import LIVE_ROOT
 
-PROCS = ("ARBS", "ARBS0B")
+# A third process since 11-16: two loops ran at ~70% of a core on quoting
+# alone, and the CPU-held market count had cut shard 0 to ~4,700 markets.
+PROCS = ("ARBS", "ARBS0B", "ARBS0C")
 GAP = 0.10
 REBALANCE_S = 86400.0
 # An event not listed for this long is forgotten (its baskets have settled).
@@ -100,6 +103,9 @@ def update(st: dict, events: list[str], now: float, spent: dict[str, float]) -> 
     to). A state with no owners starts from the old hash split (crc32), so
     the first rebalance moves as few events as it can."""
     fresh = not st["owners"]
+    resized = st.get("procs", 2) != len(PROCS)
+    # An owner past the end of PROCS (a process removed) owns nothing.
+    st["owners"] = {e: i for e, i in st["owners"].items() if i < len(PROCS)}
     for ev in events:
         st["seen"][ev] = now
     for ev in [e for e, t in st["seen"].items() if now - t > FORGET_S]:
@@ -115,7 +121,7 @@ def update(st: dict, events: list[str], now: float, spent: dict[str, float]) -> 
         st["owners"][ev] = i
         load_[i] += cost[ev]
     moves: list[tuple[str, int, int]] = []
-    if fresh or now - st["rebalanced_at"] >= REBALANCE_S:
+    if fresh or resized or now - st["rebalanced_at"] >= REBALANCE_S:
         st["rebalanced_at"] = now
         while True:
             hi = max(range(len(PROCS)), key=lambda k: load_[k])
@@ -133,6 +139,7 @@ def update(st: dict, events: list[str], now: float, spent: dict[str, float]) -> 
             load_[lo] += cost[ev]
             moves.append((ev, hi, lo))
     st["load"] = [round(x, 1) for x in load_]
+    st["procs"] = len(PROCS)
     return moves
 
 
