@@ -352,6 +352,44 @@ def test_polymarket_cancels_wait_for_the_bucket_then_go(monkeypatch):
     assert calls[-1] is True                     # sent anyway after the wait
 
 
+def test_kalshi_cancels_are_forced_only_within_the_overdraw():
+    from strategies.ARBS import execution
+    calls, tokens = [], [-5.0]
+
+    class C:
+        shard = 0
+
+        def allow_now(self, kind, force=False, reason=""):
+            calls.append(force)
+            return force or tokens[0] >= 2.0
+
+        def tokens_now(self):
+            return tokens[0]
+
+        def cancel(self, oid, ticker):
+            return True
+    gw = execution.Gateway.__new__(execution.Gateway)
+    gw.client = lambda t: C()
+
+    async def write(fn, *a):
+        return fn(*a)
+    gw.write = write
+    asyncio.run(gw.cancel("KX-A", "o1", "pull"))
+    assert calls == [False, True]                # short of tokens but within the overdraw: forced at once
+
+    calls.clear()
+    tokens[0] = -50.0                            # past it: waits for refill, then goes unforced
+
+    async def refill():
+        await asyncio.sleep(0.03)
+        tokens[0] = 10.0
+
+    async def both():
+        return await asyncio.gather(gw.cancel("KX-A", "o1", "pull"), refill())
+    (got, exc, sent), _ = asyncio.run(both())
+    assert got is True and True not in calls and calls[-1] is False and len(calls) > 2
+
+
 def test_urgent_polymarket_cancels_go_now_within_the_overdraw(monkeypatch):
     from strategies.ARBS import execution
     monkeypatch.setattr(execution, "PM_CANCEL_WAIT_S", 5.0)

@@ -28,6 +28,12 @@ PM_ROUTINE_CANCELS = frozenset({"not_hot", "duplicate", "deep_off", "excluded", 
 # An urgent cancel may overdraw the bucket by this much: 5 requests, the gap
 # between our 20/s and Polymarket's documented 25/s per IP.
 PM_URGENT_OVERDRAW = 50.0
+# A Kalshi cancel is forced past the shard's bucket only this far (5 cancels);
+# beyond it, it waits for refill (~7 ms a cancel at 300/s). Always forced, three
+# processes' pulls drew 4,486 cancel 429s (11-16 06:51-15:50): a 429'd cancel
+# cancels nothing, is retried at once, and keeps Kalshi's bucket empty for
+# quotes and completions too.
+KALSHI_CANCEL_OVERDRAW = 10.0
 
 
 class Gateway:
@@ -163,8 +169,9 @@ class Gateway:
             return None, e
 
     async def cancel(self, ticker, exchange_id, reason: str):
-        """Always sent, forced past the bucket if it must (Polymarket: only
-        while the overdraw allows): a refused cancel leaves risk on the book."""
+        """Always sent, forced past the bucket if it must, but only while the
+        overdraw allows (KALSHI_CANCEL_OVERDRAW, PM_URGENT_OVERDRAW): a refused
+        cancel leaves risk on the book, and a 429'd one cancels nothing."""
         c = self.client(ticker)
         if c is None:
             return None, RuntimeError(f"no order client for {ticker}"), False
@@ -184,7 +191,11 @@ class Gateway:
                     break
                 await asyncio.sleep(0.05)
         else:
-            c.allow_now("cancel", force=True, reason=reason)
+            while not c.allow_now("cancel", reason=reason):
+                if c.tokens_now() > -KALSHI_CANCEL_OVERDRAW:
+                    c.allow_now("cancel", force=True, reason=reason)
+                    break
+                await asyncio.sleep(0.005)
         try:
             return await self.write(c.cancel, exchange_id, ticker), None, True
         except Exception as e:
