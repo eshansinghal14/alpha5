@@ -172,6 +172,11 @@ ORDER_TOKENS, CANCEL_TOKENS = 10.0, 2.0
 # spent 84-88% of 300 with no 429s (11-15).
 WRITE_TARGET = 0.95
 SPEND_WINDOW_S = 120.0
+# Series, shard and fee rates per event, kept across restarts: reading them
+# (three reads an event, ~10,000 over the four processes) held each restart
+# off quoting 5-7 min on the shared 30 reads/s (11-16). A running process
+# already keeps them for its lifetime, days, so a day-old entry is no staler.
+EVENT_META, EVENT_META_TTL_S = "event_meta.json", 86400.0
 # The ceiling only guards a runaway estimate: at 3 shard 0 stopped at ~1,515
 # hot baskets spending ~170 of 255 target tokens/s (11-15 20:37 UTC).
 PLAN_SCALE_MIN, PLAN_SCALE_MAX = 0.5, 10.0
@@ -360,6 +365,15 @@ class _Quotes(dict):
         return list(self.side.get((ticker, side), {}).values())
 
 
+def _read_json(path: str):
+    """The file's JSON, or None if it is missing or unreadable."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
 @dataclasses.dataclass
 class Meta:
     ticker: str
@@ -386,6 +400,7 @@ class ArbsRunner:
         self.root = os.path.join(LIVE_ROOT, self.S)
         os.makedirs(self.root, exist_ok=True)
         self.meta: dict[str, Meta] = {}
+        self.event_meta: dict[str, dict] = _read_json(os.path.join(self.root, EVENT_META)) or {}
         self.real_ledger = Ledger(os.path.join(self.root, "ledger.json"))
         self.shadow_ledger = Ledger(os.path.join(self.root, "ledger_shadow.json"))
         self.alerts: list[dict] = []
@@ -540,7 +555,7 @@ class ArbsRunner:
         self.hot_churn: collections.deque = collections.deque()   # (time, entered, left) per hot-list change
         self.hot_cost = 0.0                       # estimated write tokens/s of quoting the hot list
         self.hot_cost_by_shard: dict[str, float] = {}
-        self.plan_scale: dict[int, float] = {}    # shard -> plan budget over write budget (update_plan_scale)
+        self.plan_scale: dict[int, float] = self.last_plan_scale()   # shard -> plan budget over write budget
         self.spend_tps: dict[int, float] = {}     # shard -> real write tokens/s over SPEND_WINDOW_S
         self._spend_hist: dict[int, collections.deque] = {}
         self._scale_at: dict[int, float] = {}
@@ -832,6 +847,7 @@ class ArbsRunner:
             mt.ticks = pricing.Ticks.from_market(m.get("price_ranges"))
             self.meta[t] = mt
             events.setdefault(mt.event, []).append(mt)
+        fetched = False
         for et, ms in events.items():
             known = next((mt for mt in ms if mt.shard is not None), None)
             if known is not None:
@@ -842,15 +858,24 @@ class ArbsRunner:
                         mt.series, mt.shard = known.series, known.shard
                         mt.taker_rate, mt.maker_rate = known.taker_rate, known.maker_rate
                 continue
-            try:
-                ev = kalshi_get(f"/trade-api/v2/events/{et}", auth=True)["event"]
-                sched = kfees.for_event(ev["series_ticker"], et)
-            except Exception as e:
-                self.alert("warn", None, f"{et}: event/fee lookup failed ({e!r}); not traded")
-                continue
+            c = self.event_meta.get(et)
+            if c is None or time.time() - c.get("at", 0.0) >= EVENT_META_TTL_S:
+                try:
+                    ev = kalshi_get(f"/trade-api/v2/events/{et}", auth=True)["event"]
+                    sched = kfees.for_event(ev["series_ticker"], et)
+                except Exception as e:
+                    self.alert("warn", None, f"{et}: event/fee lookup failed ({e!r}); not traded")
+                    continue
+                c = self.event_meta[et] = {"series": ev["series_ticker"], "shard": int(ev["exchange_index"]),
+                                           "taker": sched.taker_rate, "maker": sched.maker_rate, "at": time.time()}
+                fetched = True
             for mt in ms:
-                mt.series, mt.shard = ev["series_ticker"], int(ev["exchange_index"])
-                mt.taker_rate, mt.maker_rate = sched.taker_rate, sched.maker_rate
+                mt.series, mt.shard = c["series"], c["shard"]
+                mt.taker_rate, mt.maker_rate = c["taker"], c["maker"]
+        if fetched:
+            now = time.time()
+            self.event_meta = {e: c for e, c in self.event_meta.items() if now - c.get("at", 0.0) < EVENT_META_TTL_S}
+            atomic_write_json(os.path.join(self.root, EVENT_META), self.event_meta, indent=None)
         if ((self.cfg.runtime.live_params_shadow or self.cfg.trading.late_quote_cutoff_min)
                 and time.time() - self.series_group_at >= SERIES_GROUPS_S):
             try:
@@ -3404,12 +3429,21 @@ class ArbsRunner:
         cap = self.write_cap()
         return cap if cap is not None else write_budget_tokens_per_s()
 
+    def last_plan_scale(self) -> dict[int, float]:
+        """The plan scale the last process of this series reached, from its
+        summary: from 1, a restart took minutes to climb back to full quoting."""
+        for d in (_utc(), _utc() - pd.Timedelta(days=1)):
+            got = (_read_json(os.path.join(self.root, f"{d:%Y-%m-%d}", "summary.json")) or {}).get("write_plan_scale")
+            if got:
+                return {int(s): min(PLAN_SCALE_MAX, max(PLAN_SCALE_MIN, float(v))) for s, v in got.items()}
+        return {}
+
     def update_plan_scale(self, now: float):
         """Per Kalshi shard: moves the plan scale toward the one that puts
         real write spend at WRITE_TARGET of the write budget, from what the
         hot list's estimated cost really spent over SPEND_WINDOW_S, smoothed
-        over the same span. Held at 1 until the hot list has filled and a
-        full window is in."""
+        over the same span. Held where it starts (last_plan_scale) until the
+        hot list has filled and a full window is in."""
         for s, c in self.gw.clients.items():
             spent = getattr(c, "spent_total", None)
             if spent is None:

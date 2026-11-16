@@ -1,5 +1,6 @@
 """Runner decisions in shadow mode on hand-built books (no network)."""
 import collections
+import os
 import json
 import asyncio
 import dataclasses
@@ -557,6 +558,43 @@ def test_market_missing_at_first_read_is_picked_up_later(arbs, monkeypatch):
     r.load_meta()
     assert (r.meta["X-B"].event, r.meta["X-B"].status, r.meta["X-B"].shard) == ("X", "active", 0)
     assert "/trade-api/v2/events/" not in calls
+
+
+def test_a_restart_takes_event_series_shard_and_fees_from_the_cache(arbs, monkeypatch):
+    from strategies.ARBS import SERIES
+    r, b = arbs
+    listed = {"markets": [{"ticker": t, "event_ticker": "X", "status": "active"} for t in ("X-A", "X-B")]}
+    calls = []
+
+    def get(path, params=None, auth=False):
+        calls.append(path)
+        return listed if path.endswith("/markets") else {"event": {"series_ticker": "XS", "exchange_index": 3}}
+    monkeypatch.setattr(R, "kalshi_get", get)
+    monkeypatch.setattr(R.kfees, "for_event", lambda s, e: type("F", (), {"taker_rate": 0.07, "maker_rate": 0.01})())
+    r.meta.clear()
+    r.load_meta()
+    assert calls.count("/trade-api/v2/events/X") == 1
+    r2 = R.ArbsRunner(SERIES["ARBS"], live_trading=False)       # the next process, same files
+    r2.tickers = r.tickers
+    r2.load_meta()
+    assert calls.count("/trade-api/v2/events/X") == 1               # no second read
+    assert (r2.meta["X-A"].series, r2.meta["X-A"].shard, r2.meta["X-A"].taker_rate) == ("XS", 3, 0.07)
+    stale = json.load(open(os.path.join(r.root, R.EVENT_META)))
+    stale["X"]["at"] -= R.EVENT_META_TTL_S
+    json.dump(stale, open(os.path.join(r.root, R.EVENT_META), "w"))
+    r3 = R.ArbsRunner(SERIES["ARBS"], live_trading=False)
+    r3.tickers = r.tickers
+    r3.load_meta()
+    assert calls.count("/trade-api/v2/events/X") == 2               # a day old: read again
+
+
+def test_a_restart_starts_from_the_last_plan_scale(arbs):
+    from strategies.ARBS import SERIES
+    r, b = arbs
+    d = os.path.join(r.root, f"{R._utc():%Y-%m-%d}")
+    os.makedirs(d, exist_ok=True)
+    json.dump({"write_plan_scale": {"0": 2.5, "3": 99.0}}, open(os.path.join(d, "summary.json"), "w"))
+    assert R.ArbsRunner(SERIES["ARBS"], live_trading=False).plan_scale == {0: 2.5, 3: R.PLAN_SCALE_MAX}
 
 
 def _cheap_book(r):
