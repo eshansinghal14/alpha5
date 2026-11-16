@@ -354,11 +354,14 @@ class _Quotes(dict):
         super().__init__()
         self.side: dict[tuple[str, str], dict] = collections.defaultdict(dict)
         self.gone: dict[tuple[str, str], tuple[float, "Quote"]] = {}   # (ticker, side) -> (when, last quote removed)
+        self.n_by_basket: dict[str, int] = {}     # basket_id -> quotes it has
 
     def __setitem__(self, k, q):
         old = self.get(k)
         if old is not None:
             self.side[(old.ticker, old.side)].pop(k, None)
+        else:
+            self.n_by_basket[k[0]] = self.n_by_basket.get(k[0], 0) + 1
         super().__setitem__(k, q)
         self.side[(q.ticker, q.side)][k] = q
 
@@ -367,6 +370,11 @@ class _Quotes(dict):
         super().__delitem__(k)
         self.side[(q.ticker, q.side)].pop(k, None)
         self.gone[(q.ticker, q.side)] = (time.time(), q)
+        n = self.n_by_basket.get(k[0], 0) - 1
+        if n > 0:
+            self.n_by_basket[k[0]] = n
+        else:
+            self.n_by_basket.pop(k[0], None)
 
     def pop(self, k, *default):
         if k in self:
@@ -381,6 +389,7 @@ class _Quotes(dict):
         super().clear()
         self.side.clear()
         self.gone.clear()
+        self.n_by_basket.clear()
 
     def on(self, ticker: str, side: str):
         return list(self.side.get((ticker, side), {}).values())
@@ -436,6 +445,10 @@ class ArbsRunner:
         self._dirty = _Dirty((), self.wake)
         # Baskets with a fill to exit: evaluated before anything in dirty.
         self.urgent: set[str] = set()
+        # Baskets with a quote resting whose books changed: after urgent, before
+        # dirty. Behind thousands of quoteless baskets a book change took 4-7 ms
+        # p50 and 10-30 ms p75 to reach a cancel (11-16, shard 0 and Polymarket).
+        self.quoted: set[str] = set()
         # basket_id -> its ranking row, refreshed whenever the basket is
         # evaluated (its books changed), so the rank pass only sorts.
         self.rank_rows: dict[str, dict] = {}
@@ -443,8 +456,9 @@ class ArbsRunner:
         self._broken_cache: int | None = None
         self._ro_sets: tuple = (None, frozenset(), {})
         self._commit_cache: float | None = None
-        self.hot: list[str] = []
+        self.hot = []
         self.ranking: list[dict] = []
+        self._tradeable_n: tuple[float, int] = (0.0, 0)   # (monotonic, n) for the summary
         self.scan_path = os.path.join(self.root, scanner.SELECTED)
         self.scan_status: dict = {}
         self.markets: int | None = None              # markets the next scan may take (scan_markets)
@@ -617,10 +631,25 @@ class ArbsRunner:
         if items:
             self.wake.set()
 
+    @property
+    def hot(self) -> list[str]:
+        return self._hot
+
+    @hot.setter
+    def hot(self, ids):
+        # A set beside the list: membership was a list scan of 1,000-2,700 ids
+        # on every evaluation and in pick_hot's loop (py-spy 11-16).
+        self._hot = list(ids)
+        self.hot_set = frozenset(self._hot)
+
     def mark(self, basket_id: str):
-        """Dirty, or urgent for a basket with a fill to exit."""
+        """Dirty; urgent for a basket with a fill to exit, quoted for one with
+        a quote resting."""
         if basket_id in self.exit_hist:
             self.urgent.add(basket_id)
+            self.wake.set()
+        elif basket_id in self.quotes.n_by_basket:
+            self.quoted.add(basket_id)
             self.wake.set()
         else:
             self.dirty.add(basket_id)
@@ -1098,7 +1127,7 @@ class ArbsRunner:
         hot list: what the basket cap left on the table."""
         if not self.hot_ready:
             return
-        hot = set(self.hot)
+        hot = self.hot_set
         for bid in self.by_ticker.get(ticker, ()):
             px = self.quote_px.get(bid)
             b = self.baskets.get(bid)
@@ -2227,9 +2256,13 @@ class ArbsRunner:
             # each slice), urgent first: a basket with a fill to exit waited
             # behind every basket whose book ticked.
             start = time.perf_counter()
-            while self.urgent or self.dirty:
+            while self.urgent or self.quoted or self.dirty:
                 if self.urgent:
                     bid = self.urgent.pop()
+                    self.quoted.discard(bid)
+                    self.dirty.discard(bid)
+                elif self.quoted:
+                    bid = self.quoted.pop()
                     self.dirty.discard(bid)
                 else:
                     bid = self.dirty.pop()
@@ -2242,7 +2275,7 @@ class ArbsRunner:
                         traceback.print_exc()
                 if time.perf_counter() - start > EVAL_SLICE_S:
                     break
-            if self.urgent or self.dirty:
+            if self.urgent or self.quoted or self.dirty:
                 self.wake.set()
             self._in_pass, self._commit_cache, self._broken_cache = False, None, None
             # Let the websocket reader run before the next pass.
@@ -2315,7 +2348,7 @@ class ArbsRunner:
         t = self.cfg.trading
         ex = self.exit_room(b)
         now_ts = _utc()
-        want = t.enable_quoting and (b.basket_id in self.hot or ex >= 1) and self.may_quote(b, now_ts)
+        want = t.enable_quoting and (b.basket_id in self.hot_set or ex >= 1) and self.may_quote(b, now_ts)
         live = self.live_now(b, now_ts)
         cap = float(t.live_quote_size if live else t.quote_size)
         quote_need = edge_dollars(b.payout, t.min_edge + t.quote_edge_add) + (t.live_edge_add if live else 0.0)
@@ -3632,7 +3665,7 @@ class ArbsRunner:
         refused in 4 min (10-29)."""
         out, used = set(), 0.0
         for bid in quotable:
-            if bid in self.hot and used + cost[bid] <= 1.1 * budget:
+            if bid in self.hot_set and used + cost[bid] <= 1.1 * budget:
                 out.add(bid)
                 used += cost[bid]
         for bid in quotable:
@@ -3674,7 +3707,7 @@ class ArbsRunner:
                     self.hot_ready = True
                 self.update_plan_scale(time.time())
                 if hot != self.hot:
-                    entered, left = set(hot) - set(self.hot), set(self.hot) - set(hot)
+                    entered, left = set(hot) - self.hot_set, self.hot_set - set(hot)
                     if self.hot_ready and (entered or left):
                         self.hot_churn.append((time.time(), len(entered), len(left)))
                     self.dirty |= entered | left
@@ -3942,10 +3975,8 @@ class ArbsRunner:
         at its side's best bid, less the taker fee; nothing without a bid."""
         out = 0.0
         for t, q in unhedged.items():
-            v, m = self.feed.book(t), self.meta.get(t)
-            if v is None:
-                continue
-            bid = v.bid if pos.legs[t].side == "yes" else (None if v.ask is None else 1.0 - v.ask)
+            (yb, ya), m = self._top(t), self.meta.get(t)
+            bid = yb if pos.legs[t].side == "yes" else (None if ya is None else 1.0 - ya)
             if bid is not None and bid > 0:
                 out += q * bid - kfees.fee(bid, q, (m.taker_rate if m else None) or 0.0)
         return out
@@ -3960,14 +3991,32 @@ class ArbsRunner:
             return 0.0
         total = 0.0
         for leg in b.legs:
-            v = self.feed.book(leg.ticker)
-            if v is None or (v.bid is None and v.ask is None):
+            yb, ya = self._top(leg.ticker)
+            if yb is None and ya is None:
                 return 0.0
             # A side with no orders is the $0/$1 bound: a near-certain leg loses its asks
             # exactly when the upside becomes likely (AAA gas ladder at 0.98/none, 11-09).
-            mid = ((0.0 if v.bid is None else v.bid) + (1.0 if v.ask is None else v.ask)) / 2.0
+            mid = ((0.0 if yb is None else yb) + (1.0 if ya is None else ya)) / 2.0
             total += mid if leg.side == "yes" else 1.0 - mid
         return bundles * max(0.0, total - b.payout)
+
+    def _top(self, ticker: str) -> tuple:
+        """(YES bid, YES ask) as the last book update left it, for the summary:
+        a BookView per leg was ~9 ms of each one (py-spy 11-16)."""
+        top = self.last_top.get(ticker)
+        if top is None:
+            v = self.feed.book(ticker)
+            top = (None, None) if v is None else (v.bid, v.ask)
+        return top
+
+    def _n_tradeable(self) -> int:
+        """Baskets tradeable now, recounted every 30 s: the walk over every
+        basket was ~20 ms of each 2 s summary on the event loop (py-spy 11-16)."""
+        at, n = self._tradeable_n
+        if time.monotonic() - at >= 30.0:
+            n = sum(1 for b in self.all_baskets if self.tradeable(b))
+            self._tradeable_n = (time.monotonic(), n)
+        return n
 
     def summary(self) -> dict:
         # Real positions stay on screen after a disarm; shadow ones only show
@@ -4007,7 +4056,7 @@ class ArbsRunner:
             "feed": {"up": self.feed.up, "reconnects": self.feed.n_reconnects, "seq_gaps": self.feed.n_seq_gaps,
                      "ws_errors": self.feed.n_errors, "refreshes": self.feed.n_refreshes, "last_msg_s": self.feed.seconds_since_message()},
             "n_baskets": len(self.all_baskets), "n_tickers": len(self.tickers),
-            "n_tradeable": sum(1 for b in self.all_baskets if self.tradeable(b)),
+            "n_tradeable": self._n_tradeable(),
             "market_status": _count(m.status for m in self.meta.values()),
             "pnl": {"settled": round(sum(r["pnl"] for r in settled), 4),
                     "locked": round(sum(h["locked_pnl"] or 0.0 for h in holdings), 4),

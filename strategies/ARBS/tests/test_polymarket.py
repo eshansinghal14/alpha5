@@ -677,3 +677,29 @@ def test_broken_basket_stop_counts_only_baskets_broken_30s(pm_arbs):
     assert r.blocked() is None                       # y is mid-exit
     r.ledger.baskets["y"].broken_since = now - R.BROKEN_STOP_S - 1
     assert r.blocked() == "2 broken baskets"
+
+
+def test_a_basket_with_a_resting_quote_is_evaluated_before_quoteless_ones(pm_arbs):
+    r, b = pm_arbs
+    b2 = Basket(basket_id="cross:K-B:pm_no", relationship_id="cross:K-B", type="cross_venue", cluster="cross:soccer",
+                legs=(Leg("pm-ev-b", "no"), Leg("K-B", "yes")), payout=1.0, quote_until=None, resume_quoting=None)
+    r.set_baskets([b, b2])
+    q = R.Quote(basket_id=b.basket_id, leg=0, ticker="pm-ev-a", side="no", price=0.4, size=5.0, cid="c",
+                edge=0.03, max_price=0.45, exchange_id="o1", pending=False)
+    r.quotes[q.key] = q
+    assert r.quotes.n_by_basket == {b.basket_id: 1}
+    order = []
+    r.evaluate = lambda bk: order.append(bk.basket_id)
+
+    async def go():
+        r.dirty.clear()
+        for _ in range(3):
+            r.mark(b2.basket_id)
+        r.mark(b.basket_id)                         # marked last, evaluated first
+        t = asyncio.get_running_loop().create_task(r.eval_loop())
+        await asyncio.sleep(0.05)
+        t.cancel()
+    asyncio.run(go())
+    assert order[:2] == [b.basket_id, b2.basket_id]
+    r.quotes.pop(q.key)
+    assert r.quotes.n_by_basket == {}
