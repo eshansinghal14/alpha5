@@ -167,8 +167,10 @@ ORDER_TOKENS, CANCEL_TOKENS = 10.0, 2.0
 # (11-15 20:07 UTC, top-ranked hot baskets: 139 est vs 60 real tokens/s on
 # shard 0), so both shards stopped adding baskets at ~half the real rate limit.
 # Each shard's plan budget is scaled so real spend comes to WRITE_TARGET of
-# the write budget, leaving room for bursts and exits.
-WRITE_TARGET = 0.85
+# the write budget. The slack only serves quote creates and chasing moves:
+# cancels and past-limit moves never wait on the bucket. At 0.85 the shards
+# spent 84-88% of 300 with no 429s (11-15).
+WRITE_TARGET = 0.95
 SPEND_WINDOW_S = 120.0
 # The ceiling only guards a runaway estimate: at 3 shard 0 stopped at ~1,515
 # hot baskets spending ~170 of 255 target tokens/s (11-15 20:37 UTC).
@@ -185,7 +187,7 @@ DEEP_REQUOTE_S = 10.0
 # repriced only every DEEP_REQUOTE_S: that depth changes on every print.
 NEAR_KEEP, NEAR_SHRINK, NEAR_GROW = 0.5, 0.8, 1.5
 # Near quotes come after everything else for writes: placed, repriced and grown
-# only with this share of the write cap left in the bucket, and not charged to
+# only with this share of the capped bucket left in it, and not charged to
 # their basket's write cost. Charged and held only to write_reserve_tokens,
 # ~700 of them emptied shard 0's bucket and cut its hot list from 1,510 to
 # 1,106 baskets in 2 min (11-12 23:53). Cutting or pulling one is not held back.
@@ -2471,7 +2473,7 @@ class ArbsRunner:
         0.1 s or 1 s after the print."""
         t, reserve, acts = self.cfg.trading, self.cfg.runtime.write_reserve_tokens, []
         near_on = on and not live and t.near_min_size >= 1
-        near_reserve = max(reserve, NEAR_RESERVE * self.write_budget())
+        near_reserve = max(reserve, NEAR_RESERVE * self.write_budget() * self.gw.burst_s())
         # None on the Polymarket process: its config had them off until
         # deep_quote_size was removed (11-13), and they are untested there.
         on = on and not self.pm_process

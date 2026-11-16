@@ -1,3 +1,4 @@
+import pytest
 import time
 import types
 
@@ -92,6 +93,19 @@ def test_shared_bucket_read_takes_no_file_lock(tmp_path, monkeypatch):
     assert calls == [] and 0 < t < b.capacity
     b.take(1.0)
     assert calls == [True, False]
+
+
+def test_a_full_burst_bucket_holds_kalshis_capacity_and_its_cap_as_many_seconds(tmp_path, monkeypatch):
+    from infra.kalshi import orders
+    monkeypatch.setattr(orders, "write_limits", lambda: (300.0, 900.0))
+    monkeypatch.setattr(orders, "_shared_budget_path", lambda s: str(tmp_path / f"{s}.bucket"))
+    monkeypatch.setattr(orders, "_SHARED", {})
+    full, one = orders.shard_budget(7, full_burst=True), orders.shard_budget(8)
+    assert full.capacity == 900.0 and full.tokens_now() == pytest.approx(900.0, abs=1.0)
+    assert one.capacity == 300.0                                  # the default stays one second
+    c = KalshiOrderClient.__new__(KalshiOrderClient)
+    c.budget, c.cap_fn = full, lambda: 150.0
+    assert c._cap_bucket().capacity == 450.0
 
 
 def test_per_series_cap_limits_creates_never_cancels():

@@ -176,7 +176,10 @@ def _alerts(series: str, s: dict):
     al = [a for a in (s.get("alerts") or []) if a["level"] in ("error", "warn")
           and a["time"] > cuts.get(a.get("shard"), _cleared(series))]
     if al:
-        with st.expander(f"Alerts ({len(al)} new)", expanded=any(a["level"] == "error" for a in al[-10:])):
+        # Never opened by the page: an `expanded` that turned True on a new
+        # error re-opened the panel on every one. Open or closed stays the viewer's.
+        n_err = sum(a["level"] == "error" for a in al)
+        with st.expander(f"Alerts ({len(al)} new" + (f", {n_err} errors)" if n_err else ")"), expanded=False):
             df = _local(pd.DataFrame(al[::-1]), "time")
             st.dataframe(df[[c for c in ("time", "shard", "level", "basket_id", "msg", "live") if c in df]],
                          use_container_width=True, hide_index=True, column_config={"time": TIME_COL})

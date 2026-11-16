@@ -49,10 +49,19 @@ class Gateway:
         self.shard_of = dict(shard_of)
         for s in sorted(set(shard_of.values())):
             if s not in self.clients:
-                c = PolymarketOrderClient() if s == PM_SHARD else KalshiOrderClient.from_account(shard=s)
+                # Kalshi's whole bucket (900 tokens at Advanced): holding one
+                # second, bursts refused 4-5% of quote creates and moves at 88%
+                # average use (11-15). Every ARBS process passes it, so the
+                # shard's shared bucket keeps one capacity.
+                c = PolymarketOrderClient() if s == PM_SHARD else KalshiOrderClient.from_account(shard=s, full_burst=True)
                 c.cap_fn = cap_fn
                 c.price_dp = 4
                 self.clients[s] = c
+
+    def burst_s(self) -> float:
+        """Seconds of refill the Kalshi buckets hold (1 before setup)."""
+        return max((c.budget.capacity / c.budget.rate for c in self.clients.values()
+                    if isinstance(c, KalshiOrderClient) and c.budget.rate), default=1.0)
 
     def client(self, ticker: str) -> KalshiOrderClient | None:
         s = self.shard_of.get(ticker)

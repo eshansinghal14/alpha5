@@ -154,12 +154,19 @@ def is_post_only_reject(exc) -> bool:
     return "post" in body and ("only" in body or "cross" in body)
 
 
-def write_budget_tokens_per_s() -> float:
-    """The account's write-token refill rate from Kalshi (tier-dependent:
-    100/s on Basic, 2026-10-09). Read at session start, so a tier upgrade
-    takes effect at the next event."""
+def write_limits() -> tuple[float, float]:
+    """(refill tokens/s, bucket capacity) of the account's write budget
+    from Kalshi (tier-dependent: 100/s on Basic 2026-10-09, 300/s holding 900
+    on Advanced 2026-11-15). Read at session start, so a tier upgrade takes
+    effect at the next event."""
     from infra.kalshi.api import kalshi_get
-    return float(kalshi_get(LIMITS_PATH, auth=True)["write"]["refill_rate"])
+    w = kalshi_get(LIMITS_PATH, auth=True)["write"]
+    return float(w["refill_rate"]), float(w["bucket_capacity"])
+
+
+def write_budget_tokens_per_s() -> float:
+    """The account's write-token refill rate (see write_limits)."""
+    return write_limits()[0]
 
 
 def process_write_tokens_per_s() -> float:
@@ -269,12 +276,12 @@ class WriteBudget:
     clients in one process (a write group's series) can share one, so they
     draw on a single budget instead of fixed slices of it. Thread-safe."""
 
-    def __init__(self, tokens_per_s: float):
+    def __init__(self, tokens_per_s: float, burst_s: float = 1.0):
         self.tokens_per_s = tokens_per_s
         self.rate = tokens_per_s * WRITE_HEADROOM
-        # Basic tier holds one second of budget (higher tiers three; one is
-        # the safe floor for either).
-        self.capacity = self.rate
+        # `burst_s` seconds of rate held. One is the safe floor on every tier;
+        # Kalshi's own bucket holds one on Basic and three on Advanced.
+        self.capacity = self.rate * burst_s
         self._tokens = self.capacity
         self._last = time.monotonic()
         self._lock = threading.Lock()
@@ -317,10 +324,10 @@ class SharedWriteBudget(WriteBudget):
 
     _SIZE = struct.Struct("<dd")          # tokens, last refill (time.monotonic)
 
-    def __init__(self, tokens_per_s: float, shard: int, path: str | None = None):
+    def __init__(self, tokens_per_s: float, shard: int, path: str | None = None, burst_s: float = 1.0):
         self.tokens_per_s = tokens_per_s
         self.rate = tokens_per_s * WRITE_HEADROOM
-        self.capacity = self.rate
+        self.capacity = self.rate * burst_s
         self.path = path or _shared_budget_path(shard)
         self._lock = threading.Lock()     # threads of this process; the file lock covers processes
         new = not os.path.exists(self.path)
@@ -400,13 +407,17 @@ _SHARED: dict[int, SharedWriteBudget] = {}
 _SHARED_LOCK = threading.Lock()
 
 
-def shard_budget(shard: int) -> WriteBudget:
+def shard_budget(shard: int, full_burst: bool = False) -> WriteBudget:
     """The machine-wide bucket for `shard` at the account's full refill rate
-    (one per process). KALSHI_WRITE_SHARE no longer splits it."""
+    (one per process). KALSHI_WRITE_SHARE no longer splits it. `full_burst`
+    holds Kalshi's whole bucket instead of one second: every process writing
+    to the shard must then pass it too, or the smaller capacity clamps the
+    shared count."""
     with _SHARED_LOCK:
         b = _SHARED.get(shard)
         if b is None:
-            b = _SHARED[shard] = SharedWriteBudget(write_budget_tokens_per_s(), shard)
+            rate, cap = write_limits()
+            b = _SHARED[shard] = SharedWriteBudget(rate, shard, burst_s=cap / rate if full_burst else 1.0)
         return b
 
 
@@ -547,13 +558,14 @@ class KalshiOrderClient:
         self._t0 = time.monotonic()
 
     @classmethod
-    def from_account(cls, shard: int | None = None, budget: WriteBudget | None = None) -> "KalshiOrderClient":
+    def from_account(cls, shard: int | None = None, budget: WriteBudget | None = None,
+                     full_burst: bool = False) -> "KalshiOrderClient":
         """`shard`: the exchange_index every write is pinned to (see
         _shard_field). A pinned client draws on the machine-wide bucket for
-        that shard (shard_budget) unless a `budget` is passed; unpinned falls
-        back to this process's WRITE_SHARE_ENV slice."""
+        that shard (shard_budget, `full_burst` passed on) unless a `budget` is
+        passed; unpinned falls back to this process's WRITE_SHARE_ENV slice."""
         if budget is None and shard is not None:
-            budget = shard_budget(shard)
+            budget = shard_budget(shard, full_burst)
         c = cls(tokens_per_s=process_write_tokens_per_s() if budget is None else budget.tokens_per_s,
                 budget=budget)
         c.shard = shard
@@ -683,7 +695,9 @@ class KalshiOrderClient:
             self._cap = None
             return None
         if self._cap is None or abs(self._cap.tokens_per_s - rate) > 1e-9:
-            self._cap = WriteBudget(rate)
+            # Holds as many seconds as the shared bucket, so the cap limits the
+            # rate, not the bursts the shard's bucket allows.
+            self._cap = WriteBudget(rate, burst_s=self.budget.capacity / max(self.budget.rate, 1e-9))
         return self._cap
 
     def tokens_now(self) -> float:

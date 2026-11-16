@@ -1064,7 +1064,7 @@ def test_plan_budget_follows_real_write_spend(arbs):
         c.spent_total = 100.0 * i
         r.update_plan_scale(t0 + i)
     assert abs(r.spend_tps[0] - 100.0) < 1e-6
-    assert abs(r.plan_scale[0] - 0.85 * 300 / 100) < 0.01 and 100 not in r.plan_scale
+    assert abs(r.plan_scale[0] - R.WRITE_TARGET * 300 / 100) < 0.01 and 100 not in r.plan_scale
     for i in range(1805, 3601, 5):                       # now spending more than planned: scale floors at 0.5
         c.spent_total += 5 * 1000.0
         r.update_plan_scale(t0 + i)
@@ -1512,7 +1512,7 @@ def test_near_quote_waits_for_spare_write_tokens_and_is_not_charged_to_its_baske
         _near(r, b, 500)
         assert (b.basket_id, 0) in r.quotes and (b.basket_id, 0, "deep") not in r.quotes    # arb quotes go, it waits
         charged = r.spend[b.basket_id].v
-        spare[0] = R.NEAR_RESERVE * r.write_budget()
+        spare[0] = R.NEAR_RESERVE * r.write_budget() * r.gw.burst_s()
         r._near_at.clear()
         _eval(r, b)
         assert r.quotes[(b.basket_id, 0, "deep")].near and r.spend[b.basket_id].v == charged
