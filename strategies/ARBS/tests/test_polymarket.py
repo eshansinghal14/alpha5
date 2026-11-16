@@ -665,3 +665,15 @@ def test_a_polymarket_feed_drop_takes_its_quotes_down_with_one_cancel_all(pm_arb
         await asyncio.sleep(0)
     asyncio.run(go())
     assert stops == ["feed_down"] and cancels == []
+
+
+def test_broken_basket_stop_counts_only_baskets_broken_30s(pm_arbs):
+    import types
+    r, b = pm_arbs
+    r.feed.kalshi._tickers, r.feed.pm._tickers = ["K-A"], ["pm-ev-a"]
+    r.feed.up = True
+    now = time.time()
+    r.ledger.baskets = {"x": types.SimpleNamespace(broken_since=now - 300), "y": types.SimpleNamespace(broken_since=now - 1)}
+    assert r.blocked() is None                       # y is mid-exit
+    r.ledger.baskets["y"].broken_since = now - R.BROKEN_STOP_S - 1
+    assert r.blocked() == "2 broken baskets"

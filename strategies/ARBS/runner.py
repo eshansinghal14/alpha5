@@ -268,6 +268,11 @@ PM_CLOSED_REJECTS = ("This market is closed for trading",)
 # Retired Polymarket orders reconcile may still read: their cancel echo
 # normally marks them final within a second; this bounds the backlog.
 PM_RECONCILE_WINDOW_S = 3600.0
+# A basket counts toward max_broken_baskets once broken this long. Mid-exit
+# breaks last p90 0.6 s; counting them, one basket stuck 50 min plus brief
+# breaks elsewhere stopped ARBSPM 18 times in 46 min, each a cancel-all and a
+# re-place of ~1,000-2,000 quotes (11-16 14:08-14:54).
+BROKEN_STOP_S = 30.0
 # A Polymarket move unconfirmed by its REPLACE execution after this long is
 # taken as not made: a modify that would cross is dropped silently, the order
 # left at its old price (probe 11-15). The echo came 11 ms after the answer.
@@ -688,7 +693,12 @@ class ArbsRunner:
             return "Kalshi trading paused"
         # Counted once per eval pass (a pass is at most EVAL_SLICE_S and doesn't
         # yield): per basket evaluated, the walk over the ledger was ~3% of the loop.
-        broken = self._broken_cache if self._in_pass and self._broken_cache is not None else             sum(1 for b in self.ledger.baskets.values() if b.broken_since is not None)
+        if self._in_pass and self._broken_cache is not None:
+            broken = self._broken_cache
+        else:
+            now = time.time()
+            broken = sum(1 for b in self.ledger.baskets.values()
+                         if b.broken_since is not None and now - b.broken_since >= BROKEN_STOP_S)
         if self._in_pass:
             self._broken_cache = broken
         if broken >= self.cfg.completion.max_broken_baskets:
