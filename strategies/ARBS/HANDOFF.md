@@ -577,6 +577,32 @@ them where they differ.
         also shows `loop_cpu`.
       - At the first deploy: ARBS 5,096, ARBS0B 4,999, ARBS3 2,556,
         ARBSPM 1,000.
+    - **Where the loop's CPU goes** (py-spy on ARBS, 11-16 06:23, 2 min):
+      - 55% is `evaluate`: hot baskets priced and managed on every book
+        change of their legs. That's set by the write budget, not the market
+        count.
+      - The CPU-held count therefore cut shard 0 to ~4,700 markets while
+        both loops stayed near 70%.
+      - Cheap fixes (`4272c20`): `blocked()` counted once per eval pass;
+        `record_only` held as sets.
+    - **Three shard 0 processes** (`4272c20`, live 11-16 06:32; the user:
+      "we can add a third core for 0"):
+      - ARBS0C took the 16 costliest events, a third of the write cost.
+      - Loops fell to ARBS 37%, ARBS0B 57%, ARBS0C 22% (06:39–06:46).
+    - **Shared write rate** (`dc86929`, live 06:51):
+      - Fixed thirds (100/s caps) left 116 of 300 unspent: ARBS0B sat at
+        its cap while the others idled.
+      - Each process now publishes `write_spend.json`. Each aims for its
+        own spend plus an even share of what the others leave of 95% of
+        the shard's rate, never under 10%.
+      - Box caps: solo 300, priority 50 per process.
+      - Shard 0 total rose to 275–297 tokens/s (06:55–07:03).
+    - **Shard 3 quotes all it can** (11-16, ~670 of 1,607 baskets hot):
+      - 306 are pre-game watch-only (NCAAWB, ITF).
+      - 631 have a leg with no ask: nobody bids YES on a NO leg, as in NBA
+        next team, AP rank and lopsided games.
+      - Dropping that leg leaves either a subset already quoted (52 of 52
+        checked) or a single long-shot leg, which is not an arb.
     - **Restart speed (`6f15dac`):**
       - Kalshi processes armed 5–7.5 min after a restart (11-16 00:06),
         reading each event's series, shard and fee changes (3 reads an
