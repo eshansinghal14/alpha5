@@ -24,7 +24,7 @@ relationships in spec.py's format, written to scanned_spec.json.
 Every such event is listed except those off scan.shards and series another
 strategy trades (the position audit would read its contracts as ours).
 `select` picks what the runner trades: within trading.days_till_expiry, the
-most traded events per market until scan.max_markets markets.
+most traded events per market until the runner's CPU-held market count.
 
     python -m strategies.ARBS.scanner [root]   # one scan + selection, as the runner runs it
 """
@@ -273,12 +273,12 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
             "relationships": rels}
 
 
-def select(doc: dict, *, now: pd.Timestamp, days: float, max_markets: int, known_tickers: set[str] = frozenset(),
+def select(doc: dict, *, now: pd.Timestamp, days: float, max_markets: int | None, known_tickers: set[str] = frozenset(),
            held: set[str] = frozenset(), exclude: set[str] = frozenset()) -> dict:
     """The part of a scan to trade: relationships settling within `days`, the
     most traded per market first (24h volume),
-    until max_markets markets beyond `known_tickers`. Relationships holding a
-    basket in `held` are always kept."""
+    until max_markets markets beyond `known_tickers` (None: no limit).
+    Relationships holding a basket in `held` are always kept."""
     # Per market, not in total: on 11-05 a 400-market Nasdaq ladder and the
     # 14-market election-margin ladders outranked 3-market games trading
     # $40-110k a day, and only 10 games within 36 h made the budget (32 per market).
@@ -297,7 +297,7 @@ def select(doc: dict, *, now: pd.Timestamp, days: float, max_markets: int, known
         s = r.get("expected_settlement_utc")
         if (s and pd.Timestamp(s) > horizon) or r.get("cluster") in exclude                 or r["relationship_id"].split(":", 1)[-1] in exclude:
             continue
-        if len(used | ts) <= max_markets:
+        if max_markets is None or len(used | ts) <= max_markets:
             out.append(r)
             used |= ts
     return {**doc, "relationships": out}
@@ -351,13 +351,14 @@ def run(cfg, spec_path: str, held: set[str] = frozenset(), owns=None, events: li
 SELECTED = "scanned_selected.json"
 
 
-def scan_and_select(root: str, config_path: str | None = None) -> dict:
+def scan_and_select(root: str, config_path: str | None = None, markets: int | None = None) -> dict:
     """Blocking, and meant for a child process: a scan holds ~1 GB of
     temporary objects that Python keeps after freeing them, so scanning in
     the trading process grew it ~430 MB a scan until the OOM killer took it
     (10-29 03:45 and 04:12). Writes the full scan and the part to trade
-    (`select` under today's config, held baskets kept) to SELECTED, which is
-    all the runner reads. Returns counts."""
+    (`select` up to `markets`, the runner's CPU-held count, None for all;
+    held baskets kept) to SELECTED, which is all the runner reads. Returns
+    counts."""
     from infra.config import ConfigStore
     from strategies.ARBS.config import CONFIG_PATH, ArbsConfig
 
@@ -372,7 +373,7 @@ def scan_and_select(root: str, config_path: str | None = None) -> dict:
     from infra.polymarket.orders import PM_SHARD
     if PM_SHARD in cfg.scan.shards:
         from strategies.ARBS import pm_scan
-        return pm_scan.scan_and_select(root, cfg, held)
+        return pm_scan.scan_and_select(root, cfg, held, markets)
     owns, events, info = None, None, {}
     name = os.path.basename(os.path.normpath(root))
     if name in parts.PROCS:
@@ -387,8 +388,7 @@ def scan_and_select(root: str, config_path: str | None = None) -> dict:
         idx = parts.PROCS.index(name)
         owns = lambda ev: parts.owner(st, ev) == idx  # noqa: E731
     doc = run(cfg, os.path.join(root, "scanned_spec.json"), held, owns=owns, events=events)
-    sel = select(doc, now=pd.Timestamp.now(tz="UTC"), days=cfg.trading.days_till_expiry,
-                 max_markets=cfg.scan.max_markets,
+    sel = select(doc, now=pd.Timestamp.now(tz="UTC"), days=cfg.trading.days_till_expiry, max_markets=markets,
                  held=held, exclude=set(cfg.watch.exclude))
     atomic_write_json(os.path.join(root, SELECTED), sel, indent=None)
     return {"listed_markets": doc["n_markets"], "selected_relationships": len(sel["relationships"]), **info}
@@ -410,4 +410,5 @@ if __name__ == "__main__":
         pass
     root = sys.argv[1] if len(sys.argv) > 1 else os.path.join(LIVE_ROOT, "ARBS")
     os.makedirs(root, exist_ok=True)
-    print(json.dumps(scan_and_select(root, sys.argv[2] if len(sys.argv) > 2 else None)))
+    print(json.dumps(scan_and_select(root, sys.argv[2] if len(sys.argv) > 2 else None,
+                                     int(sys.argv[3]) if len(sys.argv) > 3 else None)))

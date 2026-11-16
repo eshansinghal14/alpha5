@@ -177,6 +177,14 @@ SPEND_WINDOW_S = 120.0
 # off quoting 5-7 min on the shared 30 reads/s (11-16). A running process
 # already keeps them for its lifetime, days, so a day-old entry is no staler.
 EVENT_META, EVENT_META_TTL_S = "event_meta.json", 86400.0
+# The scan takes as many markets as hold this process's event-loop thread at
+# LOOP_CPU_TARGET of a core over LOOP_CPU_WINDOW_S. Its busiest seconds ran
+# 20-27 points over the mean (11-16 00:16-00:41, Sunday night games), and a
+# loop pinned at 100% moves quotes late in exactly those seconds.
+LOOP_CPU_TARGET, LOOP_CPU_WINDOW_S = 0.70, 600.0
+# Inside this band of the target the count holds; outside, it moves by the
+# CPU ratio, at most MARKETS_STEP a window either way.
+LOOP_CPU_BAND, MARKETS_STEP, MARKETS_MIN = 0.05, 0.25, 1000
 # The ceiling only guards a runaway estimate: at 3 shard 0 stopped at ~1,515
 # hot baskets spending ~170 of 255 target tokens/s (11-15 20:37 UTC).
 PLAN_SCALE_MIN, PLAN_SCALE_MAX = 0.5, 10.0
@@ -424,6 +432,10 @@ class ArbsRunner:
         self.ranking: list[dict] = []
         self.scan_path = os.path.join(self.root, scanner.SELECTED)
         self.scan_status: dict = {}
+        self.markets: int | None = None              # markets the next scan may take (scan_markets)
+        self.listed_markets: int | None = None       # markets the last scan listed in all
+        self.loop_cpu: float | None = None           # event-loop thread's share of a core, last full window
+        self._cpu_mark: tuple[float, float] | None = None   # (monotonic, thread CPU) the window started at
         self.listed: set[str] = set()                # relationship ids this process's own scan lists
         self.set_baskets(self.scanned())
         for led in (self.real_ledger, self.shadow_ledger):
@@ -799,11 +811,12 @@ class ArbsRunner:
                     # A child process: the scan's memory goes back when it exits.
                     proc = await asyncio.create_subprocess_exec(
                         sys.executable, "-m", "strategies.ARBS.scanner", self.root, self.store.path,
-                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                        str(self.scan_markets()), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
                     out, err = await asyncio.wait_for(proc.communicate(), timeout=600)
                     if proc.returncode != 0:
                         raise RuntimeError(f"scan exited {proc.returncode}: {err.decode()[-300:]}")
                     counts = json.loads(out.decode().strip().splitlines()[-1])
+                    self.listed_markets = counts.get("listed_markets")
                     await self.reload_spec()
                     self.scan_status = {"at": _utc().isoformat(), "secs": round(time.monotonic() - t0, 1),
                                         **counts, "baskets": len(self.listed), "error": None}
@@ -3429,14 +3442,47 @@ class ArbsRunner:
         cap = self.write_cap()
         return cap if cap is not None else write_budget_tokens_per_s()
 
+    def last_summary(self, key: str):
+        """`key` of the last summary this series wrote (today's or
+        yesterday's), or None."""
+        for d in (_utc(), _utc() - pd.Timedelta(days=1)):
+            got = (_read_json(os.path.join(self.root, f"{d:%Y-%m-%d}", "summary.json")) or {}).get(key)
+            if got is not None:
+                return got
+        return None
+
     def last_plan_scale(self) -> dict[int, float]:
         """The plan scale the last process of this series reached, from its
         summary: from 1, a restart took minutes to climb back to full quoting."""
-        for d in (_utc(), _utc() - pd.Timedelta(days=1)):
-            got = (_read_json(os.path.join(self.root, f"{d:%Y-%m-%d}", "summary.json")) or {}).get("write_plan_scale")
-            if got:
-                return {int(s): min(PLAN_SCALE_MAX, max(PLAN_SCALE_MIN, float(v))) for s, v in got.items()}
-        return {}
+        got = self.last_summary("write_plan_scale") or {}
+        return {int(s): min(PLAN_SCALE_MAX, max(PLAN_SCALE_MIN, float(v))) for s, v in got.items()}
+
+    def scan_markets(self, now: float | None = None, cpu_s: float | None = None) -> int:
+        """Markets the next scan may take. Starts where the last process left
+        it (else what the spec holds now); once the hot list is up and a full
+        LOOP_CPU_WINDOW_S of loop CPU is in, moves toward LOOP_CPU_TARGET and
+        starts a new window. Grows no further than the last scan listed."""
+        if self.markets is None:
+            self.markets = max(MARKETS_MIN, int(self.last_summary("scan_markets") or len(self.tickers)))
+        now = time.monotonic() if now is None else now
+        cpu_s = time.thread_time() if cpu_s is None else cpu_s
+        if not self.hot_ready:
+            return self.markets
+        if self._cpu_mark is None:
+            self._cpu_mark = (now, cpu_s)
+            return self.markets
+        span = now - self._cpu_mark[0]
+        if span < LOOP_CPU_WINDOW_S:
+            return self.markets
+        self.loop_cpu = (cpu_s - self._cpu_mark[1]) / span
+        self._cpu_mark = (now, cpu_s)
+        if abs(self.loop_cpu - LOOP_CPU_TARGET) > LOOP_CPU_BAND:
+            f = min(1 + MARKETS_STEP, max(1 - MARKETS_STEP, LOOP_CPU_TARGET / max(self.loop_cpu, 1e-3)))
+            n = round(self.markets * f)
+            if f > 1 and self.listed_markets is not None:
+                n = min(n, max(self.markets, self.listed_markets))
+            self.markets = max(MARKETS_MIN, n)
+        return self.markets
 
     def update_plan_scale(self, now: float):
         """Per Kalshi shard: moves the plan scale toward the one that puts
@@ -3873,6 +3919,7 @@ class ArbsRunner:
                           for m in (1, 10, 60)},
             "hot_cost_tps": self.hot_cost, "hot_cost_by_shard": self.hot_cost_by_shard,
             "write_plan_scale": {str(s): round(v, 3) for s, v in self.plan_scale.items()},
+            "scan_markets": self.markets, "loop_cpu": None if self.loop_cpu is None else round(self.loop_cpu, 3),
             "write_spend_tps": {str(s): round(v, 1) for s, v in self.spend_tps.items()},
             "write_budget_tps": self.write_budget(),
             "order_groups": {e: {"id": g["id"], "tripped": g["tripped_at"] is not None}

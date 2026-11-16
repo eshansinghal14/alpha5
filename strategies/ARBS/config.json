@@ -48,7 +48,6 @@
   },
   "scan": {
     "enable": true,
-    "max_markets": 1000,
     "shards": [
       0
     ],

@@ -325,7 +325,7 @@ def add_volume(doc: dict, vol: dict[str, float]):
         r["volume_24h"] = round(sum(vol.get(t, 0.0) for t in ts), 2)
 
 
-def scan_and_select(root: str, cfg, held: set[str]) -> dict:
+def scan_and_select(root: str, cfg, held: set[str], markets: int | None = None) -> dict:
     from strategies.ARBS.scanner import SELECTED, fetch_events, select
     now = pd.Timestamp.now(tz="UTC")
     pm = list_open()
@@ -345,7 +345,7 @@ def scan_and_select(root: str, cfg, held: set[str]) -> dict:
     doc["relationships"] += [r for r in prev if r["relationship_id"] not in have
                              and any(b["basket_id"] in held for b in r["baskets"])]
     atomic_write_json(path, doc, indent=None)
-    sel = select(doc, now=now, days=cfg.trading.days_till_expiry, max_markets=cfg.scan.max_markets, held=held,
+    sel = select(doc, now=now, days=cfg.trading.days_till_expiry, max_markets=markets, held=held,
                  exclude=set(cfg.watch.exclude))
     atomic_write_json(os.path.join(root, SELECTED), sel, indent=None)
     return {"listed_markets": doc["n_markets"], "cross_pairs": doc["n_cross"],

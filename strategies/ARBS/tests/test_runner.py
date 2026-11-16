@@ -597,6 +597,32 @@ def test_a_restart_starts_from_the_last_plan_scale(arbs):
     assert R.ArbsRunner(SERIES["ARBS"], live_trading=False).plan_scale == {0: 2.5, 3: R.PLAN_SCALE_MAX}
 
 
+def test_scan_markets_hold_the_event_loop_near_its_cpu_target(arbs):
+    r, b = arbs
+    r.markets, W = 4000, R.LOOP_CPU_WINDOW_S
+    assert r.scan_markets(0.0, 0.0) == 4000                      # before the hot list is up: held
+    r.hot_ready = True
+    assert r.scan_markets(0.0, 0.0) == 4000                      # starts a window
+    assert r.scan_markets(W / 2, W / 2 * 0.9) == 4000            # half a window: held (CPU is cumulative)
+    assert r.scan_markets(W, W * 0.9) == 3111 and r.loop_cpu == pytest.approx(0.9)   # 4000 * 0.7 / 0.9
+    assert r.scan_markets(2 * W, 1.63 * W) == 3111               # 73%, inside the band: held
+    r.listed_markets = 3500
+    assert r.scan_markets(3 * W, 1.83 * W) == 3500               # 20%: +25% at most, then all listed
+    assert r.scan_markets(4 * W, 2.03 * W) == 3500
+    r.markets = 1100
+    assert r.scan_markets(5 * W, 3.03 * W) == R.MARKETS_MIN      # a pinned loop: -25%, floored
+
+
+def test_scan_markets_start_where_the_last_process_left_them(arbs):
+    from strategies.ARBS import SERIES
+    r, b = arbs
+    assert r.scan_markets() == R.MARKETS_MIN                     # nothing saved, a small spec: the floor
+    d = os.path.join(r.root, f"{R._utc():%Y-%m-%d}")
+    os.makedirs(d, exist_ok=True)
+    json.dump({"scan_markets": 4321}, open(os.path.join(d, "summary.json"), "w"))
+    assert R.ArbsRunner(SERIES["ARBS"], live_trading=False).scan_markets() == 4321
+
+
 def _cheap_book(r):
     book(r, "X-A", [(0.35, 10)], [(0.60, 10)])      # YES A ask 0.40
     book(r, "X-B", [(0.45, 10)], [(0.50, 10)])      # YES B ask 0.50
