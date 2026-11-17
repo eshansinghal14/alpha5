@@ -78,11 +78,8 @@ class MultiFeed(LiveKalshiFeed):
         sub_id = 1
         while True:
             try:
-                # No permessage-deflate: inflating every frame was ~1% of ARBS's
-                # event loop (py-spy 11-17); the box's bandwidth is no constraint.
                 async with websockets.connect(WS_URL, additional_headers=auth.ws_headers(),
-                                              open_timeout=OPEN_TIMEOUT_S, max_size=None,
-                                              compression=None) as ws:
+                                              open_timeout=OPEN_TIMEOUT_S, max_size=None) as ws:
                     self.connected_at = time.monotonic()
                     self._new = []
                     sub_id = await self._subscribe(ws, list(self._tickers), sub_id)

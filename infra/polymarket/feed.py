@@ -146,8 +146,7 @@ class PolyFeed:
         while True:
             try:
                 async with websockets.connect(WS + MARKETS_PATH, additional_headers=auth.headers("GET", MARKETS_PATH),
-                                              open_timeout=OPEN_TIMEOUT_S, max_size=None, ping_interval=20,
-                                              compression=None) as ws:
+                                              open_timeout=OPEN_TIMEOUT_S, max_size=None, ping_interval=20) as ws:
                     self._new = []
                     n_sub = 0
                     await self._subscribe(ws, list(self._tickers), f"s{n_sub}")
