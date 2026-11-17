@@ -889,7 +889,7 @@ def test_a_model_quote_priced_through_another_basket_keeps_the_models_edge(arbs,
     r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_live_events=True, live_quote_size=5, live_edge_add=0.0,
                                         requote_cooldown_s=0.0, depth_age_s=0.0, model_series=["X"])
     r.exit_model = object()                                 # model_pick is stubbed: only its presence counts
-    monkeypatch.setattr(r, "model_pick", lambda b, j, vs, now_ts: (0.20, 5.0))
+    monkeypatch.setattr(r, "model_pick", lambda b, j, vs, now_ts, *a, **k: (0.20, 5.0))
     own = R.pricing.quote_leg(r.views(b), 0, 1.0, 0.20, 5)
     _eval(r, b)
     q = r.quotes[(b.basket_id, 0)]
@@ -2516,13 +2516,13 @@ def test_model_pick_is_quick_to_cut_risk_and_slow_to_add_it(arbs, monkeypatch):
     assert pick({(0.10, 50.0): (9.0, 3.0)}) == (0.05, 50.0)                 # wider worth more, no risk: stays
     assert pick({(0.10, 50.0): (9.0, 3.0), (0.05, 50.0): (1.0, 0.2)}) == (0.10, 50.0)   # 0.2c a lot: widens
     assert pick({(0.05, 50.0): (1.1, 2.0)}) == (0.10, 50.0)                 # narrower, under 1.25x: no clock
-    assert r.model_state[(b.basket_id, 0)]["narrow"] is None
+    assert r.model_state[(b.basket_id, 0, True)]["narrow"] is None
     assert pick({(0.05, 50.0): (12.0, 2.0)}) == (0.10, 50.0)                # narrower and worth it: waits
-    r.model_state[(b.basket_id, 0)]["narrow"] -= R.MODEL_NARROW_HOLD_S
+    r.model_state[(b.basket_id, 0, True)]["narrow"] -= R.MODEL_NARROW_HOLD_S
     assert pick({(0.05, 50.0): (12.0, 2.0)}) == (0.075, 50.0)               # then one step
     assert pick({(0.075, 20.0): (12.0, 2.0)}) == (0.075, 20.0)              # smaller: at once
     assert pick({(0.075, 100.0): (12.0, 2.0)}) == (0.075, 20.0)             # bigger: waits
-    r.model_state[(b.basket_id, 0)]["grow"] -= R.MODEL_GROW_HOLD_S
+    r.model_state[(b.basket_id, 0, True)]["grow"] -= R.MODEL_GROW_HOLD_S
     assert pick({(0.075, 100.0): (12.0, 2.0)}) == (0.075, 50.0)             # then one step
     table_none = {(e, n): (-1.0, -1.0) for e in R.MODEL_EDGES for n in R.MODEL_SIZES}
     table.clear(); table.update(table_none); r._model_cache.clear()
@@ -2545,7 +2545,7 @@ def test_model_pick_keeps_its_holds_when_the_held_pick_cannot_be_priced(arbs, mo
                         lambda vs, j, payout, e, n: None if (e, n) in gone else types.SimpleNamespace(price=e))
     now_ts = pd.Timestamp.now(tz="UTC")
     vs = [types.SimpleNamespace(maker_rate=0.0)] * 2
-    st = lambda: r.model_state[(b.basket_id, 0)]
+    st = lambda: r.model_state[(b.basket_id, 0, True)]
 
     def pick(best, unpriceable=()):
         table.clear(); table.update(best)
@@ -2592,14 +2592,57 @@ def test_a_model_series_live_quote_takes_the_models_edge_and_size(arbs, monkeypa
     book(r, "X-A", [(0.20, 100)], [(0.55, 100)])
     book(r, "X-B", [(0.20, 100)], [(0.45, 100)])          # B's YES ask 0.55
     r.exit_model = object()                                 # model_pick is stubbed: only its presence counts
-    monkeypatch.setattr(r, "model_pick", lambda b, j, vs, now_ts: (0.10, 3.0))
+    monkeypatch.setattr(r, "model_pick", lambda b, j, vs, now_ts, *a, **k: (0.10, 3.0))
     _eval(r, live)
     q = r.quotes[(live.basket_id, 0)]
     limit = 1.0 - R.pricing.taker_cost(0.55, 0.07) - 0.10                # the model's 10c, not config's
     assert q.size == 3 and limit - 0.01 - 1e-9 <= q.max_price <= limit + 1e-9
-    monkeypatch.setattr(r, "model_pick", lambda b, j, vs, now_ts: (None, 0.0))
+    monkeypatch.setattr(r, "model_pick", lambda b, j, vs, now_ts, *a, **k: (None, 0.0))
     _eval(r, live)
     assert (live.basket_id, 0) not in r.quotes or r.quotes[(live.basket_id, 0)].pending   # pulled
+
+
+def test_model_names_take_a_phase_and_a_bare_name_means_live(arbs):
+    r, b = arbs
+    r.exit_model = object()
+    t = r.cfg.trading
+    r.cfg.trading = dataclasses.replace(t, model_series=["X"], model_shadow=[])
+    assert r.model_on(b, True) and not r.model_on(b, False)
+    r.cfg.trading = dataclasses.replace(t, model_series=["*:pre"], model_shadow=[])
+    assert r.model_on(b, False) and not r.model_on(b, True)
+    r.cfg.trading = dataclasses.replace(t, model_series=["*"], model_shadow=["X:pre"])
+    assert r.model_on(b, True) and not r.model_on(b, False) and r.model_shadow(b, False)
+
+
+def test_a_pregame_model_quote_keeps_its_size_unless_narrower_than_the_config(arbs, monkeypatch):
+    r, b = arbs
+    r.hot = [b.basket_id]
+    _no_deep(r)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=1000, max_bundles_per_basket=10000, max_dollars=1e6,
+                                        requote_cooldown_s=0.0, depth_age_s=0.0, near_min_size=0,
+                                        model_series=[], model_shadow=["*:pre"])
+    book(r, "X-A", [(0.20, 5000)], [(0.55, 5000)])
+    book(r, "X-B", [(0.20, 5000)], [(0.45, 5000)])          # B's YES ask 0.55
+    r.exit_model = object()
+    seen = []
+    monkeypatch.setattr(r, "model_pick", lambda b, j, vs, now_ts, live, cap, **k: seen.append((live, cap, k)) or
+                        (0.10, cap))
+    _eval(r, b)
+    q = r.quotes[(b.basket_id, 0)]
+    fixed = R.edge_dollars(b.payout, r.cfg.trading.min_edge + r.cfg.trading.quote_edge_add)
+    limit = 1.0 - R.pricing.taker_cost(0.55, 0.07) - fixed
+    assert limit - 0.01 - 1e-9 <= q.max_price <= limit + 1e-9               # shadow: the config's edge
+    assert seen[0][0] is False and seen[0][1] == 1000 and seen[0][2]["shadow"] is True
+    r.quotes.clear()
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, model_series=["*:pre"], model_shadow=[])
+    _eval(r, b)
+    q = r.quotes[(b.basket_id, 0)]
+    limit = 1.0 - R.pricing.taker_cost(0.55, 0.07) - 0.10
+    assert limit - 0.01 - 1e-9 <= q.max_price <= limit + 1e-9 and q.size > R.MODEL_PRE_NARROW_SIZE   # wider: full size
+    r.quotes.clear()
+    monkeypatch.setattr(r, "model_pick", lambda b, j, vs, now_ts, live, cap, **k: (fixed / 2, cap))
+    _eval(r, b)
+    assert r.quotes[(b.basket_id, 0)].size <= R.MODEL_PRE_NARROW_SIZE      # narrower than the config: capped
 
 
 def _second_level(r, b, behind, **cfg):

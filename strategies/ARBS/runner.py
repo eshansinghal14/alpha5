@@ -324,6 +324,13 @@ MODEL_MIN_NET_C = 0.5
 MODEL_NARROW_GAIN = 1.25
 MODEL_NARROW_HOLD_S = 120.0
 MODEL_GROW_HOLD_S = 300.0
+# Pre-game picks are judged at quote_size, at most the largest size the
+# shadow check's replay scored (11-04..16: the model's edge beat every fixed
+# one at 5-500 lots). A pre-game edge narrower than the config's rests at most
+# MODEL_PRE_NARROW_SIZE: at 100+ lots the replay's best fixed edge was 10c, so
+# a big narrow quote is the case it never validated.
+MODEL_PRE_SIZES = (5.0, 20.0, 50.0, 100.0, 200.0, 500.0)
+MODEL_PRE_NARROW_SIZE = 100.0
 
 
 class _Rate:
@@ -2118,14 +2125,23 @@ class ArbsRunner:
         self._held_cache[key] = (seq, now, v)
         return v
 
-    def model_on(self, b: Basket) -> bool:
-        ms = self.cfg.trading.model_series
-        if not ms or self.exit_model is None:
+    def model_on(self, b: Basket, live: bool = True) -> bool:
+        return self._model_names(self.cfg.trading.model_series, b, live)
+
+    def model_shadow(self, b: Basket, live: bool) -> bool:
+        return self._model_names(self.cfg.trading.model_shadow, b, live)
+
+    def _model_names(self, names, b: Basket, live: bool) -> bool:
+        """`b` named in `names` for its phase: a bare name or * live only,
+        NAME:pre / NAME:live / *:pre / *:live that phase."""
+        if not names or self.exit_model is None:
             return False
         t = b.legs[0].ticker
         m = self.meta.get(t)
         series = (m.series if m else None) or t.split("-", 1)[0]
-        return series in ms or self.series_group.get(series) in ms
+        phase = "live" if live else "pre"
+        keys = ("*", series, self.series_group.get(series))
+        return any(k is not None and ((live and k in names) or f"{k}:{phase}" in names) for k in keys)
 
     def poll_model(self):
         """Reload exit_cost.MODEL_FILE when the daily shadow check rewrites it."""
@@ -2143,11 +2159,14 @@ class ArbsRunner:
             self.alert("warn", None, "exit model file doesn't match this code's inputs; model quoting off")
         self.exit_model = model
 
-    def model_pick(self, b: Basket, j: int, vs, now_ts: pd.Timestamp):
-        """(edge $/bundle, size cap) for live leg j from the exit-cost model,
-        (None, 0) for no quote, or None to fall back to the config. Sticky: see
-        MODEL_* constants."""
-        key, now = (b.basket_id, j), time.time()
+    def model_pick(self, b: Basket, j: int, vs, now_ts: pd.Timestamp, live: bool = True, cap: float = 0.0,
+                   shadow: bool = False, fixed: float | None = None):
+        """(edge $/bundle, size) for leg j from the exit-cost model, (None, 0)
+        for no quote, or None to fall back to the config. Live: picked over
+        MODEL_SIZES. Pre-game: judged at `cap` (quote_size) on MODEL_PRE_SIZES.
+        `shadow` and `fixed` (the config edge) only go into the journal row.
+        Sticky: see MODEL_* constants."""
+        key, now = (b.basket_id, j, live), time.time()
         hit = self._model_cache.get(key)
         if hit is not None and now - hit[0] < MODEL_EVAL_S:
             return hit[1]
@@ -2158,14 +2177,15 @@ class ArbsRunner:
         unwind_top = uw.asks[0][1] if uw is not None and uw.asks else None
         tte = None if b.settles is None else (b.settles - now_ts).total_seconds() / 3600.0
         cands: dict[tuple[float, float], tuple[float, float]] = {}
-        for n in MODEL_SIZES:
-            f = exit_cost.live_features(vs, j, b.payout, n, aged, unwind_top, True, tte)
+        sizes = MODEL_SIZES if live else (max((x for x in MODEL_PRE_SIZES if x <= cap), default=MODEL_PRE_SIZES[0]),)
+        for n in sizes:
+            f = exit_cost.live_features(vs, j, b.payout, n, aged, unwind_top, live, tte)
             if f is None:
                 break
             for e in MODEL_EDGES:
                 plan = pricing.quote_leg(vs, j, b.payout, e, n)
                 if plan is not None:
-                    cands[(e, n)] = m.value(f, plan.price, True, n, vs[j].maker_rate)
+                    cands[(e, n)] = m.value(f, plan.price, live, n, vs[j].maker_rate)
         if not cands:
             return None
         (pe, pn), (pv, _) = max(cands.items(), key=lambda kv: kv[1][0])
@@ -2210,7 +2230,8 @@ class ArbsRunner:
             self.journal({"kind": "model_quote", "basket_id": b.basket_id, "leg": j, "ticker": leg.ticker,
                           "edge": res[0], "size": res[1], "prev_edge": prev[0], "prev_size": prev[1], "why": why,
                           "value": round(v, 3), "net_c": None if net is None else round(net, 2),
-                          "pick": [pe, pn]})
+                          "pick": [pe, pn], "live": live, "shadow": shadow,
+                          "fixed": None if fixed is None else round(fixed, 4)})
         st["edge"], st["size"] = res
         self.model_state[key] = st
         if len(self._model_cache) > 20000:
@@ -2443,10 +2464,15 @@ class ArbsRunner:
                     plan = pricing.quote_leg(vs, j, b.payout, need, size)
             elif want:
                 need_j, cap_j, picked = quote_need, cap, False
-                if live and self.model_on(b):
-                    mp = self.model_pick(b, j, vs, now_ts)
-                    if mp is not None:
-                        (need_j, cap_j), picked = mp, True
+                use = self.model_on(b, live)
+                if use or self.model_shadow(b, live):
+                    mp = self.model_pick(b, j, vs, now_ts, live, cap, shadow=not use, fixed=quote_need)
+                    if use and mp is not None:
+                        (need_j, n_pick), picked = mp, True
+                        if live:
+                            cap_j = n_pick
+                        elif need_j is not None and need_j < quote_need - _EPS:
+                            cap_j = min(cap, MODEL_PRE_NARROW_SIZE)       # see MODEL_PRE_NARROW_SIZE
                 if need_j is None:
                     room = 0.0                        # the model values no quote here now
                 else:
