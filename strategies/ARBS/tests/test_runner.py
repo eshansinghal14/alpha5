@@ -3018,3 +3018,46 @@ def test_a_split_process_times_each_events_evaluations_and_book_updates(arbs):
         t.cancel()
     asyncio.run(go())
     assert r._cpu_s.get("EV-2", 0.0) >= 0.002
+
+
+def _reach_setup(r, b, monkeypatch):
+    monkeypatch.setattr(R, "REACH_MODE", "shadow")
+    for t in ("X-A", "X-B"):
+        r.meta[t] = R.Meta(ticker=t, event="e", status="active", shard=0, taker_rate=0.0, maker_rate=0.0)
+    rows = []
+    monkeypatch.setattr(r, "journal", lambda row: rows.append(row))
+    return rows
+
+
+def test_reach_quote_sits_one_tick_over_the_deepest_level_a_500_dollar_sweep_reaches(arbs, monkeypatch):
+    r, b = arbs                                            # complete set X-A YES + X-B YES, payout 1
+    rows = _reach_setup(r, b, monkeypatch)
+    # X-A YES bids: 0.40 x 300 ($180 to sweep), 0.35 x 300 ($195), 0.30 x 1000 ($700), 0.25 x 100
+    book(r, "X-A", [(0.40, 300), (0.35, 300), (0.30, 1000), (0.25, 100)], [(0.20, 10)])
+    book(r, "X-B", [(0.10, 10)], [(0.40, 5000)])          # X-B YES ask 0.60
+    main = R.Quote(basket_id=b.basket_id, leg=0, ticker="X-A", side="yes", price=0.36, size=0.0, cid="m",
+                   edge=0.04, max_price=0.37, pending=False, placed_at=0.0)
+    vs = r.views(b)
+    levels = r.reach_levels(b, 0, main)
+    # 0.31 (one tick over 0.30) is reached after $375; 0.26 only after $1,075
+    assert r.reach_plan(b, vs, 0, 0.36, 0.0, 1000.0, levels, 0.0)[0] == pytest.approx(0.31)
+    plan = R.pricing.QuotePlan(leg=0, price=0.36, max_price=0.37, edge=0.04, others_cost=0.6)
+    r.reach_shadow(b, vs, 0, plan, main, 0.0, 1000.0, False)
+    acts = lambda: [(x["action"], x["price"]) for x in rows if x["kind"] == "reach_shadow"]   # noqa: E731
+    assert acts() == [("place", 0.31)]
+    # the book shifts a little, still inside the $1,500 keep band: it stays put
+    book(r, "X-A", [(0.40, 400), (0.35, 300), (0.30, 1000), (0.25, 100)], [(0.20, 10)])
+    r.reach_shadow(b, r.views(b), 0, plan, main, 0.0, 1000.0 + R.REACH_EVAL_S + 1, False)
+    assert acts() == [("place", 0.31)]
+    # $2,000 of bids now sit over it: out of reach; after the cooldown it moves up to a reachable price
+    book(r, "X-A", [(0.40, 3000), (0.33, 10), (0.30, 1000), (0.25, 100)], [(0.20, 10)])
+    r.reach_shadow(b, r.views(b), 0, plan, main, 0.0, 1000.0 + 2 * R.REACH_EVAL_S + R.DEEP_REQUOTE_S, False)
+    assert [a for a, _ in acts()][-1] in ("move", "cancel") and len(acts()) == 2
+
+
+def test_reach_quote_cancels_when_the_arb_quote_goes(arbs, monkeypatch):
+    r, b = arbs
+    rows = _reach_setup(r, b, monkeypatch)
+    r._reach[(b.basket_id, 0)] = {"price": 0.31, "size": 10.0, "spend": 100.0, "t": 0.0}
+    r.reach_shadow(b, None, 0, None, None, 0.0, 10.0, False)
+    assert [x["action"] for x in rows if x["kind"] == "reach_shadow"] == ["cancel"] and not r._reach

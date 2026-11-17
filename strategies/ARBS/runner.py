@@ -238,6 +238,16 @@ SWEEP_RETRIES, SWEEP_PACING_S = 5, 0.01
 # Least time between voluntary moves of a deep quote: it waits for a sweep,
 # so tracking every join in the gap only spends writes.
 DEEP_REQUOTE_S = 10.0
+# Reach quotes: a deep quote where a dollar-sized sweep lands. The big fills that
+# completed at plan were mostly "spend $X incl. fees" orders ($100/$500/$1,000:
+# 40% of size-ended sweeps landed within 10c under a round amount vs 2% by
+# chance) walking ~8 levels; we had a deep quote resting in 23 of 204 of them,
+# as the gap rule wants 5c of empty book behind the arb quote (11-12..17).
+# Placed one tick over the deepest level a REACH_USD buy still reaches; kept
+# while a REACH_KEEP_USD buy would reach it and it clears its edge, so it
+# rarely moves. "shadow" journals the quote it would rest (reach_shadow) and
+# places nothing; "on" is not built yet.
+REACH_MODE, REACH_USD, REACH_KEEP_USD, REACH_EVAL_S, REACH_MIN_GAP = "shadow", 500.0, 1500.0, 5.0, 0.01
 # A resting near quote stays while it would still be NEAR_KEEP of near_min_size
 # (the exit depth it is sized to hovers around any threshold). It is cut at
 # once when what the exits take falls under NEAR_SHRINK of it, and grown or
@@ -630,6 +640,8 @@ class ArbsRunner:
         self.pm_stop: tuple | None = None          # (blocked() reason, its Polymarket cancel-all task)
         self.pm_replaced: dict[str, tuple[float, float]] = {}   # order id -> (price, monotonic) of its last REPLACE
         self._top4: dict[str, tuple] = {}             # ticker -> (yes bid, its depth, yes ask, its depth)
+        self._reach: dict[tuple, dict] = {}            # (basket_id, leg) -> the shadow reach quote resting
+        self._reach_at: dict[tuple, float] = {}        # (basket_id, leg) -> when it was last judged
         self._gap_logged: dict[tuple, tuple[float, float]] = {}   # (k, pm, dir) -> (when, edge) last journaled
         self.exchange_paused = False              # Kalshi's exchange-wide trading_active is off
         self.priority_trading: list[str] = []     # write_priority_series in session now
@@ -938,6 +950,7 @@ class ArbsRunner:
                     self.pm_event[t] = rest if kind in ("complete_set", "mecnet") else t.rsplit("-", 1)[0]
         # ticker -> the cross pairs (kalshi, polymarket) it is a leg of, for cross_gap.
         self.cross_of: dict[str, list[tuple[str, str]]] = {}
+        self._reach = {k: v for k, v in getattr(self, "_reach", {}).items() if k[0] in new}
         for b in self.all_baskets:
             if b.type == "cross_venue" and len(b.legs) == 2:
                 k = next((l.ticker for l in b.legs if not is_pm(l.ticker)), None)
@@ -2871,6 +2884,101 @@ class ArbsRunner:
         n = pricing.depth_size(vs, j, b.payout, self.cfg.trading.min_exit_edge, q.remaining, at=q.price)
         return n + _EPS >= q.remaining
 
+    def reach_levels(self, b: Basket, j: int, main: Quote | None) -> list[tuple[float, float]] | None:
+        """Leg j's bids as a sweep meets them, best first: others' orders plus
+        our arb quote (a sweep takes it before any deep quote), not our deep one."""
+        leg = b.legs[j]
+        bk = self.feed.ladder(leg.ticker)
+        if bk is None:
+            return None
+        bids = dict(bk.yes_bids if leg.side == "yes" else bk.no_bids)
+        for p, q in self._own(leg.ticker, leg.side).items():
+            bids[p] = bids.get(p, 0.0) - q
+        if main is not None and not main.pending and main.remaining > 0:
+            bids[round(main.price, 4)] = bids.get(round(main.price, 4), 0.0) + main.remaining
+        return sorted(((p, q) for p, q in bids.items() if q > _EPS), key=lambda x: -x[0])
+
+    def spend_above(self, levels: list[tuple[float, float]], price: float, rate: float) -> float:
+        """Dollars (incl. taker fee) a sweep spends on bids above `price` before
+        reaching an order there (one placed a tick over a level is first at it)."""
+        return sum((1.0 - p) * q + kfees.fee(1.0 - p, q, rate) for p, q in levels if p > price + _EPS)
+
+    def reach_plan(self, b: Basket, vs, j: int, main_px: float, need: float, cap: float, levels, rate: float):
+        """(price, size, spend) for a reach quote on leg j: the lowest price one
+        tick over a level, at least REACH_MIN_GAP under the arb quote, that a
+        REACH_USD sweep still gets to, sized by what the other legs complete
+        there at `need`; None when no such price completes a bundle."""
+        lv = vs[j]
+        have = {round(p, 4) for p, _ in levels}
+        best = None
+        for p, _ in levels:
+            price = round(lv.ticks.up(p), 4)
+            if price in have or price > main_px - REACH_MIN_GAP + _EPS:
+                continue
+            spend = self.spend_above(levels, price, rate)
+            if spend > REACH_USD:
+                break                                   # deeper levels only cost more to reach
+            n = self.covered(b, vs, j, pricing.depth_size(vs, j, b.payout, need, float(int(cap + _EPS)), at=price), price)
+            q = pricing.quote_leg(vs, j, b.payout, need, n) if n >= 1 else None
+            if q is not None and price <= q.max_price + _EPS:
+                best = (price, n, spend)
+        return best
+
+    def reach_shadow(self, b: Basket, vs, j: int, plan, main: Quote | None, need: float, now: float, live: bool):
+        """The reach quote leg j would rest, tracked and journaled, not placed."""
+        key = (b.basket_id, j)
+        r = self._reach.get(key)
+        if plan is None or main is None or main.pending:
+            if r is not None:
+                self._reach.pop(key)
+                self._reach_log("cancel", b, j, r, live, why="no_arb_quote")
+            return
+        if now - self._reach_at.get(key, 0.0) < REACH_EVAL_S:
+            return
+        if r is None and now - main.placed_at < DEEP_REQUOTE_S:
+            return                                      # as a deep quote: only behind an arb quote that has rested
+        if len(self._reach_at) > 100000:
+            self._reach_at.clear()
+        self._reach_at[key] = now
+        leg = b.legs[j]
+        rate = self._rates(leg.ticker)[0]
+        levels = self.reach_levels(b, j, main)
+        if not levels:
+            return
+        cap = self.deep_cap(b, j, live)
+        if r is not None:
+            spend = self.spend_above(levels, r["price"], rate)
+            n = self.covered(b, vs, j, pricing.depth_size(vs, j, b.payout, need, float(int(cap + _EPS)), at=r["price"]),
+                             r["price"])
+            q = pricing.quote_leg(vs, j, b.payout, need, min(n, r["size"])) if n >= 1 else None
+            edge_ok = q is not None and r["price"] <= q.max_price + _EPS and r["price"] <= main.price - REACH_MIN_GAP + _EPS
+            if edge_ok and spend <= REACH_KEEP_USD:
+                if n < r["size"] - _EPS:                # shrink only: never grows in place
+                    r.update(size=n, spend=spend)
+                    self._reach_log("shrink", b, j, r, live)
+                return
+            if edge_ok and now - r["t"] < DEEP_REQUOTE_S:
+                return                                  # out of reach but still safe: wait out the cooldown
+        got = self.reach_plan(b, vs, j, main.price, need, cap, levels, rate)
+        if got is None:
+            if r is not None:
+                self._reach.pop(key)
+                self._reach_log("cancel", b, j, r, live, why="no_plan")
+            return
+        price, n, spend = got
+        if r is not None and abs(price - r["price"]) < _EPS and abs(n - r["size"]) < _EPS:
+            r.update(spend=spend)
+            return
+        new = {"price": price, "size": n, "spend": spend, "t": now}
+        self._reach[key] = new
+        self._reach_log("move" if r is not None else "place", b, j, new, live, main_px=main.price)
+
+    def _reach_log(self, action: str, b: Basket, j: int, r: dict, live: bool, **kw):
+        self.n["reach_" + action] = self.n.get("reach_" + action, 0) + 1
+        self.journal({"kind": "reach_shadow", "action": action, "basket_id": b.basket_id, "ticker": b.legs[j].ticker,
+                      "side": b.legs[j].side, "price": r["price"], "size": round(r["size"], 2),
+                      "spend": round(r["spend"], 2), "live": live, **kw})
+
     def deep_cap(self, b: Basket, j: int, live: bool) -> float:
         """Most bundles a deep quote on leg j may rest: the arb quote's own
         size cap, held to the bundle and dollar room left after the arb quote
@@ -2922,6 +3030,8 @@ class ArbsRunner:
                 continue
             plan, size, near = None, 0, False
             main = self.quotes.get((b.basket_id, j))
+            if REACH_MODE == "shadow":
+                self.reach_shadow(b, vs, j, mains.get(j) if on else None, main, need, now, live)
             if dq is not None and dq.near and main is not None and main.pending:
                 continue                    # the arb quote is being re-placed: judge the near quote once it rests
             # A near quote is placed, repriced and grown only under an arb quote
