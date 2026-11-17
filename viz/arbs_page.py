@@ -21,10 +21,10 @@ from viz.perf_panel import time_axis
 from viz.data import latest_summary, read_summary, summary_age_s
 
 STALE_S = 15.0
-SHARD_OF = {"ARBS": "shard 0", "ARBS0B": "shard 0 (b)", "ARBS0C": "shard 0 (c)", "ARBS3": "shard 3",
+SHARD_OF = {"ARBS": "shard 0 (a)", "ARBS0B": "shard 0 (b)", "ARBS0C": "shard 0 (c)", "ARBS3": "shard 3",
             "ARBS3B": "shard 3 (b)", "ARBSPM": "Polymarket"}
 # Short labels for the headline tiles' breakdowns, by process and by shard.
-SHORT = {"ARBS": "K0", "ARBS0B": "K0b", "ARBS0C": "K0c", "ARBS3": "K3", "ARBS3B": "K3b", "ARBSPM": "PM"}
+SHORT = {"ARBS": "K0a", "ARBS0B": "K0b", "ARBS0C": "K0c", "ARBS3": "K3", "ARBS3B": "K3b", "ARBSPM": "PM"}
 SHARD_SHORT = {"0": "K0", "3": "K3", str(PM_SHARD): "PM"}
 # Processes sharing one exchange shard, shown as one line: K0, K0b and K0c split shard 0.
 SHARD_GROUP = {"ARBS": "K0", "ARBS0B": "K0", "ARBS0C": "K0", "ARBS3": "K3", "ARBS3B": "K3"}
