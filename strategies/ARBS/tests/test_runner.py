@@ -2830,3 +2830,21 @@ def test_exit_model_predict_equals_the_row_dot_product():
         f = {name: rng.uniform(edges[0] - 1, edges[-1] + 1) if np.isfinite(edges[0]) and np.isfinite(edges[-1])
              else rng.uniform(-5, 50) for name, edges in E.BINS.items()}
         assert E.predict(w, f) == pytest.approx(float(E.row(f) @ w), abs=1e-12)
+
+
+def test_rank_dump_writes_estimates_beside_real_spend(arbs, monkeypatch):
+    import gzip
+    r, b = arbs
+    r.hot_ready = True
+    rows = [{"basket_id": b.basket_id, "quote_usd_h": 1.5, "legs": 2}]
+
+    async def go():
+        r.rank_dump(rows, [b.basket_id], {b.basket_id}, 1000.0)
+        r.rank_dump(rows, [b.basket_id], {b.basket_id}, 1001.0)       # inside RANK_DUMP_S: skipped
+        await asyncio.sleep(0.2)
+    asyncio.run(go())
+    files = list((__import__("pathlib").Path(r.root) / "rank_dump").glob("*.jsonl.gz"))
+    lines = gzip.open(files[0], "rt").read().splitlines()
+    assert len(lines) == 1
+    row = json.loads(lines[0])["rows"][0]
+    assert row[0] == b.basket_id and row[1] == 1.5 and row[4] == 1 and row[5] == 2

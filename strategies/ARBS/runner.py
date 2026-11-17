@@ -178,6 +178,7 @@ class _Dirty(set):
 # Time constant of the per-basket write spend and per-market top-of-book
 # change rates the hot list is budgeted on.
 WRITE_COST_TAU_S = 300.0
+RANK_DUMP_S = 300.0
 # Write tokens per order or move, per cancel (Kalshi's write budget).
 ORDER_TOKENS, CANCEL_TOKENS = 10.0, 2.0
 # write_cost's estimates ran 2.3-2.5x what the same baskets really spent
@@ -652,7 +653,7 @@ class ArbsRunner:
         self.spend_tps: dict[int, float] = {}     # shard -> real write tokens/s over SPEND_WINDOW_S
         self._spend_hist: dict[int, collections.deque] = {}
         self._sib: dict[int, list[float]] = {}         # sibling_spend, read every WRITE_SPEND_EVERY_S
-        self._sib_at = self._spend_written_at = 0.0
+        self._sib_at = self._spend_written_at = self._rank_dump_at = 0.0
         self._scale_at: dict[int, float] = {}
         # Quote ids are saved by ledger_flush_loop, not per placement: a
         # synchronous write per quote held the loop ~200 ms each and queued a
@@ -3627,11 +3628,48 @@ class ArbsRunner:
         """Write tokens/s quoting `b` takes: what its quotes spent lately, or
         if more, a move per leg each time its best bid/ask changes (at most
         one per requote_cooldown_s), plus placing every leg once per tau."""
+        return max(self.write_cost_parts(b, now))
+
+    def write_cost_parts(self, b: Basket, now: float) -> tuple[float, float]:
+        """(estimate from book moves, what its quotes really spent lately)."""
         gap = max(self.cfg.trading.requote_cooldown_s, 0.1)
         est = sum(ORDER_TOKENS * (min(self.top_moves[l.ticker].at(now) if l.ticker in self.top_moves else 0.0,
                                       1.0 / gap) + 1.0 / WRITE_COST_TAU_S) for l in b.legs)
         spent = self.spend.get(b.basket_id)
-        return max(est, spent.at(now) if spent else 0.0)
+        return est, (spent.at(now) if spent else 0.0)
+
+    def rank_dump(self, rows: list[dict], quotable: list[str], picked: set, now: float):
+        """Every RANK_DUMP_S, one gzip line per quotable basket set into
+        data/live/<S>/rank_dump/<day>.jsonl.gz: [basket_id, quote_usd_h,
+        est tokens/s, spent tokens/s, hot, legs]. For checking the ranking's
+        $/h and write-cost estimates against fills and real spend."""
+        if now - self._rank_dump_at < RANK_DUMP_S or not self.hot_ready:
+            return
+        self._rank_dump_at = now
+        ok = set(quotable)
+        out = []
+        for r in rows:
+            bid = r["basket_id"]
+            if bid not in ok:
+                continue
+            est, spent = self.write_cost_parts(self.baskets[bid], now)
+            out.append([bid, round(r["quote_usd_h"], 4), round(est, 3), round(spent, 3), int(bid in picked),
+                        r.get("legs")])
+        line = {"t": round(now, 1), "scale": {str(k): round(v, 3) for k, v in self.plan_scale.items()},
+                "budget": self.write_budget(), "rows": out}
+        path = os.path.join(self.root, "rank_dump", f"{_utc():%Y-%m-%d}.jsonl.gz")
+
+        def write():
+            import gzip
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            try:
+                import orjson
+                data = orjson.dumps(line) + b"\n"
+            except ImportError:
+                data = (json.dumps(line) + "\n").encode()
+            with gzip.open(path, "ab") as fh:
+                fh.write(data)
+        asyncio.get_running_loop().run_in_executor(self.pool, write)
 
     def write_budget(self) -> float:
         cap = self.write_cap()
@@ -3796,6 +3834,7 @@ class ArbsRunner:
                 if _utc() - self.started > pd.Timedelta(minutes=2):
                     self.hot_ready = True
                 self.update_plan_scale(time.time())
+                self.rank_dump(rows, quotable, picked, now)
                 if hot != self.hot:
                     entered, left = set(hot) - self.hot_set, self.hot_set - set(hot)
                     if self.hot_ready and (entered or left):
