@@ -2645,6 +2645,24 @@ def test_a_pregame_model_quote_keeps_its_size_unless_narrower_than_the_config(ar
     assert r.quotes[(b.basket_id, 0)].size <= R.MODEL_PRE_NARROW_SIZE      # narrower than the config: capped
 
 
+def test_a_pregame_model_pick_values_each_edge_at_the_size_it_would_rest_at(arbs, monkeypatch):
+    r, b = arbs
+    book(r, "X-A", [(0.20, 5000)], [(0.55, 5000)])
+    book(r, "X-B", [(0.20, 5000)], [(0.45, 40), (0.40, 5000)])     # B's YES asks: 40 at 0.55, then 0.60
+    vs = r.views(b)
+    seen = {}
+
+    class M:
+        def value(self, f, x, live, n, rate):
+            seen[round(1.0 - x - 0.55, 2)] = (n, live)
+            return (1.0, 5.0)
+    r.exit_model = M()
+    monkeypatch.setattr(R.exit_cost, "live_features", lambda *a, **k: {})
+    r.model_pick(b, 0, vs, R._utc(), live=False, cap=1000.0)
+    # Valued at the 40 B's top completes, not at quote_size (1,000) or the 500-lot cap.
+    assert {n for n, _ in seen.values()} == {40.0} and all(live is False for _, live in seen.values())
+
+
 def _second_level(r, b, behind, **cfg):
     """b pre-game. A's arb quote rests at its 0.40 limit. B's YES asks: 100 at
     0.55, `behind` at 0.56 (the last level that completes a fill at 0.40

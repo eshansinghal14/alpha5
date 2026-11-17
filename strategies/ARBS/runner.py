@@ -328,12 +328,14 @@ MODEL_MIN_NET_C = 0.5
 MODEL_NARROW_GAIN = 1.25
 MODEL_NARROW_HOLD_S = 120.0
 MODEL_GROW_HOLD_S = 300.0
-# Pre-game picks are judged at quote_size, at most the largest size the
-# shadow check's replay scored (11-04..16: the model's edge beat every fixed
-# one at 5-500 lots). A pre-game edge narrower than the config's rests at most
-# MODEL_PRE_NARROW_SIZE: at 100+ lots the replay's best fixed edge was 10c, so
-# a big narrow quote is the case it never validated.
-MODEL_PRE_SIZES = (5.0, 20.0, 50.0, 100.0, 200.0, 500.0)
+# A pre-game edge is judged at the size its quote would rest at (depth_size
+# at that edge, up to quote_size), within the replay's 5-500 lots. Judged at
+# 500 lots for every leg, the model put 64-81% of pre-game legs at its widest
+# 20c (shadow, 11-17 02:05-02:35): pre-game quotes are far smaller. A pre-game
+# edge narrower than the config's rests at most MODEL_PRE_NARROW_SIZE: at 100+
+# lots the replay's best fixed edge was 10c, so a big narrow quote is the case
+# it never validated.
+MODEL_PRE_MIN_SIZE, MODEL_PRE_MAX_SIZE = 5.0, 500.0
 MODEL_PRE_NARROW_SIZE = 100.0
 
 
@@ -2173,7 +2175,8 @@ class ArbsRunner:
                    shadow: bool = False, fixed: float | None = None):
         """(edge $/bundle, size) for leg j from the exit-cost model, (None, 0)
         for no quote, or None to fall back to the config. Live: picked over
-        MODEL_SIZES. Pre-game: judged at `cap` (quote_size) on MODEL_PRE_SIZES.
+        MODEL_SIZES. Pre-game: each edge valued at the size its quote would
+        rest at (depth_size up to `cap`), see MODEL_PRE_MIN_SIZE.
         `shadow` and `fixed` (the config edge) only go into the journal row.
         Sticky: see MODEL_* constants."""
         key, now = (b.basket_id, j, live), time.time()
@@ -2187,15 +2190,27 @@ class ArbsRunner:
         unwind_top = uw.asks[0][1] if uw is not None and uw.asks else None
         tte = None if b.settles is None else (b.settles - now_ts).total_seconds() / 3600.0
         cands: dict[tuple[float, float], tuple[float, float]] = {}
-        sizes = MODEL_SIZES if live else (max((x for x in MODEL_PRE_SIZES if x <= cap), default=MODEL_PRE_SIZES[0]),)
-        for n in sizes:
-            f = exit_cost.live_features(vs, j, b.payout, n, aged, unwind_top, live, tte)
-            if f is None:
-                break
+        if live:
+            for n in MODEL_SIZES:
+                f = exit_cost.live_features(vs, j, b.payout, n, aged, unwind_top, True, tte)
+                if f is None:
+                    break
+                for e in MODEL_EDGES:
+                    plan = pricing.quote_leg(vs, j, b.payout, e, n)
+                    if plan is not None:
+                        cands[(e, n)] = m.value(f, plan.price, True, n, vs[j].maker_rate)
+        else:
+            # One size key (`cap`) so the sticky rules see a single size; each
+            # edge is valued at the size it would rest at.
             for e in MODEL_EDGES:
+                rest = pricing.depth_size(vs, j, b.payout, e, cap)
+                if rest < 1:
+                    continue
+                n = min(max(rest, MODEL_PRE_MIN_SIZE), MODEL_PRE_MAX_SIZE)
+                f = exit_cost.live_features(vs, j, b.payout, n, aged, unwind_top, False, tte)
                 plan = pricing.quote_leg(vs, j, b.payout, e, n)
-                if plan is not None:
-                    cands[(e, n)] = m.value(f, plan.price, live, n, vs[j].maker_rate)
+                if f is not None and plan is not None:
+                    cands[(e, cap)] = m.value(f, plan.price, False, n, vs[j].maker_rate)
         if not cands:
             return None
         (pe, pn), (pv, _) = max(cands.items(), key=lambda kv: kv[1][0])
