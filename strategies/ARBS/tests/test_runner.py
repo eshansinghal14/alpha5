@@ -1447,8 +1447,9 @@ def test_deep_quote_rests_one_tick_over_the_next_bid_behind(arbs):
     assert deep.price == pytest.approx(0.21) and deep.size == 2 and deep.edge > main.edge
 
 
-def test_no_deep_quote_on_a_small_gap(arbs):
+def test_no_deep_quote_on_a_small_gap(arbs, monkeypatch):
     r, b = arbs
+    monkeypatch.setattr(R, "REACH_MODE", "shadow")         # the gap rule alone: a reach quote may rest here
     live = _live_gap(r, b, [(0.45, 10), (0.37, 5)])        # 0.38 is 2 ticks behind 0.40
     assert (live.basket_id, 0) in r.quotes and (live.basket_id, 0, "deep") not in r.quotes
 
@@ -3078,6 +3079,25 @@ def test_rank_loop_rechecks_reach_quotes_of_baskets_not_evaluated(arbs, monkeypa
     r._reach[(b.basket_id, 0)] = {"price": 0.31, "size": 10.0, "spend": 375.0, "t": 0.0, "on_at": 0.0}
     r.expire_reach(R.REACH_GRACE_S + 1)
     assert [x["action"] for x in rows if x["kind"] == "reach_shadow"] == ["cancel"] and not r._reach
+
+
+def test_live_reach_quote_rests_in_the_deep_slot_and_goes_once_its_edge_does(arbs, monkeypatch):
+    r, b = arbs
+    _reach_setup(r, b, monkeypatch)
+    monkeypatch.setattr(R, "REACH_MODE", "on")
+    book(r, "X-A", [(0.40, 300), (0.35, 300), (0.30, 1000), (0.25, 100)], [(0.20, 10)])
+    book(r, "X-B", [(0.10, 10)], [(0.40, 5000)])
+    main = R.Quote(basket_id=b.basket_id, leg=0, ticker="X-A", side="yes", price=0.36, size=10.0, cid="m",
+                   edge=0.04, max_price=0.37, pending=False, placed_at=0.0)
+    run = lambda acts: [asyncio.run(a) for a in acts]    # noqa: E731
+    run(r.reach_live(b, r.views(b), 0, None, main, True, 0.0, 1000.0, False, 0.0))
+    dq = r.quotes[(b.basket_id, 0, "deep")]
+    assert dq.reach and dq.price == pytest.approx(0.31)
+    # inside the throttle nothing but the edge is checked: unchanged book, no write
+    assert r.reach_live(b, r.views(b), 0, dq, main, True, 0.0, 1001.0, False, 0.0) == []
+    book(r, "X-B", [(0.10, 10)], [(0.05, 5000)])          # X-B YES ask 0.95: edge gone at once
+    run(r.reach_live(b, r.views(b), 0, dq, None, False, 0.0, 1002.0, False, 0.0))
+    assert (b.basket_id, 0, "deep") not in r.quotes
 
 
 def test_sweep_cancels_our_order_on_a_market_no_longer_in_meta(arbs, monkeypatch):

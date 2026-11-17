@@ -141,6 +141,7 @@ class Quote:
     kind: str = "arb"           # or "complete" / "unwind": resting on a broken basket's exit
     deep: bool = False          # the small second quote in the gap behind a live leg's arb quote
     near: bool = False          # a deep quote resting one tick under a pre-game arb quote (near_plan)
+    reach: bool = False         # a deep quote where a dollar-sized sweep lands (reach_live)
     group: str | None = None    # Kalshi order group it rests in (live events, live_order_groups)
     booked_to: str | None = None  # basket its last fill was booked into (see book_target)
     short_at: float | None = None  # since when its second-level cover has been under it (COVER_GRACE_S)
@@ -245,9 +246,9 @@ DEEP_REQUOTE_S = 10.0
 # as the gap rule wants 5c of empty book behind the arb quote (11-12..17).
 # Placed one tick over the deepest level a REACH_USD buy still reaches; kept
 # while a REACH_KEEP_USD buy would reach it and it clears its edge, so it
-# rarely moves. "shadow" journals the quote it would rest (reach_shadow) and
-# places nothing; "on" is not built yet.
-REACH_MODE, REACH_USD, REACH_KEEP_USD, REACH_EVAL_S, REACH_MIN_GAP = "shadow", 500.0, 1500.0, 5.0, 0.01
+# rarely moves. "on" rests it in the deep slot where the gap rule rests
+# nothing; "shadow" only journals it (reach_shadow).
+REACH_MODE, REACH_USD, REACH_KEEP_USD, REACH_EVAL_S, REACH_MIN_GAP = "on", 500.0, 1500.0, 5.0, 0.01
 # Tied to its arb quote, 95% of shadow reach quotes were cancelled when that
 # quote churned, living 19 s p50 (ARBS0C, 11-17 20:12-20:24); tied to the hot
 # list after that, flicker still cancelled and re-placed them (~27 tokens/s on
@@ -2939,6 +2940,58 @@ class ArbsRunner:
                 best = (price, n, spend)
         return best
 
+    def reach_decide(self, b: Basket, vs, j: int, main: Quote | None, quoted: bool, need: float, live: bool,
+                     cur: tuple | None, now: float, full: bool) -> tuple:
+        """What leg j's reach quote should do. `cur`: (price, size, when set)
+        of the one resting, or None. `full`: run the throttled checks too (reach
+        band, shrink, re-plan); without it only the edge is checked. Returns
+        ("keep"|"none", None), ("shrink", n), ("set", (price, n, spend)) or
+        ("cancel", why). Placing needs `quoted` (an arb quote resting on the leg);
+        a resting one stays while it clears its own edge, quoted or not."""
+        if vs is None:
+            return ("cancel", "untradeable") if cur is not None else ("none", None)
+        leg = b.legs[j]
+        gap_ok = lambda px: not quoted or px <= main.price - REACH_MIN_GAP + _EPS   # noqa: E731
+        size_at = lambda px: self.covered(b, vs, j, pricing.depth_size(            # noqa: E731
+            vs, j, b.payout, need, float(int(self.deep_cap(b, j, live) + _EPS)), at=px), px)
+        if cur is not None:
+            price, size, t_set = cur
+            q = pricing.quote_leg(vs, j, b.payout, need, size) if size >= 1 else None
+            if q is None or price > q.max_price + _EPS or not gap_ok(price):
+                # Edge gone at its size: smaller may still clear, else re-plan or go.
+                n = size_at(price)
+                q2 = pricing.quote_leg(vs, j, b.payout, need, n) if n >= 1 else None
+                if q2 is not None and price <= q2.max_price + _EPS and gap_ok(price) and n < size - _EPS:
+                    return ("shrink", n)
+                if not (quoted and full):
+                    return ("cancel", "no_edge")
+            elif not full:
+                return ("keep", None)
+            else:
+                levels = self.reach_levels(b, j, main if quoted else None) or []
+                spend = self.spend_above(levels, price, self._rates(leg.ticker)[0])
+                n = size_at(price)
+                if spend <= REACH_KEEP_USD:
+                    if n < REACH_SHRINK * size - _EPS:            # shrink only, and only well short
+                        return ("shrink", n) if n >= 1 else ("cancel", "no_edge")
+                    return ("keep", None)
+                if now - t_set < DEEP_REQUOTE_S or not quoted:
+                    return ("keep", None)                        # out of reach but safe: wait
+        if not quoted or not full:
+            return ("none", None) if cur is None else ("keep", None)
+        if cur is None and now - main.placed_at < DEEP_REQUOTE_S:
+            return ("none", None)                                # as a deep quote: behind an arb quote that has rested
+        levels = self.reach_levels(b, j, main)
+        if not levels:
+            return ("none", None) if cur is None else ("keep", None)
+        got = self.reach_plan(b, vs, j, main.price, need, self.deep_cap(b, j, live), levels,
+                              self._rates(leg.ticker)[0])
+        if got is None:
+            return ("cancel", "no_plan") if cur is not None else ("none", None)
+        if cur is not None and abs(got[0] - cur[0]) < _EPS and abs(got[1] - cur[1]) < _EPS:
+            return ("keep", None)
+        return ("set", got)
+
     def reach_shadow(self, b: Basket, vs, j: int, plan, main: Quote | None, need: float, now: float, live: bool):
         """The reach quote leg j would rest, tracked and journaled, not placed."""
         key = (b.basket_id, j)
@@ -2948,50 +3001,59 @@ class ArbsRunner:
             r["on_at"] = now
         if now - self._reach_at.get(key, 0.0) < REACH_EVAL_S:
             return
-        if r is None and (not quoted or now - main.placed_at < DEEP_REQUOTE_S):
-            return                                      # as a deep quote: only behind an arb quote that has rested
         if len(self._reach_at) > 100000:
             self._reach_at.clear()
         self._reach_at[key] = now
+        cur = None if r is None else (r["price"], r["size"], r["t"])
+        act, pay = self.reach_decide(b, vs, j, main, quoted, need, live, cur, now, True)
+        if act == "shrink":
+            r.update(size=pay)
+            self._reach_log("shrink", b, j, r, live)
+        elif act == "cancel":
+            self._reach.pop(key, None)
+            self._reach_log("cancel", b, j, r, live, why=pay)
+        elif act == "set":
+            price, n, spend = pay
+            new = {"price": price, "size": n, "spend": spend, "t": now, "on_at": now}
+            self._reach[key] = new
+            self._reach_log("move" if r is not None else "place", b, j, new, live, main_px=main.price)
+
+    def reach_live(self, b: Basket, vs, j: int, dq: Quote | None, main: Quote | None, quoted: bool, need: float,
+                   now: float, live: bool, reserve: float) -> list:
+        """REACH_MODE "on": the orders for leg j's reach quote (the deep slot,
+        flagged reach). Its edge is checked on every evaluation; the reach band,
+        shrink and re-plan every REACH_EVAL_S."""
+        key = (b.basket_id, j)
+        full = now - self._reach_at.get(key, 0.0) >= REACH_EVAL_S
+        if dq is None and not (full and quoted):
+            return []
+        if full:
+            if len(self._reach_at) > 100000:
+                self._reach_at.clear()
+            self._reach_at[key] = now
+        cur = None if dq is None else (dq.price, dq.remaining, max(dq.placed_at, dq.moved_at))
+        act, pay = self.reach_decide(b, vs, j, main, quoted, need, live, cur, now, full)
+        if act in ("keep", "none"):
+            return []
+        if act == "cancel":
+            return [self.cancel_quote(dq, "reach_" + pay)]
+        price, n = (dq.price, pay) if act == "shrink" else (pay[0], pay[1])
+        q = pricing.quote_leg(vs, j, b.payout, need, n)
+        if q is None:
+            return [self.cancel_quote(dq, "reach_no_edge")] if dq is not None else []
+        plan = pricing.QuotePlan(leg=j, price=price, max_price=q.max_price, others_cost=q.others_cost,
+                                 edge=b.payout - q.others_cost - pricing.maker_cost(price, vs[j].maker_rate))
         leg = b.legs[j]
-        if vs is None:
-            return
-        rate = self._rates(leg.ticker)[0]
-        levels = self.reach_levels(b, j, main if quoted else None)
-        if not levels:
-            return
-        cap = self.deep_cap(b, j, live)
-        if r is not None:
-            spend = self.spend_above(levels, r["price"], rate)
-            n = self.covered(b, vs, j, pricing.depth_size(vs, j, b.payout, need, float(int(cap + _EPS)), at=r["price"]),
-                             r["price"])
-            q = pricing.quote_leg(vs, j, b.payout, need, min(n, r["size"])) if n >= 1 else None
-            edge_ok = q is not None and r["price"] <= q.max_price + _EPS and \
-                (not quoted or r["price"] <= main.price - REACH_MIN_GAP + _EPS)
-            if edge_ok and spend <= REACH_KEEP_USD:
-                if n < REACH_SHRINK * r["size"] - _EPS:  # shrink only, and only well short: never grows in place
-                    r.update(size=n, spend=spend)
-                    self._reach_log("shrink", b, j, r, live)
-                return
-            if edge_ok and (now - r["t"] < DEEP_REQUOTE_S or not quoted):
-                return                                  # out of reach but still safe: wait (unquoted: it may come back in reach)
-            if not quoted:
-                self._reach.pop(key)
-                self._reach_log("cancel", b, j, r, live, why="no_edge")
-                return
-        got = self.reach_plan(b, vs, j, main.price, need, cap, levels, rate)
-        if got is None:
-            if r is not None:
-                self._reach.pop(key)
-                self._reach_log("cancel", b, j, r, live, why="no_plan")
-            return
-        price, n, spend = got
-        if r is not None and abs(price - r["price"]) < _EPS and abs(n - r["size"]) < _EPS:
-            r.update(spend=spend)
-            return
-        new = {"price": price, "size": n, "spend": spend, "t": now, "on_at": now}
-        self._reach[key] = new
-        self._reach_log("move" if r is not None else "place", b, j, new, live, main_px=main.price)
+        if dq is None:
+            if self.live and not self.gw.can_afford(leg.ticker, "order", reserve):
+                return []
+            nq = self.new_quote(b, plan, n, deep=True)
+            nq.reach = True
+            return [self.place_quote(nq)]
+        # A shrink cuts risk: sent past the reserve; a move waits for room.
+        if act == "set" and self.live and not self.gw.can_afford(leg.ticker, "amend", reserve):
+            return []
+        return [self.move_quote(dq, plan, n)]
 
     def expire_reach(self, now: float):
         """Shadow reach quotes on baskets no longer evaluated (not hot, nothing
@@ -3061,6 +3123,7 @@ class ArbsRunner:
         # None on the Polymarket process: its config had them off until
         # deep_quote_size was removed (11-13), and they are untested there.
         on = on and not self.pm_process
+        on_all = not self.pm_process          # a resting reach quote is judged even off the hot list
         for j, leg in enumerate(b.legs):
             dq = self.quotes.get((b.basket_id, j, "deep"))
             if dq is not None and dq.pending:
@@ -3087,6 +3150,12 @@ class ArbsRunner:
                     self._near_at[(b.basket_id, j)] = now
                     plan, size = self.near_plan(b, vs, j, main, need, dq if resting else None)
                     near = plan is not None
+            if REACH_MODE == "on" and on_all and plan is None and (dq is None or dq.reach) and not \
+                    (on and j in mains and self.deep_plan(b, vs, j, mains[j], need, 1.0)[0] is not None):
+                # Where the gap rule rests nothing, the reach quote takes the deep slot.
+                quoted = on and j in mains and main is not None and not main.pending
+                acts += self.reach_live(b, vs, j, dq, main, quoted, need, now, live, reserve)
+                continue
             if dq is not None and dq.near and not near and (j in mains or not near_on):
                 # Only a near plan covers its size: under an arb quote or in-play it
                 # must not wait out a deep quote's cooldown, or stay as one.
@@ -3138,6 +3207,7 @@ class ArbsRunner:
                 move = cooled and (stepped or abs(dq.remaining - size) > _EPS)
             if past_limit or (move and (not self.live or self.gw.can_afford(leg.ticker, "amend", left))):
                 dq.near = near
+                dq.reach = False
                 acts.append(self.move_quote(dq, plan, size))
             else:
                 dq.edge, dq.max_price = plan.edge, plan.max_price
@@ -4762,7 +4832,9 @@ def flips(baskets: list[Basket]) -> dict[str, str]:
 
 
 def _deep(q: Quote) -> dict:
-    return ({"deep": True, "near": True} if q.near else {"deep": True}) if q.deep else {}
+    if not q.deep:
+        return {}
+    return {"deep": True, "near": True} if q.near else {"deep": True, "reach": True} if q.reach else {"deep": True}
 
 
 def datetime_iso(ts: float) -> str:
