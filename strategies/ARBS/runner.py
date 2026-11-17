@@ -142,6 +142,7 @@ class Quote:
     group: str | None = None    # Kalshi order group it rests in (live events, live_order_groups)
     booked_to: str | None = None  # basket its last fill was booked into (see book_target)
     short_at: float | None = None  # since when its second-level cover has been under it (COVER_GRACE_S)
+    unpriced_at: float | None = None  # since when a pre-game quote has had no plan (PRE_NO_EDGE_GRACE_S)
     pm_from: tuple | None = None   # a Polymarket move not yet confirmed: (price before it, its moved_at)
 
     def __setattr__(self, name, value):
@@ -250,6 +251,16 @@ NEAR_EVAL_S = 2.0
 # size 253 times a minute against 134 before the rule, a third of them
 # re-placed at the same size ~15 ms later (11-13 17:30-18:15 UTC).
 COVER_GRACE_S = 1.0
+# Pre-game quotes rest deep (93% 6+ ticks under the best bid, first in their
+# queue 77%) and fill on sweeps: over 8.7 h shard 0 spent 103 tokens/s moving
+# them for 3 fills after a move (9 of 12 on fresh placements), and 63k pre-game
+# no_edge cancels were placed again within a minute within a tick of the old
+# price (11-17 08:01-16:43). So pre-game quotes move voluntarily only by
+# PRE_REQUOTE_MIN_TICKS after PRE_REQUOTE_COOLDOWN_S, and one with no plan rests
+# up to PRE_NO_EDGE_GRACE_S while a fill of it still completes at min_exit_edge.
+PRE_REQUOTE_MIN_TICKS = 2
+PRE_REQUOTE_COOLDOWN_S = 10.0
+PRE_NO_EDGE_GRACE_S = 10.0
 # Longest an eval pass runs before letting the websocket reader in: a fill that
 # lands mid-pass isn't even read until the pass yields (fill -> exit decision
 # p99 was 176 ms with whole passes, 10-30/31). A yield costs microseconds.
@@ -2582,9 +2593,13 @@ class ArbsRunner:
                 if q is not None and q.remaining > size + _EPS:
                     plan = None
             if plan is None:
+                if q is not None and want and not live and self.no_edge_grace(b, vs, j, q, now):
+                    continue
                 if q is not None:
                     acts.append(self.cancel_quote(q, "no_edge" if want else "not_hot"))
                 continue
+            if q is not None:
+                q.unpriced_at = None
             other = self.quoted_elsewhere(b.basket_id, leg.ticker, leg.side)
             if other is not None and (q is None or other.placed_at < q.placed_at):
                 # One quote per market side: baskets sharing a leg would rest
@@ -2603,20 +2618,22 @@ class ArbsRunner:
                 continue
             past_limit = q.price > plan.max_price + _EPS
             ticks = vs[j].ticks.steps(plan.price, q.price)
-            cooled = now - max(q.moved_at, q.placed_at) >= t.requote_cooldown_s
+            cooldown = t.requote_cooldown_s if live else max(t.requote_cooldown_s, PRE_REQUOTE_COOLDOWN_S)
+            min_ticks = t.requote_min_ticks if live else max(t.requote_min_ticks, PRE_REQUOTE_MIN_TICKS)
+            cooled = now - max(q.moved_at, q.placed_at) >= cooldown
             # Grown in place when the room is much bigger than what rests: a
             # quote placed small kept its size through every later move
             # (KXRT-MON-30 stayed 1 lot with 629 behind the other leg, 10-29).
             grow = size >= 2.0 * q.remaining and cooled
             held = q.price < plan.price <= q.price + t.requote_hold_up + _EPS
-            if past_limit or grow or (ticks >= t.requote_min_ticks and cooled and not held):
+            if past_limit or grow or (ticks >= min_ticks and cooled and not held):
                 if self.live and not past_limit and not self.gw.can_afford(leg.ticker, "amend", reserve):
                     continue
                 acts.append(self.move_quote(q, plan, size if grow else None))
             else:
                 q.edge, q.max_price = plan.edge, plan.max_price
-                if not cooled and ((ticks >= t.requote_min_ticks and not held) or size >= 2.0 * q.remaining):
-                    self.wake_when_cooled(b.basket_id, max(q.moved_at, q.placed_at) + t.requote_cooldown_s)
+                if not cooled and ((ticks >= min_ticks and not held) or size >= 2.0 * q.remaining):
+                    self.wake_when_cooled(b.basket_id, max(q.moved_at, q.placed_at) + cooldown)
         acts += self.manage_deep(b, vs, mains, quote_need, now, want, live, pulled)
         if acts:
             async def run(acts=acts):
@@ -2734,6 +2751,20 @@ class ArbsRunner:
         if now - q.short_at >= COVER_GRACE_S:
             return plan, size
         return pricing.quote_leg(vs, j, b.payout, need, q.remaining), q.remaining
+
+    def no_edge_grace(self, b: Basket, vs, j: int, q: Quote, now: float) -> bool:
+        """True while pre-game quote q, its plan gone, may keep resting: for
+        PRE_NO_EDGE_GRACE_S from when it lost its plan, if a fill of what
+        rests still completes at min_exit_edge at its price."""
+        if q.pending:
+            return False
+        if q.unpriced_at is None:
+            q.unpriced_at = now
+            self.later(b.basket_id, PRE_NO_EDGE_GRACE_S + 0.01)
+        if now - q.unpriced_at >= PRE_NO_EDGE_GRACE_S:
+            return False
+        n = pricing.depth_size(vs, j, b.payout, self.cfg.trading.min_exit_edge, q.remaining, at=q.price)
+        return n + _EPS >= q.remaining
 
     def deep_cap(self, b: Basket, j: int, live: bool) -> float:
         """Most bundles a deep quote on leg j may rest: the arb quote's own

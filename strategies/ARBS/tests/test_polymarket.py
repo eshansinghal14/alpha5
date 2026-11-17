@@ -387,7 +387,7 @@ def test_kalshi_cancels_are_forced_only_within_the_overdraw():
     async def both():
         return await asyncio.gather(gw.cancel("KX-A", "o1", "pull"), refill())
     (got, exc, sent), _ = asyncio.run(both())
-    assert got is True and True not in calls and calls[-1] is False and len(calls) > 2
+    assert got is True and calls == [False, True]           # refused once, then sent once the bucket allows
 
 
 def test_urgent_polymarket_cancels_go_now_within_the_overdraw(monkeypatch):

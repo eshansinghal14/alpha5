@@ -17,6 +17,11 @@ from strategies.ARBS.spec import Basket, Leg
 @pytest.fixture
 def arbs(tmp_path, monkeypatch):
     monkeypatch.setattr(R, "LIVE_ROOT", str(tmp_path))
+    # The fixture's basket is pre-game: tests of the move rules get the live
+    # ones; the pre-game damping has tests of its own.
+    monkeypatch.setattr(R, "PRE_REQUOTE_MIN_TICKS", 1)
+    monkeypatch.setattr(R, "PRE_REQUOTE_COOLDOWN_S", 0.0)
+    monkeypatch.setattr(R, "PRE_NO_EDGE_GRACE_S", 0.0)
     from strategies.ARBS import SERIES
     r = R.ArbsRunner(SERIES["ARBS"], live_trading=False)
     r.part_idx = None                                     # a whole process, not one half of shard 0
@@ -1203,6 +1208,56 @@ def test_quote_holds_a_small_move_up_but_follows_down(arbs):
     book(r, "X-A", [(0.31, 10)], [(0.35, 10)])          # bid falls 1c: follows down
     _eval(r, b)
     assert q.price == pytest.approx(0.32)
+
+
+def test_a_pregame_quote_moves_by_two_ticks_after_its_cooldown(arbs, monkeypatch):
+    r, b = arbs
+    _no_deep(r)
+    monkeypatch.setattr(R, "PRE_REQUOTE_MIN_TICKS", 2)
+    monkeypatch.setattr(R, "PRE_REQUOTE_COOLDOWN_S", 10.0)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, requote_cooldown_s=0.0, requote_hold_up=0.0)
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    _eval(r, b)
+    q = r.quotes[(b.basket_id, 0)]
+    assert q.price == pytest.approx(0.31)
+    q.placed_at = q.moved_at = time.time() - 60.0
+    book(r, "X-A", [(0.31, 10)], [(0.35, 10)])          # wants 0.32: one tick, stays
+    _eval(r, b)
+    assert q.price == pytest.approx(0.31)
+    book(r, "X-A", [(0.32, 10)], [(0.35, 10)])          # wants 0.33: two ticks, cooled: moves
+    _eval(r, b)
+    assert q.price == pytest.approx(0.33)
+    book(r, "X-A", [(0.34, 10)], [(0.35, 10)])          # wants 0.35 two ticks up, but it just moved
+    _eval(r, b)
+    assert q.price == pytest.approx(0.33)
+
+
+def test_a_pregame_quote_without_a_plan_rests_out_its_grace_while_still_profitable(arbs, monkeypatch):
+    r, b = arbs
+    _no_deep(r)
+    monkeypatch.setattr(R, "PRE_NO_EDGE_GRACE_S", 10.0)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, requote_cooldown_s=0.0, min_exit_edge=0.01, depth_age_s=0.0)
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])          # B's YES ask: 10 at 0.55
+    _eval(r, b)
+    q = r.quotes[(b.basket_id, 0)]
+    assert q.price == pytest.approx(0.31) and q.remaining == 5
+    # B's ask thins to 2 at 0.55, then 0.66: a fill of 5 at 0.31 nets ~1.4c,
+    # under the 3c it needs but over min_exit_edge: no plan, but it rests.
+    book(r, "X-B", [(0.30, 10)], [(0.45, 2), (0.34, 10)])
+    _eval(r, b)
+    assert r.quotes.get((b.basket_id, 0)) is q and q.unpriced_at is not None and not q.pending
+    q.unpriced_at -= 10.0                                 # grace over: goes
+    _eval(r, b)
+    assert r.quotes.get((b.basket_id, 0)) is not q or q.pending
+    r.quotes.clear()
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    _eval(r, b)
+    q = r.quotes[(b.basket_id, 0)]
+    book(r, "X-B", [(0.30, 10)], [(0.45, 2), (0.30, 10)])   # then 0.70: a fill of 5 would lose: goes at once
+    _eval(r, b)
+    assert r.quotes.get((b.basket_id, 0)) is not q or q.pending
 
 
 def test_move_held_by_cooldown_is_rechecked_when_it_ends(arbs):

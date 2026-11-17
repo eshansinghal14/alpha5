@@ -190,12 +190,12 @@ class Gateway:
                     c.allow_now("cancel", force=True, reason=reason)
                     break
                 await asyncio.sleep(0.05)
-        else:
-            while not c.allow_now("cancel", reason=reason):
-                if c.tokens_now() > -KALSHI_CANCEL_OVERDRAW:
-                    c.allow_now("cancel", force=True, reason=reason)
-                    break
+        elif not c.allow_now("cancel", reason=reason):
+            # Counted refused once, not per check: per check, the waits showed
+            # as 300k+ "refused" cancels a process in a few hours (11-17).
+            while c.tokens_now() <= -KALSHI_CANCEL_OVERDRAW:
                 await asyncio.sleep(0.005)
+            c.allow_now("cancel", force=True, reason=reason)
         try:
             return await self.write(c.cancel, exchange_id, ticker), None, True
         except Exception as e:
