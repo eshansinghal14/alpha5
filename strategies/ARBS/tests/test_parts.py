@@ -37,7 +37,7 @@ def test_the_first_update_starts_from_the_hash_split_then_balances(two):
     assert hi - lo <= parts.GAP * (lo + hi) and len(moves) < len(evs) // 2
 
 
-def test_rebalance_runs_once_a_day_and_moves_until_within_the_gap(two):
+def test_rebalance_runs_once_a_period_and_moves_until_within_the_gap(two):
     evs = ["A-1", "A-2", "A-3", "B-1"]
     st = fresh()
     st["owners"] = {"A-1": 0, "A-2": 0, "A-3": 0, "B-1": 1}
@@ -45,8 +45,8 @@ def test_rebalance_runs_once_a_day_and_moves_until_within_the_gap(two):
     st["rebalanced_at"] = 0.0
     moves = parts.update(st, evs, DAY, spent)
     assert moves and sorted(st["load"]) == [50.0, 60.0]
-    st["owners"]["A-1"] = 0                             # a fresh imbalance the same day: left alone
-    assert parts.update(st, evs, DAY + 3600, spent) == []
+    st["owners"]["A-1"] = 0                             # a fresh imbalance within the period: left alone
+    assert parts.update(st, evs, DAY + parts.REBALANCE_S / 2, spent) == []
 
 
 def test_a_new_process_gets_its_share_at_once():
@@ -97,3 +97,57 @@ def test_shard3_group_has_its_own_owners_map_and_split():
     evs = [f"S-{i}" for i in range(40)]
     parts.update(st, evs, 1000.0, {e: 1.0 for e in evs}, procs=parts.SHARD3_PROCS)
     assert set(st["owners"].values()) == {0, 1} and st["procs"] == 2
+
+
+def test_book_updates_count_half_so_a_cpu_heavy_owner_sheds_events(two):
+    evs = [f"S{i}-E" for i in range(40)]
+    st = fresh()
+    st["owners"] = {e: (0 if i < 20 else 1) for i, e in enumerate(evs)}
+    st["rebalanced_at"] = 0.0
+    spent = {e: 1.0 for e in evs}                              # writes even
+    msgs = {e: (100.0 if i < 20 else 1.0) for i, e in enumerate(evs)}   # process 0's events are busy books
+    assert parts.update(st, evs, 1.0, spent) == []             # on writes alone: balanced, nothing moves
+    moves = parts.update(st, evs, 1.0 + parts.REBALANCE_S, spent, msgs=msgs)
+    assert moves and all(fr == 0 and to == 1 for _, fr, to in moves)
+
+
+def test_a_rebalance_moves_at_most_its_share_and_never_a_held_event(two):
+    evs = [f"S{i}-E" for i in range(100)]
+    st = fresh()
+    st["owners"] = {e: 0 for e in evs}
+    st["procs"], st["rebalanced_at"] = 2, 0.0                   # not a resize: the per-pass cap applies
+    spent = {e: 1.0 for e in evs}
+    held = set(evs[:50])
+    moves = parts.update(st, evs, parts.REBALANCE_S, spent, held=held)
+    assert 0 < len(moves) <= int(parts.MAX_MOVE_FRAC * len(evs))
+    assert not {ev for ev, _, _ in moves} & held
+
+
+def test_dropped_events_go_only_to_a_process_with_cpu_to_spare(two):
+    evs = ["E-1", "E-2", "E-3"]
+    st = fresh()
+    st["owners"] = {"E-1": 0, "E-2": 0, "E-3": 1}
+    st["procs"], st["rebalanced_at"] = 2, 1e9                    # no rebalance due
+    spent = {e: 1.0 for e in evs}
+    drops = {0: {"E-1", "E-2"}, 1: {"E-3"}}
+    assert parts.update(st, evs, 1.0, spent, drops=drops, spare=set()) == []      # nobody has room: stay
+    moves = parts.update(st, evs, 2.0, spent, drops=drops, spare={1}, held={"E-2"})
+    assert moves == [("E-1", 0, 1)] and st["owners"]["E-2"] == 0 and st["owners"]["E-3"] == 1
+
+
+def test_dropped_room_and_held_read_each_process_files(tmp_path):
+    import os
+    import time as _t
+    procs = ("P0", "P1")
+    now = _t.time()
+    for p, cpu in zip(procs, (0.9, 0.4)):
+        d = tmp_path / p / _t.strftime("%Y-%m-%d", _t.gmtime(now))
+        d.mkdir(parents=True)
+        (d / "summary.json").write_text(json.dumps({"loop_cpu": cpu}))
+    (tmp_path / "P0" / parts.DROPPED).write_text(json.dumps({"t": now, "events": ["E-1"]}))
+    (tmp_path / "P1" / parts.DROPPED).write_text(json.dumps({"t": now - 2 * parts.DROPPED_STALE_S, "events": ["E-9"]}))
+    (tmp_path / "P1" / "ledger.json").write_text(json.dumps({"baskets": {"mecnet:E-7:no:a+b": {}}}))
+    root = str(tmp_path)
+    assert parts.dropped(procs, now, root) == {0: {"E-1"}}           # P1's is stale
+    assert parts.room(procs, now, root) == {1}
+    assert parts.held_events(procs, root) == {"E-7"}

@@ -380,9 +380,13 @@ def scan_and_select(root: str, config_path: str | None = None, markets: int | No
         events = fetch_events()
         st = parts.load(procs=group)
         if name == group[0]:
-            # The one writer of the owners map: assigns new events, rebalances daily.
+            # The one writer of the owners map: assigns new events, rebalances hourly
+            # on writes and book updates, and hands on events an owner's scan dropped.
+            now = time.time()
             listed = [e["event_ticker"] for e in events if tradeable_event(e, set(cfg.scan.shards), other_series())]
-            moves = parts.update(st, listed, time.time(), parts.spend(procs=group), procs=group)
+            moves = parts.update(st, listed, now, parts.spend(procs=group), procs=group,
+                                 msgs=parts.spend(procs=group, name=parts.MSGS), held=parts.held_events(group),
+                                 drops=parts.dropped(group, now), spare=parts.room(group, now))
             parts.save(st, parts.owners_path(group))
             info = {"moved": len(moves), "load": st.get("load")}
         idx = group.index(name)
@@ -391,6 +395,16 @@ def scan_and_select(root: str, config_path: str | None = None, markets: int | No
     sel = select(doc, now=pd.Timestamp.now(tz="UTC"), days=cfg.trading.days_till_expiry, max_markets=markets,
                  held=held, exclude=set(cfg.watch.exclude))
     atomic_write_json(os.path.join(root, SELECTED), sel, indent=None)
+    if owns is not None:
+        # Owned events only the CPU-held count left out (not the horizon or
+        # exclude, which would leave them out anywhere), for the group's
+        # leader to hand on (parts.update).
+        ev_of = lambda rs: {r["relationship_id"].split(":", 1)[-1] for r in rs}  # noqa: E731
+        every = select(doc, now=pd.Timestamp.now(tz="UTC"), days=cfg.trading.days_till_expiry, max_markets=None,
+                       held=held, exclude=set(cfg.watch.exclude))
+        atomic_write_json(os.path.join(root, parts.DROPPED),
+                          {"t": time.time(), "events": sorted(ev_of(every["relationships"]) - ev_of(sel["relationships"]))},
+                          indent=None)
     return {"listed_markets": doc["n_markets"], "selected_relationships": len(sel["relationships"]), **info}
 
 

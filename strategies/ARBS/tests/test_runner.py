@@ -2897,3 +2897,19 @@ def test_cost_from_spend_uses_real_spend_once_quoted_a_while(arbs, monkeypatch):
     assert r.write_cost(b, now) == pytest.approx(3.0)
     monkeypatch.setattr(R, "COST_FROM_SPEND", False)
     assert r.write_cost(b, now) == pytest.approx(max(est, 3.0))              # off: as before
+
+
+def test_a_split_process_counts_book_updates_per_event(arbs):
+    import types
+    r, b = arbs
+    assert r.event_msgs is not None                         # ARBS is one of shard 0's processes
+    r.meta["X-A"] = R.Meta(ticker="X-A", event="EV-1", status="active", shard=0, taker_rate=0.07, maker_rate=0.0)
+    bk = types.SimpleNamespace(ticker="X-A", bid=0.30, ask=0.35, bid_depth=10.0, ask_depth=10.0)
+    r._on_quote(bk)
+    r._on_quote(bk)
+    assert r._msg_n == {"EV-1": 2}
+    for ev, n in r._msg_n.items():
+        r.event_msgs.add(ev, float(n))
+    r.event_msgs.write(r.event_msgs.snapshot())
+    saved = json.load(open(os.path.join(r.root, R.parts.MSGS)))
+    assert list(saved.values())[0] == {"EV-1": 2.0}

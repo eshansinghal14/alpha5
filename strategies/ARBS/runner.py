@@ -643,6 +643,11 @@ class ArbsRunner:
         self.prints = Prints(self.root)
         self.top_hist = TopHistory(self.root)
         self.event_spend = parts.EventSpend(self.root)
+        # Book updates per event, for parts.py's CPU-aware split: counted in a
+        # plain dict per message, folded into the day file each prints flush.
+        self.event_msgs = parts.EventSpend(self.root, parts.MSGS) if self.part_group else None
+        self._msg_n: dict[str, int] = {}
+        self._ev_of: dict[str, str] = {}
         # Shadow live edges (live_params_shadow). lp and lp_seen belong to the
         # pool thread running _shadow_live; the loop reads only lp_view.
         self.lp = lparams.LiveParams(list(lparams.DEFAULT_LEVELS), z=lparams.DEFAULT_Z,
@@ -1360,6 +1365,15 @@ class ArbsRunner:
             if self._moves_quotes(old, top):
                 self.top_moves.setdefault(book.ticker, _Rate()).add(1.0, time.time())
         self.book_seq[book.ticker] = self.book_seq.get(book.ticker, 0) + 1
+        if self.event_msgs is not None:
+            ev = self._ev_of.get(book.ticker)
+            if ev is None:
+                m = self.meta.get(book.ticker)
+                ev = m.event if m is not None and m.event else None
+                if ev:
+                    self._ev_of[book.ticker] = ev
+            if ev:
+                self._msg_n[ev] = self._msg_n.get(ev, 0) + 1
         self.book_time[book.ticker] = time.monotonic()
         self.book_wall[book.ticker] = time.time()
         self.liq.on_book(book.ticker, time.monotonic(), book.ask, book.ask_depth, book.bid, book.bid_depth)
@@ -1661,6 +1675,11 @@ class ArbsRunner:
                 await loop.run_in_executor(self.pool, self.prints.write, rows, day)
                 await loop.run_in_executor(self.pool, self.top_hist.write, self.top_hist.take(time.time()), day)
                 await loop.run_in_executor(self.write_pool, self.event_spend.write, self.event_spend.snapshot())
+                if self.event_msgs is not None:
+                    counts, self._msg_n = self._msg_n, {}
+                    for ev, n in counts.items():
+                        self.event_msgs.add(ev, float(n))
+                    await loop.run_in_executor(self.write_pool, self.event_msgs.write, self.event_msgs.snapshot())
             except Exception as e:
                 _log(f"WARN: print log failed ({e!r})")
 
