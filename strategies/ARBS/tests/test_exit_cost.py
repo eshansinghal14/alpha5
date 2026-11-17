@@ -48,3 +48,31 @@ def test_in_play_and_time_to_settlement_are_inputs():
     w = s.fit()
     assert ec.predict(w, {**_f(1.0), "live": 1.0, "tte_h": 2.0}) - ec.predict(w, {**_f(1.0), "live": 0.0, "tte_h": 48.0}) \
         == pytest.approx(4.0, abs=0.5)
+
+
+def test_model_value_matches_predict_at_price_bit_for_bit():
+    import math
+    import random
+    import numpy as np
+    from strategies.ARBS import exit_cost as X
+
+    rng = random.Random(5)
+    st = X.Stats()
+    models = [X.Model(np.array([rng.uniform(-5, 5) for _ in range(X.WIDTH)]), st, []) for _ in range(2)]
+
+    def draw(edges):
+        lo = edges[1] - 1 if math.isinf(edges[0]) else edges[0]
+        hi = edges[-2] + 5 if math.isinf(edges[-1]) else edges[-1]
+        return rng.uniform(lo - 0.5, hi + 0.5)
+
+    for _ in range(300):
+        f = {name: draw(edges) for name, edges in X.BINS.items()}
+        f.update(payout=1.0, c0=rng.uniform(0.3, 0.9), touch=rng.uniform(0.05, 0.6), plan=rng.uniform(0.3, 0.95))
+        for _ in range(6):
+            m = models[rng.randrange(2)]                       # the weights change under a kept f
+            x, live, size, mr = round(rng.uniform(0.01, 0.6), 2), rng.random() < 0.5, rng.choice([5.0, 50.0]), 0.0175
+            g = X.at_price(f, x)
+            net = 100 * (f["payout"] - x - f["plan"] - mr * x * (1 - x)) - X.predict(m.w, g)
+            want = (st.fill_prob(live, g["reach_c"]) * st.expected_fill(live, size) * net, net)
+            assert m.value(f, x, live, size, mr) == want
+

@@ -262,9 +262,9 @@ class Model:
     def value(self, f: dict, x: float, live: bool, size: float, maker_rate: float = 0.0) -> tuple[float, float]:
         """(expected $-cents of a quote at x for `size`: fill odds x expected
         lots x net, net c per lot after the predicted exit loss)."""
-        g = at_price(f, x)
-        net = 100 * (f["payout"] - x - f["plan"] - maker_rate * x * (1 - x)) - predict(self.w, g)
-        return self.stats.fill_prob(live, g["reach_c"]) * self.stats.expected_fill(live, size) * net, net
+        edge_c, reach_c = 100 * (f["payout"] - x - f["c0"]), max(0.0, 100 * (f["touch"] - x))
+        net = 100 * (f["payout"] - x - f["plan"] - maker_rate * x * (1 - x)) - _predict_at(self.w, f, edge_c, reach_c)
+        return self.stats.fill_prob(live, reach_c) * self.stats.expected_fill(live, size) * net, net
 
 
 MODEL_FILE = "exit_model.json"
@@ -304,6 +304,46 @@ def predict(w: np.ndarray, f: dict) -> float:
         _W_LIST[0], _W_LIST[1] = w, [float(x) for x in w]
     wl = _W_LIST[1]
     return sum(wl[i] for i in _active(f))
+
+
+_AT_PRICE = ("edge_c", "reach_c")
+
+
+def _bin(edges: list, v: float) -> int:
+    return next((i for i in range(len(edges) - 1) if v <= edges[i + 1]), len(edges) - 2)
+
+
+def _predict_at(w: np.ndarray, f: dict, edge_c: float, reach_c: float) -> float:
+    """predict(w, at_price(f, x)) for the edge_c and reach_c of price x, bit
+    for bit (same terms, same order). Only those two features move with the
+    price, so the others' weights are looked up once per f and kept in it:
+    pricing 28 edge/size pairs a live leg every 0.5 s, Model.value was ~6% of
+    ARBS0B's busy loop (py-spy 11-17 19:26)."""
+    if _W_LIST[0] is not w:
+        _W_LIST[0], _W_LIST[1] = w, [float(x) for x in w]
+    wl = _W_LIST[1]
+    got = f.get("_terms")
+    if got is None or got[0] is not wl:
+        terms, k = [], 1
+        for name, edges in BINS.items():
+            if name in _AT_PRICE:
+                terms.append((name, k, edges))
+            else:
+                b = _bin(edges, f[name])
+                if b > 0:
+                    terms.append(wl[k + b - 1])
+            k += len(edges) - 2
+        got = f["_terms"] = (wl, terms)
+    at = {"edge_c": edge_c, "reach_c": reach_c}
+    vals = [wl[0]]
+    for t in got[1]:
+        if type(t) is tuple:
+            b = _bin(t[2], at[t[0]])
+            if b > 0:
+                vals.append(wl[t[1] + b - 1])
+        else:
+            vals.append(t)
+    return sum(vals)                                # sum(), as predict: its float summation is compensated
 
 
 def at_price(f: dict, x: float) -> dict:

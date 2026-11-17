@@ -2362,10 +2362,13 @@ class ArbsRunner:
                 o = pricing.others_cost(vs, j, n)
                 if o is None:
                     continue
+                at_price: dict[float, tuple[float, float]] = {}     # edges joining at one price value the same
                 for e in MODEL_EDGES:
                     plan = pricing.plan_at(vs, j, b.payout, e, o)
                     if plan is not None:
-                        cands[(e, n)] = m.value(f, plan.price, True, n, vs[j].maker_rate)
+                        if plan.price not in at_price:
+                            at_price[plan.price] = m.value(f, plan.price, True, n, vs[j].maker_rate)
+                        cands[(e, n)] = at_price[plan.price]
         else:
             # One size key (`cap`) so the sticky rules see a single size; each
             # edge is valued at the size it would rest at. Edges resting at the
