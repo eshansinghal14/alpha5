@@ -384,8 +384,11 @@ def scan_and_select(root: str, config_path: str | None = None, markets: int | No
             # on writes and book updates, and hands on events an owner's scan dropped.
             now = time.time()
             listed = [e["event_ticker"] for e in events if tradeable_event(e, set(cfg.scan.shards), other_series())]
+            cpu = parts.spend(procs=group, name=parts.CPU)
+            if sum(cpu.values()) < parts.CPU_MIN_S:
+                cpu = parts.spend(procs=group, name=parts.MSGS)
             moves = parts.update(st, listed, now, parts.spend(procs=group), procs=group,
-                                 msgs=parts.spend(procs=group, name=parts.MSGS), held=parts.held_events(group),
+                                 msgs=cpu, held=parts.held_events(group),
                                  drops=parts.dropped(group, now), spare=parts.room(group, now))
             parts.save(st, parts.owners_path(group))
             info = {"moved": len(moves), "load": st.get("load")}

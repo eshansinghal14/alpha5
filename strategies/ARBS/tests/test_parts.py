@@ -151,3 +151,9 @@ def test_dropped_room_and_held_read_each_process_files(tmp_path):
     assert parts.dropped(procs, now, root) == {0: {"E-1"}}           # P1's is stale
     assert parts.room(procs, now, root) == {1}
     assert parts.held_events(procs, root) == {"E-7"}
+
+
+def test_event_spend_keeps_small_cpu_seconds(tmp_path):
+    es = parts.EventSpend(str(tmp_path), parts.CPU, dp=4)
+    es.add("E-1", 0.00123, now=0.0)
+    assert es.snapshot() == {"1970-01-01": {"E-1": 0.0012}}

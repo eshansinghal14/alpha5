@@ -2968,3 +2968,25 @@ def test_a_split_process_counts_book_updates_per_event(arbs):
     r.event_msgs.write(r.event_msgs.snapshot())
     saved = json.load(open(os.path.join(r.root, R.parts.MSGS)))
     assert list(saved.values())[0] == {"EV-1": 2.0}
+
+
+def test_a_split_process_times_each_events_evaluations_and_book_updates(arbs):
+    import types
+    r, b = arbs
+    assert r.event_cpu is not None
+    r.meta["X-A"] = R.Meta(ticker="X-A", event="EV-1", status="active", shard=0, taker_rate=0.07, maker_rate=0.0)
+    r._on_quote(types.SimpleNamespace(ticker="X-A", bid=0.30, ask=0.35, bid_depth=10.0, ask_depth=10.0))
+    assert r._cpu_s.get("EV-1", 0.0) > 0.0
+    bb = Basket(basket_id="mecnet:EV-2:no:a+b", relationship_id="mecnet:EV-2", type="mutually_exclusive_no",
+                cluster="t", legs=(Leg("X-A", "no"), Leg("X-B", "no")), payout=1.0, quote_until=None,
+                resume_quoting=None)
+    r.baskets[bb.basket_id] = bb
+    r.evaluate = lambda bk: time.sleep(0.002)
+
+    async def go():
+        r.dirty.add(bb.basket_id)
+        t = asyncio.get_running_loop().create_task(r.eval_loop())
+        await asyncio.sleep(0.05)
+        t.cancel()
+    asyncio.run(go())
+    assert r._cpu_s.get("EV-2", 0.0) >= 0.002

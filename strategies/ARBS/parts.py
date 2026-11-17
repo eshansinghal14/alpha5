@@ -9,10 +9,13 @@ cost per event; once every REBALANCE_S, or at once when PROCS changes,
 events move from the costliest process to the cheapest while they differ
 by more than GAP of the total, at most MAX_MOVE_FRAC of the events a pass.
 An event's cost is half its share of the group's write tokens and half its
-share of book updates (its CPU), over the last two UTC days, from each
-process's event_spend.json and event_msgs.json (EventSpend). Writes alone
-balanced ARBS0C onto the write-heavy index ladders, whose book updates held
-its loop over target at 1,000 markets while ARBS0B idled at 51% (11-17).
+share of event-loop CPU seconds (evaluating its baskets and handling its
+book updates), over the last two UTC days, from each process's
+event_spend.json and event_cpu.json (EventSpend); book-update counts
+(event_msgs.json) stand in where no CPU is measured yet. Writes alone
+balanced ARBS0C onto the write-heavy index ladders, whose CPU held its loop
+over target at 1,000 markets while ARBS0B idled at 51% (11-17); update
+counts came out even across the three while their loops ran 70-93%.
 An event an owner lists but its CPU-held scan leaves out (scan_dropped.json)
 goes to the cheapest process with loop CPU to spare: nobody traded 1,101 of
 them (11-17). An event any process holds a basket of is never moved. A
@@ -47,6 +50,10 @@ FORGET_S = 3 * 86400.0
 OWNERS = "shard0_owners.json"
 SPEND = "event_spend.json"
 MSGS = "event_msgs.json"
+CPU = "event_cpu.json"
+# Loop seconds the group must have timed before CPU replaces update counts:
+# minutes of it after a deploy would rebalance on noise.
+CPU_MIN_S = 3600.0
 DROPPED = "scan_dropped.json"
 DROPPED_STALE_S = 900.0
 SPEND_DAYS = 3
@@ -260,8 +267,9 @@ class EventSpend:
     """Write tokens a process spends per event per UTC day, kept SPEND_DAYS
     days in <root>/event_spend.json for update()'s costs."""
 
-    def __init__(self, root: str, name: str = SPEND):
+    def __init__(self, root: str, name: str = SPEND, dp: int = 1):
         self.path = os.path.join(root, name)
+        self.dp = dp
         try:
             with open(self.path, encoding="utf-8") as fh:
                 self.by_day: dict[str, dict[str, float]] = json.load(fh)
@@ -278,7 +286,7 @@ class EventSpend:
     def snapshot(self) -> dict[str, dict[str, float]]:
         keep = sorted(self.by_day)[-SPEND_DAYS:]
         self.by_day = {k: self.by_day[k] for k in keep}
-        return {k: {e: round(t, 1) for e, t in v.items()} for k, v in self.by_day.items()}
+        return {k: {e: round(t, self.dp) for e, t in v.items()} for k, v in self.by_day.items()}
 
     def write(self, snap: dict):
         atomic_write_json(self.path, snap, indent=None)

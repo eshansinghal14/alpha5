@@ -658,6 +658,10 @@ class ArbsRunner:
         # plain dict per message, folded into the day file each prints flush.
         self.event_msgs = parts.EventSpend(self.root, parts.MSGS) if self.part_group else None
         self._msg_n: dict[str, int] = {}
+        # Event-loop seconds per event (its evaluations and book updates), the
+        # same way: parts.py balances on it.
+        self.event_cpu = parts.EventSpend(self.root, parts.CPU, dp=4) if self.part_group else None
+        self._cpu_s: dict[str, float] = {}
         self._ev_of: dict[str, str] = {}
         # Shadow live edges (live_params_shadow). lp and lp_seen belong to the
         # pool thread running _shadow_live; the loop reads only lp_view.
@@ -1369,6 +1373,14 @@ class ArbsRunner:
         return False
 
     def _on_quote(self, book):
+        t0 = time.perf_counter()
+        ev = self._on_quote_inner(book)
+        if ev:
+            self._cpu_s[ev] = self._cpu_s.get(ev, 0.0) + time.perf_counter() - t0
+
+    def _on_quote_inner(self, book) -> str | None:
+        """_on_quote's work; its event when this process counts per event."""
+        ev = None
         top = (book.bid, book.ask)
         old = self.last_top.get(book.ticker)
         if old != top:
@@ -1399,6 +1411,7 @@ class ArbsRunner:
             self.mark(bid)
         for bid in self.via_by_ticker.get(book.ticker, ()):
             self.mark(bid)
+        return ev
 
     def _watch_pulls(self, book):
         """Mark a market side pulled (see depth.PullWatch) while a live
@@ -1691,6 +1704,11 @@ class ArbsRunner:
                     for ev, n in counts.items():
                         self.event_msgs.add(ev, float(n))
                     await loop.run_in_executor(self.write_pool, self.event_msgs.write, self.event_msgs.snapshot())
+                if self.event_cpu is not None:
+                    secs, self._cpu_s = self._cpu_s, {}
+                    for ev, s in secs.items():
+                        self.event_cpu.add(ev, s)
+                    await loop.run_in_executor(self.write_pool, self.event_cpu.write, self.event_cpu.snapshot())
             except Exception as e:
                 _log(f"WARN: print log failed ({e!r})")
 
@@ -2438,11 +2456,16 @@ class ArbsRunner:
                     bid = self.dirty.pop()
                 b = self.baskets.get(bid)
                 if b is not None and bid not in self.busy:
+                    t0 = time.perf_counter()
                     try:
                         self.evaluate(b)
                     except Exception:
                         _log(f"eval error {bid}:")
                         traceback.print_exc()
+                    if self.event_cpu is not None:
+                        ev = parts.event_of(bid)
+                        if ev:
+                            self._cpu_s[ev] = self._cpu_s.get(ev, 0.0) + time.perf_counter() - t0
                 if time.perf_counter() - start > EVAL_SLICE_S:
                     break
             if self.urgent or self.quoted or self.dirty:
