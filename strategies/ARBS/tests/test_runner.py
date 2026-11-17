@@ -2581,7 +2581,7 @@ def test_model_pick_is_quick_to_cut_risk_and_slow_to_add_it(arbs, monkeypatch):
     r.exit_model = Stub()
     monkeypatch.setattr(R.exit_cost, "live_features", lambda *a, **k: {})
     monkeypatch.setattr(R.pricing, "others_cost", lambda vs, j, n: n)          # stands in for the size below
-    monkeypatch.setattr(R.pricing, "plan_at", lambda vs, j, payout, e, o: types.SimpleNamespace(price=e))
+    monkeypatch.setattr(R.pricing, "prices_at", lambda vs, j, payout, edges, o: list(edges))   # price = edge
     now_ts = pd.Timestamp.now(tz="UTC")
     vs = [types.SimpleNamespace(maker_rate=0.0)] * 2
 
@@ -2624,8 +2624,8 @@ def test_model_pick_keeps_its_holds_when_the_held_pick_cannot_be_priced(arbs, mo
     r.exit_model = Stub()
     monkeypatch.setattr(R.exit_cost, "live_features", lambda *a, **k: {})
     monkeypatch.setattr(R.pricing, "others_cost", lambda vs, j, n: n)          # stands in for the size below
-    monkeypatch.setattr(R.pricing, "plan_at",
-                        lambda vs, j, payout, e, n: None if (e, n) in gone else types.SimpleNamespace(price=e))
+    monkeypatch.setattr(R.pricing, "prices_at",
+                        lambda vs, j, payout, edges, n: [None if (e, n) in gone else e for e in edges])
     now_ts = pd.Timestamp.now(tz="UTC")
     vs = [types.SimpleNamespace(maker_rate=0.0)] * 2
     st = lambda: r.model_state[(b.basket_id, 0, True)]

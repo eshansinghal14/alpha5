@@ -2363,12 +2363,11 @@ class ArbsRunner:
                 if o is None:
                     continue
                 at_price: dict[float, tuple[float, float]] = {}     # edges joining at one price value the same
-                for e in MODEL_EDGES:
-                    plan = pricing.plan_at(vs, j, b.payout, e, o)
-                    if plan is not None:
-                        if plan.price not in at_price:
-                            at_price[plan.price] = m.value(f, plan.price, True, n, vs[j].maker_rate)
-                        cands[(e, n)] = at_price[plan.price]
+                for e, x in zip(MODEL_EDGES, pricing.prices_at(vs, j, b.payout, MODEL_EDGES, o)):
+                    if x is not None:
+                        if x not in at_price:
+                            at_price[x] = m.value(f, x, True, n, vs[j].maker_rate)
+                        cands[(e, n)] = at_price[x]
         else:
             # One size key (`cap`) so the sticky rules see a single size; each
             # edge is valued at the size it would rest at. Edges resting at the
@@ -3132,7 +3131,12 @@ class ArbsRunner:
             return
         if old is not None:
             del self.via[(basket_id, j)]
-            if old in self.baskets and old not in {v for (bid, _), v in self.via.items() if bid == basket_id}:
+            # This basket's own legs, not a scan of every basket's via: that
+            # was ~5% of ARBS0B's busy loop (py-spy 11-17 19:57).
+            b = self.baskets.get(basket_id)
+            still = (any(self.via.get((basket_id, k)) == old for k in range(len(b.legs))) if b is not None
+                     else old in {v for (bid, _), v in self.via.items() if bid == basket_id})
+            if old in self.baskets and not still:
                 for t in self.baskets[old].tickers:
                     self.via_by_ticker.get(t, set()).discard(basket_id)
         if y is not None:

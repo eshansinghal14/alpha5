@@ -224,4 +224,7 @@ def test_depth_sizes_and_shared_walks_match_one_quote_leg_per_edge_and_size():
         for e in edges:
             want = P.quote_leg(legs, j, payout, e, n)
             assert (None if o is None else P.plan_at(legs, j, payout, e, o)) == want
+        if o is not None:
+            assert P.prices_at(legs, j, payout, edges, o) == [
+                None if (p := P.plan_at(legs, j, payout, e, o)) is None else p.price for e in edges]
 

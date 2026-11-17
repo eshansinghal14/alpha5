@@ -227,6 +227,27 @@ def plan_at(legs: list[LegView], j: int, payout: float, required_edge: float, ot
                      edge=payout - others - maker_cost(price, lv.maker_rate), others_cost=others)
 
 
+def prices_at(legs: list[LegView], j: int, payout: float, edges, others: float) -> list[float | None]:
+    """plan_at(...).price at each of `edges` (None where plan_at is None),
+    the leg's ask cap and join price worked out once: model_pick prices 7
+    edges at each size."""
+    lv = legs[j]
+    ticks, rate, lo = lv.ticks, lv.maker_rate, lv.ticks.lo
+    ask_cap = None if lv.best_ask is None else ticks.down(lv.best_ask)
+    join = None if lv.bid is None else ticks.up(lv.bid)
+    out: list[float | None] = []
+    for e in edges:
+        cap = max_price_within(payout - e - others, rate, ticks)
+        if cap is not None and ask_cap is not None:
+            cap = min(cap, ask_cap)
+        if cap is None or cap < lo - _EPS:
+            out.append(None)
+            continue
+        price = cap if join is None else min(cap, join)
+        out.append(max(price, lo))
+    return out
+
+
 def depth_size(legs: list[LegView], j: int, payout: float, required_edge: float, cap: float,
                at: float | None = None) -> float:
     """Largest whole size, up to `cap`, that leg j can rest at price `at`
