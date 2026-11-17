@@ -2747,3 +2747,31 @@ def test_fill_stats_answers_are_cached_until_the_counts_change():
     assert (s.fill_prob(True, 1), s.expected_fill(True, 10.0)) == (p, f)
     s.add_reach(True, 0)                          # a new count clears them
     assert s.fill_prob(True, 1) == pytest.approx(0.5)
+
+
+def test_leg_view_cache_sees_our_quote_repriced_in_place(arbs):
+    r, b = arbs
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    q = R.Quote(basket_id=b.basket_id, leg=0, ticker="X-A", side="yes", price=0.30, size=4.0, cid="c",
+                edge=0.03, max_price=0.4, pending=False)
+    r.quotes[q.key] = q
+    r._in_pass = True
+    try:
+        v1 = r.leg_view("X-A", "no")                 # our 4 at 0.30 left out of the YES bids
+        q.price = 0.29                               # repriced in place, no dict write
+        v2 = r.leg_view("X-A", "no")
+        assert v2 is not v1
+        r.quotes.pop(q.key)
+        assert r.leg_view("X-A", "no") is not v2
+    finally:
+        r._in_pass = False
+
+
+def test_summary_written_with_orjson_reads_back_like_json(tmp_path):
+    import numpy as np
+    p = str(tmp_path / "summary.json")
+    s = {"counts": {"a": 1}, "by_shard": {0: 2.5, 100: np.float64(1.25)}, "quotes": [{"price": 0.42}], "x": None}
+    R._write_summary(p, s)
+    import json as _j
+    got = _j.load(open(p))
+    assert got == {"counts": {"a": 1}, "by_shard": {"0": 2.5, "100": 1.25}, "quotes": [{"price": 0.42}], "x": None}

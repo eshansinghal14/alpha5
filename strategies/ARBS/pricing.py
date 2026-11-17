@@ -14,6 +14,9 @@ from infra.kalshi.fees import fee
 _EPS = 1e-9
 
 
+_TICKS: dict[tuple, "Ticks"] = {}    # price_ranges -> its Ticks (from_market)
+
+
 @dataclasses.dataclass(frozen=True)
 class Ticks:
     """A market's price grid, from its `price_ranges`: (start, end, step)
@@ -24,9 +27,15 @@ class Ticks:
 
     @classmethod
     def from_market(cls, price_ranges: list[dict] | None) -> "Ticks":
+        """One shared Ticks per distinct grid: rebuilt for every market each
+        meta refresh, it was ~10% of that thread's GIL time (py-spy 11-16)."""
         if not price_ranges:
             return cls()
-        return cls(tuple(sorted((float(r["start"]), float(r["end"]), float(r["step"])) for r in price_ranges)))
+        key = tuple((r["start"], r["end"], r["step"]) for r in price_ranges)
+        got = _TICKS.get(key)
+        if got is None:
+            got = _TICKS[key] = cls(tuple(sorted((float(a), float(b), float(c)) for a, b, c in key)))
+        return got
 
     @property
     def lo(self) -> float:

@@ -21,6 +21,11 @@ from backtest.data import MAX_SNAPSHOT_AGE_S
 from infra.polymarket import WS, auth
 from infra.polymarket.orders import _amt, order_side, parse_execution
 
+try:
+    from orjson import loads as _loads
+except ImportError:          # orjson is optional: same parse, ~3x slower
+    _loads = json.loads
+
 MARKETS_PATH = "/v1/ws/markets"
 PRIVATE_PATH = "/v1/ws/private"
 OPEN_TIMEOUT_S = 15.0
@@ -169,7 +174,7 @@ class PolyFeed:
                         except asyncio.TimeoutError:
                             continue
                         self.last_msg_mono = time.monotonic()
-                        self.handle_market(json.loads(raw))
+                        self.handle_market(_loads(raw))
             except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
                 self._set_up(False)
                 print(f"[{self.label}] polymarket ws error ({e!r}); reconnecting", flush=True)
@@ -208,7 +213,7 @@ class PolyFeed:
                                                             "marketSlugs": []}}))
                     self.private_up = True
                     async for raw in ws:
-                        self.handle_private(json.loads(raw))
+                        self.handle_private(_loads(raw))
             except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
                 print(f"[{self.label}] polymarket private ws error ({e!r}); reconnecting", flush=True)
             self.private_up = False

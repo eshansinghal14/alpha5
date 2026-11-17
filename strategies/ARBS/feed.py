@@ -12,7 +12,7 @@ import websockets
 from backtest.book import L2Book
 from infra.kalshi import auth
 from infra.kalshi.ws_feed import (OPEN_TIMEOUT_S, RECONNECT_DELAY_S, RECV_TIMEOUT_S, RESYNC_INTERVAL_S,
-                                         WS_URL, LiveKalshiFeed)
+                                  WS_URL, LiveKalshiFeed, _loads)
 
 # Same batching as ws_raw_ob_collector (SUBSCRIBE_BATCH / _PACING_S): one
 # command with ~1000 tickers was the suspect in a 12h silent gap (2026-08-26).
@@ -112,7 +112,7 @@ class MultiFeed(LiveKalshiFeed):
                         except asyncio.TimeoutError:
                             continue
                         self.last_msg_mono = time.monotonic()
-                        d = json.loads(raw)
+                        d = _loads(raw)
                         mtype = d.get("type", "")
                         if mtype == "subscribed" and (d.get("msg") or {}).get("channel") == "orderbook_delta":
                             ob_sid = d["msg"].get("sid")

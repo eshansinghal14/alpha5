@@ -19,7 +19,8 @@ class _Resp:
 def _serve(monkeypatch, codes):
     seq = iter(codes)
     slept = []
-    monkeypatch.setattr(api.requests, "get", lambda *a, **k: _Resp(next(seq), {"ok": True}))
+    sess = type("S", (), {"get": staticmethod(lambda *a, **k: _Resp(next(seq), {"ok": True}))})()
+    monkeypatch.setattr(api, "_session", lambda: sess)
     monkeypatch.setattr(api.time, "sleep", slept.append)
     return slept
 

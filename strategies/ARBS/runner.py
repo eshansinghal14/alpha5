@@ -35,7 +35,7 @@ import uuid
 import pandas as pd
 
 from infra.kalshi.api import kalshi_get
-from infra.config import ConfigStore, atomic_write_json
+from infra.config import ConfigStore, _replace_with_retry, atomic_write_json
 from infra.kalshi import fees as kfees
 from infra.kalshi.orders import (RealFill, error_code, http_status, is_market_paused, is_order_group_reject,
                                         is_post_only_reject)
@@ -107,6 +107,18 @@ def _utc() -> pd.Timestamp:
     return _UTC_AT[1]
 
 
+# ticker -> a version of our own quotes on it, bumped whenever one is added,
+# removed, repriced or resized: leg_view's cache key used to copy them (two
+# dicts and tuples per lookup, ~60% of leg_view's time, py-spy 11-16).
+_OWN_VER: dict[str, int] = {}
+_OWN_FIELDS = frozenset({"ticker", "side", "price", "size", "filled"})
+
+
+def _bump_own(ticker: str | None):
+    if ticker is not None:
+        _OWN_VER[ticker] = _OWN_VER.get(ticker, 0) + 1
+
+
 @dataclasses.dataclass
 class Quote:
     basket_id: str
@@ -130,6 +142,11 @@ class Quote:
     booked_to: str | None = None  # basket its last fill was booked into (see book_target)
     short_at: float | None = None  # since when its second-level cover has been under it (COVER_GRACE_S)
     pm_from: tuple | None = None   # a Polymarket move not yet confirmed: (price before it, its moved_at)
+
+    def __setattr__(self, name, value):
+        object.__setattr__(self, name, value)
+        if name in _OWN_FIELDS:
+            _bump_own(self.__dict__.get("ticker"))
 
     @property
     def remaining(self) -> float:
@@ -360,15 +377,18 @@ class _Quotes(dict):
         old = self.get(k)
         if old is not None:
             self.side[(old.ticker, old.side)].pop(k, None)
+            _bump_own(old.ticker)
         else:
             self.n_by_basket[k[0]] = self.n_by_basket.get(k[0], 0) + 1
         super().__setitem__(k, q)
         self.side[(q.ticker, q.side)][k] = q
+        _bump_own(q.ticker)
 
     def __delitem__(self, k):
         q = self[k]
         super().__delitem__(k)
         self.side[(q.ticker, q.side)].pop(k, None)
+        _bump_own(q.ticker)
         self.gone[(q.ticker, q.side)] = (time.time(), q)
         n = self.n_by_basket.get(k[0], 0) - 1
         if n > 0:
@@ -386,6 +406,8 @@ class _Quotes(dict):
         raise KeyError(k)
 
     def clear(self):
+        for q in self.values():
+            _bump_own(q.ticker)
         super().clear()
         self.side.clear()
         self.gone.clear()
@@ -393,6 +415,21 @@ class _Quotes(dict):
 
     def on(self, ticker: str, side: str):
         return list(self.side.get((ticker, side), {}).values())
+
+
+def _write_summary(path: str, s: dict):
+    """orjson when it can encode it: json.dumps of the 0.6-1 MB summary was
+    6-9 ms of the event loop every 2 s (11-16). NaN becomes null."""
+    try:
+        import orjson
+        data = orjson.dumps(s, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY)
+    except Exception:
+        atomic_write_json(path, s, indent=None)
+        return
+    tmp = f"{path}.tmp-{os.getpid()}"
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+    _replace_with_retry(tmp, path)
 
 
 def _read_json(path: str):
@@ -458,7 +495,7 @@ class ArbsRunner:
         self._commit_cache: float | None = None
         self.hot = []
         self.ranking: list[dict] = []
-        self._tradeable_n: tuple[float, int] = (0.0, 0)   # (monotonic, n) for the summary
+        self._tradeable_ok: dict[str, bool] = {}          # basket_id -> tradeable at its last evaluation
         self.scan_path = os.path.join(self.root, scanner.SELECTED)
         self.scan_status: dict = {}
         self.markets: int | None = None              # markets the next scan may take (scan_markets)
@@ -1179,8 +1216,7 @@ class ArbsRunner:
             return None
         if self._in_pass:
             # Many baskets share a leg; each view copies and sorts the whole book.
-            key = (self.book_seq.get(ticker), tuple(self._own(ticker, "yes").items()),
-                   tuple(self._own(ticker, "no").items()), self.inflight.get((ticker, side)),
+            key = (self.book_seq.get(ticker), _OWN_VER.get(ticker, 0), self.inflight.get((ticker, side)),
                    m.taker_rate, m.maker_rate, m.ticks)
             hit = self._lv_cache.get((ticker, side))
             if hit is not None and hit[0] == key:
@@ -2300,7 +2336,12 @@ class ArbsRunner:
         if any(q.kind != "arb" for q in live_qs):
             self.spawn(self.cancel_quotes([q for q in live_qs if q.kind != "arb"], "whole"), b.basket_id)
             return
-        vs = self.views(b) if self.tradeable(b) else None
+        # Excluded first: its views were built on every book tick only to be
+        # thrown away (record_only, another process's shard, past the horizon).
+        excl = self.excluded(b)
+        ok = self.tradeable(b)
+        self._tradeable_ok[b.basket_id] = ok
+        vs = self.views(b) if ok and not excl else None
         # Priced for the ranking once per rank interval, not on every book
         # update: it was a fifth of the loop (py-spy 10-29).
         if vs is None or now - self.rank_at.get(b.basket_id, 0.0) >= self.cfg.watch.rank_interval_s:
@@ -2313,11 +2354,11 @@ class ArbsRunner:
         pm_all = blocked or ("feed_down" if self.feed.pm._tickers and not self.feed.pm.up else None)
         if not pm_all:
             self.pm_stop = None
-        if vs is None or blocked or feed_down or self.excluded(b):
+        if vs is None or blocked or feed_down or excl:
             if pm_all and self.live and any(is_pm(q.ticker) for q in live_qs) and self._pm_stop_all(pm_all):
                 live_qs = [q for q in live_qs if not is_pm(q.ticker)]
             if live_qs:
-                why = blocked or ("feed_down" if feed_down else "excluded" if self.excluded(b) else "untradeable")
+                why = blocked or ("feed_down" if feed_down else "excluded" if excl else "untradeable")
                 self.spawn(self.cancel_quotes(live_qs, why), b.basket_id)
             return
         t = self.cfg.trading
@@ -2356,6 +2397,8 @@ class ArbsRunner:
         ex = self.exit_room(b)
         now_ts = _utc()
         want = t.enable_quoting and (b.basket_id in self.hot_set or ex >= 1) and self.may_quote(b, now_ts)
+        if not want and b.basket_id not in self.quotes.n_by_basket:
+            return              # no plan is made and nothing rests to cancel: most baskets, most ticks
         live = self.live_now(b, now_ts)
         cap = float(t.live_quote_size if live else t.quote_size)
         quote_need = edge_dollars(b.payout, t.min_edge + t.quote_edge_add) + (t.live_edge_add if live else 0.0)
@@ -4017,13 +4060,9 @@ class ArbsRunner:
         return top
 
     def _n_tradeable(self) -> int:
-        """Baskets tradeable now, recounted every 30 s: the walk over every
-        basket was ~20 ms of each 2 s summary on the event loop (py-spy 11-16)."""
-        at, n = self._tradeable_n
-        if time.monotonic() - at >= 30.0:
-            n = sum(1 for b in self.all_baskets if self.tradeable(b))
-            self._tradeable_n = (time.monotonic(), n)
-        return n
+        """Baskets tradeable at their last evaluation: walking every basket here
+        blocked the event loop ~70 ms (18k baskets, py-spy 11-16)."""
+        return sum(1 for bid, ok in self._tradeable_ok.items() if ok and bid in self.baskets)
 
     def summary(self) -> dict:
         # Real positions stay on screen after a disarm; shadow ones only show
@@ -4119,8 +4158,7 @@ class ArbsRunner:
             await asyncio.sleep(SUMMARY_S)
             try:
                 s = self.summary()
-                atomic_write_json(os.path.join(day_dir(self.S, f"{_utc():%Y-%m-%d}"), "summary.json"), s,
-                                  indent=None)
+                _write_summary(os.path.join(day_dir(self.S, f"{_utc():%Y-%m-%d}"), "summary.json"), s)
             except Exception:
                 traceback.print_exc()
 

@@ -89,7 +89,9 @@ class L2Book:
         ages = [t for t in self.last_snapshot_time.values() if t is not None]
         if len(ages) < 2:
             return None
-        return (now - min(ages)).total_seconds()
+        # In integer ns: Timestamp - Timestamp -> Timedelta.total_seconds() ran
+        # ~3x per live book message and was ~1% of ARBS's event loop (py-spy 11-16).
+        return (now.value - min(t.value for t in ages)) / 1e9
 
     def to_quote(self, time: pd.Timestamp, max_snapshot_age_s: float | None = None) -> Quote:
         """max_snapshot_age_s, if given, distrusts (reports as unknown --

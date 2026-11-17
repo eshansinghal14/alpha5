@@ -4,12 +4,18 @@ discovery, orderbook midpoints, historical candles, and the series lists the
 raw orderbook collector sweeps.
 """
 import datetime
+import threading
 import time
 
 import requests
 import pandas as pd
 
 from infra.kalshi import auth
+
+try:
+    from orjson import loads as _loads
+except ImportError:          # optional: resp.json() instead
+    _loads = None
 from infra.keys import KALSHI_API_KEY as API_KEY
 
 BASE_URL = "https://api.elections.kalshi.com"
@@ -69,6 +75,25 @@ HOURLY_SERIES_TICKERS = [
 _load_private_key = auth.load_private_key
 _auth_headers = auth.rest_headers
 
+# One keep-alive session per thread (requests.Session isn't documented as
+# thread-safe): ARBS's market refresh opened a new TLS connection for each
+# of ~95 GETs every 2 min, the handshakes on worker threads sharing the GIL
+# with the event loop (py-spy 11-16).
+_tls = threading.local()
+
+
+def _session() -> requests.Session:
+    s = getattr(_tls, "s", None)
+    if s is None:
+        s = _tls.s = requests.Session()
+    return s
+
+
+def _json(resp) -> dict:
+    body = getattr(resp, "content", None)
+    return _loads(body) if _loads is not None and isinstance(body, bytes) else resp.json()
+
+
 # Kalshi's 5xx come in short bursts: one 500 on ARBS3's startup market load
 # (11-15 17:50 UTC) exited the shard, and nothing restarts a strategy unit.
 RETRY_5XX = (500, 502, 503, 504)
@@ -84,7 +109,7 @@ def kalshi_get(path: str, params: dict = None, auth: bool = False, max_retries: 
     for attempt in range(max_retries):
         # Signed per attempt: a retry can come a minute after the first try.
         headers = _auth_headers("GET", path) if auth else {"accept": "application/json"}
-        resp = requests.get(BASE_URL + path, headers=headers, params=params, timeout=10)
+        resp = _session().get(BASE_URL + path, headers=headers, params=params, timeout=10)
         if resp.status_code == 429 and attempt < max_retries - 1:
             retry_after = resp.headers.get("Retry-After")
             if retry_after is not None:
@@ -97,7 +122,7 @@ def kalshi_get(path: str, params: dict = None, auth: bool = False, max_retries: 
             time.sleep(min(2 ** attempt, 30))
             continue
         resp.raise_for_status()
-        return resp.json()
+        return _json(resp)
 
 
 # ---------------------------------------------------------------------------
