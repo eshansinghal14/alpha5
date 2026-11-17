@@ -20,6 +20,18 @@ from backtest.core import Trade
 from backtest.data import MAX_SNAPSHOT_AGE_S
 from infra.kalshi import auth
 
+
+_NOW: list = [0.0, None]
+
+
+def _now_utc() -> pd.Timestamp:
+    """UTC now, one Timestamp per ms: built per book message it was ~2.5% of
+    a busy ARBS loop (py-spy 11-17), and messages arrive in bursts."""
+    t = time.time()
+    if _NOW[1] is None or abs(t - _NOW[0]) > 0.001:
+        _NOW[0], _NOW[1] = t, pd.Timestamp(t, unit="s", tz="UTC")
+    return _NOW[1]
+
 WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
 
 # Kalshi sends orderbook_snapshot only on subscribe, so a long-lived
@@ -101,7 +113,7 @@ class LiveKalshiFeed:
         if b is None or (not b.yes_bids and not b.no_bids):
             return None
         return BookView.from_quote(
-            b.to_quote(pd.Timestamp.now(tz="UTC"), max_snapshot_age_s=MAX_SNAPSHOT_AGE_S), ladder=b)
+            b.to_quote(_now_utc(), max_snapshot_age_s=MAX_SNAPSHOT_AGE_S), ladder=b)
 
     def seconds_since_message(self) -> float | None:
         return None if self.last_msg_mono is None else time.monotonic() - self.last_msg_mono
@@ -155,7 +167,7 @@ class LiveKalshiFeed:
             self._handle_message(d)
 
     def _emit_book(self, book: L2Book):
-        now = pd.Timestamp.now(tz="UTC")
+        now = _now_utc()
         self._on_quote(BookView.from_quote(book.to_quote(now, max_snapshot_age_s=MAX_SNAPSHOT_AGE_S),
                                            ladder=book))
 
@@ -173,7 +185,7 @@ class LiveKalshiFeed:
                 self._on_fill(f)
             return
         if mtype == "orderbook_snapshot":
-            now = pd.Timestamp.now(tz="UTC")
+            now = _now_utc()
             for side_key, side in (("yes_dollars_fp", "yes"), ("no_dollars_fp", "no")):
                 levels = msg.get(side_key) or []
                 book.apply_snapshot(side, [(float(p), float(q)) for p, q in levels], time=now)
@@ -182,7 +194,7 @@ class LiveKalshiFeed:
             book.apply_delta(msg.get("side"), float(msg["price_dollars"]), float(msg["delta_fp"]))
             self._emit_book(book)
         elif mtype == "trade":
-            now = pd.Timestamp.now(tz="UTC")
+            now = _now_utc()
             if self._on_print is not None:
                 row = parse_ws_print(msg, now)
                 if row is not None:

@@ -7,6 +7,7 @@ order's fee (Kalshi ceils the whole order's fee, not each contract's).
 from __future__ import annotations
 
 import dataclasses
+import functools
 import math
 
 from infra.kalshi.fees import fee
@@ -37,12 +38,14 @@ class Ticks:
             got = _TICKS[key] = cls(tuple(sorted((float(a), float(b), float(c)) for a, b, c in key)))
         return got
 
-    @property
+    # Cached: read on every quote_leg, the round() was 2-3% of a busy ARBS
+    # loop (py-spy 11-17 18:48).
+    @functools.cached_property
     def lo(self) -> float:
         s, _, st = self.ranges[0]
         return round(s + st, 4)
 
-    @property
+    @functools.cached_property
     def hi(self) -> float:
         _, e, st = self.ranges[-1]
         return round(e - st, 4)
@@ -190,6 +193,13 @@ def quote_leg(legs: list[LegView], j: int, payout: float, required_edge: float, 
     Joins one tick above the best bid (never above the edge-limited price,
     never at or through the ask, which post_only would reject). None if no
     price works or another leg can't fill `size` now."""
+    others = others_cost(legs, j, size)
+    return None if others is None else plan_at(legs, j, payout, required_edge, others)
+
+
+def others_cost(legs: list[LegView], j: int, size: float) -> float | None:
+    """Per bundle, every leg but j taken at the level `size` bundles reach,
+    fees in; None if one can't fill `size`."""
     others = 0.0
     for i, lv in enumerate(legs):
         if i == j:
@@ -198,6 +208,11 @@ def quote_leg(legs: list[LegView], j: int, payout: float, required_edge: float, 
         if p is None:
             return None
         others += taker_cost(p, lv.taker_rate)
+    return others
+
+
+def plan_at(legs: list[LegView], j: int, payout: float, required_edge: float, others: float) -> QuotePlan | None:
+    """quote_leg given others_cost: one ladder walk can price every edge."""
     lv = legs[j]
     cap = max_price_within(payout - required_edge - others, lv.maker_rate, lv.ticks)
     if cap is None:
@@ -218,19 +233,44 @@ def depth_size(legs: list[LegView], j: int, payout: float, required_edge: float,
     (default: its smallest quote's price) and still have a fill completed
     through the other legs' books (each taken at the worst level that size
     reaches) for `required_edge`. 0 if not even 1 works."""
-    first = quote_leg(legs, j, payout, required_edge, 1.0)
-    if first is None or cap < 1:
-        return 0.0
-    price = first.price if at is None else at
-    if first.max_price < price - _EPS:
-        return 0.0
+    return depth_sizes(legs, j, payout, (required_edge,), cap, at)[0]
+
+
+def depth_sizes(legs: list[LegView], j: int, payout: float, edges, cap: float,
+                at: float | None = None) -> list[float]:
+    """depth_size at each of `edges`. Each size's ladder walk is shared by
+    every edge, and a probe computes only the limit price, not a whole plan:
+    model_pick values 7 edges, and its depth_size calls were 7-9% of a busy
+    ARBS loop (py-spy 11-17)."""
+    if cap < 1:
+        return [0.0] * len(edges)
+    lv = legs[j]
+    ticks, rate, lo = lv.ticks, lv.maker_rate, lv.ticks.lo
+    ask_cap = None if lv.best_ask is None else ticks.down(lv.best_ask)
+    walked: dict[float, float | None] = {}
+
+    def limit(e: float, n: float) -> float | None:
+        """plan_at's max_price at size n, None where quote_leg is None."""
+        if n in walked:
+            o = walked[n]
+        else:
+            o = walked[n] = others_cost(legs, j, n)
+        if o is None:
+            return None
+        c = max_price_within(payout - e - o, rate, ticks)
+        if c is None:
+            return None
+        if ask_cap is not None and ask_cap < c:
+            c = ask_cap
+        return None if c < lo - _EPS else c
+
     # Sizes where some other leg's worst level changes, then the cap.
     marks = {float(cap)}
-    for i, lv in enumerate(legs):
+    for i, other in enumerate(legs):
         if i == j:
             continue
         got = 0.0
-        for _, q in lv.asks:
+        for _, q in other.asks:
             got += q
             if got >= cap:
                 break
@@ -239,15 +279,30 @@ def depth_size(legs: list[LegView], j: int, payout: float, required_edge: float,
     # it still works is monotone: binary search, not one quote_leg per mark
     # (depth_size was ~2% of ARBS's busy loop, py-spy 11-17).
     ns = sorted(m for m in marks if m >= 1)
-    lo, hi, best = 0, len(ns) - 1, 1.0
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        plan = quote_leg(legs, j, payout, required_edge, ns[mid])
-        if plan is None or plan.max_price < price - _EPS:
-            hi = mid - 1
+    out = []
+    for e in edges:
+        c1 = limit(e, 1.0)
+        if c1 is None:
+            out.append(0.0)
+            continue
+        if at is not None:
+            price = at
         else:
-            best, lo = ns[mid], mid + 1
-    return best
+            price = c1 if lv.bid is None else min(c1, ticks.up(lv.bid))
+            price = max(price, lo)
+        if c1 < price - _EPS:
+            out.append(0.0)
+            continue
+        i_lo, i_hi, best = 0, len(ns) - 1, 1.0
+        while i_lo <= i_hi:
+            mid = (i_lo + i_hi) // 2
+            c = limit(e, ns[mid])
+            if c is None or c < price - _EPS:
+                i_hi = mid - 1
+            else:
+                best, i_lo = ns[mid], mid + 1
+        out.append(best)
+    return out
 
 
 def second_level_size(legs: list[LegView], j: int, payout: float, cap: float, at: float) -> float:

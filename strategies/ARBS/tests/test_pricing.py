@@ -173,3 +173,55 @@ def test_depth_size_binary_search_matches_the_linear_scan():
         j, need, cap = rng.randrange(len(legs)), rng.uniform(0.0, 0.08), float(rng.randint(1, 300))
         payout = float(len(legs) - 1) if rng.random() < 0.3 else 1.0
         assert P.depth_size(legs, j, payout, need, cap) == linear(legs, j, payout, need, cap)
+
+
+def test_depth_sizes_and_shared_walks_match_one_quote_leg_per_edge_and_size():
+    import random
+    from strategies.ARBS import pricing as P
+
+    def linear(legs, j, payout, need, cap, at):
+        first = P.quote_leg(legs, j, payout, need, 1.0)
+        if first is None or cap < 1:
+            return 0.0
+        price = first.price if at is None else at
+        if first.max_price < price - 1e-9:
+            return 0.0
+        marks = {float(cap)}
+        for i, lv in enumerate(legs):
+            if i == j:
+                continue
+            got = 0.0
+            for _, q in lv.asks:
+                got += q
+                if got >= cap:
+                    break
+                marks.add(float(int(got + 1e-9)))
+        best = 1.0
+        for n in sorted(m for m in marks if m >= 1):
+            plan = P.quote_leg(legs, j, payout, need, n)
+            if plan is None or plan.max_price < price - 1e-9:
+                break
+            best = n
+        return best
+
+    tapered = P.Ticks(((0.0, 0.1, 0.001), (0.1, 0.9, 0.01), (0.9, 1.0, 0.001)))
+    edges = (0.0, 0.01, 0.03, 0.05, 0.1, 0.2)
+    rng = random.Random(11)
+    for _ in range(2000):
+        ticks = tapered if rng.random() < 0.3 else P.CENT
+        legs = []
+        for _ in range(rng.randint(2, 5)):
+            px = sorted({round(rng.uniform(0.005, 0.6), 3 if ticks is tapered else 2) for _ in range(rng.randint(1, 8))})
+            legs.append(P.LegView(asks=[(p, float(rng.randint(1, 40))) for p in px],
+                                  bid=round(rng.uniform(0.01, 0.3), 2) if rng.random() < 0.8 else None,
+                                  taker_rate=0.07, maker_rate=0.0175, ticks=ticks))
+        j, cap = rng.randrange(len(legs)), float(rng.randint(0, 300))
+        payout = float(len(legs) - 1) if rng.random() < 0.3 else 1.0
+        at = None if rng.random() < 0.7 else round(rng.uniform(0.01, 0.4), 2)
+        assert P.depth_sizes(legs, j, payout, edges, cap, at) == [linear(legs, j, payout, e, cap, at) for e in edges]
+        n = float(rng.randint(1, 60))
+        o = P.others_cost(legs, j, n)
+        for e in edges:
+            want = P.quote_leg(legs, j, payout, e, n)
+            assert (None if o is None else P.plan_at(legs, j, payout, e, o)) == want
+

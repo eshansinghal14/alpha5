@@ -60,7 +60,9 @@ _EPS = 1e-9
 OTHER = {"yes": "no", "no": "yes"}
 TRADEABLE = ("active", "open")
 SETTLED = ("determined", "settled", "finalized")
-SUMMARY_S = 2.0
+# Every quote goes into each summary: at 2 s it was 4-5% of a busy loop
+# (py-spy 11-17 18:48). The dashboard calls a summary stale after 15 s.
+SUMMARY_S = 5.0
 MAX_ALERTS = 300
 # A quote whose create got no response may still rest at Kalshi; look for it
 # by client id after this long.
@@ -377,8 +379,11 @@ MODEL_PRE_NARROW_SIZE = 100.0
 # the replay found profitable at every fixed edge (11-04..16).
 # Pre-game picks are re-valued this often: valued every 0.5 s like live ones,
 # the pre-game shadow took enough loop CPU that shard 0's market count fell
-# 7.8k -> 2.9k (11-17 02:35-06:52), and pre-game books move slowly.
-MODEL_PRE_EVAL_S = 5.0
+# 7.8k -> 2.9k (11-17 02:35-06:52), and pre-game books move slowly. At 5 s
+# model_pick was still 23% of ARBS's and ARBS0B's busy loop, ARBS0B's at 99%
+# (py-spy 11-17 18:48). The pick is an edge only: every pass still prices the
+# quote at that edge on fresh books.
+MODEL_PRE_EVAL_S = 30.0
 
 
 class _Rate:
@@ -2346,27 +2351,35 @@ class ArbsRunner:
         aged = [self._held_depth(l.ticker, l.side, now, MODEL_AGE_S) for i, l in enumerate(b.legs) if i != j]
         uw = self.leg_view(leg.ticker, OTHER[leg.side])
         unwind_top = uw.asks[0][1] if uw is not None and uw.asks else None
-        tte = None if b.settles is None else (b.settles - now_ts).total_seconds() / 3600.0
+        # Epoch seconds, not Timestamp arithmetic (1-2% of a busy loop, py-spy 11-17).
+        tte = None if b.settles is None else (b.settles.timestamp() - now) / 3600.0
         cands: dict[tuple[float, float], tuple[float, float]] = {}
         if live:
             for n in MODEL_SIZES:
                 f = exit_cost.live_features(vs, j, b.payout, n, aged, unwind_top, True, tte)
                 if f is None:
                     break
+                o = pricing.others_cost(vs, j, n)
+                if o is None:
+                    continue
                 for e in MODEL_EDGES:
-                    plan = pricing.quote_leg(vs, j, b.payout, e, n)
+                    plan = pricing.plan_at(vs, j, b.payout, e, o)
                     if plan is not None:
                         cands[(e, n)] = m.value(f, plan.price, True, n, vs[j].maker_rate)
         else:
             # One size key (`cap`) so the sticky rules see a single size; each
-            # edge is valued at the size it would rest at.
-            for e in MODEL_EDGES:
-                rest = pricing.depth_size(vs, j, b.payout, e, cap)
+            # edge is valued at the size it would rest at. Edges resting at the
+            # same size share its features and ladder walk.
+            by_n: dict[float, tuple] = {}
+            for e, rest in zip(MODEL_EDGES, pricing.depth_sizes(vs, j, b.payout, MODEL_EDGES, cap)):
                 if rest < 1:
                     continue
                 n = min(max(rest, MODEL_PRE_MIN_SIZE), MODEL_PRE_MAX_SIZE)
-                f = exit_cost.live_features(vs, j, b.payout, n, aged, unwind_top, False, tte)
-                plan = pricing.quote_leg(vs, j, b.payout, e, n)
+                if n not in by_n:
+                    by_n[n] = (exit_cost.live_features(vs, j, b.payout, n, aged, unwind_top, False, tte),
+                               pricing.others_cost(vs, j, n))
+                f, o = by_n[n]
+                plan = None if o is None else pricing.plan_at(vs, j, b.payout, e, o)
                 if f is not None and plan is not None:
                     cands[(e, cap)] = m.value(f, plan.price, False, n, vs[j].maker_rate)
         if not cands:
