@@ -1,5 +1,5 @@
 {
-  "$base": "config_shard3.json",
+  "$base": "config.json",
   "trading": {
     "enable_takes": null,
     "enable_quoting": null,
@@ -48,7 +48,9 @@
   },
   "scan": {
     "enable": null,
-    "shards": null,
+    "shards": [
+      3
+    ],
     "interval_s": null,
     "mecnet_max_legs": null,
     "ladder_span": null,
