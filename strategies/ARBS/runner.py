@@ -349,6 +349,13 @@ MODEL_GROW_HOLD_S = 300.0
 # it never validated.
 MODEL_PRE_MIN_SIZE, MODEL_PRE_MAX_SIZE = 5.0, 500.0
 MODEL_PRE_NARROW_SIZE = 100.0
+# Where the model values no pre-game quote, the config edge rests at most
+# MODEL_PRE_NARROW_SIZE: it skipped 58% of economics legs (11-16 prints) that
+# the replay found profitable at every fixed edge (11-04..16).
+# Pre-game picks are re-valued this often: valued every 0.5 s like live ones,
+# the pre-game shadow took enough loop CPU that shard 0's market count fell
+# 7.8k -> 2.9k (11-17 02:35-06:52), and pre-game books move slowly.
+MODEL_PRE_EVAL_S = 5.0
 
 
 class _Rate:
@@ -2219,7 +2226,7 @@ class ArbsRunner:
         Sticky: see MODEL_* constants."""
         key, now = (b.basket_id, j, live), time.time()
         hit = self._model_cache.get(key)
-        if hit is not None and now - hit[0] < MODEL_EVAL_S:
+        if hit is not None and now - hit[0] < (MODEL_EVAL_S if live else MODEL_PRE_EVAL_S):
             return hit[1]
         m = self.exit_model
         leg = b.legs[j]
@@ -2534,8 +2541,11 @@ class ArbsRunner:
                         (need_j, n_pick), picked = mp, True
                         if live:
                             cap_j = n_pick
-                        elif need_j is not None and need_j < quote_need - _EPS:
-                            cap_j = min(cap, MODEL_PRE_NARROW_SIZE)       # see MODEL_PRE_NARROW_SIZE
+                        elif need_j is None:
+                            need_j, picked = quote_need, False        # see MODEL_PRE_NARROW_SIZE
+                            cap_j = min(cap, MODEL_PRE_NARROW_SIZE)
+                        elif need_j < quote_need - _EPS:
+                            cap_j = min(cap, MODEL_PRE_NARROW_SIZE)
                 if need_j is None:
                     room = 0.0                        # the model values no quote here now
                 else:

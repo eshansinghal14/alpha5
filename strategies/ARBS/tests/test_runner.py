@@ -2643,6 +2643,12 @@ def test_a_pregame_model_quote_keeps_its_size_unless_narrower_than_the_config(ar
     monkeypatch.setattr(r, "model_pick", lambda b, j, vs, now_ts, live, cap, **k: (fixed / 2, cap))
     _eval(r, b)
     assert r.quotes[(b.basket_id, 0)].size <= R.MODEL_PRE_NARROW_SIZE      # narrower than the config: capped
+    r.quotes.clear()
+    monkeypatch.setattr(r, "model_pick", lambda b, j, vs, now_ts, live, cap, **k: (None, 0.0))
+    _eval(r, b)
+    q = r.quotes[(b.basket_id, 0)]
+    limit = 1.0 - R.pricing.taker_cost(0.55, 0.07) - fixed
+    assert q.size <= R.MODEL_PRE_NARROW_SIZE and limit - 0.01 - 1e-9 <= q.max_price <= limit + 1e-9   # none: config edge, capped
 
 
 def test_a_pregame_model_pick_values_each_edge_at_the_size_it_would_rest_at(arbs, monkeypatch):

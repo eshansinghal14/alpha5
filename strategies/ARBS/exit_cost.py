@@ -29,8 +29,13 @@ BINS = {
     "top_r_min": [0, 1, 1.5, 3, 10, 50, math.inf],
     "aged_frac": [-0.01, 0, 0.5, 0.99, 1.0],
     "depth2_r": [0, 1, 2, 5, 20, math.inf],
-    "reach_c": [-math.inf, 0.5, 1.5, 3.5, 6.5, math.inf],
-    "edge_c": [-math.inf, 0, 2, 5, 10, math.inf],
+    # Deep sweeps get their own bins: with one bin past 6.5c (edge past 10c),
+    # a 30c sweep was predicted to cost what a 7c one did. Pre-game realized
+    # exit loss rose 2.0 -> 3.6 -> 5.8 -> 8.5 -> 14.7c per lot over reach
+    # 6.5-10 / 10-15 / 15-20 / 20-30 / 30+c (11-14..16), and the flat
+    # prediction put most pre-game picks at the widest edge.
+    "reach_c": [-math.inf, 0.5, 1.5, 3.5, 6.5, 10, 15, 20, 30, math.inf],
+    "edge_c": [-math.inf, 0, 2, 5, 10, 15, 20, math.inf],
     "spread_c": [-math.inf, 1.5, 3.5, 10, math.inf],
     "n": [0, 5, 20, 50, math.inf],
     "unwind_top_r": [-0.01, 0.5, 1, 3, math.inf],
