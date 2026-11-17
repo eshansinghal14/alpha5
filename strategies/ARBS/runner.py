@@ -285,6 +285,9 @@ PM_CLOSED_REJECTS = ("This market is closed for trading",)
 # Retired Polymarket orders reconcile may still read: their cancel echo
 # normally marks them final within a second; this bounds the backlog.
 PM_RECONCILE_WINDOW_S = 3600.0
+# Between load_meta's market GETs (100 tickers each): ~95 of them per process,
+# six processes, under Kalshi's read limit when they all start together.
+META_GET_GAP_S = 0.25
 # A basket counts toward max_broken_baskets once broken this long. Mid-exit
 # breaks last p90 0.6 s; counting them, one basket stuck 50 min plus brief
 # breaks elsewhere stopped ARBSPM 18 times in 46 min, each a cancel-all and a
@@ -433,6 +436,8 @@ def _write_summary(path: str, s: dict):
     except Exception:
         atomic_write_json(path, s, indent=None)
         return
+    # A new process's (or a new UTC day's) folder may not exist yet: ARBS3B's didn't (11-17).
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     tmp = f"{path}.tmp-{os.getpid()}"
     with open(tmp, "wb") as fh:
         fh.write(data)
@@ -938,6 +943,10 @@ class ArbsRunner:
         got: dict[str, dict] = {}
         for i in range(0, len(kt), 100):
             batch = kt[i:i + 100]
+            if i:
+                # Paced: with keep-alive GETs six processes starting at once
+                # read past Kalshi's limit for ~2 min and ARBS exited (11-17 01:40).
+                time.sleep(META_GET_GAP_S)
             for m in kalshi_get("/trade-api/v2/markets", params={"tickers": ",".join(batch), "limit": 1000}) \
                     .get("markets", []):
                 got[m["ticker"]] = m
@@ -4198,7 +4207,17 @@ class ArbsRunner:
     async def run(self, stop_requested: bool = False):
         loop = asyncio.get_running_loop()
         _log(f"{len(self.all_baskets)} baskets over {len(self.tickers)} markets")
-        await loop.run_in_executor(self.pool, self.load_meta)
+        for attempt in range(10):
+            try:
+                await loop.run_in_executor(self.pool, self.load_meta)
+                break
+            except Exception as e:
+                # Once kalshi_get's own retries are spent: a 429 storm at a
+                # restart exited ARBS, and nothing restarts one process (11-17).
+                if attempt == 9:
+                    raise
+                _log(f"WARN: market load failed ({e!r}); retrying in 30s")
+                await asyncio.sleep(30.0)
         shards = {t: m.shard for t, m in self.meta.items() if m.shard is not None}
         _log(f"markets by status {_count(m.status for m in self.meta.values())}; shards {sorted(set(shards.values()))}")
         try:
