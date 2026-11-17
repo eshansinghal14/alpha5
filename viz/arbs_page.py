@@ -50,11 +50,9 @@ def _grouped(procs: list[dict]) -> list[dict]:
 
 
 def _basket_line(g: dict) -> str:
-    """quoting / watching of one shard's row; a shard split over processes
-    shows each one's after its total."""
-    who = (" · ".join(f"{r['label']} {r['quoting']:,} / {_k(r['watching'])}" for r in g["parts"])
-           if len(g["parts"]) > 1 else g["label"])
-    return f"{g['quoting']:,} / {_k(g['watching'])} ({who}{'' if g['real'] else ', shadow, not in total'})"
+    """quoting / watching of one shard's row, one pair per process."""
+    pairs = ", ".join(f"{r['quoting']:,} / {_k(r['watching'])}" for r in g["parts"])
+    return f"{pairs} ({g['label']}{'' if g['real'] else ', shadow, not in total'})"
 
 
 def parts(series: str) -> list[str]:
