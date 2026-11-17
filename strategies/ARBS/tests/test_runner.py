@@ -287,7 +287,7 @@ def test_flip_exits_held_bundles_at_min_exit_edge(arbs):
     r, b = arbs
     f = _with_flip(r, b)
     r.cfg.trading = dataclasses.replace(r.cfg.trading, min_exit_edge=0.01, min_edge=0.05, max_dollars=0.0,
-                                        enable_quoting=False)
+                                        enable_quoting=False, exit_ref_days=7.0)     # the scaled exit (Polymarket's)
     for t in b.tickers:
         r.shadow_ledger.record(b.basket_id, b.tickers, t, "yes", 3, 1.35, time.time())
     # NO asks 0.47 + 0.47 + fees 0.035: a 2.5c edge, above min_exit_edge, below min_edge.
