@@ -118,7 +118,7 @@ def test_dashboard_merges_the_arbs_processes():
     assert m["pnl"]["settled"] == 9.0 and m["pnl"]["cash"] == 1200.0  # the shadow process left out
     assert m["pnl"]["positions_value"] == 500.0                    # the account's, not summed
     assert m["counts"]["quote_fills"] == 4 and m["n_baskets"] == 17
-    assert [q["shard"] for q in m["quotes"]] == ["shard 0", "shard 0", "shard 3", "Polymarket"]
+    assert [q["shard"] for q in m["quotes"]] == ["shard 0 (a)", "shard 0", "shard 3", "Polymarket"]
     assert m["blocked_reason"] == "shard 3: feed_down" and not m["feed"]["up"]
     sh = m["by_shard"]
     assert list(sh) == ["0", "3", "100"] and sh["0"]["room"] == 800.0 and sh["0"]["real"]   # shard 0 once
