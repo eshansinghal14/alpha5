@@ -2721,8 +2721,8 @@ class ArbsRunner:
                     plan, size = self.cover_grace(b, vs, j, q, plan, size, full, need_j, now)
                 if room >= 1:
                     plan, size = self.best_plan(b, j, plan, size, room, need_j if picked else 0.0)
-                if q is not None and q.remaining > size + _EPS:
-                    plan = None
+                if q is not None and q.remaining > size + _EPS and size < 1:
+                    plan = None                       # a smaller plan is cut to in place below
             if plan is None:
                 if q is not None and want and not live and self.no_edge_grace(b, vs, j, q, now):
                     continue
@@ -2746,6 +2746,20 @@ class ArbsRunner:
                 # Registered now, not when the coroutine runs, so the next
                 # basket's dollar room in this same pass already counts it.
                 acts.append(self.place_quote(self.new_quote(b, plan, size)))
+                continue
+            if q.remaining > size + _EPS:
+                # Cut in place: a pure size decrease keeps the order's queue place,
+                # where cancel + re-place lost it and left the side unquoted for a
+                # pass (47,596 live re-placements within a tick, 11-17). Past its
+                # new limit it reprices too. Without the tokens it is cancelled.
+                if self.live and not self.gw.can_afford(leg.ticker, "amend", reserve):
+                    acts.append(self.cancel_quote(q, "no_edge"))
+                    continue
+                if q.price <= plan.max_price + _EPS:
+                    rate = vs[j].maker_rate
+                    plan = dataclasses.replace(plan, price=q.price, edge=plan.edge + pricing.maker_cost(plan.price, rate)
+                                               - pricing.maker_cost(q.price, rate))
+                acts.append(self.move_quote(q, plan, size))
                 continue
             past_limit = q.price > plan.max_price + _EPS
             if (past_limit and not live and q.remaining <= MODEL_PRE_NARROW_SIZE
@@ -3926,11 +3940,13 @@ class ArbsRunner:
             resp, exc, sent = await self.gw.amend(q.ticker, q.side, q.exchange_id, plan.price, left, q.filled)
             self.order_times.append({"kind": "amend", "reason": q.kind, "ticker": q.ticker, "sent": t0,
                                      "answered": time.time(), "book": book, "order_id": q.exchange_id})
+            # Past its edge limit, or bigger than the cut it was being sized
+            # down to, it would fill at a loss: a cancel costs 2 write tokens to
+            # an amend's 10 and always goes out.
+            unsafe = q.price > plan.max_price + _EPS or left < q.remaining - _EPS
             if not sent:
                 self.n["moves_refused"] += 1
-                if q.price > plan.max_price + _EPS:
-                    # Past its edge limit it would fill at a loss; a cancel
-                    # costs 2 write tokens to an amend's 10 and always goes out.
+                if unsafe:
                     await self.cancel_quote(q, "move_refused")
                 return
             if exc is not None:
@@ -3938,7 +3954,7 @@ class ArbsRunner:
                     self._retire(q)           # filled or gone; fills arrive on their own
                     return
                 self._order_err(q.basket_id, f"move {q.ticker}", exc, q.ticker)
-                if q.price > plan.max_price + _EPS:
+                if unsafe:
                     await self.cancel_quote(q, "move_failed")
                 return
             self._order_ok()

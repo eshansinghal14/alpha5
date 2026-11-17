@@ -1244,19 +1244,19 @@ def test_a_pregame_quote_without_a_plan_rests_out_its_grace_while_still_profitab
     _eval(r, b)
     q = r.quotes[(b.basket_id, 0)]
     assert q.price == pytest.approx(0.31) and q.remaining == 5
-    # B's ask thins to 2 at 0.55, then 0.66: a fill of 5 at 0.31 nets ~1.4c,
-    # under the 3c it needs but over min_exit_edge: no plan, but it rests.
-    book(r, "X-B", [(0.30, 10)], [(0.45, 2), (0.34, 10)])
+    real_best = r.best_plan
+    r.best_plan = lambda *a, **k: (None, 0.0)            # its plan gone; a fill at 0.31 still clears 1c
     _eval(r, b)
     assert r.quotes.get((b.basket_id, 0)) is q and q.unpriced_at is not None and not q.pending
     q.unpriced_at -= 10.0                                 # grace over: goes
     _eval(r, b)
     assert r.quotes.get((b.basket_id, 0)) is not q or q.pending
     r.quotes.clear()
-    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    r.best_plan = real_best
     _eval(r, b)
     q = r.quotes[(b.basket_id, 0)]
-    book(r, "X-B", [(0.30, 10)], [(0.45, 2), (0.30, 10)])   # then 0.70: a fill of 5 would lose: goes at once
+    r.best_plan = lambda *a, **k: (None, 0.0)
+    book(r, "X-B", [(0.30, 10)], [(0.30, 10)])          # B's ask 0.70: a fill at 0.31 would lose: goes at once
     _eval(r, b)
     assert r.quotes.get((b.basket_id, 0)) is not q or q.pending
 
@@ -3132,4 +3132,44 @@ def test_gateway_keeps_a_dropped_markets_shard():
     g.setup({"A-1": 0}, None)
     g.setup({"B-1": 0}, None)                               # A-1 left the scan
     assert g.client("A-1") is g.clients[0]
+
+
+def test_a_quote_whose_completion_thins_is_cut_in_place(arbs):
+    r, b = arbs
+    _no_deep(r)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, requote_cooldown_s=0.0, depth_age_s=0.0)
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])          # B's YES ask: 10 at 0.55
+    _eval(r, b)
+    q = r.quotes[(b.basket_id, 0)]
+    assert q.remaining == 5 and q.price == pytest.approx(0.31)
+    book(r, "X-B", [(0.40, 10)], [(0.45, 3), (0.30, 10)])   # 3 at 0.55, then 0.70: 3 complete
+    _eval(r, b)
+    assert r.quotes.get((b.basket_id, 0)) is q and q.remaining == 3 and q.price == pytest.approx(0.31)
+    book(r, "X-B", [(0.40, 10)], [(0.32, 2), (0.20, 10)])   # 2 at 0.68: 0.31 is past the limit
+    _eval(r, b)
+    assert r.quotes.get((b.basket_id, 0)) is q and q.remaining == 2 and q.price < 0.31 - 0.005
+
+
+def test_a_cut_that_cannot_be_sent_cancels_the_quote(arbs):
+    r, b = arbs
+    _no_deep(r)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, requote_cooldown_s=0.0, depth_age_s=0.0)
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    _eval(r, b)
+    q = r.quotes[(b.basket_id, 0)]
+    q.exchange_id = "ex-1"
+    sent = []
+
+    async def cancel(ticker, oid, reason):
+        sent.append((oid, reason))
+        return True, None, True
+
+    r.live = True
+    r.gw.can_afford = lambda *a: False
+    r.gw.cancel = cancel
+    book(r, "X-B", [(0.40, 10)], [(0.45, 3), (0.30, 10)])
+    _eval(r, b)
+    assert sent == [("ex-1", "no_edge")] and r.quotes.get((b.basket_id, 0)) is not q
 
