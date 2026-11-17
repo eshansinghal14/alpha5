@@ -3055,9 +3055,20 @@ def test_reach_quote_sits_one_tick_over_the_deepest_level_a_500_dollar_sweep_rea
     assert [a for a, _ in acts()][-1] in ("move", "cancel") and len(acts()) == 2
 
 
-def test_reach_quote_cancels_when_the_arb_quote_goes(arbs, monkeypatch):
+def test_reach_quote_outlives_its_arb_quote_and_goes_after_the_grace(arbs, monkeypatch):
     r, b = arbs
     rows = _reach_setup(r, b, monkeypatch)
-    r._reach[(b.basket_id, 0)] = {"price": 0.31, "size": 10.0, "spend": 100.0, "t": 0.0}
-    r.reach_shadow(b, None, 0, None, None, 0.0, 10.0, False)
+    r._reach[(b.basket_id, 0)] = {"price": 0.31, "size": 10.0, "spend": 100.0, "t": 0.0, "on_at": 0.0}
+    r.reach_shadow(b, None, 0, None, None, 0.0, R.REACH_GRACE_S - 1, False)       # arb quote gone: kept
+    assert not [x for x in rows if x["kind"] == "reach_shadow"] and r._reach
+    r._reach_at.clear()
+    r.reach_shadow(b, None, 0, None, None, 0.0, R.REACH_GRACE_S + 1, False)       # unquoted past the grace
     assert [x["action"] for x in rows if x["kind"] == "reach_shadow"] == ["cancel"] and not r._reach
+
+
+def test_stale_reach_quotes_expire_from_the_rank_loop(arbs, monkeypatch):
+    r, b = arbs
+    rows = _reach_setup(r, b, monkeypatch)
+    r._reach[(b.basket_id, 0)] = {"price": 0.31, "size": 10.0, "spend": 100.0, "t": 0.0, "on_at": 0.0}
+    r.expire_reach(2 * R.REACH_GRACE_S + 1)
+    assert [x["why"] for x in rows if x["kind"] == "reach_shadow"] == ["expired"] and not r._reach

@@ -248,6 +248,11 @@ DEEP_REQUOTE_S = 10.0
 # rarely moves. "shadow" journals the quote it would rest (reach_shadow) and
 # places nothing; "on" is not built yet.
 REACH_MODE, REACH_USD, REACH_KEEP_USD, REACH_EVAL_S, REACH_MIN_GAP = "shadow", 500.0, 1500.0, 5.0, 0.01
+# Tied to its arb quote, 95% of shadow reach quotes were cancelled when that
+# quote churned, living 19 s p50 (ARBS0C, 11-17 20:12-20:24): it now outlives
+# it while it clears its own edge, and goes once the basket hasn't been quoted
+# for REACH_GRACE_S. It shrinks only below REACH_SHRINK of its size.
+REACH_GRACE_S, REACH_SHRINK = 30.0, 0.7
 # A resting near quote stays while it would still be NEAR_KEEP of near_min_size
 # (the exit depth it is sized to hovers around any threshold). It is cut at
 # once when what the exits take falls under NEAR_SHRINK of it, and grown or
@@ -2928,21 +2933,25 @@ class ArbsRunner:
         """The reach quote leg j would rest, tracked and journaled, not placed."""
         key = (b.basket_id, j)
         r = self._reach.get(key)
-        if plan is None or main is None or main.pending:
-            if r is not None:
-                self._reach.pop(key)
-                self._reach_log("cancel", b, j, r, live, why="no_arb_quote")
-            return
+        quoted = plan is not None and main is not None and not main.pending
+        if r is not None and quoted:
+            r["on_at"] = now
         if now - self._reach_at.get(key, 0.0) < REACH_EVAL_S:
             return
-        if r is None and now - main.placed_at < DEEP_REQUOTE_S:
+        if r is None and (not quoted or now - main.placed_at < DEEP_REQUOTE_S):
             return                                      # as a deep quote: only behind an arb quote that has rested
+        if r is not None and not quoted and now - r.get("on_at", r["t"]) > REACH_GRACE_S:
+            self._reach.pop(key)
+            self._reach_log("cancel", b, j, r, live, why="not_quoted")
+            return
         if len(self._reach_at) > 100000:
             self._reach_at.clear()
         self._reach_at[key] = now
         leg = b.legs[j]
+        if vs is None:
+            return
         rate = self._rates(leg.ticker)[0]
-        levels = self.reach_levels(b, j, main)
+        levels = self.reach_levels(b, j, main if quoted else None)
         if not levels:
             return
         cap = self.deep_cap(b, j, live)
@@ -2951,14 +2960,19 @@ class ArbsRunner:
             n = self.covered(b, vs, j, pricing.depth_size(vs, j, b.payout, need, float(int(cap + _EPS)), at=r["price"]),
                              r["price"])
             q = pricing.quote_leg(vs, j, b.payout, need, min(n, r["size"])) if n >= 1 else None
-            edge_ok = q is not None and r["price"] <= q.max_price + _EPS and r["price"] <= main.price - REACH_MIN_GAP + _EPS
+            edge_ok = q is not None and r["price"] <= q.max_price + _EPS and \
+                (not quoted or r["price"] <= main.price - REACH_MIN_GAP + _EPS)
             if edge_ok and spend <= REACH_KEEP_USD:
-                if n < r["size"] - _EPS:                # shrink only: never grows in place
+                if n < REACH_SHRINK * r["size"] - _EPS:  # shrink only, and only well short: never grows in place
                     r.update(size=n, spend=spend)
                     self._reach_log("shrink", b, j, r, live)
                 return
-            if edge_ok and now - r["t"] < DEEP_REQUOTE_S:
-                return                                  # out of reach but still safe: wait out the cooldown
+            if edge_ok and (now - r["t"] < DEEP_REQUOTE_S or not quoted):
+                return                                  # out of reach but still safe: wait (or for an arb quote to move under)
+            if not quoted:
+                self._reach.pop(key)
+                self._reach_log("cancel", b, j, r, live, why="no_edge")
+                return
         got = self.reach_plan(b, vs, j, main.price, need, cap, levels, rate)
         if got is None:
             if r is not None:
@@ -2969,9 +2983,18 @@ class ArbsRunner:
         if r is not None and abs(price - r["price"]) < _EPS and abs(n - r["size"]) < _EPS:
             r.update(spend=spend)
             return
-        new = {"price": price, "size": n, "spend": spend, "t": now}
+        new = {"price": price, "size": n, "spend": spend, "t": now, "on_at": now}
         self._reach[key] = new
         self._reach_log("move" if r is not None else "place", b, j, new, live, main_px=main.price)
+
+    def expire_reach(self, now: float):
+        """Shadow reach quotes on baskets no longer evaluated (not hot, nothing
+        resting) never see reach_shadow again: retire them past the grace."""
+        for key in [k for k, r in self._reach.items() if now - r.get("on_at", r["t"]) > 2 * REACH_GRACE_S]:
+            b = self.baskets.get(key[0])
+            r = self._reach.pop(key)
+            if b is not None:
+                self._reach_log("cancel", b, key[1], r, False, why="expired")
 
     def _reach_log(self, action: str, b: Basket, j: int, r: dict, live: bool, **kw):
         self.n["reach_" + action] = self.n.get("reach_" + action, 0) + 1
@@ -4198,6 +4221,7 @@ class ArbsRunner:
                     self.hot_ready = True
                 self.update_plan_scale(time.time())
                 self.rank_dump(rows, quotable, picked, now)
+                self.expire_reach(now)
                 if hot != self.hot:
                     entered, left = set(hot) - self.hot_set, self.hot_set - set(hot)
                     if self.hot_ready and (entered or left):
