@@ -1,5 +1,5 @@
-"""Kalshi websocket for every basket leg (~1500 markets) on one connection,
-subscribed in batches. Seq is checked per sid."""
+"""Kalshi websocket for every basket leg on one connection, subscribed in
+batches beside the reader. Seq is checked per sid."""
 from __future__ import annotations
 
 import asyncio
@@ -37,6 +37,7 @@ class MultiFeed(LiveKalshiFeed):
         self.down_since: float | None = time.monotonic()
         self._new: list[str] = []
         self.n_refreshes = 0
+        self._sub_id = 1
 
     def add(self, tickers):
         """Subscribe to more markets: on the open connection, and on every
@@ -47,15 +48,34 @@ class MultiFeed(LiveKalshiFeed):
         self._tickers += new
         self._new += new
 
-    async def _subscribe(self, ws, tickers, sub_id: int) -> int:
+    def _next_id(self) -> int:
+        self._sub_id += 1
+        return self._sub_id - 1
+
+    async def _subscribe(self, ws, tickers):
         for i in range(0, len(tickers), SUBSCRIBE_BATCH):
             batch = tickers[i:i + SUBSCRIBE_BATCH]
             for ch in (["orderbook_delta"], ["trade"]):
-                await ws.send(json.dumps({"id": sub_id, "cmd": "subscribe",
+                await ws.send(json.dumps({"id": self._next_id(), "cmd": "subscribe",
                                           "params": {"channels": ch, "market_tickers": batch}}))
-                sub_id += 1
             await asyncio.sleep(SUBSCRIBE_PACING_S)
-        return sub_id
+
+    async def _subscriber(self, ws, first: list[str]):
+        """Subscribes `first`, then marks the feed up and subscribes whatever
+        add() queues. Runs beside the reader: subscribing 12-23k markets before
+        reading took 50-90 s, the unread snapshots stalled the 20 s keepalive,
+        and the connection closed 1011 and resubscribed in a loop (11-17)."""
+        await self._subscribe(ws, first)
+        if self._on_fill:
+            # `fill` is account-wide; one subscription covers every market.
+            await ws.send(json.dumps({"id": self._next_id(), "cmd": "subscribe", "params": {"channels": ["fill"]}}))
+        self._set_up(True)
+        while True:
+            if self._new:
+                new, self._new = self._new, []
+                await self._subscribe(ws, new)
+            else:
+                await asyncio.sleep(SUBSCRIBE_PACING_S)
 
     def _refresh_gap(self) -> float:
         return RESYNC_INTERVAL_S / max(1, math.ceil(len(self._tickers) / REFRESH_BATCH))
@@ -75,36 +95,29 @@ class MultiFeed(LiveKalshiFeed):
         # lands; raising here left its feed down for good.
         while not self._tickers:
             await asyncio.sleep(1.0)
-        sub_id = 1
         while True:
+            sub = None
             try:
                 async with websockets.connect(WS_URL, additional_headers=auth.ws_headers(),
                                               open_timeout=OPEN_TIMEOUT_S, max_size=None) as ws:
                     self.connected_at = time.monotonic()
                     self._new = []
-                    sub_id = await self._subscribe(ws, list(self._tickers), sub_id)
-                    if self._on_fill:
-                        # `fill` is account-wide; one subscription covers every market.
-                        await ws.send(json.dumps({"id": sub_id, "cmd": "subscribe",
-                                                  "params": {"channels": ["fill"]}}))
-                        sub_id += 1
+                    sub = asyncio.create_task(self._subscriber(ws, list(self._tickers)))
                     last_seq: dict = {}
                     ob_sid, refresh_i = None, 0
                     refresh_at = time.monotonic() + self._refresh_gap()
-                    self._set_up(True)
                     while True:
-                        if self._new:
-                            new, self._new = self._new, []
-                            sub_id = await self._subscribe(ws, new, sub_id)
-                        if ob_sid is not None and time.monotonic() >= refresh_at:
+                        if sub.done():
+                            sub.result()          # a failed subscribe ends the connection
+                        if self.up and ob_sid is not None and time.monotonic() >= refresh_at:
                             if refresh_i >= len(self._tickers):
                                 refresh_i = 0
                             batch = self._tickers[refresh_i:refresh_i + REFRESH_BATCH]
                             refresh_i += REFRESH_BATCH
                             for action in ("delete_markets", "add_markets"):
-                                await ws.send(json.dumps({"id": sub_id, "cmd": "update_subscription", "params": {
-                                    "sids": [ob_sid], "market_tickers": batch, "action": action}}))
-                                sub_id += 1
+                                await ws.send(json.dumps({"id": self._next_id(), "cmd": "update_subscription",
+                                                          "params": {"sids": [ob_sid], "market_tickers": batch,
+                                                                     "action": action}}))
                             self.n_refreshes += 1
                             refresh_at = time.monotonic() + self._refresh_gap()
                         try:
@@ -141,5 +154,8 @@ class MultiFeed(LiveKalshiFeed):
                 self._set_up(False)
                 print(f"[{self.label}] kalshi ws connection error ({e!r}); reconnecting", flush=True)
                 await asyncio.sleep(RECONNECT_DELAY_S)
+            finally:
+                if sub is not None:
+                    sub.cancel()
             self._set_up(False)
             self.n_reconnects += 1
