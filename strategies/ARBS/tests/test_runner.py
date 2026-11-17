@@ -2866,3 +2866,28 @@ def test_rank_dump_writes_estimates_beside_real_spend(arbs, monkeypatch):
     assert len(lines) == 1
     row = json.loads(lines[0])["rows"][0]
     assert row[0] == b.basket_id and row[1] == 1.5 and row[4] == 1 and row[5] == 2
+
+
+def test_recent_flow_is_kept_apart_from_the_long_window(arbs):
+    r, b = arbs
+    t = time.time()
+    for dt in (3500.0, 100.0, 10.0):
+        r.flow.add("X-A", "yes", 10.0, t - dt)
+        r.flow_recent.add("X-A", "yes", 10.0, t - dt)
+    _, rate, recent = r.queue_parts("X-A", "yes", 0.30) or (None, None, None)
+    assert recent == pytest.approx(20.0 / 1800.0, rel=1e-3)
+    assert r.flow.rate("X-A", "yes", t, 3600.0) == pytest.approx(30.0 / 3600.0, rel=1e-3)   # long window intact
+
+
+def test_cost_from_spend_uses_real_spend_once_quoted_a_while(arbs, monkeypatch):
+    r, b = arbs
+    monkeypatch.setattr(R, "COST_FROM_SPEND", True)
+    now = time.time()
+    est, _ = r.write_cost_parts(b, now)
+    assert r.write_cost(b, now) == pytest.approx(est * R.EST_SCALE)          # never quoted: scaled estimate
+    r.spend_first[b.basket_id] = now - R.WRITE_COST_TAU_S - 1
+    r.spend[b.basket_id] = R._Rate()
+    r.spend[b.basket_id].add(R.WRITE_COST_TAU_S * 3.0, now)                   # 3 tokens/s really spent
+    assert r.write_cost(b, now) == pytest.approx(3.0)
+    monkeypatch.setattr(R, "COST_FROM_SPEND", False)
+    assert r.write_cost(b, now) == pytest.approx(max(est, 3.0))              # off: as before

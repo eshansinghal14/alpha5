@@ -179,6 +179,18 @@ class _Dirty(set):
 # change rates the hot list is budgeted on.
 WRITE_COST_TAU_S = 300.0
 RANK_DUMP_S = 300.0
+# Every RANK_PARTS_EVERY-th rank dump also carries each leg's inputs to
+# quote_score (edge, size, queue ahead, flow rates), so other value formulas
+# can be scored offline against fills.
+RANK_PARTS_EVERY, RANK_PARTS_TOP = 3, 500
+# Off until replayed on a day of rank dumps (11-17: estimates ran 2.4x real per
+# basket at the median, 3-14x per hot list; predicted $/h ran ~1000x realized,
+# a finished NFL game still ranked first on its 3 h flow):
+#   COST_FROM_SPEND: a basket quoted for WRITE_COST_TAU_S costs what it really
+#   spent (floored at its placements); a new one, its estimate x EST_SCALE.
+#   FLOW_RECENT_S: queue_wait's flow rate over this many seconds, not watch.queue_window_s.
+COST_FROM_SPEND, EST_SCALE = False, 0.4
+FLOW_RECENT_S: float | None = None
 # Write tokens per order or move, per cancel (Kalshi's write budget).
 ORDER_TOKENS, CANCEL_TOKENS = 10.0, 2.0
 # write_cost's estimates ran 2.3-2.5x what the same baskets really spent
@@ -637,8 +649,12 @@ class ArbsRunner:
         self.series_group: dict[str, str] = {}
         self.series_group_at = 0.0
         self.flow = _Flow()
+        # The same prints over FLOW_RECENT_S (or 1800 s): its own deques, as rate() drops what's past its window.
+        self.flow_recent = _Flow()
         # basket_id -> per leg (price, edge per bundle, size) we'd quote, or None.
         self.quote_px: dict[str, list] = {}
+        self.quote_parts: dict[str, list] = {}      # basket_id -> [live, per leg [px, edge, size, ahead, rate, recent]]
+        self.spend_first: dict[str, float] = {}     # basket_id -> when its quotes first spent writes
         # basket_id -> prints that would have filled a quote on a basket we didn't quote.
         self.missed: dict[str, dict] = {}
         # Misses count only from 2 min after a start, once the hot list has
@@ -656,6 +672,7 @@ class ArbsRunner:
         self._spend_hist: dict[int, collections.deque] = {}
         self._sib: dict[int, list[float]] = {}         # sibling_spend, read every WRITE_SPEND_EVERY_S
         self._sib_at = self._spend_written_at = self._rank_dump_at = 0.0
+        self._rank_dumps = 0
         self._scale_at: dict[int, float] = {}
         # Quote ids are saved by ledger_flush_loop, not per placement: a
         # synchronous write per quote held the loop ~200 ms each and queued a
@@ -1149,14 +1166,29 @@ class ArbsRunner:
         """Seconds of recent trading to fill `size` bid at `price`: other
         orders at or above it go first (joining a level puts us at its back).
         inf on a side nothing has sold into lately."""
+        return self._wait(self.queue_parts(ticker, side, price), size)
+
+    @staticmethod
+    def _wait(parts: tuple | None, size: float) -> float:
+        if parts is None:
+            return float("inf")
+        ahead, rate, recent = parts
+        r = recent if FLOW_RECENT_S else rate
+        return (ahead + size) / r if r > 0 else float("inf")
+
+    def queue_parts(self, ticker: str, side: str, price: float) -> tuple[float, float, float] | None:
+        """(contracts ahead of a bid at `price`, flow rate over
+        watch.queue_window_s, flow rate over FLOW_RECENT_S or 1800 s)."""
         bk = self.feed.ladder(ticker)
         if bk is None:
-            return float("inf")
+            return None
         own = self._own(ticker, side)
         ahead = sum(max(0.0, q - own.get(round(p, 4), 0.0))
                     for p, q in (bk.yes_bids if side == "yes" else bk.no_bids).items() if p >= price - _EPS)
-        rate = self.flow.rate(ticker, side, time.time(), self.cfg.watch.queue_window_s)
-        return (ahead + size) / rate if rate > 0 else float("inf")
+        now = time.time()
+        rate = self.flow.rate(ticker, side, now, self.cfg.watch.queue_window_s)
+        recent = self.flow_recent.rate(ticker, side, now, FLOW_RECENT_S or 1800.0)
+        return ahead, rate, recent
 
     def quote_score(self, b: Basket, vs) -> tuple[float, float]:
         """(expected $/h of quoting every leg, shortest leg wait in s): each
@@ -1165,7 +1197,7 @@ class ArbsRunner:
         live = self.live_now(b, _utc())
         need = edge_dollars(b.payout, t.min_edge + t.quote_edge_add) + (t.live_edge_add if live else 0.0)
         score, fastest = 0.0, float("inf")
-        px = []
+        px, parts = [], []
         for j, leg in enumerate(b.legs):
             size = max(1.0, pricing.depth_size(vs, j, b.payout, need, float(t.quote_size)))
             plan = pricing.quote_leg(vs, j, b.payout, need, size)
@@ -1174,11 +1206,15 @@ class ArbsRunner:
             px.append(None if plan is None else (plan.price, plan.edge, size))
             if plan is None:
                 continue
-            wait = self.queue_wait(leg.ticker, leg.side, plan.price, size)
+            qp = self.queue_parts(leg.ticker, leg.side, plan.price)
+            wait = self._wait(qp, size)
             fastest = min(fastest, wait)
             if wait < float("inf"):
                 score += plan.edge * size * 3600.0 / max(wait, 1.0)
+            parts.append(None if qp is None else [round(plan.price, 4), round(plan.edge, 4), size,
+                                                  round(qp[0], 1), round(qp[1], 5), round(qp[2], 5)])
         self.quote_px[b.basket_id] = px
+        self.quote_parts[b.basket_id] = [int(live)] + parts
         return score, fastest
 
     def note_missed(self, ticker: str, side: str, trade):
@@ -1224,6 +1260,7 @@ class ArbsRunner:
                     if r["t"] >= since and r["contracts"] > 0 and r["ticker"] in self.by_ticker:
                         for s in ("yes", "no"):
                             self.flow.add(r["ticker"], s, r["contracts"] / 2, r["t"])
+                            self.flow_recent.add(r["ticker"], s, r["contracts"] / 2, r["t"])
 
     def leg_view(self, ticker: str, side: str) -> pricing.LegView | None:
         """None if the book can't be trusted (no snapshot yet, or crossed: a
@@ -1358,6 +1395,7 @@ class ArbsRunner:
         maker = {"yes": "no", "no": "yes"}.get(trade.taker_side)
         if maker:
             self.flow.add(ticker, maker, trade.size, time.time())
+            self.flow_recent.add(ticker, maker, trade.size, time.time())
             self.note_missed(ticker, maker, trade)
             if self.cfg.runtime.record_prints:
                 # Research logging: never in the way of the trade handling.
@@ -3636,14 +3674,24 @@ class ArbsRunner:
             "depth": round(min(v.depth() for v in vs), 1)}
 
     def charge(self, basket_id: str, tokens: float):
-        self.spend.setdefault(basket_id, _Rate()).add(tokens, time.time())
+        now = time.time()
+        r = self.spend.get(basket_id)
+        if r is None or r.t is None or now - r.t > 2 * WRITE_COST_TAU_S:
+            self.spend_first[basket_id] = now           # (re)starts after a long quiet
+        self.spend.setdefault(basket_id, _Rate()).add(tokens, now)
         self.event_spend.add(parts.event_of(basket_id), tokens)
 
     def write_cost(self, b: Basket, now: float) -> float:
         """Write tokens/s quoting `b` takes: what its quotes spent lately, or
         if more, a move per leg each time its best bid/ask changes (at most
         one per requote_cooldown_s), plus placing every leg once per tau."""
-        return max(self.write_cost_parts(b, now))
+        est, spent = self.write_cost_parts(b, now)
+        if not COST_FROM_SPEND:
+            return max(est, spent)
+        first = self.spend_first.get(b.basket_id)
+        if first is not None and now - first >= WRITE_COST_TAU_S:
+            return max(spent, ORDER_TOKENS * len(b.legs) / WRITE_COST_TAU_S)
+        return est * EST_SCALE
 
     def write_cost_parts(self, b: Basket, now: float) -> tuple[float, float]:
         """(estimate from book moves, what its quotes really spent lately)."""
@@ -3668,10 +3716,15 @@ class ArbsRunner:
             if bid not in ok:
                 continue
             est, spent = self.write_cost_parts(self.baskets[bid], now)
+            first = self.spend_first.get(bid)
             out.append([bid, round(r["quote_usd_h"], 4), round(est, 3), round(spent, 3), int(bid in picked),
-                        r.get("legs")])
+                        r.get("legs"), None if first is None else round(now - first)])
         line = {"t": round(now, 1), "scale": {str(k): round(v, 3) for k, v in self.plan_scale.items()},
                 "budget": self.write_budget(), "rows": out}
+        self._rank_dumps += 1
+        if self._rank_dumps % RANK_PARTS_EVERY == 1:
+            keep = {bid for bid in picked} | {r["basket_id"] for r in rows[:RANK_PARTS_TOP]}
+            line["parts"] = {bid: self.quote_parts[bid] for bid in keep if bid in self.quote_parts}
         path = os.path.join(self.root, "rank_dump", f"{_utc():%Y-%m-%d}.jsonl.gz")
 
         def write():
