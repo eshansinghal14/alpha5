@@ -22,6 +22,7 @@ def arbs(tmp_path, monkeypatch):
     monkeypatch.setattr(R, "PRE_REQUOTE_MIN_TICKS", 1)
     monkeypatch.setattr(R, "PRE_REQUOTE_COOLDOWN_S", 0.0)
     monkeypatch.setattr(R, "PRE_NO_EDGE_GRACE_S", 0.0)
+    monkeypatch.setattr(R, "PRE_LIMIT_SLACK_TICKS", 0)
     from strategies.ARBS import SERIES
     r = R.ArbsRunner(SERIES["ARBS"], live_trading=False)
     r.part_idx = None                                     # a whole process, not one half of shard 0
@@ -1258,6 +1259,31 @@ def test_a_pregame_quote_without_a_plan_rests_out_its_grace_while_still_profitab
     book(r, "X-B", [(0.30, 10)], [(0.45, 2), (0.30, 10)])   # then 0.70: a fill of 5 would lose: goes at once
     _eval(r, b)
     assert r.quotes.get((b.basket_id, 0)) is not q or q.pending
+
+
+def test_a_small_pregame_quote_one_tick_past_its_limit_stays(arbs, monkeypatch):
+    r, b = arbs
+    _no_deep(r)
+    monkeypatch.setattr(R, "PRE_LIMIT_SLACK_TICKS", 1)
+    monkeypatch.setattr(R, "PRE_REQUOTE_MIN_TICKS", 2)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, requote_cooldown_s=0.0, depth_age_s=0.0)
+    book(r, "X-A", [(0.50, 10)], [(0.30, 10)])          # A's best bid 0.50: the quote rests at its limit
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])          # B's YES ask 0.55
+    _eval(r, b)
+    q = r.quotes[(b.basket_id, 0)]
+    start = q.price
+    assert start < 0.50
+    book(r, "X-B", [(0.40, 10)], [(0.44, 10)])          # B's ask 0.56: the limit one tick under the quote
+    _eval(r, b)
+    assert q.price == pytest.approx(start)
+    book(r, "X-B", [(0.40, 10)], [(0.43, 10)])          # 0.57: two ticks past: moves
+    _eval(r, b)
+    assert q.price < start - 0.015
+    monkeypatch.setattr(R, "MODEL_PRE_NARROW_SIZE", 1.0)  # a quote bigger than the slack's size moves at one tick
+    book(r, "X-B", [(0.40, 10)], [(0.42, 10)])
+    p1 = q.price
+    _eval(r, b)
+    assert q.price < p1 - 0.005
 
 
 def test_move_held_by_cooldown_is_rechecked_when_it_ends(arbs):

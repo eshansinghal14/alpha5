@@ -261,6 +261,12 @@ COVER_GRACE_S = 1.0
 PRE_REQUOTE_MIN_TICKS = 2
 PRE_REQUOTE_COOLDOWN_S = 10.0
 PRE_NO_EDGE_GRACE_S = 10.0
+# A pre-game quote of at most MODEL_PRE_NARROW_SIZE that its limit has passed
+# by one tick stays: over 1.1 h those 1-tick protective moves cost 32 tokens/s
+# (12,805 of them) and a trade reached the old price only in 1 of their windows
+# (median 12 s; 11-17 16:05-17:11). Bigger quotes still move: the one such
+# trade was a 1,053-lot sweep.
+PRE_LIMIT_SLACK_TICKS = 1
 # Longest an eval pass runs before letting the websocket reader in: a fill that
 # lands mid-pass isn't even read until the pass yields (fill -> exit decision
 # p99 was 176 ms with whole passes, 10-30/31). A yield costs microseconds.
@@ -2640,6 +2646,9 @@ class ArbsRunner:
                 acts.append(self.place_quote(self.new_quote(b, plan, size)))
                 continue
             past_limit = q.price > plan.max_price + _EPS
+            if (past_limit and not live and q.remaining <= MODEL_PRE_NARROW_SIZE
+                    and vs[j].ticks.steps(plan.max_price, q.price) <= PRE_LIMIT_SLACK_TICKS):
+                past_limit = False                    # see PRE_LIMIT_SLACK_TICKS
             ticks = vs[j].ticks.steps(plan.price, q.price)
             cooldown = t.requote_cooldown_s if live else max(t.requote_cooldown_s, PRE_REQUOTE_COOLDOWN_S)
             min_ticks = t.requote_min_ticks if live else max(t.requote_min_ticks, PRE_REQUOTE_MIN_TICKS)
