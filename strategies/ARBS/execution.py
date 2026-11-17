@@ -51,8 +51,11 @@ class Gateway:
         self.ioc_ids: set[str] = set()
 
     def setup(self, shard_of: dict[str, int], cap_fn) -> None:
-        """Blocking (from_account reads /account/limits)."""
-        self.shard_of = dict(shard_of)
+        """Blocking (from_account reads /account/limits). Adds to shard_of,
+        never forgets: a market's shard doesn't change, and a quote still
+        resting on a market the scan dropped must stay cancellable (one sat
+        on SENATEIN-28-R with every sweep failing "no order client", 11-17)."""
+        self.shard_of.update(shard_of)
         for s in sorted(set(shard_of.values())):
             if s not in self.clients:
                 # Kalshi's whole bucket (900 tokens at Advanced): holding one

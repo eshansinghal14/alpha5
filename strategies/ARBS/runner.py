@@ -3961,6 +3961,20 @@ class ArbsRunner:
         self.journal({"kind": "pm_cancel_all", "reason": reason, "n": len(ids)})
         return True
 
+    def learn_shard(self, ticker: str) -> None:
+        """Blocking. A market not in meta (dropped from the scan before this
+        start) gets its shard from Kalshi, market -> event, so a quote of ours
+        still resting there can be cancelled."""
+        try:
+            et = kalshi_get(f"/trade-api/v2/markets/{ticker}", auth=True)["market"]["event_ticker"]
+            c = self.event_meta.get(et)
+            s = c["shard"] if c else int(kalshi_get(f"/trade-api/v2/events/{et}", auth=True)["event"]["exchange_index"])
+        except Exception as e:
+            self.alert("warn", None, f"{ticker}: shard lookup for a sweep cancel failed ({e!r})")
+            return
+        if s in self.gw.clients:
+            self.gw.shard_of[ticker] = s
+
     async def sweep(self, reason: str, venues: set[str] | None = None):
         """Cancel anything of ours resting: on our tickers, or placed by us on a
         market since dropped from the scan (KXYTVIEWSW quotes sat 19 h, 10-29).
@@ -3976,9 +3990,12 @@ class ArbsRunner:
                 await self.pm_cancel_all(f"sweep/{reason}", raise_=True)
                 continue
             resting += await self.gw.call(c._resting, "")
+        loop = asyncio.get_running_loop()
         for oid, ticker, cid in resting:
             if ticker not in ours and oid not in self.real_ledger.quote_ids:
                 continue
+            if self.gw.client(ticker) is None:
+                await loop.run_in_executor(self.pool, self.learn_shard, ticker)
             # Paced, with retries: ~700 cancels at once drew 429s on 180 of
             # them at a restart (10-29 19:23 ET), leaving orders untracked.
             for attempt in range(SWEEP_RETRIES):

@@ -3078,3 +3078,38 @@ def test_rank_loop_rechecks_reach_quotes_of_baskets_not_evaluated(arbs, monkeypa
     r._reach[(b.basket_id, 0)] = {"price": 0.31, "size": 10.0, "spend": 375.0, "t": 0.0, "on_at": 0.0}
     r.expire_reach(R.REACH_GRACE_S + 1)
     assert [x["action"] for x in rows if x["kind"] == "reach_shadow"] == ["cancel"] and not r._reach
+
+
+def test_sweep_cancels_our_order_on_a_market_no_longer_in_meta(arbs, monkeypatch):
+    # The quote's market left the scan, so no shard maps it: the sweep asks
+    # Kalshi for the shard instead of failing "no order client" every pass.
+    import types
+    r, b = arbs
+    client = types.SimpleNamespace(shard=0, _resting=lambda _: [("oid-1", "SENATEIN-28-R", "cid-1")])
+    r.gw.clients = {0: client}
+    r.real_ledger.quote_ids["oid-1"] = {"ticker": "SENATEIN-28-R"}
+    calls, sent = [], []
+    monkeypatch.setattr(R, "kalshi_get", lambda path, **k: calls.append(path) or (
+        {"market": {"event_ticker": "SENATEIN-28"}} if "/markets/" in path else {"event": {"exchange_index": 0}}))
+
+    async def call(fn, *a):
+        return fn(*a)
+
+    async def cancel(ticker, oid, reason):
+        sent.append((ticker, oid, r.gw.client(ticker) is client))
+        return True, None, True
+
+    r.gw.call, r.gw.cancel = call, cancel
+    asyncio.run(r.sweep("test"))
+    assert sent == [("SENATEIN-28-R", "oid-1", True)]
+    assert calls == ["/trade-api/v2/markets/SENATEIN-28-R", "/trade-api/v2/events/SENATEIN-28"]
+
+
+def test_gateway_keeps_a_dropped_markets_shard():
+    from strategies.ARBS import execution as E
+    g = E.Gateway(pool=None)
+    g.clients = {0: object()}
+    g.setup({"A-1": 0}, None)
+    g.setup({"B-1": 0}, None)                               # A-1 left the scan
+    assert g.client("A-1") is g.clients[0]
+
