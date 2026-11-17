@@ -3055,20 +3055,26 @@ def test_reach_quote_sits_one_tick_over_the_deepest_level_a_500_dollar_sweep_rea
     assert [a for a, _ in acts()][-1] in ("move", "cancel") and len(acts()) == 2
 
 
-def test_reach_quote_outlives_its_arb_quote_and_goes_after_the_grace(arbs, monkeypatch):
+def test_reach_quote_stays_unquoted_while_it_clears_its_edge(arbs, monkeypatch):
     r, b = arbs
     rows = _reach_setup(r, b, monkeypatch)
-    r._reach[(b.basket_id, 0)] = {"price": 0.31, "size": 10.0, "spend": 100.0, "t": 0.0, "on_at": 0.0}
-    r.reach_shadow(b, None, 0, None, None, 0.0, R.REACH_GRACE_S - 1, False)       # arb quote gone: kept
+    book(r, "X-A", [(0.40, 300), (0.35, 300), (0.30, 1000), (0.25, 100)], [(0.20, 10)])
+    book(r, "X-B", [(0.10, 10)], [(0.40, 5000)])          # X-B YES ask 0.60: 0.31 + 0.60 clears
+    r._reach[(b.basket_id, 0)] = {"price": 0.31, "size": 1.0, "spend": 375.0, "t": 0.0, "on_at": 0.0}
+    r.reach_shadow(b, r.views(b), 0, None, None, 0.0, 1000.0, False)    # arb quote gone, hot or not: kept
     assert not [x for x in rows if x["kind"] == "reach_shadow"] and r._reach
+    book(r, "X-B", [(0.10, 10)], [(0.05, 5000)])           # X-B YES ask 0.95: 0.31 + 0.95 > 1, edge gone
     r._reach_at.clear()
-    r.reach_shadow(b, None, 0, None, None, 0.0, R.REACH_GRACE_S + 1, False)       # unquoted past the grace
-    assert [x["action"] for x in rows if x["kind"] == "reach_shadow"] == ["cancel"] and not r._reach
+    r.reach_shadow(b, r.views(b), 0, None, None, 0.0, 1010.0, False)
+    assert [(x["action"], x.get("why")) for x in rows if x["kind"] == "reach_shadow"] == [("cancel", "no_edge")]
 
 
-def test_stale_reach_quotes_expire_from_the_rank_loop(arbs, monkeypatch):
+def test_rank_loop_rechecks_reach_quotes_of_baskets_not_evaluated(arbs, monkeypatch):
     r, b = arbs
     rows = _reach_setup(r, b, monkeypatch)
-    r._reach[(b.basket_id, 0)] = {"price": 0.31, "size": 10.0, "spend": 100.0, "t": 0.0, "on_at": 0.0}
-    r.expire_reach(2 * R.REACH_GRACE_S + 1)
-    assert [x["why"] for x in rows if x["kind"] == "reach_shadow"] == ["expired"] and not r._reach
+    r.meta["X-A"].status = r.meta["X-B"].status = "active"
+    book(r, "X-A", [(0.40, 300), (0.30, 1000)], [(0.20, 10)])
+    book(r, "X-B", [(0.10, 10)], [(0.05, 5000)])            # no edge at 0.31
+    r._reach[(b.basket_id, 0)] = {"price": 0.31, "size": 10.0, "spend": 375.0, "t": 0.0, "on_at": 0.0}
+    r.expire_reach(R.REACH_GRACE_S + 1)
+    assert [x["action"] for x in rows if x["kind"] == "reach_shadow"] == ["cancel"] and not r._reach

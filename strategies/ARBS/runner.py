@@ -249,9 +249,12 @@ DEEP_REQUOTE_S = 10.0
 # places nothing; "on" is not built yet.
 REACH_MODE, REACH_USD, REACH_KEEP_USD, REACH_EVAL_S, REACH_MIN_GAP = "shadow", 500.0, 1500.0, 5.0, 0.01
 # Tied to its arb quote, 95% of shadow reach quotes were cancelled when that
-# quote churned, living 19 s p50 (ARBS0C, 11-17 20:12-20:24): it now outlives
-# it while it clears its own edge, and goes once the basket hasn't been quoted
-# for REACH_GRACE_S. It shrinks only below REACH_SHRINK of its size.
+# quote churned, living 19 s p50 (ARBS0C, 11-17 20:12-20:24); tied to the hot
+# list after that, flicker still cancelled and re-placed them (~27 tokens/s on
+# shard 0, 20:33-20:43). Once resting it now stays while it clears its own edge,
+# hot or not: only placing one needs a quoted arb leg. A basket no longer
+# evaluated has its resting reach quotes re-checked from the rank loop after
+# REACH_GRACE_S. It shrinks only below REACH_SHRINK of its size.
 REACH_GRACE_S, REACH_SHRINK = 30.0, 0.7
 # A resting near quote stays while it would still be NEAR_KEEP of near_min_size
 # (the exit depth it is sized to hovers around any threshold). It is cut at
@@ -2941,10 +2944,6 @@ class ArbsRunner:
             return
         if r is None and (not quoted or now - main.placed_at < DEEP_REQUOTE_S):
             return                                      # as a deep quote: only behind an arb quote that has rested
-        if r is not None and not quoted and now - r.get("on_at", r["t"]) > REACH_GRACE_S:
-            self._reach.pop(key)
-            self._reach_log("cancel", b, j, r, live, why="not_quoted")
-            return
         if len(self._reach_at) > 100000:
             self._reach_at.clear()
         self._reach_at[key] = now
@@ -2969,7 +2968,7 @@ class ArbsRunner:
                     self._reach_log("shrink", b, j, r, live)
                 return
             if edge_ok and (now - r["t"] < DEEP_REQUOTE_S or not quoted):
-                return                                  # out of reach but still safe: wait (or for an arb quote to move under)
+                return                                  # out of reach but still safe: wait (unquoted: it may come back in reach)
             if not quoted:
                 self._reach.pop(key)
                 self._reach_log("cancel", b, j, r, live, why="no_edge")
@@ -2990,12 +2989,24 @@ class ArbsRunner:
 
     def expire_reach(self, now: float):
         """Shadow reach quotes on baskets no longer evaluated (not hot, nothing
-        resting) never see reach_shadow again: retire them past the grace."""
-        for key in [k for k, r in self._reach.items() if now - r.get("on_at", r["t"]) > 2 * REACH_GRACE_S]:
+        resting) never see reach_shadow from manage_deep: re-check their edge
+        here, as a live one would be (its own resting quote keeps its basket
+        evaluated). Gone with the basket, or once it can't be traded."""
+        t = self.cfg.trading
+        for key, r in list(self._reach.items()):
+            if now - r.get("on_at", r["t"]) <= REACH_GRACE_S:
+                continue
             b = self.baskets.get(key[0])
-            r = self._reach.pop(key)
-            if b is not None:
-                self._reach_log("cancel", b, key[1], r, False, why="expired")
+            if b is None:
+                self._reach.pop(key)
+                continue
+            if self.excluded(b) or not self.tradeable(b) or self.blocked():
+                self._reach.pop(key)
+                self._reach_log("cancel", b, key[1], r, False, why="untradeable")
+                continue
+            live = self.live_now(b, _utc())
+            need = edge_dollars(b.payout, t.min_edge + t.quote_edge_add) + (t.live_edge_add if live else 0.0)
+            self.reach_shadow(b, self.views(b), key[1], None, None, need, now, live)
 
     def _reach_log(self, action: str, b: Basket, j: int, r: dict, live: bool, **kw):
         self.n["reach_" + action] = self.n.get("reach_" + action, 0) + 1
