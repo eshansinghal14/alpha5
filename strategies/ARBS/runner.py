@@ -80,7 +80,7 @@ FOREIGN_POSITIONS = "foreign_positions.json"
 # Every ARBS process trading on this one Kalshi account. A process's audit
 # takes the others' ledgers off Kalshi's positions: the Polymarket process's
 # cross-exchange legs sit on markets ARBS trades too.
-ARBS_PROCESSES = ("ARBS", "ARBS0B", "ARBS0C", "ARBS3", "ARBSPM")
+ARBS_PROCESSES = ("ARBS", "ARBS0B", "ARBS0C", "ARBS3", "ARBS3B", "ARBSPM")
 # Cash is tracked from our own fills and settlements between balance reads
 # (runtime.balance_poll_s): two processes reading every 30 s had about half
 # their reads 429 (11-12). A failed read retries after 60 s, doubling to this.
@@ -459,8 +459,9 @@ class ArbsRunner:
     def __init__(self, series, *, live_trading: bool):
         self.S = series.ticker
         # This process's index among shard 0's (parts.py), or None for one that shares nothing.
-        self.part_idx = parts.PROCS.index(self.S) if self.S in parts.PROCS else None
-        self.owners = parts.load() if self.part_idx is not None else {"owners": {}}
+        self.part_group = parts.group_of(self.S)
+        self.part_idx = self.part_group.index(self.S) if self.part_group else None
+        self.owners = parts.load(procs=self.part_group) if self.part_group else {"owners": {}}
         self._owners_mtime = 0.0
         self.store = ConfigStore(series.config_cls, series.config_path, series.config_key)
         self.cfg = self.store.config
@@ -1077,12 +1078,12 @@ class ArbsRunner:
     def reload_owners(self):
         """parts.py's owners map, re-read when ARBS's scan rewrites it."""
         try:
-            m = os.path.getmtime(parts.owners_path())
+            m = os.path.getmtime(parts.owners_path(self.part_group))
         except OSError:
             return
         if m != self._owners_mtime:
             self._owners_mtime = m
-            self.owners = parts.load()
+            self.owners = parts.load(procs=self.part_group)
             self.dirty |= set(self.baskets)
 
     def record_only(self) -> list[str]:

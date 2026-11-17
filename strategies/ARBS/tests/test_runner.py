@@ -2381,7 +2381,7 @@ def test_shard3_process_trades_only_its_scan(tmp_path, monkeypatch):
     monkeypatch.setattr(R, "LIVE_ROOT", str(tmp_path))
     from strategies.ARBS import SERIES
     r = R.ArbsRunner(SERIES["ARBS3"], live_trading=False)
-    assert r.cfg.scan.shards == [3] and r.root.endswith("ARBS3") and r.part_idx is None
+    assert r.cfg.scan.shards == [3] and r.root.endswith("ARBS3") and r.part_idx == 0 and r.part_group == ("ARBS3", "ARBS3B")
     assert R.ArbsRunner(SERIES["ARBS0B"], live_trading=False).part_idx == 1
 
 

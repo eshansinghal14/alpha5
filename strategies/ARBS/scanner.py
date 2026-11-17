@@ -376,16 +376,16 @@ def scan_and_select(root: str, config_path: str | None = None, markets: int | No
         return pm_scan.scan_and_select(root, cfg, held, markets)
     owns, events, info = None, None, {}
     name = os.path.basename(os.path.normpath(root))
-    if name in parts.PROCS:
+    if (group := parts.group_of(name)) is not None:
         events = fetch_events()
-        st = parts.load()
-        if name == parts.PROCS[0]:
+        st = parts.load(procs=group)
+        if name == group[0]:
             # The one writer of the owners map: assigns new events, rebalances daily.
             listed = [e["event_ticker"] for e in events if tradeable_event(e, set(cfg.scan.shards), other_series())]
-            moves = parts.update(st, listed, time.time(), parts.spend())
-            parts.save(st)
+            moves = parts.update(st, listed, time.time(), parts.spend(procs=group), procs=group)
+            parts.save(st, parts.owners_path(group))
             info = {"moved": len(moves), "load": st.get("load")}
-        idx = parts.PROCS.index(name)
+        idx = group.index(name)
         owns = lambda ev: parts.owner(st, ev) == idx  # noqa: E731
     doc = run(cfg, os.path.join(root, "scanned_spec.json"), held, owns=owns, events=events)
     sel = select(doc, now=pd.Timestamp.now(tz="UTC"), days=cfg.trading.days_till_expiry, max_markets=markets,

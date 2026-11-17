@@ -25,6 +25,9 @@ from infra.runtime.persist import LIVE_ROOT
 # A third process since 11-16: two loops ran at ~70% of a core on quoting
 # alone, and the CPU-held market count had cut shard 0 to ~4,700 markets.
 PROCS = ("ARBS", "ARBS0B", "ARBS0C")
+# Shard 3 split the same way since 11-17: one loop ran at ~89% of a core and its
+# CPU-held market count was shedding markets. Its own owners map, under ARBS3.
+SHARD3_PROCS = ("ARBS3", "ARBS3B")
 GAP = 0.10
 REBALANCE_S = 86400.0
 # An event not listed for this long is forgotten (its baskets have settled).
@@ -34,8 +37,18 @@ SPEND = "event_spend.json"
 SPEND_DAYS = 3
 
 
-def owners_path() -> str:
-    return os.path.join(LIVE_ROOT, PROCS[0], OWNERS)
+def groups() -> tuple[tuple[str, ...], ...]:
+    return (PROCS, SHARD3_PROCS)
+
+
+def group_of(name: str) -> tuple[str, ...] | None:
+    """The processes splitting `name`'s shard, or None for one that splits nothing."""
+    return next((g for g in groups() if name in g), None)
+
+
+def owners_path(procs: tuple[str, ...] | None = None) -> str:
+    procs = procs or PROCS
+    return os.path.join(LIVE_ROOT, procs[0], OWNERS if procs[0] == PROCS[0] else f"{procs[0].lower()}_owners.json")
 
 
 def event_of(basket_id: str) -> str:
@@ -48,9 +61,9 @@ def series_of(event: str) -> str:
     return event.split("-", 1)[0]
 
 
-def load(path: str | None = None) -> dict:
+def load(path: str | None = None, procs: tuple[str, ...] | None = None) -> dict:
     try:
-        with open(path or owners_path(), encoding="utf-8") as fh:
+        with open(path or owners_path(procs), encoding="utf-8") as fh:
             st = json.load(fh)
     except (OSError, ValueError):
         st = {}
@@ -68,10 +81,10 @@ def owner(st: dict, event: str) -> int | None:
     return st["owners"].get(event)
 
 
-def spend(days: int = 2, root: str | None = None) -> dict[str, float]:
-    """event -> write tokens every process spent on it over the last `days` UTC days."""
+def spend(days: int = 2, root: str | None = None, procs: tuple[str, ...] | None = None) -> dict[str, float]:
+    """event -> write tokens every process of `procs` (shard 0's) spent on it over the last `days` UTC days."""
     out: dict[str, float] = {}
-    for p in PROCS:
+    for p in procs or PROCS:
         try:
             with open(os.path.join(root or LIVE_ROOT, p, SPEND), encoding="utf-8") as fh:
                 by_day = json.load(fh)
@@ -97,11 +110,13 @@ def _costs(events: list[str], spent: dict[str, float]) -> dict[str, float]:
     return {ev: spent[ev] if ev in spent else tot[series_of(ev)] / n[series_of(ev)] for ev in events}
 
 
-def update(st: dict, events: list[str], now: float, spent: dict[str, float]) -> list[tuple[str, int, int]]:
+def update(st: dict, events: list[str], now: float, spent: dict[str, float],
+           procs: tuple[str, ...] | None = None) -> list[tuple[str, int, int]]:
     """Assigns `events` (shard 0's listed now) not yet owned, forgets ones
     long unlisted, and rebalances when due. Returns the moves (event, from,
     to). A state with no owners starts from the old hash split (crc32), so
     the first rebalance moves as few events as it can."""
+    PROCS = procs or globals()["PROCS"]     # noqa: N806 (shard 0's unless given)
     fresh = not st["owners"]
     resized = st.get("procs", 2) != len(PROCS)
     # An owner past the end of PROCS (a process removed) owns nothing.

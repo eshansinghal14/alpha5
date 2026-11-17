@@ -278,8 +278,9 @@ def _inherit(doc: dict, path: str) -> dict:
     base = doc.get(BASE_KEY)
     if base is None:
         return doc
-    return _fill(read_json(os.path.join(os.path.dirname(path), base)),
-                 {k: v for k, v in doc.items() if k != BASE_KEY})
+    # Through the base's own $base: ARBS3B's file names ARBS3's, which names config.json.
+    bpath = os.path.join(os.path.dirname(path), base)
+    return _fill(_inherit(read_json(bpath), bpath), {k: v for k, v in doc.items() if k != BASE_KEY})
 
 
 def _fill(base, own: dict) -> dict:

@@ -88,3 +88,12 @@ def test_event_of_reads_scanned_basket_ids():
     assert parts.event_of("mecnet:KXNFLGAME-26NOV15CARNO:no:CAR+NO") == "KXNFLGAME-26NOV15CARNO"
     assert parts.event_of("ladder:KXHIGHLAX-26NOV14:B71.5=>B69.5") == "KXHIGHLAX-26NOV14"
     assert parts.event_of("t:b") == ""
+
+
+def test_shard3_group_has_its_own_owners_map_and_split():
+    assert parts.group_of("ARBS3B") == ("ARBS3", "ARBS3B") and parts.group_of("ARBSPM") is None
+    assert parts.owners_path(parts.SHARD3_PROCS) != parts.owners_path()
+    st = parts.load("/nonexistent/owners.json")
+    evs = [f"S-{i}" for i in range(40)]
+    parts.update(st, evs, 1000.0, {e: 1.0 for e in evs}, procs=parts.SHARD3_PROCS)
+    assert set(st["owners"].values()) == {0, 1} and st["procs"] == 2
