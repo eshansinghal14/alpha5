@@ -35,17 +35,26 @@ def _k(n: float) -> str:
 
 
 def _grouped(procs: list[dict]) -> list[dict]:
-    """procs with each SHARD_GROUP's processes summed into one row."""
+    """procs with each SHARD_GROUP's processes summed into one row, the
+    members kept in `parts`."""
     out: dict[str, dict] = {}
     for r in procs:
         g = SHARD_GROUP.get(r["name"], r["name"])
         row = out.setdefault(g, {"label": SHARD_GROUP.get(r["name"], r["label"]), "real": r["real"],
-                                 "quoting": 0, "watching": 0, "n": 0})
+                                 "quoting": 0, "watching": 0, "parts": []})
         row["quoting"] += r["quoting"]
         row["watching"] += r["watching"]
         row["real"] = row["real"] and r["real"]
-        row["n"] += 1
+        row["parts"].append(r)
     return list(out.values())
+
+
+def _basket_line(g: dict) -> str:
+    """quoting / watching of one shard's row; a shard split over processes
+    shows each one's after its total."""
+    who = (" · ".join(f"{r['label']} {r['quoting']:,} / {_k(r['watching'])}" for r in g["parts"])
+           if len(g["parts"]) > 1 else g["label"])
+    return f"{g['quoting']:,} / {_k(g['watching'])} ({who}{'' if g['real'] else ', shadow, not in total'})"
 
 
 def parts(series: str) -> list[str]:
@@ -288,10 +297,8 @@ def _metrics(s: dict):
                 f"{sum(r['quoting'] for r in live_procs):,} / {_k(sum(r['watching'] for r in live_procs))}",
                 help="Baskets with a resting quote of ours now, of the baskets each process watches (its "
                      "scan). The total counts processes trading real money.")
-    # One process a line: on one line the subtext was cut off at four processes.
-    c[3].caption("  \n".join(f"{r['quoting']:,} / {_k(r['watching'])} ({r['label']}"
-                             + (f", {r['n']} processes" if r["n"] > 1 else "")
-                             + f"{'' if r['real'] else ', shadow, not in total'})" for r in _grouped(procs)))
+    # One shard a line: on one line the subtext was cut off at four processes.
+    c[3].caption("  \n".join(_basket_line(g) for g in _grouped(procs)))
     n = s.get("counts") or {}
     c[4].metric("Quote fills / takes", f"{n.get('quote_fills', 0)} / {n.get('takes', 0)}",
                 f"{n.get('completions', 0)} completions", delta_color="off")

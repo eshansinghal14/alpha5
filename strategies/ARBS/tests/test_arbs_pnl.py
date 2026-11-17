@@ -128,6 +128,11 @@ def test_dashboard_merges_the_arbs_processes():
     # The listed parts add up to the headline; a shadow process follows apart.
     assert ap._split(list(pr.values()), lambda r: ap._usd0(r["pnl"])) ==         "$+12 (K0), $0 (K3) · not in total: $+5 (PM shadow)"
     assert ap._split([pr["ARBSPM"]], lambda r: ap._usd0(r["pnl"])) == "$+5 (PM shadow)"
+    # Baskets tile: a shard split over processes shows each one's after its total.
+    g = ap._grouped([{"name": "ARBS", "label": "K0", "real": True, "quoting": 900, "watching": 9500},
+                     {"name": "ARBS0B", "label": "K0b", "real": True, "quoting": 1000, "watching": 5600},
+                     {"name": "ARBS3", "label": "K3", "real": True, "quoting": 50, "watching": 800}])
+    assert [ap._basket_line(x) for x in g] == ["1,900 / 15.1k (K0 900 / 9.5k · K0b 1,000 / 5.6k)", "50 / 800 (K3)"]
     # Total PnL's subtext: one entry per venue, the Kalshi shards summed.
     assert ap.by_venue(list(pr.values())) == [{"label": "K", "real": True, "pnl": 11.5},
                                               {"label": "PM", "real": False, "pnl": 5.0}]
