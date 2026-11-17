@@ -369,7 +369,11 @@ HELD_CACHE_S = 0.25
 # No 2c: on its first hour (11-11) the model took 11 live NCAAMB legs to 2c.
 MODEL_EDGES = (0.03, 0.04, 0.05, 0.075, 0.10, 0.15, 0.20)
 MODEL_SIZES = (5.0, 20.0, 50.0, 100.0)
-MODEL_EVAL_S = 0.5            # a leg's pick is reused this long between book changes
+# A leg's pick is reused this long between book changes. 1 s, not 0.5: live
+# legs pricing 28 edge/size pairs each re-value kept model_pick at ~13% of
+# ARBS0B's loop, held over its 70% CPU target (py-spy 11-17 20:58). Quotes
+# still price on fresh books every pass; only a widen or shrink waits.
+MODEL_EVAL_S = 1.0
 MODEL_AGE_S = 0.25            # the depth age the model's training rows measured
 # Sticky by design: every price move or size increase costs queue place. Only
 # risk moves at once: widening when the current edge is predicted to net under
