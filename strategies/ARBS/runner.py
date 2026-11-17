@@ -254,8 +254,10 @@ REACH_MODE, REACH_USD, REACH_KEEP_USD, REACH_EVAL_S, REACH_MIN_GAP = "shadow", 5
 # shard 0, 20:33-20:43). Once resting it now stays while it clears its own edge,
 # hot or not: only placing one needs a quoted arb leg. A basket no longer
 # evaluated has its resting reach quotes re-checked from the rank loop after
-# REACH_GRACE_S. It shrinks only below REACH_SHRINK of its size.
-REACH_GRACE_S, REACH_SHRINK = 30.0, 0.7
+# REACH_GRACE_S. It shrinks only below REACH_SHRINK of its size: at 0.7,
+# shrinks were half its write cost (~5 of ~10 tokens/s on shard 0, 20:56-21:08);
+# a fill past what the other legs complete at min edge still completes, nearer it.
+REACH_GRACE_S, REACH_SHRINK = 30.0, 0.5
 # A resting near quote stays while it would still be NEAR_KEEP of near_min_size
 # (the exit depth it is sized to hovers around any threshold). It is cut at
 # once when what the exits take falls under NEAR_SHRINK of it, and grown or
