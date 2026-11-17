@@ -118,7 +118,7 @@ def test_dashboard_merges_the_arbs_processes():
     assert m["pnl"]["settled"] == 9.0 and m["pnl"]["cash"] == 1200.0  # the shadow process left out
     assert m["pnl"]["positions_value"] == 500.0                    # the account's, not summed
     assert m["counts"]["quote_fills"] == 4 and m["n_baskets"] == 17
-    assert [q["shard"] for q in m["quotes"]] == ["shard 0 (a)", "shard 0", "shard 3", "Polymarket"]
+    assert [q["shard"] for q in m["quotes"]] == ["shard 0 (a)", "shard 0 (a)", "shard 3", "Polymarket"]
     assert m["blocked_reason"] == "shard 3: feed_down" and not m["feed"]["up"]
     sh = m["by_shard"]
     assert list(sh) == ["0", "3", "100"] and sh["0"]["room"] == 800.0 and sh["0"]["real"]   # shard 0 once
@@ -126,7 +126,7 @@ def test_dashboard_merges_the_arbs_processes():
     pr = m["by_process"]
     assert pr["ARBS"]["quoting"] == 1 and pr["ARBS"]["pnl"] == 12.0 and not pr["ARBSPM"]["real"]
     # The listed parts add up to the headline; a shadow process follows apart.
-    assert ap._split(list(pr.values()), lambda r: ap._usd0(r["pnl"])) ==         "$+12 (K0), $0 (K3) · not in total: $+5 (PM shadow)"
+    assert ap._split(list(pr.values()), lambda r: ap._usd0(r["pnl"])) ==         "$+12 (K0a), $0 (K3) · not in total: $+5 (PM shadow)"
     assert ap._split([pr["ARBSPM"]], lambda r: ap._usd0(r["pnl"])) == "$+5 (PM shadow)"
     # Baskets tile: one quoting / watching pair per process, by shard.
     g = ap._grouped([{"name": "ARBS", "label": "K0", "real": True, "quoting": 900, "watching": 9500},
