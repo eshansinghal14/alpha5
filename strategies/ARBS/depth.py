@@ -130,10 +130,14 @@ class TopHistory:
         if not d:
             return None
         col = 4 if side == "yes" else 2
-        lo = None
+        lo, start = None, now - age
+        # No min() call per sample: this loop was ~6% of ARBS0B's busy loop
+        # (py-spy 11-17 20:25), busy books holding hundreds of samples.
         for s in reversed(d):
-            lo = s[col] if lo is None else min(lo, s[col])
-            if s[0] <= now - age:
+            v = s[col]
+            if lo is None or v < lo:
+                lo = v
+            if s[0] <= start:
                 break
         return lo
 

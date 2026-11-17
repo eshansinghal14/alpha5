@@ -616,6 +616,7 @@ class ArbsRunner:
         self._alt_pick: dict[tuple[str, int], tuple[float, str | None]] = {}   # (basket, leg) -> (searched at, via)
         self._near_at: dict[tuple[str, int], float] = {}     # (basket, leg) -> last check for a near quote
         self._held_cache: dict[tuple, tuple] = {}
+        self._cutoff_at: dict = {}           # (live_from, cutoff minutes) -> cutoff time (past_cutoff)
         self.exit_model: exit_cost.Model | None = None
         self._model_mtime: float | None = None
         self.model_state: dict[tuple[str, int], dict] = {}
@@ -3152,7 +3153,17 @@ class ArbsRunner:
         t = b.legs[0].ticker
         m = self.meta.get(t)
         lim = cut.get(self.series_group.get((m.series if m else None) or t.split("-", 1)[0], ""))
-        return lim is not None and now >= b.live_from + pd.Timedelta(minutes=lim)
+        if lim is None:
+            return False
+        # Cached by start and limit: building the Timedelta and sum for every
+        # basket each pass was ~4% of ARBS0B's busy loop (py-spy 11-17 20:25).
+        key = (b.live_from, lim)
+        end = self._cutoff_at.get(key)
+        if end is None:
+            if len(self._cutoff_at) > 50000:
+                self._cutoff_at.clear()
+            end = self._cutoff_at[key] = b.live_from + pd.Timedelta(minutes=lim)
+        return now >= end
 
     def alternatives(self, b: Basket, j: int) -> list[tuple[Basket, int]]:
         """(basket, its leg) for other baskets holding leg j's market side
