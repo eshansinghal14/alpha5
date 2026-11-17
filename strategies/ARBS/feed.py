@@ -7,6 +7,7 @@ import json
 import math
 import time
 
+import pandas as pd
 import websockets
 
 from backtest.book import L2Book
@@ -25,8 +26,21 @@ SUBSCRIBE_PACING_S = 0.2
 # feed_down_pull_s, so every quote was pulled every 15 min.
 REFRESH_BATCH = 50
 
+_NOW: list = [0.0, None]
+
+
+def _now_utc():
+    """UTC now, one Timestamp per ms: built per book message it was ~2.5% of
+    a busy ARBS loop (py-spy 11-17), and messages arrive in bursts."""
+    t = time.time()
+    if _NOW[1] is None or abs(t - _NOW[0]) > 0.001:
+        _NOW[0], _NOW[1] = t, pd.Timestamp(t, unit="s", tz="UTC")
+    return _NOW[1]
+
 
 class MultiFeed(LiveKalshiFeed):
+    _now = staticmethod(_now_utc)
+
     def __init__(self, tickers, on_quote, on_trade, *, label, on_fill=None, on_error=None):
         super().__init__(tickers, on_quote, on_trade, label=label, on_fill=on_fill, price_dp=4)
         self._on_error = on_error
