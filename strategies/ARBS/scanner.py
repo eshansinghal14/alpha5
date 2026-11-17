@@ -273,9 +273,9 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
             "relationships": rels}
 
 
-def select(doc: dict, *, now: pd.Timestamp, days: float, max_markets: int | None, known_tickers: set[str] = frozenset(),
+def select(doc: dict, *, now: pd.Timestamp, days: float | None, max_markets: int | None, known_tickers: set[str] = frozenset(),
            held: set[str] = frozenset(), exclude: set[str] = frozenset()) -> dict:
-    """The part of a scan to trade: relationships settling within `days`, the
+    """The part of a scan to trade: relationships settling within `days` (None: any), the
     most traded per market first (24h volume),
     until max_markets markets beyond `known_tickers` (None: no limit).
     Relationships holding a basket in `held` are always kept."""
@@ -286,7 +286,7 @@ def select(doc: dict, *, now: pd.Timestamp, days: float, max_markets: int | None
         n = len({l["ticker"] for b in r["baskets"] for l in b["legs"]})
         return (r.get("volume_24h") or 0.0) / max(n, 1)
 
-    horizon = now + pd.Timedelta(days=days)
+    horizon = None if days is None else now + pd.Timedelta(days=days)
     out, used = [], set()
     for r in sorted(doc["relationships"], key=lambda r: -per_market(r)):
         ts = {l["ticker"] for b in r["baskets"] for l in b["legs"]} - known_tickers
@@ -295,7 +295,7 @@ def select(doc: dict, *, now: pd.Timestamp, days: float, max_markets: int | None
             used |= ts
             continue
         s = r.get("expected_settlement_utc")
-        if (s and pd.Timestamp(s) > horizon) or r.get("cluster") in exclude                 or r["relationship_id"].split(":", 1)[-1] in exclude:
+        if (s and horizon is not None and pd.Timestamp(s) > horizon) or r.get("cluster") in exclude                 or r["relationship_id"].split(":", 1)[-1] in exclude:
             continue
         if max_markets is None or len(used | ts) <= max_markets:
             out.append(r)

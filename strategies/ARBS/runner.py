@@ -1034,7 +1034,8 @@ class ArbsRunner:
             o = parts.owner(self.owners, parts.event_of(b.basket_id))
             if o is not None and o != self.part_idx:
                 return True
-        return b.settles is not None and b.settles > self.horizon()
+        h = self.horizon()
+        return h is not None and b.settles is not None and b.settles > h
 
     def reload_owners(self):
         """parts.py's owners map, re-read when ARBS's scan rewrites it."""
@@ -1069,12 +1070,13 @@ class ArbsRunner:
             self._now = (now, _utc())
         return self._now[1]
 
-    def horizon(self) -> pd.Timestamp:
-        """Latest settlement traded, refreshed once a second: evaluate asks
-        for every basket and pd.Timestamp.now() was a tenth of the loop."""
+    def horizon(self) -> pd.Timestamp | None:
+        """Latest settlement traded (None: no limit), refreshed once a second:
+        evaluate asks for every basket and pd.Timestamp.now() was a tenth of the loop."""
         now = time.monotonic()
         if self._horizon is None or now - self._horizon[0] > 1.0:
-            self._horizon = (now, _utc() + pd.Timedelta(days=self.cfg.trading.days_till_expiry))
+            d = self.cfg.trading.days_till_expiry
+            self._horizon = (now, None if d is None else _utc() + pd.Timedelta(days=d))
         return self._horizon[1]
 
     # ------------------------------------------------------------------ books
@@ -2014,10 +2016,11 @@ class ArbsRunner:
         """Edge ($/bundle) to close held bundles through flip basket `b`:
         `need` (the arb edge) within trading.exit_ref_days of settlement,
         need x ref_days / days left beyond, never under min_exit_edge or over
-        need. No settlement date counts as far out."""
+        need. No settlement date counts as far out. With no exit_ref_days,
+        always `need`."""
         t = self.cfg.trading
-        if self.live_now(b, now):
-            # The same stale-leg risk as a new arb, whichever way the bundle points.
+        if self.live_now(b, now) or t.exit_ref_days is None:
+            # Live: the same stale-leg risk as a new arb, whichever way the bundle points.
             return need
         days = None if b.settles is None else (b.settles - now).total_seconds() / 86400.0
         scaled = need if days is not None and days <= t.exit_ref_days else \

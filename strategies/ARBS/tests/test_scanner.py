@@ -116,6 +116,8 @@ def test_scan_lists_everything_and_select_keeps_held():
     assert [r["relationship_id"] for r in got["relationships"]] == ["mecnet:FAR-1"]
     got = scanner.select(doc, now=NOW, days=90, max_markets=None)              # no count: every market
     assert [r["relationship_id"] for r in got["relationships"]] == ["mecnet:BIG-1"]   # FAR settles past 90 days
+    got = scanner.select(doc, now=NOW, days=None, max_markets=None)            # no horizon: FAR too
+    assert sorted(r["relationship_id"] for r in got["relationships"]) == ["mecnet:BIG-1", "mecnet:FAR-1"]
 
 
 def test_scan_lists_only_the_events_its_process_owns():

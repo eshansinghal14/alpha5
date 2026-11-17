@@ -597,6 +597,20 @@ def test_a_restart_starts_from_the_last_plan_scale(arbs):
     assert R.ArbsRunner(SERIES["ARBS"], live_trading=False).plan_scale == {0: 2.5, 3: R.PLAN_SCALE_MAX}
 
 
+def test_with_no_horizon_or_exit_scaling_a_far_basket_trades_at_the_full_edge(arbs):
+    r, b = arbs
+    far = dataclasses.replace(b, settles=R._utc() + pd.Timedelta(days=700))
+    t = r.cfg.trading
+    r.cfg.trading = dataclasses.replace(t, days_till_expiry=120.0, exit_ref_days=7.0, min_exit_edge=0.01)
+    r._horizon = None
+    assert r.excluded(far)
+    assert r.exit_need(far, 0.05, R._utc()) == pytest.approx(0.01)       # 0.05 x 7 / 700, floored
+    r.cfg.trading = dataclasses.replace(t, days_till_expiry=None, exit_ref_days=None, min_exit_edge=0.01)
+    r._horizon = None
+    assert not r.excluded(far)
+    assert r.exit_need(far, 0.05, R._utc()) == 0.05
+
+
 def test_scan_markets_hold_the_event_loop_near_its_cpu_target(arbs):
     r, b = arbs
     r.markets, W = 4000, R.LOOP_CPU_WINDOW_S

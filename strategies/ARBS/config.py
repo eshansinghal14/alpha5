@@ -34,15 +34,17 @@ class TradingParams:
                                  "(every leg's other side) up to the bundles held in it. Kalshi nets the pair to "
                                  "$1 a leg at once, so this closes a position early and frees its capital; no "
                                  "max_dollars or max_bundles_per_basket check.", min=0.0, max=0.5, step=0.0025)
-    exit_ref_days: float = param("A flip settling within this many days needs the full min_edge (quotes: plus "
-                                 "quote_edge_add) to close held bundles; further out the requirement falls as "
-                                 "exit_ref_days / days to settlement, the capital freed for longer, down to "
-                                 "min_exit_edge. Live events always need the full edge.", min=1.0, max=2000.0,
-                                 step=1.0)
-    days_till_expiry: float = param("Trade only baskets whose markets are all expected to settle within this "
-                                    "many days (the hand spec's settlement month, else Kalshi's expected "
-                                    "expiration). The scan skips events past it. Open positions past it are still "
-                                    "completed and settled.", min=0.0, max=2000.0, step=1.0)
+    exit_ref_days: float | None = param("A flip settling within this many days needs the full min_edge (quotes: "
+                                        "plus quote_edge_add) to close held bundles; further out the requirement "
+                                        "falls as exit_ref_days / days to settlement, the capital freed for longer, "
+                                        "down to min_exit_edge. Live events always need the full edge. Empty: every "
+                                        "flip needs the full edge (Kalshi nets an event's positions, so held "
+                                        "bundles tie up no capital).", min=1.0, max=2000.0, step=1.0)
+    days_till_expiry: float | None = param("Trade only baskets whose markets are all expected to settle within "
+                                           "this many days (Kalshi's expected expiration). The scan skips events "
+                                           "past it. Open positions past it are still completed and settled. Empty: "
+                                           "no limit (Kalshi nets an event's positions, so a whole basket ties up no "
+                                           "capital however far out it settles).", min=0.0, max=2000.0, step=1.0)
     quote_size: int = param("Bundles per resting quote.", min=1, max=10000, step=1)
     quote_live_events: bool = param("Quote events that have started (a game after kickoff). A live score change "
                                     "sweeps every leg at once, so a fill there is usually already a loss; "
