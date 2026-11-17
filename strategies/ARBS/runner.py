@@ -64,6 +64,7 @@ SUMMARY_S = 2.0
 MAX_ALERTS = 300
 # A quote whose create got no response may still rest at Kalshi; look for it
 # by client id after this long.
+PM_LOST_TRIES, PM_LOST_RETRY_S = 5, 2.0
 LOST_LOOKUP_S = 1.0
 ORPHAN_FILL_S = 30.0
 CASH_STALE_POLLS = 6       # balance reads missed before max_dollars_auto falls back to max_dollars
@@ -3491,13 +3492,27 @@ class ArbsRunner:
         """A create with no response may be resting: find it by client id and pull it."""
         await asyncio.sleep(LOST_LOOKUP_S)
         c = self.gw.client(q.ticker)
-        try:
-            hit = await self.gw.call(c.find_by_client_id, q.ticker, q.cid)
-        except Exception as e:
-            self.alert("error", q.basket_id, f"quote {q.ticker} create got no response and lookup failed "
-                                             f"({e!r}) -- CHECK KALSHI for a resting order")
-            self.halt = f"lost quote on {q.ticker}"
-            return
+        pm = is_pm(q.ticker)
+        for attempt in range(PM_LOST_TRIES if pm else 1):
+            try:
+                hit = await self.gw.call(c.find_by_client_id, q.ticker, q.cid)
+                break
+            except Exception as e:
+                # Polymarket answers the idempotent re-send 409 "Order pending" while
+                # the first is still processing: wait it out (ARBSPM halted on one, 11-17).
+                if pm and http_status(e) == 409 and attempt < PM_LOST_TRIES - 1:
+                    await asyncio.sleep(PM_LOST_RETRY_S)
+                    continue
+                if pm and self.live and await self.pm_cancel_all(f"lost quote on {q.ticker}"):
+                    # The account's only Polymarket trader: one cancel-all takes any copy down.
+                    self.alert("error", q.basket_id, f"quote {q.ticker} create unresolved ({e!r}); "
+                                                     f"every Polymarket order cancelled instead of halting")
+                    self.quotes.pop(q.key, None)
+                    return
+                self.alert("error", q.basket_id, f"quote {q.ticker} create got no response and lookup failed "
+                                                 f"({e!r}) -- CHECK KALSHI for a resting order")
+                self.halt = f"lost quote on {q.ticker}"
+                return
         if hit is None:
             self.quotes.pop(q.key, None)
             return

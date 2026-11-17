@@ -703,3 +703,54 @@ def test_a_basket_with_a_resting_quote_is_evaluated_before_quoteless_ones(pm_arb
     assert order[:2] == [b.basket_id, b2.basket_id]
     r.quotes.pop(q.key)
     assert r.quotes.n_by_basket == {}
+
+
+def _pending_409():
+    import requests
+    resp = requests.Response()
+    resp.status_code = 409
+    return requests.HTTPError('409 Conflict: {"code":10,"message":"Order pending"}', response=resp)
+
+
+def test_lost_polymarket_create_waits_out_order_pending(pm_arbs, monkeypatch):
+    r, b = pm_arbs
+    r.live = True
+    monkeypatch.setattr(R, "LOST_LOOKUP_S", 0.0)
+    monkeypatch.setattr(R, "PM_LOST_RETRY_S", 0.0)
+    answers = [_pending_409(), _pending_409(), None]
+
+    async def call(fn, *a):
+        x = answers.pop(0)
+        if isinstance(x, Exception):
+            raise x
+        return x
+    r.gw.call = call
+    r.gw.client = lambda t: type("C", (), {"find_by_client_id": None})()
+    q = R.Quote(basket_id=b.basket_id, leg=0, ticker="pm-ev-a", side="no", price=0.4, size=5.0, cid="c1",
+                edge=0.03, max_price=0.45)
+    r.quotes[q.key] = q
+    asyncio.run(r._find_lost(q))
+    assert r.halt is None and q.key not in r.quotes and answers == []      # resolved as never placed
+
+
+def test_unresolved_lost_polymarket_create_cancels_all_instead_of_halting(pm_arbs, monkeypatch):
+    r, b = pm_arbs
+    r.live = True
+    monkeypatch.setattr(R, "LOST_LOOKUP_S", 0.0)
+    monkeypatch.setattr(R, "PM_LOST_RETRY_S", 0.0)
+
+    async def call(fn, *a):
+        raise _pending_409()
+    r.gw.call = call
+    r.gw.client = lambda t: type("C", (), {"find_by_client_id": None})()
+    swept = []
+
+    async def cancel_all(reason, raise_=False):
+        swept.append(reason)
+        return True
+    r.pm_cancel_all = cancel_all
+    q = R.Quote(basket_id=b.basket_id, leg=0, ticker="pm-ev-a", side="no", price=0.4, size=5.0, cid="c1",
+                edge=0.03, max_price=0.45)
+    r.quotes[q.key] = q
+    asyncio.run(r._find_lost(q))
+    assert r.halt is None and swept == ["lost quote on pm-ev-a"] and q.key not in r.quotes
