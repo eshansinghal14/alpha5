@@ -25,6 +25,27 @@ SHARD_OF = {"ARBS": "shard 0", "ARBS0B": "shard 0 (b)", "ARBS0C": "shard 0 (c)",
 # Short labels for the headline tiles' breakdowns, by process and by shard.
 SHORT = {"ARBS": "K0", "ARBS0B": "K0b", "ARBS0C": "K0c", "ARBS3": "K3", "ARBSPM": "PM"}
 SHARD_SHORT = {"0": "K0", "3": "K3", str(PM_SHARD): "PM"}
+# Processes sharing one exchange shard, shown as one line: K0, K0b and K0c split shard 0.
+SHARD_GROUP = {"ARBS": "K0", "ARBS0B": "K0", "ARBS0C": "K0"}
+
+
+def _k(n: float) -> str:
+    """12,345 -> 12.3k; under 1,000 as is."""
+    return f"{n / 1000:.1f}k" if n >= 1000 else f"{n:,.0f}"
+
+
+def _grouped(procs: list[dict]) -> list[dict]:
+    """procs with each SHARD_GROUP's processes summed into one row."""
+    out: dict[str, dict] = {}
+    for r in procs:
+        g = SHARD_GROUP.get(r["name"], r["name"])
+        row = out.setdefault(g, {"label": SHARD_GROUP.get(r["name"], r["label"]), "real": r["real"],
+                                 "quoting": 0, "watching": 0, "n": 0})
+        row["quoting"] += r["quoting"]
+        row["watching"] += r["watching"]
+        row["real"] = row["real"] and r["real"]
+        row["n"] += 1
+    return list(out.values())
 
 
 def parts(series: str) -> list[str]:
@@ -49,7 +70,7 @@ def _breakdown(ss: dict[str, dict]) -> dict:
     procs = {}
     for n, x in ss.items():
         p = x.get("pnl") or {}
-        procs[n] = {"label": SHORT.get(n, n), "real": _real(x),
+        procs[n] = {"name": n, "label": SHORT.get(n, n), "real": _real(x),
                     "pnl": (p.get("settled") or 0.0) + (p.get("locked") or 0.0) + (p.get("broken") or 0.0),
                     "quoting": len({q.get("basket_id") for q in x.get("quotes") or []}),
                     "watching": x.get("n_baskets") or 0}
@@ -160,14 +181,22 @@ def _alerts(series: str, s: dict):
     if s.get("audit_diff"):
         st.error("📒 Ledger vs Kalshi position mismatch: "
                  + ", ".join(f"{t} kalshi {d['kalshi']:+g} / ours {d['ledger']:+g}" for t, d in s["audit_diff"].items()))
-    broken = [h for h in s.get("holdings") or [] if h.get("unhedged")]
-    for h in broken:
-        c = h.get("completion") or {}
-        st.error(f"🧩 **Incomplete basket {h['basket_id']}** for {h.get('broken_s') or 0}s -- unhedged "
-                 + ", ".join(f"{t.split('-', 1)[-1]} {q:g}" for t, q in h["unhedged"].items())
-                 + (f"; exits now: complete {_usd(c.get('complete_loss') and -c['complete_loss'])}, "
-                    f"unwind {_usd(c.get('unwind_loss') and -c['unwind_loss'])} -- {c.get('action')} "
-                    f"{c.get('path') or ''}" + (f" ({c['why']})" if c.get("why") else "") if c else ""))
+    broken = sorted((h for h in s.get("holdings") or [] if h.get("unhedged")),
+                    key=lambda h: -(h.get("broken_s") or 0))
+    if broken:
+        # One line for all of them, details folded: a box each filled the page (11-17).
+        oldest = broken[0].get("broken_s") or 0
+        st.error(f"🧩 **{len(broken)} incomplete basket{'s' if len(broken) > 1 else ''}** -- oldest "
+                 f"{oldest // 3600}h {oldest % 3600 // 60}m, {_usd(sum(h.get('broken_pnl') or 0.0 for h in broken))} "
+                 f"marked")
+        with st.expander("Incomplete baskets", expanded=False):
+            for h in broken:
+                c = h.get("completion") or {}
+                st.markdown(f"- `{h['basket_id']}` {h.get('broken_s') or 0}s -- unhedged "
+                            + ", ".join(f"{t.split('-', 1)[-1]} {q:g}" for t, q in h["unhedged"].items())
+                            + (f"; exits now: complete {_usd(c.get('complete_loss') and -c['complete_loss'])}, "
+                               f"unwind {_usd(c.get('unwind_loss') and -c['unwind_loss'])} -- {c.get('action')} "
+                               f"{c.get('path') or ''}" + (f" ({c['why']})" if c.get("why") else "") if c else ""))
     f = s.get("feed") or {}
     if not f.get("up"):
         st.error("📡 Kalshi websocket down (quotes are pulled after runtime.feed_down_pull_s).")
@@ -256,12 +285,13 @@ def _metrics(s: dict):
                     delta_color="off", help="Cost of held baskets (resting quotes aren't counted; each is sized to fit what's left).")
     live_procs = [r for r in procs if r["real"]] or procs
     c[3].metric("Baskets quoting / watching",
-                f"{sum(r['quoting'] for r in live_procs):,} / {sum(r['watching'] for r in live_procs):,}",
+                f"{sum(r['quoting'] for r in live_procs):,} / {_k(sum(r['watching'] for r in live_procs))}",
                 help="Baskets with a resting quote of ours now, of the baskets each process watches (its "
                      "scan). The total counts processes trading real money.")
     # One process a line: on one line the subtext was cut off at four processes.
-    c[3].caption("  \n".join(f"{r['quoting']:,} / {r['watching']:,} ({r['label']}"
-                             f"{'' if r['real'] else ', shadow, not in total'})" for r in procs))
+    c[3].caption("  \n".join(f"{r['quoting']:,} / {_k(r['watching'])} ({r['label']}"
+                             + (f", {r['n']} processes" if r["n"] > 1 else "")
+                             + f"{'' if r['real'] else ', shadow, not in total'})" for r in _grouped(procs)))
     n = s.get("counts") or {}
     c[4].metric("Quote fills / takes", f"{n.get('quote_fills', 0)} / {n.get('takes', 0)}",
                 f"{n.get('completions', 0)} completions", delta_color="off")
