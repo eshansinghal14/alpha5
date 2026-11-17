@@ -754,3 +754,22 @@ def test_unresolved_lost_polymarket_create_cancels_all_instead_of_halting(pm_arb
     r.quotes[q.key] = q
     asyncio.run(r._find_lost(q))
     assert r.halt is None and swept == ["lost quote on pm-ev-a"] and q.key not in r.quotes
+
+
+def test_cross_gaps_are_journaled_from_both_tops(pm_arbs, monkeypatch):
+    import types
+    r, b = pm_arbs                                   # cross:K-A:pm_no, legs pm-ev-a NO, K-A YES
+    assert r.cross_of.get("K-A") == [("K-A", "pm-ev-a")] and r.cross_of.get("pm-ev-a") == [("K-A", "pm-ev-a")]
+    rows = []
+    monkeypatch.setattr(r, "journal", lambda row: rows.append(row))
+    for t in ("K-A", "pm-ev-a"):
+        r.meta[t] = R.Meta(ticker=t, event="e", status="active", shard=100 if is_pm(t) else 0, taker_rate=0.0,
+                           maker_rate=0.0)
+    # K YES ask 0.40, PM YES bid 0.55 -> PM NO ask 0.45: K YES + PM NO = 0.85, a 15c gap with no fees
+    r._on_quote(types.SimpleNamespace(ticker="K-A", bid=0.38, ask=0.40, bid_depth=5.0, ask_depth=7.0))
+    r._on_quote(types.SimpleNamespace(ticker="pm-ev-a", bid=0.55, ask=0.57, bid_depth=9.0, ask_depth=3.0))
+    gaps = [x for x in rows if x["kind"] == "cross_gap"]
+    assert len(gaps) == 1 and gaps[0]["dir"] == "k_yes+pm_no" and gaps[0]["edge"] == pytest.approx(0.15)
+    assert gaps[0]["k_size"] == 7.0 and gaps[0]["pm_size"] == 9.0
+    r._on_quote(types.SimpleNamespace(ticker="pm-ev-a", bid=0.55, ask=0.57, bid_depth=9.0, ask_depth=3.0))
+    assert len([x for x in rows if x["kind"] == "cross_gap"]) == 1          # same edge within a second: once

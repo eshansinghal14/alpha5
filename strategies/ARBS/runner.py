@@ -181,6 +181,11 @@ class _Dirty(set):
 # change rates the hot list is budgeted on.
 WRITE_COST_TAU_S = 300.0
 RANK_DUMP_S = 300.0
+# Cross-exchange gaps (K YES + PM NO of one outcome, or K NO + PM YES, under $1
+# after both fees) journaled as cross_gap, at most once a second per pair unless
+# the edge moves this much: a replay at Kalshi prints (11-13..17) found 220
+# moments, almost all PM staleness gone by +150 ms; this logs every one live.
+CROSS_GAP_EVERY_S, CROSS_GAP_STEP = 1.0, 0.005
 # Every RANK_PARTS_EVERY-th rank dump also carries each leg's inputs to
 # quote_score (edge, size, queue ahead, flow rates), so other value formulas
 # can be scored offline against fills.
@@ -619,6 +624,8 @@ class ArbsRunner:
         self.paused_until: dict[str, float] = {}  # ticker -> monotonic time Kalshi's pause is next retried
         self.pm_stop: tuple | None = None          # (blocked() reason, its Polymarket cancel-all task)
         self.pm_replaced: dict[str, tuple[float, float]] = {}   # order id -> (price, monotonic) of its last REPLACE
+        self._top4: dict[str, tuple] = {}             # ticker -> (yes bid, its depth, yes ask, its depth)
+        self._gap_logged: dict[tuple, tuple[float, float]] = {}   # (k, pm, dir) -> (when, edge) last journaled
         self.exchange_paused = False              # Kalshi's exchange-wide trading_active is off
         self.priority_trading: list[str] = []     # write_priority_series in session now
         self.last_exit: dict[str, tuple] = {}
@@ -924,6 +931,15 @@ class ArbsRunner:
             for t in b.tickers:
                 if is_pm(t) and (kind in ("complete_set", "mecnet") or t not in self.pm_event):
                     self.pm_event[t] = rest if kind in ("complete_set", "mecnet") else t.rsplit("-", 1)[0]
+        # ticker -> the cross pairs (kalshi, polymarket) it is a leg of, for cross_gap.
+        self.cross_of: dict[str, list[tuple[str, str]]] = {}
+        for b in self.all_baskets:
+            if b.type == "cross_venue" and len(b.legs) == 2:
+                k = next((l.ticker for l in b.legs if not is_pm(l.ticker)), None)
+                p = next((l.ticker for l in b.legs if is_pm(l.ticker)), None)
+                if k and p and (k, p) not in self.cross_of.get(k, []):
+                    for t in (k, p):
+                        self.cross_of.setdefault(t, []).append((k, p))
         self.event_markets: dict[str, set[str]] = {}
         for b in self.all_baskets:
             kind, _, et = b.relationship_id.partition(":")
@@ -1405,6 +1421,10 @@ class ArbsRunner:
                 self._msg_n[ev] = self._msg_n.get(ev, 0) + 1
         self.book_time[book.ticker] = time.monotonic()
         self.book_wall[book.ticker] = time.time()
+        if self.cross_of and book.ticker in self.cross_of:
+            self._top4[book.ticker] = (book.bid, book.bid_depth, book.ask, book.ask_depth)
+            for k, p in self.cross_of[book.ticker]:
+                self._cross_gap(k, p)
         self.liq.on_book(book.ticker, time.monotonic(), book.ask, book.ask_depth, book.bid, book.bid_depth)
         if self.cfg.runtime.record_prints:
             try:
@@ -1418,6 +1438,39 @@ class ArbsRunner:
         for bid in self.via_by_ticker.get(book.ticker, ()):
             self.mark(bid)
         return ev
+
+    def _cross_tops(self, k: str, p: str):
+        """Both directions of a cross pair from the two best prices: [(dir,
+        edge after both taker fees, k price, k size, pm price, pm size)]."""
+        tk, tp = self._top4.get(k), self._top4.get(p)
+        if tk is None or tp is None:
+            return []
+        (kb, kbd, ka, kad), (pb, pbd, pa, pad) = tk, tp
+        kr, pr = self._rates(k)[0], self._rates(p)[0]
+        out = []
+        # K YES at its ask + PM NO (ask 1 - PM yes bid); K NO (1 - K yes bid) + PM YES at its ask.
+        for d, kp, ks, pp, ps in (("k_yes+pm_no", ka, kad, None if pb is None else 1.0 - pb, pbd),
+                                  ("k_no+pm_yes", None if kb is None else 1.0 - kb, kbd, pa, pad)):
+            if kp is None or pp is None:
+                continue
+            edge = 1.0 - kp - pp - kfees.fee(kp, 1.0, kr) - kfees.fee(pp, 1.0, pr)
+            out.append((d, edge, kp, ks or 0.0, pp, ps or 0.0))
+        return out
+
+    def _cross_gap(self, k: str, p: str):
+        now = time.time()
+        for d, edge, kp, ks, pp, ps in self._cross_tops(k, p):
+            if edge <= 0:
+                continue
+            last = self._gap_logged.get((k, p, d))
+            if last is not None and now - last[0] < CROSS_GAP_EVERY_S and abs(edge - last[1]) < CROSS_GAP_STEP:
+                continue
+            self._gap_logged[(k, p, d)] = (now, edge)
+            mono = time.monotonic()
+            self.journal({"kind": "cross_gap", "k": k, "pm": p, "dir": d, "edge": round(edge, 4),
+                          "k_px": round(kp, 4), "k_size": round(ks, 2), "pm_px": round(pp, 4), "pm_size": round(ps, 2),
+                          "k_age_ms": round(1000 * (mono - self.book_time.get(k, mono))),
+                          "pm_age_ms": round(1000 * (mono - self.book_time.get(p, mono)))})
 
     def _watch_pulls(self, book):
         """Mark a market side pulled (see depth.PullWatch) while a live
@@ -1868,6 +1921,11 @@ class ArbsRunner:
 
     def _quote_fill(self, q: Quote, size: float, cost: float, trade_id, source: str, exch_t: float | None = None):
         q.filled += size
+        for k, p in self.cross_of.get(q.ticker, ()):
+            # Both exchanges' tops at our fill on a paired market (single-leg hedge research).
+            self.journal({"kind": "cross_fill_ctx", "basket_id": q.basket_id, "ticker": q.ticker, "side": q.side,
+                          "price": q.price, "size": size, "k": k, "pm": p, "k_top": self._top4.get(k),
+                          "pm_top": self._top4.get(p), "gaps": [list(x) for x in self._cross_tops(k, p)]})
         if self.cfg.runtime.record_prints:
             try:
                 self._log_quote_context("fill", q, fill_kind="deep" if q.deep else "quote", size=size,
