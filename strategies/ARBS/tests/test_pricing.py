@@ -133,3 +133,43 @@ def test_second_level_size_is_what_the_other_legs_complete_without_their_best_le
     assert pricing.second_level_size(legs, 0, 1.0, 1000.0, at=0.25) == 530     # at 0.25 the 0.70 level completes too
     assert pricing.second_level_size(legs, 0, 1.0, 100.0, at=0.43) == 0        # 0.43 + 0.56 + its fee is over $1
     assert pricing.second_level_size([lv([], bid=0.45), lv([(0.55, 100)])], 0, 1.0, 100.0, at=0.40) == 0
+
+
+def test_depth_size_binary_search_matches_the_linear_scan():
+    import random
+    from strategies.ARBS import pricing as P
+
+    def linear(legs, j, payout, need, cap):
+        first = P.quote_leg(legs, j, payout, need, 1.0)
+        if first is None or cap < 1:
+            return 0.0
+        price = first.price
+        marks = {float(cap)}
+        for i, lv in enumerate(legs):
+            if i == j:
+                continue
+            got = 0.0
+            for _, q in lv.asks:
+                got += q
+                if got >= cap:
+                    break
+                marks.add(float(int(got + 1e-9)))
+        best = 1.0
+        for n in sorted(m for m in marks if m >= 1):
+            plan = P.quote_leg(legs, j, payout, need, n)
+            if plan is None or plan.max_price < price - 1e-9:
+                break
+            best = n
+        return best
+
+    rng = random.Random(7)
+    for _ in range(3000):
+        legs = []
+        for _ in range(rng.randint(2, 5)):
+            px = sorted({round(rng.uniform(0.02, 0.6), 2) for _ in range(rng.randint(1, 8))})
+            legs.append(P.LegView(asks=[(p, float(rng.randint(1, 40))) for p in px],
+                                  bid=round(rng.uniform(0.01, 0.3), 2) if rng.random() < 0.8 else None,
+                                  taker_rate=0.07, maker_rate=0.0175))
+        j, need, cap = rng.randrange(len(legs)), rng.uniform(0.0, 0.08), float(rng.randint(1, 300))
+        payout = float(len(legs) - 1) if rng.random() < 0.3 else 1.0
+        assert P.depth_size(legs, j, payout, need, cap) == linear(legs, j, payout, need, cap)

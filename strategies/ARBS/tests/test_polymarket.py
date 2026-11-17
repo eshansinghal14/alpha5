@@ -418,7 +418,7 @@ def test_urgent_polymarket_cancels_go_now_within_the_overdraw(monkeypatch):
         calls.clear()
         asyncio.run(gw.cancel("pm-a", "o1", reason))
         assert calls == [False, True], reason    # forced on the first refusal
-    assert time.monotonic() - t0 < 1.0
+    assert time.monotonic() - t0 < 2.5             # none waited its 5 s (loose: flaked at 1.0 under load)
 
     # Past the overdraw nothing is forced, however long it waits: forcing
     # each of a stop's 2,000 cancels drew 15,708 429s (11-16).

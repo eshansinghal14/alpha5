@@ -1925,8 +1925,12 @@ class ArbsRunner:
             ts = f.get("time")
             if ts:
                 newest = max(newest, pd.Timestamp(ts).timestamp())
-        self.real_ledger.last_fill_ts = newest
-        self.real_ledger.save(time.time())
+        # Fills booked above save as they book; this only keeps last_fill_ts.
+        # Every 5 s regardless, ARBS's 1.9 MB ledger took ~30 ms of the event
+        # loop each time (py-spy 11-17).
+        if newest != self.real_ledger.last_fill_ts:
+            self.real_ledger.last_fill_ts = newest
+            self.real_ledger.save(time.time())
 
     def _pm_final(self, oid: str, info: dict, cum: float | None, avg: float | None, source: str):
         """A Polymarket order's final filled quantity: book what isn't yet,

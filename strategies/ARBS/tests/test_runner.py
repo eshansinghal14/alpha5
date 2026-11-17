@@ -2775,3 +2775,15 @@ def test_summary_written_with_orjson_reads_back_like_json(tmp_path):
     import json as _j
     got = _j.load(open(p))
     assert got == {"counts": {"a": 1}, "by_shard": {"0": 2.5, "100": 1.25}, "quotes": [{"price": 0.42}], "x": None}
+
+
+def test_exit_model_predict_equals_the_row_dot_product():
+    import random
+    import numpy as np
+    from strategies.ARBS import exit_cost as E
+    rng = random.Random(3)
+    w = np.array([rng.uniform(-1, 1) for _ in range(E.WIDTH)])
+    for _ in range(500):
+        f = {name: rng.uniform(edges[0] - 1, edges[-1] + 1) if np.isfinite(edges[0]) and np.isfinite(edges[-1])
+             else rng.uniform(-5, 50) for name, edges in E.BINS.items()}
+        assert E.predict(w, f) == pytest.approx(float(E.row(f) @ w), abs=1e-12)

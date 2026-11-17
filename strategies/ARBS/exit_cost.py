@@ -124,16 +124,21 @@ def loss(r: dict, f: dict, when: str = "0.1") -> float:
     return min(CLIP_C[1], max(CLIP_C[0], c))
 
 
-def row(f: dict) -> np.ndarray:
-    x = np.zeros(WIDTH)
-    x[0] = 1.0
-    k = 1
+def _active(f: dict) -> list[int]:
+    """Indices of row(f)'s ones: the intercept and each feature's bin."""
+    out, k = [0], 1
     for name, edges in BINS.items():
         v = f[name]
         b = next((i for i in range(len(edges) - 1) if v <= edges[i + 1]), len(edges) - 2)
         if b > 0:                                   # bin 0 is the baseline
-            x[k + b - 1] = 1.0
+            out.append(k + b - 1)
         k += len(edges) - 2
+    return out
+
+
+def row(f: dict) -> np.ndarray:
+    x = np.zeros(WIDTH)
+    x[_active(f)] = 1.0
     return x
 
 
@@ -271,7 +276,7 @@ def live_features(views, j: int, payout: float, n: float, aged: list, unwind_top
         return None
     tops = [views[i].asks[0] for i in others]
     top = [q / n for _, q in tops]
-    k = int(np.argmin(top))
+    k = min(range(len(top)), key=top.__getitem__)    # np.argmin's first minimum, without numpy
     ag = [min(a, q) / n if a is not None else 0.0 for a, (_, q) in zip(aged, tops)]
     p0k = tops[k][0]
     depth2 = sum(q for p, q in views[others[k]].asks if p <= p0k + 0.02 + 1e-9) / n
@@ -284,8 +289,16 @@ def live_features(views, j: int, payout: float, n: float, aged: list, unwind_top
             "touch": views[j].bid, "c0": c0, "plan": sum(p + _fee(p) for p, _ in tops), "payout": payout}
 
 
+_W_LIST: list = [None, None]                        # (w, w as floats), predict's last weights
+
+
 def predict(w: np.ndarray, f: dict) -> float:
-    return float(row(f) @ w)
+    """row(f) @ w as the sum of the weights row(f) selects: a numpy row and
+    dot per leg priced was ~1% of ARBS's busy loop (py-spy 11-17)."""
+    if _W_LIST[0] is not w:
+        _W_LIST[0], _W_LIST[1] = w, [float(x) for x in w]
+    wl = _W_LIST[1]
+    return sum(wl[i] for i in _active(f))
 
 
 def at_price(f: dict, x: float) -> dict:

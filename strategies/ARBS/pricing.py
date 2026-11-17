@@ -235,12 +235,18 @@ def depth_size(legs: list[LegView], j: int, payout: float, required_edge: float,
             if got >= cap:
                 break
             marks.add(float(int(got + _EPS)))
-    best = 1.0
-    for n in sorted(m for m in marks if m >= 1):
-        plan = quote_leg(legs, j, payout, required_edge, n)
+    # A bigger size only reaches worse levels on the other legs, so whether
+    # it still works is monotone: binary search, not one quote_leg per mark
+    # (depth_size was ~2% of ARBS's busy loop, py-spy 11-17).
+    ns = sorted(m for m in marks if m >= 1)
+    lo, hi, best = 0, len(ns) - 1, 1.0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        plan = quote_leg(legs, j, payout, required_edge, ns[mid])
         if plan is None or plan.max_price < price - _EPS:
-            break
-        best = n
+            hi = mid - 1
+        else:
+            best, lo = ns[mid], mid + 1
     return best
 
 
