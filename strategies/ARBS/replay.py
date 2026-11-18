@@ -24,13 +24,26 @@ def _fee(p: float, n: float, rate: float) -> float:
     return rate * n * p * (1.0 - p) if n > 0 and rate > 0 else 0.0
 
 
-def legs_of(basket_id: str, tickers) -> list[tuple[str, str]] | None:
+def legs_of(basket_id: str, tickers, own: str | None = None) -> list[tuple[str, str]] | None:
     """Legs from a scanned basket id; a complete set's are its event's markets
-    among `tickers`. None for a shape it can't read (hand-spec ids)."""
+    among `tickers`. `own`: the print row's market, which every basket the row
+    lists holds. None for a shape it can't read (hand-spec ids)."""
     kind, _, rest = basket_id.partition(":")
     if kind == "mecnet":
         ev, side, names = rest.rsplit(":", 2)
-        return [(f"{ev}-{n}", side) for n in names.split("+")]
+        out = [_market(f"{ev}-{n}", tickers) for n in names.split("+")]
+        if own is not None and own not in out:
+            # Polymarket games name legs home/away, its markets carry team codes:
+            # the row's own market is one, the event's other team market the other.
+            open_ = [i for i, t in enumerate(out) if t not in tickers]
+            if open_:
+                out[open_[0]] = own
+                rest_ = [t for t in tickers if f"-{ev}-" in t and "-" not in t.split(f"-{ev}-", 1)[1]
+                         and t not in out and not t.endswith("-draw")]
+                if len(open_) - 1 == len(rest_):
+                    for i, t in zip(open_[1:], rest_):
+                        out[i] = t
+        return [(t, side) for t in out]
     if kind == "ladder":
         ev, pair = rest.rsplit(":", 1)
         a, _, b = pair.partition("=>")
@@ -38,8 +51,23 @@ def legs_of(basket_id: str, tickers) -> list[tuple[str, str]] | None:
     if kind == "complete_set":
         ev, how = rest.rsplit(":", 1)
         side = "yes" if how.endswith("yes") else "no"
-        return [(t, side) for t in tickers if t.startswith(ev + "-")]
+        got = [t for t in tickers if t.startswith(ev + "-")]
+        if not got:
+            # Polymarket: "<type>-<event>-<outcome>". A game's half markets
+            # (<event>-dh1-<outcome>) share the infix, so one-word outcomes win.
+            got = [t for t in tickers if f"-{ev}-" in t and not t.startswith(ev)]
+            one = [t for t in got if "-" not in t.split(f"-{ev}-", 1)[1]]
+            got = one or got
+        return [(t, side) for t in got]
     return None
+
+
+def _market(name: str, tickers) -> str:
+    """`name` as listed in `tickers`: Kalshi's is the name itself, a Polymarket
+    slug carries a market-type prefix ("atc-" + name)."""
+    if name in tickers:
+        return name
+    return next((t for t in tickers if t.endswith("-" + name) and t[0].islower()), name)
 
 
 def asks(books: dict, ticker: str, side: str) -> list[tuple[float, float]] | None:

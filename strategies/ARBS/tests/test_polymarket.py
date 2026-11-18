@@ -773,3 +773,29 @@ def test_cross_gaps_are_journaled_from_both_tops(pm_arbs, monkeypatch):
     assert gaps[0]["k_size"] == 7.0 and gaps[0]["pm_size"] == 9.0
     r._on_quote(types.SimpleNamespace(ticker="pm-ev-a", bid=0.55, ask=0.57, bid_depth=9.0, ask_depth=3.0))
     assert len([x for x in rows if x["kind"] == "cross_gap"]) == 1          # same edge within a second: once
+
+
+def test_replay_reads_polymarket_legs_off_their_prefixed_slugs():
+    from strategies.ARBS import replay
+    ev = "unl-bih-rou-2026-11-17"
+    books = {f"atc-{ev}-bih": {}, f"atc-{ev}-draw": {}, f"atc-{ev}-rou": {}, "KXUEFANLGAME-26NOV17BIHROU-BIH": {},
+             f"atc-{ev}-dh1-bih": {}}
+    # home/away are the row's own market and the event's other team
+    assert sorted(replay.legs_of(f"mecnet:{ev}:no:draw+home", books, f"atc-{ev}-bih")) == \
+        [(f"atc-{ev}-bih", "no"), (f"atc-{ev}-draw", "no")]
+    assert sorted(replay.legs_of(f"mecnet:{ev}:no:away+home", books, f"atc-{ev}-rou")) == \
+        [(f"atc-{ev}-bih", "no"), (f"atc-{ev}-rou", "no")]
+    # a complete set leaves the half-game markets out
+    assert sorted(t for t, _ in replay.legs_of(f"complete_set:{ev}:buy_all_yes", books)) == \
+        [f"atc-{ev}-bih", f"atc-{ev}-draw", f"atc-{ev}-rou"]
+    # Kalshi ids read as before
+    assert replay.legs_of("mecnet:KXE-1:no:A+B", {"KXE-1-A": {}, "KXE-1-B": {}}) == [("KXE-1-A", "no"), ("KXE-1-B", "no")]
+
+
+def test_polymarket_trains_apart_from_kalshi(tmp_path):
+    from strategies.ARBS import shadow_check
+    for s in ("ARBS", "ARBS0B", "ARBSPM"):
+        (tmp_path / s).mkdir()
+    k = [p.rsplit("/", 1)[-1].rsplit("\\", 1)[-1] for p in shadow_check.family_roots(str(tmp_path / "ARBS"))]
+    pm = [p.rsplit("/", 1)[-1].rsplit("\\", 1)[-1] for p in shadow_check.family_roots(str(tmp_path / "ARBSPM"))]
+    assert "ARBSPM" not in k and "ARBS0B" in k and pm == ["ARBSPM"]

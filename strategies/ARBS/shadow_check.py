@@ -93,7 +93,7 @@ def markout(row: dict):
     best = None
     pmin = min(p for _, p, _ in row["prints"])
     for bid, payout, _ in row["baskets"]:
-        legs = replay.legs_of(bid, row["books"])
+        legs = replay.legs_of(bid, row["books"], row["ticker"])
         if not legs or (row["ticker"], row["side"]) not in legs:
             continue
         others = [l for l in legs if l[0] != row["ticker"]]
@@ -243,13 +243,20 @@ def run(day: str, root: str | None = None, groups: dict | None = None) -> dict:
             "markout": mk_rows}
 
 
+# Polymarket trains its own exit model: its books, fees and sweeps differ, and
+# with its prints matched (11-18) it records about as many rows a day as a
+# Kalshi process, enough to swamp the Kalshi model it was merged into.
+PM_ROOTS = ("ARBSPM",)
+
+
 def family_roots(root: str) -> list[str]:
-    """`root` and the other ARBS processes' folders beside it."""
+    """`root` and the other ARBS processes' folders beside it on the same venue."""
     from strategies.ARBS import SERIES
+    pm = os.path.basename(os.path.normpath(root)) in PM_ROOTS
     out = [root]
     for s in SERIES:
         p = os.path.join(os.path.dirname(root), s)
-        if os.path.normpath(p) != os.path.normpath(root) and os.path.isdir(p):
+        if (s in PM_ROOTS) == pm and os.path.normpath(p) != os.path.normpath(root) and os.path.isdir(p):
             out.append(p)
     return out
 
@@ -357,7 +364,11 @@ def main():
         os.makedirs(os.path.join(root, OUT_DIR), exist_ok=True)
         atomic_write_json(os.path.join(root, OUT_DIR, f"{day}.json"), doc, indent=None)
         print(json.dumps({"series": s, "day": day, "coverage": doc["coverage"], "groups": len(doc["calibration"])}))
-    write_model(os.path.join(LIVE_ROOT, "ARBS"), (pd.Timestamp(day) + pd.Timedelta(days=1)).strftime("%Y-%m-%d"))
+    nxt = (pd.Timestamp(day) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    write_model(os.path.join(LIVE_ROOT, "ARBS"), nxt)
+    for s in PM_ROOTS:                                   # not quoted with yet: collected for a PM edge/size model
+        if os.path.isdir(os.path.join(LIVE_ROOT, s)):
+            write_model(os.path.join(LIVE_ROOT, s), nxt)
 
 
 def write_model(root: str, before: str):

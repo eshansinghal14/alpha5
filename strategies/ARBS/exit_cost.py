@@ -54,8 +54,14 @@ MAX_REACH = 30                      # ticks a sweep's depth is counted to, for f
 VOL_EDGES = (0.0, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, math.inf)
 
 
-def _fee(p: float) -> float:
-    return 0.07 * p * (1.0 - p)
+def _fee(p: float, rate: float = 0.07) -> float:
+    return rate * p * (1.0 - p)
+
+
+def _rate(ticker: str) -> float:
+    """Taker rate a training row's leg pays: Polymarket's default or Kalshi's."""
+    from strategies.ARBS.venues import PM_TAKER_RATE, is_pm
+    return PM_TAKER_RATE if is_pm(ticker) else 0.07
 
 
 def ask_at(pre_rows, side: str, lag: float):
@@ -84,7 +90,7 @@ def features(r: dict, bid: str, payout: float, n: float) -> dict | None:
     the same with taker fees). reach_c and edge_c are the print's own; a rule
     pricing its own quote sets them for that price."""
     pre, books = r.get("pre") or {}, r["books"]
-    legs = replay.legs_of(bid, books)
+    legs = replay.legs_of(bid, books, r["ticker"])
     if not legs or (r["ticker"], r["side"]) not in legs:
         return None
     others = [l for l in legs if l[0] != r["ticker"]]
@@ -113,7 +119,7 @@ def features(r: dict, bid: str, payout: float, n: float) -> dict | None:
             "depth2_r": depth2[j], "reach_c": 100 * (tb - pmin), "edge_c": 100 * (payout - pmin - c0),
             "spread_c": spread[j], "n": n, "unwind_top_r": (uw[1] / n) if uw else 0.0, "n_other": len(others),
             "stable": min(stable), "live": 1.0 if live else 0.0, "tte_h": -1.0 if tte is None else float(tte),
-            "touch": tb, "c0": c0, "plan": sum(p + _fee(p) for p, _ in tops),
+            "touch": tb, "c0": c0, "plan": sum(p + _fee(p, _rate(t)) for (t, _), (p, _) in zip(others, tops)),
             "payout": payout, "pmin": pmin, "others": others}
 
 
