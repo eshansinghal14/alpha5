@@ -3173,3 +3173,41 @@ def test_a_cut_that_cannot_be_sent_cancels_the_quote(arbs):
     _eval(r, b)
     assert sent == [("ex-1", "no_edge")] and r.quotes.get((b.basket_id, 0)) is not q
 
+
+def test_a_pregame_cut_rides_out_a_depth_flicker_and_keeps_its_price_within_the_tolerance(arbs, monkeypatch):
+    r, b = arbs
+    _no_deep(r)
+    monkeypatch.setattr(R, "PRE_NO_EDGE_GRACE_S", 10.0)
+    monkeypatch.setattr(R, "PRE_LIMIT_SLACK_TICKS", 1)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, requote_cooldown_s=0.0, depth_age_s=0.0, min_exit_edge=0.01)
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])          # B's YES ask: 10 at 0.55
+    _eval(r, b)
+    q = r.quotes[(b.basket_id, 0)]
+    assert q.remaining == 5 and q.price == pytest.approx(0.31)
+    # B thins to 3 at 0.55 then 0.645: 5 lots at 0.31 still clear 1c, so the
+    # quote rests at full size through the grace.
+    book(r, "X-B", [(0.40, 10)], [(0.45, 3), (0.355, 10)])
+    _eval(r, b)
+    assert r.quotes.get((b.basket_id, 0)) is q and q.remaining == 5 and q.unpriced_at is not None
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])          # depth back: the clock stops
+    _eval(r, b)
+    assert q.remaining == 5 and q.unpriced_at is None
+    book(r, "X-B", [(0.40, 10)], [(0.45, 3), (0.355, 10)])
+    _eval(r, b)
+    q.unpriced_at -= 10.0                                 # the thin book lasted: cut, price kept
+    _eval(r, b)
+    assert r.quotes.get((b.basket_id, 0)) is q and q.remaining == 3 and q.price == pytest.approx(0.31)
+    # A cut that leaves 0.31 one tick past the new limit (B: 3 at 0.645, then
+    # 0.80) keeps 0.31; two ticks past it reprices.
+    r.quotes.clear()
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    _eval(r, b)
+    q = r.quotes[(b.basket_id, 0)]
+    book(r, "X-B", [(0.40, 10)], [(0.355, 3), (0.20, 10)])
+    _eval(r, b)
+    assert r.quotes.get((b.basket_id, 0)) is q and q.remaining == 3 and q.price == pytest.approx(0.31)
+    book(r, "X-B", [(0.40, 10)], [(0.345, 2), (0.20, 10)])  # 2 at 0.655: limit 0.29
+    _eval(r, b)
+    assert r.quotes.get((b.basket_id, 0)) is q and q.remaining == 2 and q.price == pytest.approx(0.29)
+

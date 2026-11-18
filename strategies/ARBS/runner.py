@@ -2729,7 +2729,7 @@ class ArbsRunner:
                 if q is not None:
                     acts.append(self.cancel_quote(q, "no_edge" if want else "not_hot"))
                 continue
-            if q is not None:
+            if q is not None and q.remaining <= size + _EPS:
                 q.unpriced_at = None
             other = self.quoted_elsewhere(b.basket_id, leg.ticker, leg.side)
             if other is not None and (q is None or other.placed_at < q.placed_at):
@@ -2752,10 +2752,17 @@ class ArbsRunner:
                 # where cancel + re-place lost it and left the side unquoted for a
                 # pass (47,596 live re-placements within a tick, 11-17). Past its
                 # new limit it reprices too. Without the tokens it is cancelled.
+                # Pre-game, a flicker in the other legs' depth is first ridden out
+                # (no_edge_grace): cut at once, each flicker became a cut and a
+                # regrow, ~1,500 1c moves an hour on quotes <= 100 lots (11-18).
+                if not live and self.no_edge_grace(b, vs, j, q, now):
+                    continue
                 if self.live and not self.gw.can_afford(leg.ticker, "amend", reserve):
                     acts.append(self.cancel_quote(q, "no_edge"))
                     continue
-                if q.price <= plan.max_price + _EPS:
+                slack = (not live and size <= MODEL_PRE_NARROW_SIZE      # see PRE_LIMIT_SLACK_TICKS
+                         and vs[j].ticks.steps(plan.max_price, q.price) <= PRE_LIMIT_SLACK_TICKS)
+                if q.price <= plan.max_price + _EPS or slack:
                     rate = vs[j].maker_rate
                     plan = dataclasses.replace(plan, price=q.price, edge=plan.edge + pricing.maker_cost(plan.price, rate)
                                                - pricing.maker_cost(q.price, rate))
