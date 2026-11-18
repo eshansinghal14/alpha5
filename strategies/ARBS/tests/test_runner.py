@@ -3291,3 +3291,20 @@ def test_a_fill_for_an_unlisted_basket_is_held_aside_for_the_audit_until_booked(
     assert r.apply_real_fill(f, "rest")
     assert r.unbooked_pos == {} and r.real_ledger.net_by_ticker().get("X-A") == 1.0
 
+
+
+def test_a_basket_with_a_quote_resting_is_marked_on_every_book_update(arbs, monkeypatch):
+    import types
+    r, b = arbs
+    monkeypatch.setattr(r, "liq", types.SimpleNamespace(on_book=lambda *a: None))
+    monkeypatch.setattr(r.cfg.runtime, "record_prints", False, raising=False)
+    upd = types.SimpleNamespace(ticker="X-A", bid=0.40, ask=0.45, bid_depth=1, ask_depth=1)
+    r.quotes[(b.basket_id, 0)] = R.Quote(basket_id=b.basket_id, leg=0, ticker="X-A", side="yes", price=0.31,
+                                         size=5.0, cid="c", edge=0.04, max_price=0.32, pending=False)
+
+    async def go():
+        r._on_quote_inner(upd)
+        r.quoted.clear(); r.dirty.clear()
+        r._on_quote_inner(upd)                              # deeper levels only, but our quote rests: now
+        assert b.basket_id in r.quoted and not r.lazy
+    asyncio.run(go())

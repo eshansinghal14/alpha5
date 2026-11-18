@@ -309,7 +309,10 @@ EVAL_SLICE_S = 0.001
 # A book update that leaves the top unchanged re-evaluates a pre-game basket at
 # most once per LAZY_EVAL_S: deep-level churn on KXNVDACEO-29JAN (2.75M updates
 # on 11-18, 12x the day before) re-evaluated its 6 baskets on every one, a
-# quarter of ARBS0A's CPU. Top changes, fills and live baskets stay immediate.
+# quarter of ARBS0A's CPU. Top changes, fills, live baskets and any basket with
+# a quote resting stay immediate: holding those put edge cancels and re-prices
+# at ~100 ms p75 on every process (11-18 19:15-20:00 UTC, 4-18 ms the day before);
+# a completion leg's depth can go without its top moving.
 LAZY_EVAL_S = 0.1
 # Relationship types whose bundles can pay more than their worst case:
 # complete sets and exact identities pay the same in every outcome.
@@ -1506,8 +1509,8 @@ class ArbsRunner:
 
     def _mark_book(self, bid: str, deep: bool, now: float):
         """mark() for a book update; deferred up to LAZY_EVAL_S when only
-        levels under the top moved on a basket not live."""
-        if deep and bid not in self.exit_hist and now < self._live_at(bid):
+        levels under the top moved on a basket not live with nothing resting."""
+        if deep and bid not in self.quotes.n_by_basket and bid not in self.exit_hist and now < self._live_at(bid):
             if bid not in self.lazy:
                 try:
                     asyncio.get_running_loop().call_later(LAZY_EVAL_S, self._lazy_mark, bid)
