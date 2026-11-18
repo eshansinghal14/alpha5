@@ -1181,8 +1181,9 @@ def test_plan_budget_follows_real_write_spend(arbs):
     assert abs(r.plan_scale[0] - 0.5) < 0.01
 
 
-def test_write_cost_counts_top_of_book_changes(arbs):
+def test_write_cost_counts_top_of_book_changes(arbs, monkeypatch):
     r, b = arbs
+    monkeypatch.setattr(R, "COST_FROM_SPEND", False)        # the book-move estimate itself
     now = time.time()
     quiet = r.write_cost(b, now)
     for i in range(60):
@@ -2945,6 +2946,7 @@ def test_rank_dump_writes_estimates_beside_real_spend(arbs, monkeypatch):
     r, b = arbs
     r.hot_ready = True
     rows = [{"basket_id": b.basket_id, "quote_usd_h": 1.5, "legs": 2}]
+    r.quote_parts[b.basket_id] = [0, None, None]
 
     async def go():
         r.rank_dump(rows, [b.basket_id], {b.basket_id}, 1000.0)
@@ -2956,6 +2958,7 @@ def test_rank_dump_writes_estimates_beside_real_spend(arbs, monkeypatch):
     assert len(lines) == 1
     row = json.loads(lines[0])["rows"][0]
     assert row[0] == b.basket_id and row[1] == 1.5 and row[4] == 1 and row[5] == 2
+    assert json.loads(lines[0])["legs"] == {b.basket_id: [[l.ticker, l.side] for l in b.legs]}
 
 
 def test_recent_flow_is_kept_apart_from_the_long_window(arbs):

@@ -199,13 +199,14 @@ CROSS_GAP_EVERY_S, CROSS_GAP_STEP = 1.0, 0.005
 # quote_score (edge, size, queue ahead, flow rates), so other value formulas
 # can be scored offline against fills.
 RANK_PARTS_EVERY, RANK_PARTS_TOP = 3, 500
-# Off until replayed on a day of rank dumps (11-17: estimates ran 2.4x real per
-# basket at the median, 3-14x per hot list; predicted $/h ran ~1000x realized,
-# a finished NFL game still ranked first on its 3 h flow):
+# COST_FROM_SPEND on since 11-18: over all of 11-17 the book-move estimate ran
+# 2.8-4.8x real spend per hot list on every process (per basket p50 2.3-4.4x),
+# and the plan scale made up for it (8x on ARBS0C, ARBSPM pinned at 10x).
+# FLOW_RECENT_S stays off: predicted $/h ranks fills well past its top 1%.
 #   COST_FROM_SPEND: a basket quoted for WRITE_COST_TAU_S costs what it really
 #   spent (floored at its placements); a new one, its estimate x EST_SCALE.
 #   FLOW_RECENT_S: queue_wait's flow rate over this many seconds, not watch.queue_window_s.
-COST_FROM_SPEND, EST_SCALE = False, 0.4
+COST_FROM_SPEND, EST_SCALE = True, 0.4
 FLOW_RECENT_S: float | None = None
 # Write tokens per order or move, per cancel (Kalshi's write budget).
 ORDER_TOKENS, CANCEL_TOKENS = 10.0, 2.0
@@ -4252,6 +4253,9 @@ class ArbsRunner:
         if self._rank_dumps % RANK_PARTS_EVERY == 1:
             keep = {bid for bid in picked} | {r["basket_id"] for r in rows[:RANK_PARTS_TOP]}
             line["parts"] = {bid: self.quote_parts[bid] for bid in keep if bid in self.quote_parts}
+            # Each leg's market, in quote_parts' order: scored offline against prints.
+            line["legs"] = {bid: [[l.ticker, l.side] for l in self.baskets[bid].legs]
+                            for bid in line["parts"] if bid in self.baskets}
         path = os.path.join(self.root, "rank_dump", f"{_utc():%Y-%m-%d}.jsonl.gz")
 
         def write():
