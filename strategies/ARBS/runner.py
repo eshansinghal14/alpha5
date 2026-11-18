@@ -266,6 +266,10 @@ REACH_MODE, REACH_USD, REACH_KEEP_USD, REACH_EVAL_S, REACH_MIN_GAP = "on", 500.0
 # shrinks were half its write cost (~5 of ~10 tokens/s on shard 0, 20:56-21:08);
 # a fill past what the other legs complete at min edge still completes, nearer it.
 REACH_GRACE_S, REACH_SHRINK = 30.0, 0.5
+# Reach quotes on the Polymarket process, placed and moved only while half its
+# quoting cap is free (NEAR_RESERVE). Gap and near deep quotes stay Kalshi-only:
+# with them on, ARBSPM's writes went from ~30 to 93 of 100 tokens/s (11-18).
+PM_REACH = False
 # A resting near quote stays while it would still be NEAR_KEEP of near_min_size
 # (the exit depth it is sized to hovers around any threshold). It is cut at
 # once when what the exits take falls under NEAR_SHRINK of it, and grown or
@@ -3214,14 +3218,18 @@ class ArbsRunner:
         11-07..08, 16 non-live deep fills at up to 400 made +$284, completing
         0.1 s or 1 s after the print."""
         t, reserve, acts = self.cfg.trading, self.cfg.runtime.write_reserve_tokens, []
-        near_on = on and not live and t.near_min_size >= 1
         near_reserve = max(reserve, NEAR_RESERVE * self.write_budget() * self.gw.burst_s())
-        # None on the Polymarket process: its config had them off until
-        # deep_quote_size was removed (11-13), and they are untested there.
-        on = on and not self.pm_process
-        on_all = not self.pm_process          # a resting reach quote is judged even off the hot list
+        quoted_on = on                        # the basket is being quoted
+        on = on and not self.pm_process       # gap and near deep quotes: Kalshi only (see PM_REACH)
+        near_on = on and not live and t.near_min_size >= 1
+        reach_on = REACH_MODE == "on" and (not self.pm_process or PM_REACH)
+        reach_reserve = near_reserve if self.pm_process else reserve
         for j, leg in enumerate(b.legs):
             dq = self.quotes.get((b.basket_id, j, "deep"))
+            if self.pm_process and not is_pm(leg.ticker):
+                if dq is not None:
+                    acts.append(self.cancel_quote(dq, "venue"))
+                continue
             if dq is not None and dq.pending:
                 continue
             if j in pulled:
@@ -3246,11 +3254,14 @@ class ArbsRunner:
                     self._near_at[(b.basket_id, j)] = now
                     plan, size = self.near_plan(b, vs, j, main, need, dq if resting else None)
                     near = plan is not None
-            if REACH_MODE == "on" and on_all and plan is None and (dq is None or dq.reach) and not \
+            if reach_on and plan is None and (dq is None or dq.reach) and not \
                     (on and j in mains and self.deep_plan(b, vs, j, mains[j], need, 1.0)[0] is not None):
                 # Where the gap rule rests nothing, the reach quote takes the deep slot.
-                quoted = on and j in mains and main is not None and not main.pending
-                acts += self.reach_live(b, vs, j, dq, main, quoted, need, now, live, reserve)
+                quoted = quoted_on and j in mains and main is not None and not main.pending
+                acts += self.reach_live(b, vs, j, dq, main, quoted, need, now, live, reach_reserve)
+                continue
+            if dq is not None and dq.reach:
+                acts.append(self.cancel_quote(dq, "deep_off"))  # reach switched off with one resting
                 continue
             if dq is not None and dq.near and not near and (j in mains or not near_on):
                 # Only a near plan covers its size: under an arb quote or in-play it

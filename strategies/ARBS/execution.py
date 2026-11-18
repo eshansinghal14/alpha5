@@ -44,6 +44,7 @@ class Gateway:
         self.write_pool = write_pool or pool
         self.clients: dict[int, KalshiOrderClient] = {}
         self.shard_of: dict[str, int] = {}
+        self.cancel_wait: dict[str, list] = {}         # PM cancel reason -> [held, total s, max s]
         self._ids = itertools.count(1)
         # Exchange ids of our IOCs: their fills are booked from the create
         # response, so the same fill arriving on the websocket is ignored.
@@ -187,12 +188,26 @@ class Gateway:
             # (11-16 05:55). A 429'd cancel cancels nothing anyway.
             routine = reason in PM_ROUTINE_CANCELS
             loop = asyncio.get_running_loop()
-            end = loop.time() + PM_CANCEL_WAIT_S
-            while not c.allow_now("cancel", reason=reason):
-                if c.tokens_now() > -PM_URGENT_OVERDRAW and (not routine or loop.time() >= end):
-                    c.allow_now("cancel", force=True, reason=reason)
-                    break
-                await asyncio.sleep(0.05)
+            t0 = loop.time()
+            end = t0 + PM_CANCEL_WAIT_S
+            if not c.allow_now("cancel", reason=reason):        # counted refused once, not per check
+                while True:
+                    # An urgent cancel is held only by the per-IP bucket, not by
+                    # this process's quoting cap: with the cap spent, pulls waited
+                    # while Polymarket's own limit had room (11-18).
+                    if routine and loop.time() < end:
+                        if c.can_afford("cancel"):
+                            c.allow_now("cancel", force=True, reason=reason)
+                            break
+                    elif (c.tokens_now() if routine else c.budget.tokens_now()) > -PM_URGENT_OVERDRAW:
+                        c.allow_now("cancel", force=True, reason=reason)
+                        break
+                    await asyncio.sleep(0.05)
+                w = self.cancel_wait.setdefault(reason, [0, 0.0, 0.0])
+                dt = loop.time() - t0
+                w[0] += 1
+                w[1] += dt
+                w[2] = max(w[2], dt)
         elif not c.allow_now("cancel", reason=reason):
             # Counted refused once, not per check: per check, the waits showed
             # as 300k+ "refused" cancels a process in a few hours (11-17).
@@ -207,6 +222,11 @@ class Gateway:
             return None, e, True
 
     def usage(self) -> dict:
-        return {str(s): {"tokens_now": round(c.tokens_now(), 1), "tokens_per_s": c.tokens_per_s,
-                         "http_429": (u := c.usage()).get("http_429"), "refused": u.get("refused")}
-                for s, c in self.clients.items()}
+        out = {str(s): {"tokens_now": round(c.tokens_now(), 1), "tokens_per_s": c.tokens_per_s,
+                        "http_429": (u := c.usage()).get("http_429"), "refused": u.get("refused")}
+               for s, c in self.clients.items()}
+        if self.cancel_wait and str(PM_SHARD) in out:
+            out[str(PM_SHARD)]["cancel_wait"] = {r: {"n": n, "mean_ms": round(1000 * tot / n, 1),
+                                                    "max_ms": round(1000 * mx, 1)}
+                                                for r, (n, tot, mx) in self.cancel_wait.items()}
+        return out

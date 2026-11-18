@@ -322,14 +322,19 @@ def test_resolved_market_settles_from_its_outcome_prices():
 def test_polymarket_cancels_wait_for_the_bucket_then_go(monkeypatch):
     from strategies.ARBS import execution
     monkeypatch.setattr(execution, "PM_CANCEL_WAIT_S", 0.2)
-    calls = []
+    calls, checks = [], [0]
 
     class C:
         shard = 100
+        budget = None
 
         def allow_now(self, kind, force=False, reason=""):
             calls.append(force)
-            return force or len(calls) > 3       # refused 3 times, then the bucket has room
+            return force
+
+        def can_afford(self, kind="order", reserve=0.0):
+            checks[0] += 1
+            return checks[0] > 3                 # no room for 3 checks, then the bucket has room
 
         def tokens_now(self):
             return -100.0                        # overdrawn: even urgent cancels wait
@@ -338,12 +343,13 @@ def test_polymarket_cancels_wait_for_the_bucket_then_go(monkeypatch):
             return True
     gw = execution.Gateway.__new__(execution.Gateway)
     gw.client = lambda t: C()
+    gw.cancel_wait = {}
 
     async def write(fn, *a):
         return fn(*a)
     gw.write = write
     got, exc, sent = asyncio.run(gw.cancel("pm-a", "o1", "not_hot"))
-    assert got is True and exc is None and calls == [False, False, False, False]
+    assert got is True and exc is None and calls == [False, True] and checks[0] == 4   # refused once, sent with room
 
     calls.clear()
     C.allow_now = lambda self, kind, force=False, reason="": calls.append(force) or force   # never room
@@ -393,10 +399,15 @@ def test_kalshi_cancels_are_forced_only_within_the_overdraw():
 def test_urgent_polymarket_cancels_go_now_within_the_overdraw(monkeypatch):
     from strategies.ARBS import execution
     monkeypatch.setattr(execution, "PM_CANCEL_WAIT_S", 5.0)
-    calls, tokens = [], [0.0]
+    calls, tokens, ip = [], [0.0], [None]
+
+    class B:                                     # the per-IP bucket (tokens unless set apart)
+        def tokens_now(self):
+            return tokens[0] if ip[0] is None else ip[0]
 
     class C:
         shard = 100
+        budget = B()
 
         def allow_now(self, kind, force=False, reason=""):
             calls.append(force)
@@ -405,10 +416,14 @@ def test_urgent_polymarket_cancels_go_now_within_the_overdraw(monkeypatch):
         def tokens_now(self):
             return tokens[0]
 
+        def can_afford(self, kind="order", reserve=0.0):
+            return tokens[0] >= 10 + reserve
+
         def cancel(self, oid, ticker):
             return True
     gw = execution.Gateway.__new__(execution.Gateway)
     gw.client = lambda t: C()
+    gw.cancel_wait = {}
 
     async def write(fn, *a):
         return fn(*a)
@@ -438,6 +453,15 @@ def test_urgent_polymarket_cancels_go_now_within_the_overdraw(monkeypatch):
             return time.monotonic() - t1
         assert asyncio.run(go()) >= 0.3, reason
         assert calls[-1] is True and calls.count(True) == 1
+
+    # This process's quoting cap spent but the per-IP bucket has room: a pull
+    # goes at once, a routine cancel still waits its turn.
+    tokens[0], ip[0] = -60.0, 100.0
+    calls.clear()
+    t1 = time.monotonic()
+    asyncio.run(gw.cancel("pm-a", "o1", "pull"))
+    assert calls == [False, True] and time.monotonic() - t1 < 0.04
+    assert gw.cancel_wait["pull"][0] >= 1                  # held cancels are timed
 
 
 def test_polymarket_move_is_one_modify_unless_partly_filled(monkeypatch, tmp_path):
@@ -799,3 +823,18 @@ def test_polymarket_trains_apart_from_kalshi(tmp_path):
     k = [p.rsplit("/", 1)[-1].rsplit("\\", 1)[-1] for p in shadow_check.family_roots(str(tmp_path / "ARBS"))]
     pm = [p.rsplit("/", 1)[-1].rsplit("\\", 1)[-1] for p in shadow_check.family_roots(str(tmp_path / "ARBSPM"))]
     assert "ARBSPM" not in k and "ARBS0B" in k and pm == ["ARBSPM"]
+
+
+def test_pm_deep_quotes_are_reach_only_and_switched_off(pm_arbs, monkeypatch):
+    r, b = pm_arbs
+    monkeypatch.setattr(R, "PM_REACH", False)
+    cancelled = []
+    monkeypatch.setattr(r, "cancel_quote", lambda q, why: cancelled.append((q.ticker, why)))
+    for j, t in enumerate(("pm-ev-a", "K-A")):
+        q = R.Quote(basket_id=b.basket_id, leg=j, ticker=t, side=b.legs[j].side, price=0.2, size=5.0, cid=f"c{j}",
+                    edge=0.05, max_price=0.25, pending=False, deep=True)
+        q.reach = True
+        r.quotes[q.key] = q
+    r.manage_deep(b, None, {}, 0.0, time.time(), True, False)
+    # off: the PM leg's reach quote comes down; a Kalshi leg never holds one from this process
+    assert sorted(cancelled) == [("K-A", "venue"), ("pm-ev-a", "deep_off")]
