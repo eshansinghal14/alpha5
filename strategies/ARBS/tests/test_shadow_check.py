@@ -61,3 +61,15 @@ def test_rules_train_on_earlier_days_only(tmp_path):
     assert ru["best_ev"] is not None and ru["narrowest"] is not None and ru["best_ev_size"] is not None
     assert set(ru["fixed_by_size"]) == {"5", "20", "50", "100", "200", "500"}
     assert set(ru["best_ev_by_size"]) <= set(ru["fixed_by_size"])
+
+
+def test_write_model_skips_days_saved_in_another_layout(tmp_path):
+    import json, os
+    from strategies.ARBS import exit_cost, shadow_check as SC
+    root = tmp_path / "ARBS"
+    (root / SC.OUT_DIR).mkdir(parents=True)
+    old = {"xtx": [[1.0] * 3] * 3, "xty": [1.0] * 3, "n": 5, "reach": {}, "vol": {}}   # an older, narrower layout
+    (root / SC.OUT_DIR / "2026-11-10.json").write_text(json.dumps({"exit_stats": old}))
+    SC.write_model(str(root), "2026-11-11")
+    assert not os.path.exists(root / exit_cost.MODEL_FILE)
+

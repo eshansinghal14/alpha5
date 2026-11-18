@@ -388,7 +388,7 @@ HELD_CACHE_S = 0.25
 # picked over this grid (sizes within the model's 11-08..10 training range).
 # No 2c: on its first hour (11-11) the model took 11 live NCAAMB legs to 2c.
 MODEL_EDGES = (0.03, 0.04, 0.05, 0.075, 0.10, 0.15, 0.20)
-MODEL_SIZES = (5.0, 20.0, 50.0, 100.0)
+MODEL_SIZES = (5.0, 20.0, 50.0, 100.0, 200.0)     # live picks stop at trading.live_quote_size
 # A leg's pick is reused this long between book changes. 1 s, not 0.5: live
 # legs pricing 28 edge/size pairs each re-value kept model_pick at ~13% of
 # ARBS0B's loop, held over its 70% CPU target (py-spy 11-17 20:58). Quotes
@@ -2464,6 +2464,8 @@ class ArbsRunner:
         cands: dict[tuple[float, float], tuple[float, float]] = {}
         if live:
             for n in MODEL_SIZES:
+                if cap > 0 and n > max(cap, MODEL_SIZES[0]) + _EPS:
+                    break
                 f = exit_cost.live_features(vs, j, b.payout, n, aged, unwind_top, True, tte)
                 if f is None:
                     break

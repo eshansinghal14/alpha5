@@ -157,7 +157,7 @@ def run(day: str, root: str | None = None, groups: dict | None = None) -> dict:
             key = (g, tte_bucket((r.get("tte_h") or {}).get(bid)), bool(live), shape(bid))
             marks[key].append((g0, m01, m1))
             if g0 >= -0.01:
-                n = max(1.0, min(sum(q for _, _, q in r["prints"]), 100.0))
+                n = max(1.0, min(sum(q for _, _, q in r["prints"]), exit_cost.TRAIN_MAX_N))
                 f = exit_cost.features(r, bid, payout, n)
                 if f is not None:
                     stats.add(f, exit_cost.loss(r, f))
@@ -375,8 +375,8 @@ def write_model(root: str, before: str):
     """The model ARBS processes quote with (exit_cost.MODEL_FILE in `root`),
     fitted on every saved day before `before`."""
     prev, used = training_stats(root, before)
-    if not used:
-        return
+    if not used or not prev.n:
+        return                    # nothing in this layout (EXIT bins changed): a fit would be singular
     m = exit_cost.Model(prev.fit(), prev, sorted(used))
     atomic_write_json(os.path.join(root, exit_cost.MODEL_FILE), m.to_json(), indent=None)
 

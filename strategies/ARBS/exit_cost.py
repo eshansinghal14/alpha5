@@ -37,7 +37,9 @@ BINS = {
     "reach_c": [-math.inf, 0.5, 1.5, 3.5, 6.5, 10, 15, 20, 30, math.inf],
     "edge_c": [-math.inf, 0, 2, 5, 10, 15, 20, math.inf],
     "spread_c": [-math.inf, 1.5, 3.5, 10, math.inf],
-    "n": [0, 5, 20, 50, math.inf],
+    # Bins at 100 and 200 so live quotes can size past 100: walk-forward on live
+    # prints 11-13..18, picks up to 200 made +$558 vs +$413 capped at 100.
+    "n": [0, 5, 20, 50, 100, 200, math.inf],
     "unwind_top_r": [-0.01, 0.5, 1, 3, math.inf],
     "n_other": [0, 1, 2, math.inf],
     "stable": [-0.01, 0.5, 1.0],
@@ -47,6 +49,9 @@ BINS = {
     "tte_h": [-math.inf, -0.5, 1, 6, 24, math.inf],
 }
 WIDTH = 1 + sum(len(e) - 2 for e in BINS.values())
+# A training row's fill size: the print's volume, up to this. At 100 the model
+# never saw what a 200-lot exit costs.
+TRAIN_MAX_N = 500.0
 RIDGE = 50.0
 CLIP_C = (-10.0, 50.0)
 MAX_REACH = 30                      # ticks a sweep's depth is counted to, for fill odds

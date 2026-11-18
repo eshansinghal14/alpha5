@@ -3308,3 +3308,25 @@ def test_a_basket_with_a_quote_resting_is_marked_on_every_book_update(arbs, monk
         r._on_quote_inner(upd)                              # deeper levels only, but our quote rests: now
         assert b.basket_id in r.quoted and not r.lazy
     asyncio.run(go())
+
+
+def test_live_model_sizes_stop_at_live_quote_size(arbs, monkeypatch):
+    import types
+    r, b = arbs
+    seen = []
+
+    class Stub:
+        def value(self, f, x, live, n, maker_rate=0.0):
+            seen.append(n)
+            return (n, 1.0)                                       # bigger is worth more
+
+    r.exit_model = Stub()
+    monkeypatch.setattr(R.exit_cost, "live_features", lambda *a, **k: {})
+    monkeypatch.setattr(R.pricing, "others_cost", lambda vs, j, n: n)
+    monkeypatch.setattr(R.pricing, "prices_at", lambda vs, j, payout, edges, o: list(edges))
+    vs = [types.SimpleNamespace(maker_rate=0.0)] * 2
+    now_ts = pd.Timestamp.now(tz="UTC")
+    assert r.model_pick(b, 0, vs, now_ts, True, 100.0)[1] == 100.0 and max(seen) == 100.0
+    seen.clear(); r._model_cache.clear(); r.model_state.clear()
+    assert r.model_pick(b, 0, vs, now_ts, True, 200.0)[1] == 200.0 and max(seen) == 200.0
+
