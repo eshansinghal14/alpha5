@@ -3211,3 +3211,42 @@ def test_a_pregame_cut_rides_out_a_depth_flicker_and_keeps_its_price_within_the_
     _eval(r, b)
     assert r.quotes.get((b.basket_id, 0)) is q and q.remaining == 2 and q.price == pytest.approx(0.29)
 
+
+def test_deep_only_book_updates_on_pre_game_baskets_are_coalesced(arbs, monkeypatch):
+    import types
+    r, b = arbs
+    r.dirty.clear(); r.quoted.clear()
+    upd = lambda bid, ask: types.SimpleNamespace(ticker="X-A", bid=bid, ask=ask, bid_depth=1, ask_depth=1)  # noqa: E731
+    monkeypatch.setattr(r, "liq", types.SimpleNamespace(on_book=lambda *a: None))
+    monkeypatch.setattr(r.cfg.runtime, "record_prints", False, raising=False)
+
+    async def go():
+        r._on_quote_inner(upd(0.40, 0.45))                  # first sight: a top change, marked now
+        assert b.basket_id in r.dirty
+        r.dirty.clear()
+        for _ in range(5):
+            r._on_quote_inner(upd(0.40, 0.45))              # deeper levels only: one deferred mark
+        assert b.basket_id not in r.dirty and r.lazy == {b.basket_id}
+        await asyncio.sleep(R.LAZY_EVAL_S + 0.05)
+        assert b.basket_id in r.dirty and not r.lazy
+        r.dirty.clear()
+        r._on_quote_inner(upd(0.41, 0.45))                  # the top moved: now
+        assert b.basket_id in r.dirty
+    asyncio.run(go())
+
+
+def test_live_baskets_are_marked_on_every_book_update(arbs, monkeypatch):
+    import types
+    r, b = arbs
+    live = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
+    r.set_baskets([live])
+    monkeypatch.setattr(r, "liq", types.SimpleNamespace(on_book=lambda *a: None))
+    monkeypatch.setattr(r.cfg.runtime, "record_prints", False, raising=False)
+    upd = types.SimpleNamespace(ticker="X-A", bid=0.40, ask=0.45, bid_depth=1, ask_depth=1)
+
+    async def go():
+        r._on_quote_inner(upd)
+        r.dirty.clear()
+        r._on_quote_inner(upd)
+        assert live.basket_id in r.dirty and not r.lazy
+    asyncio.run(go())

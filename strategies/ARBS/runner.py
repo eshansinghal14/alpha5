@@ -299,6 +299,11 @@ PRE_LIMIT_SLACK_TICKS = 1
 # lands mid-pass isn't even read until the pass yields (fill -> exit decision
 # p99 was 176 ms with whole passes, 10-30/31). A yield costs microseconds.
 EVAL_SLICE_S = 0.001
+# A book update that leaves the top unchanged re-evaluates a pre-game basket at
+# most once per LAZY_EVAL_S: deep-level churn on KXNVDACEO-29JAN (2.75M updates
+# on 11-18, 12x the day before) re-evaluated its 6 baskets on every one, a
+# quarter of ARBS0A's CPU. Top changes, fills and live baskets stay immediate.
+LAZY_EVAL_S = 0.1
 # Relationship types whose bundles can pay more than their worst case:
 # complete sets and exact identities pay the same in every outcome.
 UPSIDE_TYPES = ("mutually_exclusive_no", "implication", "mutual_exclusion")
@@ -673,6 +678,8 @@ class ArbsRunner:
         # with that basket's books too.
         self.via: dict[tuple[str, int], str] = {}
         self.via_by_ticker: dict[str, set[str]] = {}
+        self.lazy: set[str] = set()                     # baskets with a deferred book mark (LAZY_EVAL_S)
+        self._live_from: dict[str, float] = {}          # basket_id -> epoch it goes live (inf: never)
         self.completion_note: dict[str, dict] = {}
         # basket_id -> recent (time, exit cost) of a broken basket: the chase
         # reference. Exit cost is what finishing costs from here, net of the
@@ -920,6 +927,7 @@ class ArbsRunner:
         to finish: excluded() stops new quotes and takes on it."""
         new = {b.basket_id: b for b in baskets}
         self.listed = {b.relationship_id for b in baskets}
+        self._live_from = {}
         # Quotes are keyed by leg index, and the scan orders a mecnet's legs by
         # price under an id that doesn't change: a reorder moved one leg's quote
         # to another leg's price (NCX/TIJ 0.34<->0.65, 11-06), so keep the old order.
@@ -1467,11 +1475,47 @@ class ArbsRunner:
                 self.n["print_errors"] = self.n.get("print_errors", 0) + 1
         if self.cfg.trading.pull_drop > 0:
             self._watch_pulls(book)
+        deep = old == top
+        now = time.time() if deep else 0.0
         for bid in self.by_ticker.get(book.ticker, ()):
-            self.mark(bid)
+            self._mark_book(bid, deep, now)
         for bid in self.via_by_ticker.get(book.ticker, ()):
-            self.mark(bid)
+            self._mark_book(bid, deep, now)
         return ev
+
+    def _mark_book(self, bid: str, deep: bool, now: float):
+        """mark() for a book update; deferred up to LAZY_EVAL_S when only
+        levels under the top moved on a basket not live."""
+        if deep and bid not in self.exit_hist and now < self._live_at(bid):
+            if bid not in self.lazy:
+                try:
+                    asyncio.get_running_loop().call_later(LAZY_EVAL_S, self._lazy_mark, bid)
+                except RuntimeError:
+                    self.mark(bid)
+                    return
+                self.lazy.add(bid)
+            self.n["marks_lazy"] = self.n.get("marks_lazy", 0) + 1
+            return
+        self.mark(bid)
+
+    def _lazy_mark(self, bid: str):
+        self.lazy.discard(bid)
+        self.mark(bid)
+
+    def _live_at(self, bid: str) -> float:
+        """Epoch `bid` goes live: 0 if a leg is flagged live, inf if it never does."""
+        t = self._live_from.get(bid)
+        if t is None:
+            b = self.baskets.get(bid)
+            t = float("inf") if b is None or b.live_from is None else b.live_from.timestamp()
+            if len(self._live_from) > 200000:
+                self._live_from.clear()
+            self._live_from[bid] = t
+        if self.flagged and t > 0:
+            b = self.baskets.get(bid)
+            if b is not None and any(x in self.flagged for x in b.tickers):
+                return 0.0
+        return t
 
     def _cross_tops(self, k: str, p: str):
         """Both directions of a cross pair from the two best prices: [(dir,
