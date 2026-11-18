@@ -99,6 +99,11 @@ def _json(resp) -> dict:
 RETRY_5XX = (500, 502, 503, 504)
 
 
+# When this process last saw a 429 from kalshi_get (time.time()): ARBS holds its
+# market count while Kalshi's read limit binds.
+LAST_429_AT = [0.0]
+
+
 def kalshi_get(path: str, params: dict = None, auth: bool = False, max_retries: int = 8) -> dict:
     """GET with built-in 429 backoff -- Kalshi's rate-limit cooldown can
     outlast a few seconds of naive exponential backoff (confirmed directly:
@@ -110,6 +115,8 @@ def kalshi_get(path: str, params: dict = None, auth: bool = False, max_retries: 
         # Signed per attempt: a retry can come a minute after the first try.
         headers = _auth_headers("GET", path) if auth else {"accept": "application/json"}
         resp = _session().get(BASE_URL + path, headers=headers, params=params, timeout=10)
+        if resp.status_code == 429:
+            LAST_429_AT[0] = time.time()
         if resp.status_code == 429 and attempt < max_retries - 1:
             retry_after = resp.headers.get("Retry-After")
             if retry_after is not None:

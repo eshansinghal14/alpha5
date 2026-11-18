@@ -432,7 +432,7 @@ def test_audit_books_settlement_before_striking(arbs):
     async def call(fn, *a):
         return fn(*a)
 
-    def load_meta():
+    def load_meta(*a):
         for t, res in zip(b.tickers, ("yes", "no")):
             r.meta[t].status, r.meta[t].result = "finalized", res
     r.gw.any_client, r.gw.call, r.load_meta = Client, call, load_meta
@@ -3250,3 +3250,26 @@ def test_live_baskets_are_marked_on_every_book_update(arbs, monkeypatch):
         r._on_quote_inner(upd)
         assert live.basket_id in r.dirty and not r.lazy
     asyncio.run(go())
+
+
+def test_scan_markets_do_not_grow_while_kalshi_rate_limits_reads(arbs, monkeypatch):
+    r, b = arbs
+    r.markets, W, r.hot_ready = 4000, R.LOOP_CPU_WINDOW_S, True
+    monkeypatch.setattr(R.kalshi_api, "LAST_429_AT", [time.time()])
+    assert r.scan_markets(0.0, 0.0) == 4000
+    assert r.scan_markets(W, W * 0.2) == 4000                    # 20%: would grow, but reads are limited
+    assert r.scan_markets(2 * W, W * 0.2 + W * 0.95) == 3000     # shrinking still works (-25% at most)
+    R.kalshi_api.LAST_429_AT[0] = time.time() - 2 * W
+    assert r.scan_markets(3 * W, W * 1.35) == 3750               # no recent 429: grows again (+25%)
+
+
+def test_audit_rereads_only_the_markets_that_disagree(arbs, monkeypatch):
+    r, b = arbs
+    seen = []
+    monkeypatch.setattr(R, "kalshi_get", lambda path, params=None, **k: seen.append(params["tickers"]) or {"markets": []})
+    r.load_meta(["X-A"])
+    assert seen == ["X-A"]
+    seen.clear()
+    r.load_meta()
+    assert seen == ["X-A,X-B"]
+

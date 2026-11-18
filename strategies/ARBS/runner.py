@@ -28,12 +28,14 @@ import math
 import os
 import random
 import sys
+import threading
 import time
 import traceback
 import uuid
 
 import pandas as pd
 
+from infra.kalshi import api as kalshi_api
 from infra.kalshi.api import kalshi_get
 from infra.config import ConfigStore, _replace_with_retry, atomic_write_json
 from infra.kalshi import fees as kfees
@@ -631,6 +633,7 @@ class ArbsRunner:
         self._alt_pick: dict[tuple[str, int], tuple[float, str | None]] = {}   # (basket, leg) -> (searched at, via)
         self._near_at: dict[tuple[str, int], float] = {}     # (basket, leg) -> last check for a near quote
         self._held_cache: dict[tuple, tuple] = {}
+        self._meta_lock = threading.Lock()           # one full load_meta at a time
         self._cutoff_at: dict = {}           # (live_from, cutoff minutes) -> cutoff time (past_cutoff)
         self.exit_model: exit_cost.Model | None = None
         self._model_mtime: float | None = None
@@ -1048,10 +1051,19 @@ class ArbsRunner:
 
     # ------------------------------------------------------------------ meta
 
-    def load_meta(self):
-        """Blocking. Market status/result for every leg; shard and fees per event."""
-        self.load_pm_meta([t for t in self.tickers if is_pm(t)])
-        kt = [t for t in self.tickers if not is_pm(t)]
+    def load_meta(self, tickers: list[str] | None = None):
+        """Blocking. Market status/result for every leg, or only `tickers`;
+        shard and fees per event. Full reads take turns: at 55k markets one is
+        550 paced reads, and two at once plus the arm's audit (which re-read
+        every market) held ARBS0C unarmed for 30+ min in 429s (11-18)."""
+        if tickers is not None:
+            return self._load_meta(tickers)
+        with self._meta_lock:
+            return self._load_meta(self.tickers)
+
+    def _load_meta(self, tickers: list[str]):
+        self.load_pm_meta([t for t in tickers if is_pm(t)])
+        kt = [t for t in tickers if not is_pm(t)]
         got: dict[str, dict] = {}
         for i in range(0, len(kt), 100):
             batch = kt[i:i + 100]
@@ -1153,6 +1165,8 @@ class ArbsRunner:
     async def meta_loop(self):
         while True:
             await asyncio.sleep(self.cfg.runtime.meta_refresh_s)
+            if self._meta_lock.locked():
+                continue                              # a full read is already under way
             try:
                 await asyncio.get_running_loop().run_in_executor(self.pool, self.load_meta)
                 self.dirty |= set(self.baskets)
@@ -4279,6 +4293,10 @@ class ArbsRunner:
         self._cpu_mark = (now, cpu_s)
         if abs(self.loop_cpu - LOOP_CPU_TARGET) > LOOP_CPU_BAND:
             f = min(1 + MARKETS_STEP, max(1 - MARKETS_STEP, LOOP_CPU_TARGET / max(self.loop_cpu, 1e-3)))
+            if f > 1 and time.time() - kalshi_api.LAST_429_AT[0] < LOOP_CPU_WINDOW_S:
+                # Kalshi's read limit binds before CPU: grown to 55k markets on a
+                # 63% loop, ARBS0C's meta reads drew 429s and it could not arm (11-18).
+                f = 1.0
             n = round(self.markets * f)
             if f > 1 and self.listed_markets is not None:
                 n = min(n, max(self.markets, self.listed_markets))
@@ -4513,8 +4531,8 @@ class ArbsRunner:
         if diff:
             # Kalshi drops a position the moment it settles; our cached status
             # can still say active until the next meta refresh (FLUINT 00:36,
-            # CRBOT 02:28 on 10-29 both halted us), so re-read it first.
-            await asyncio.get_running_loop().run_in_executor(self.pool, self.load_meta)
+            # CRBOT 02:28 on 10-29 both halted us), so re-read those markets first.
+            await asyncio.get_running_loop().run_in_executor(self.pool, self.load_meta, list(diff))
             self.settle()
             mine = self.real_ledger.net_by_ticker()
             # On a determined or settled market we book the payout when the
