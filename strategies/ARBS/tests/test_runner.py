@@ -3273,3 +3273,18 @@ def test_audit_rereads_only_the_markets_that_disagree(arbs, monkeypatch):
     r.load_meta()
     assert seen == ["X-A,X-B"]
 
+
+def test_a_fill_for_an_unlisted_basket_is_held_aside_for_the_audit_until_booked(arbs):
+    r, b = arbs
+    r.real_ledger.quote_ids["oid-9"] = {"basket_id": "gone:basket", "ticker": "X-A", "side": "yes", "retired_at": None}
+    f = {"order_id": "oid-9", "trade_id": "t1", "ticker": "X-A", "side": "yes", "price": 0.31, "size": 1.0,
+         "fee": 0.0, "liquidity": "maker"}
+    assert r.apply_real_fill(f, "rest")
+    assert r.unbooked_pos == {"oid-9:t1": {"ticker": "X-A", "qty": 1.0}}
+    assert json.load(open(os.path.join(r.root, R.UNBOOKED_POSITIONS))) == r.unbooked_pos
+    r.apply_real_fill(f, "rest")                               # read again: counted once
+    assert len(r.unbooked_pos) == 1
+    r.real_ledger.quote_ids["oid-9"]["basket_id"] = b.basket_id  # the basket is back: booked, no longer aside
+    assert r.apply_real_fill(f, "rest")
+    assert r.unbooked_pos == {} and r.real_ledger.net_by_ticker().get("X-A") == 1.0
+

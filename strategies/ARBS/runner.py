@@ -82,6 +82,10 @@ SETTLE_REREAD_S = 60.0
 # Account positions that aren't ARBS's, {ticker: signed YES}: retired LIPFARM's,
 # written 11-12. The audit takes them off Kalshi's; ARBS still trades those markets.
 FOREIGN_POSITIONS = "foreign_positions.json"
+# Real fills of our quotes on baskets no longer listed, left unbooked: the audit
+# subtracts them like foreign positions. Counted against the ledger, one lot
+# held ARBS0C unarmed with three broken baskets unmanaged (11-18).
+UNBOOKED_POSITIONS = "unbooked_positions.json"
 # Every ARBS process trading on this one Kalshi account. A process's audit
 # takes the others' ledgers off Kalshi's positions: the Polymarket process's
 # cross-exchange legs sit on markets ARBS trades too.
@@ -651,6 +655,8 @@ class ArbsRunner:
         self.cash_at = 0.0
         self._cash_reread_at: float | None = None
         self.foreign = _load_foreign()
+        # "order_id:trade_id" -> {"ticker", "qty": signed YES like Kalshi's positions}
+        self.unbooked_pos: dict[str, dict] = _read_json(os.path.join(self.root, UNBOOKED_POSITIONS)) or {}
         # Set while apply_real_fill books: a real fill goes in the real ledger
         # even when it lands disarmed (a failed arm, a fill racing a disarm).
         self._booking_real = False
@@ -2076,11 +2082,18 @@ class ArbsRunner:
                 self.unbooked.add(key)
                 self.alert("error", info["basket_id"], f"real fill on {info['ticker']} for a basket no longer "
                                                        f"listed; not booked, check by hand")
+            held = f"{oid}:{tid}"
+            if held not in self.unbooked_pos and f.get("cum") is None:
+                n = float(f["size"])
+                self.unbooked_pos[held] = {"ticker": info["ticker"], "qty": n if info["side"] == "yes" else -n}
+                atomic_write_json(os.path.join(self.root, UNBOOKED_POSITIONS), self.unbooked_pos, indent=None)
             return True
         key = f"{oid}:{tid}"
         if key in self.real_ledger.seen_trades:
             return True
         self.real_ledger.seen_trades.add(key)
+        if self.unbooked_pos.pop(key, None) is not None:
+            atomic_write_json(os.path.join(self.root, UNBOOKED_POSITIONS), self.unbooked_pos, indent=None)
         size, cost = float(f["size"]), float(f["price"]) * float(f["size"]) + float(f.get("fee") or 0.0)
         if f.get("cum") is not None:
             # Polymarket: booked up to the order's filled quantity, so a fill read
@@ -4518,6 +4531,8 @@ class ArbsRunner:
             real.update(await self.gw.call(c.positions_all))
         for t, v in self.foreign.items():
             real[t] = real.get(t, 0.0) - v
+        for e in self.unbooked_pos.values():
+            real[e["ticker"]] = real.get(e["ticker"], 0.0) - e["qty"]
         for t, v in (await asyncio.get_running_loop().run_in_executor(self.pool, self.siblings)).items():
             real[t] = real.get(t, 0.0) - v
         mine = self.real_ledger.net_by_ticker()
