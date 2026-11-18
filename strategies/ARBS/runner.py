@@ -3216,12 +3216,14 @@ class ArbsRunner:
         t, reserve, acts = self.cfg.trading, self.cfg.runtime.write_reserve_tokens, []
         near_on = on and not live and t.near_min_size >= 1
         near_reserve = max(reserve, NEAR_RESERVE * self.write_budget() * self.gw.burst_s())
-        # None on the Polymarket process: its config had them off until
-        # deep_quote_size was removed (11-13), and they are untested there.
-        on = on and not self.pm_process
-        on_all = not self.pm_process          # a resting reach quote is judged even off the hot list
+        # On the Polymarket process too since 11-18 (off there before, untested):
+        # it spent 30 of its 100 tokens/s with every quotable basket quoted.
         for j, leg in enumerate(b.legs):
             dq = self.quotes.get((b.basket_id, j, "deep"))
+            if self.pm_process and not is_pm(leg.ticker):
+                if dq is not None:
+                    acts.append(self.cancel_quote(dq, "venue"))
+                continue
             if dq is not None and dq.pending:
                 continue
             if j in pulled:
@@ -3246,7 +3248,7 @@ class ArbsRunner:
                     self._near_at[(b.basket_id, j)] = now
                     plan, size = self.near_plan(b, vs, j, main, need, dq if resting else None)
                     near = plan is not None
-            if REACH_MODE == "on" and on_all and plan is None and (dq is None or dq.reach) and not \
+            if REACH_MODE == "on" and plan is None and (dq is None or dq.reach) and not \
                     (on and j in mains and self.deep_plan(b, vs, j, mains[j], need, 1.0)[0] is not None):
                 # Where the gap rule rests nothing, the reach quote takes the deep slot.
                 quoted = on and j in mains and main is not None and not main.pending
