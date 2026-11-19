@@ -46,6 +46,11 @@ POLICY_SIZE = 5.0
 OUT_DIR = "shadow_check"
 RULE_MARGIN_C = 1.0
 TRAIN_DAYS = 14
+# Live bias: our real live arbs over TRAIN_DAYS, the model's net at the pick
+# less what each made per lot, lot-weighted. Each arb's miss is capped at
+# BIAS_CLIP_C (one 500-lot news sweep was -27c/lot, 11-18), the estimate needs
+# BIAS_MIN_LOTS and is held to 0..BIAS_MAX_C.
+BIAS_CLIP_C, BIAS_MIN_LOTS, BIAS_MAX_C = 20.0, 1500.0, 4.0
 RULE_SIZES = (5.0, 20.0, 50.0, 100.0, 200.0, 500.0)
 
 
@@ -371,13 +376,65 @@ def main():
             write_model(os.path.join(LIVE_ROOT, s), nxt)
 
 
+def live_bias(root: str, before: str) -> tuple[float, float]:
+    """(bias c/lot, lots) of the model's live nets over our real live arbs in
+    the TRAIN_DAYS before `before`, every process of `root`'s venue."""
+    from viz.arbs_pnl import bundle_log
+    end = pd.Timestamp(before, tz="UTC")
+    start = end - pd.Timedelta(days=TRAIN_DAYS)
+    num = lots = 0.0
+    for r in family_roots(root):
+        picks = collections.defaultdict(list)
+        fills = []
+        for d in pd.date_range(start, end - pd.Timedelta(days=1), freq="D"):
+            path = os.path.join(r, "journal", f"{d:%Y-%m-%d}.jsonl")
+            if not os.path.exists(path):
+                continue
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    if '"model_quote"' in line:
+                        x = json.loads(line)
+                        if x.get("live") and not x.get("shadow") and x.get("net_c") is not None:
+                            # The net before the bias then in force, so the estimate isn't of itself.
+                            picks[(x["basket_id"], x["ticker"])].append((x["t"], x["net_c"] + (x.get("bias_c") or 0.0)))
+                    elif '"fill_kind": "quote"' in line:
+                        x = json.loads(line)
+                        if x.get("live"):
+                            fills.append(x)
+        first = {}
+        for x in fills:
+            ps = sorted(picks.get((x["basket_id"], x["ticker"]), ()))
+            i = bisect.bisect_right([p[0] for p in ps], x["t"]) - 1
+            if i >= 0:
+                first.setdefault((x["basket_id"], round(x["t"], 1)), (ps[i][1], float(x["size"])))
+        log = bundle_log(os.path.basename(os.path.normpath(r)), days=TRAIN_DAYS + 2)
+        if not len(log):
+            continue
+        log = log[log.pnl.notna() & (log.time >= start) & (log.time < end)]
+        for bid, t, pnl in zip(log.basket_id, log.time, log.pnl):
+            hit = first.get((bid, round(t.timestamp(), 1)))
+            if hit is None or hit[1] <= 0:
+                continue
+            net, n = hit
+            num += n * max(-BIAS_CLIP_C, min(BIAS_CLIP_C, net - 100.0 * pnl / n))
+            lots += n
+    if lots < BIAS_MIN_LOTS:
+        return 0.0, lots
+    return min(BIAS_MAX_C, max(0.0, num / lots)), lots
+
+
 def write_model(root: str, before: str):
     """The model ARBS processes quote with (exit_cost.MODEL_FILE in `root`),
     fitted on every saved day before `before`."""
     prev, used = training_stats(root, before)
     if not used or not prev.n:
         return                    # nothing in this layout (EXIT bins changed): a fit would be singular
-    m = exit_cost.Model(prev.fit(), prev, sorted(used))
+    try:
+        bias, _ = live_bias(root, before)
+    except Exception as e:                # the weights still ship; the bias waits a night
+        print(f"live bias failed ({e!r}); 0")
+        bias = 0.0
+    m = exit_cost.Model(prev.fit(), prev, sorted(used), bias)
     atomic_write_json(os.path.join(root, exit_cost.MODEL_FILE), m.to_json(), indent=None)
 
 

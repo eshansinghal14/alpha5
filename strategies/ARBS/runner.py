@@ -2551,6 +2551,7 @@ class ArbsRunner:
                           "edge": res[0], "size": res[1], "prev_edge": prev[0], "prev_size": prev[1], "why": why,
                           "value": round(v, 3), "net_c": None if net is None else round(net, 2),
                           "pick": [pe, pn], "live": live, "shadow": shadow,
+                          "bias_c": getattr(m, "live_bias_c", 0.0) if live else 0.0,
                           "fixed": None if fixed is None else round(fixed, 4)})
         st["edge"], st["size"] = res
         self.model_state[key] = st

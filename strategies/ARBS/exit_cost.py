@@ -252,20 +252,24 @@ class Model:
     """The fitted model as the runner uses it: weights plus fill odds and fill
     sizes, written by the daily shadow check (MODEL_FILE)."""
 
-    def __init__(self, w: np.ndarray, stats: Stats, trained_on: list[str]):
-        self.w, self.stats, self.trained_on = w, stats, trained_on
+    def __init__(self, w: np.ndarray, stats: Stats, trained_on: list[str], live_bias_c: float = 0.0):
+        # Taken off every live net: on our own live fills the model's net ran
+        # 1.2-1.7c/lot above what they made (11-14..19) while its training
+        # target matched their real exit cost, so the miss is the prediction's.
+        self.w, self.stats, self.trained_on, self.live_bias_c = w, stats, trained_on, live_bias_c
 
     def to_json(self) -> dict:
         return {"w": [round(float(x), 6) for x in self.w], "width": WIDTH, "trained_on": self.trained_on,
                 "reach": {k: v.tolist() for k, v in self.stats.reach.items()},
-                "vol": {k: v.tolist() for k, v in self.stats.vol.items()}}
+                "vol": {k: v.tolist() for k, v in self.stats.vol.items()},
+                "live_bias_c": round(self.live_bias_c, 3)}
 
     @classmethod
     def from_json(cls, d: dict) -> Model | None:
         if d.get("width") != WIDTH or len(d.get("w") or []) != WIDTH:
             return None
         st = Stats.from_json({"reach": d.get("reach"), "vol": d.get("vol")})
-        return cls(np.array(d["w"]), st, d.get("trained_on") or [])
+        return cls(np.array(d["w"]), st, d.get("trained_on") or [], float(d.get("live_bias_c") or 0.0))
 
     def loss(self, f: dict) -> float:
         return predict(self.w, f)
@@ -275,6 +279,8 @@ class Model:
         lots x net, net c per lot after the predicted exit loss)."""
         edge_c, reach_c = 100 * (f["payout"] - x - f["c0"]), max(0.0, 100 * (f["touch"] - x))
         net = 100 * (f["payout"] - x - f["plan"] - maker_rate * x * (1 - x)) - _predict_at(self.w, f, edge_c, reach_c)
+        if live:
+            net -= self.live_bias_c
         return self.stats.fill_prob(live, reach_c) * self.stats.expected_fill(live, size) * net, net
 
 

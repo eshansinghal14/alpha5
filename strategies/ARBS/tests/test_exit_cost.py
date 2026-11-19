@@ -76,3 +76,16 @@ def test_model_value_matches_predict_at_price_bit_for_bit():
             want = (st.fill_prob(live, g["reach_c"]) * st.expected_fill(live, size) * net, net)
             assert m.value(f, x, live, size, mr) == want
 
+
+def test_live_bias_comes_off_live_nets_only_and_survives_the_model_file():
+    import numpy as np
+    from strategies.ARBS import exit_cost as X
+    st = X.Stats()
+    m = X.Model(np.zeros(X.WIDTH), st, ["ARBS:2026-11-18"], live_bias_c=1.5)
+    f = {name: 1.0 for name in X.BINS}
+    f.update(payout=1.0, c0=0.6, touch=0.3, plan=0.65)
+    (_, live_net), (_, pre_net) = m.value(f, 0.30, True, 20.0), m.value(f, 0.30, False, 20.0)
+    assert pre_net - live_net == 1.5
+    back = X.Model.from_json(m.to_json())
+    assert back.live_bias_c == 1.5 and back.value(f, 0.30, True, 20.0)[1] == live_net
+

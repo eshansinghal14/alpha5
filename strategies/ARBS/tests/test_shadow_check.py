@@ -73,3 +73,33 @@ def test_write_model_skips_days_saved_in_another_layout(tmp_path):
     SC.write_model(str(root), "2026-11-11")
     assert not os.path.exists(root / exit_cost.MODEL_FILE)
 
+
+def test_live_bias_is_the_lot_weighted_miss_of_live_nets_against_real_arbs(tmp_path, monkeypatch):
+    import json
+    import pandas as pd
+    import viz.arbs_pnl as AP
+    from strategies.ARBS import shadow_check as SC
+    root = tmp_path / "ARBS"
+    (root / "journal").mkdir(parents=True)
+    t0 = pd.Timestamp("2026-11-18 12:00", tz="UTC").timestamp()
+    rows = [
+        # live pick: net 3c with a 1c bias in force -> 4c before the bias
+        {"t": t0, "kind": "model_quote", "basket_id": "b1", "ticker": "X-A", "live": True, "shadow": False, "net_c": 3.0, "bias_c": 1.0},
+        {"t": t0 + 5, "kind": "fill", "fill_kind": "quote", "basket_id": "b1", "ticker": "X-A", "size": 100.0, "live": True},
+        {"t": t0, "kind": "model_quote", "basket_id": "b2", "ticker": "X-B", "live": True, "shadow": False, "net_c": 2.0},
+        {"t": t0 + 9, "kind": "fill", "fill_kind": "quote", "basket_id": "b2", "ticker": "X-B", "size": 100.0, "live": True},
+    ]
+    (root / "journal" / "2026-11-18.jsonl").write_text("".join(json.dumps(r) + chr(10) for r in rows))
+    log = pd.DataFrame({"basket_id": ["b1", "b2"],
+                        "time": [pd.Timestamp(t0 + 5, unit="s", tz="UTC"), pd.Timestamp(t0 + 9, unit="s", tz="UTC")],
+                        "pnl": [2.0, -50.0]})                 # 2c/lot; -50c/lot, capped at a 20c miss
+    monkeypatch.setattr(AP, "bundle_log", lambda series, days=2: log if series == "ARBS" else log.iloc[0:0])
+    monkeypatch.setattr(SC, "BIAS_MIN_LOTS", 100.0)
+    monkeypatch.setattr(SC, "BIAS_MAX_C", 100.0)
+    bias, lots = SC.live_bias(str(root), "2026-11-19")
+    assert lots == 200.0 and abs(bias - (100 * (4.0 - 2.0) + 100 * 20.0) / 200) < 1e-9   # 11c
+    monkeypatch.setattr(SC, "BIAS_MAX_C", 4.0)
+    assert SC.live_bias(str(root), "2026-11-19")[0] == 4.0                                # held to the cap
+    monkeypatch.setattr(SC, "BIAS_MIN_LOTS", 1000.0)
+    assert SC.live_bias(str(root), "2026-11-19") == (0.0, 200.0)   # too few lots: no bias
+
