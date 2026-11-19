@@ -3436,3 +3436,26 @@ def test_a_quote_fill_sends_its_completion_before_the_fill_handler_returns(arbs)
         return n
     assert asyncio.run(go()) == 1 and sent[0]
     r.live = False
+
+
+def test_live_quotes_named_in_size_table_rest_at_the_tables_size(arbs):
+    r, b = arbs
+    log = []
+    live = _live_groups(r, b, log)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, live_quote_size=50, live_order_groups=False)
+    book(r, "X-A", [(0.30, 500)], [(0.35, 500)])
+    book(r, "X-B", [(0.40, 500)], [(0.45, 500)])
+
+    class Tab:
+        ok = True
+
+        def size(self, size, live_, dmin, dist, stable):
+            return 5.0 if size > 5 else size
+    r.size_tab = Tab()
+    _eval(r, live)
+    assert r.quotes and all(q.size == 50 for q in r.quotes.values())       # not named: untouched
+    r.quotes.clear()
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, size_table=["*:live"])
+    _eval(r, live)
+    assert r.quotes and all(q.size == 5 for q in r.quotes.values())
+    r.live = False

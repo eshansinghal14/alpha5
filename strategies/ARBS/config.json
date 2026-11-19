@@ -16,6 +16,7 @@
     },
     "live_quote_size": 5,
     "model_series": [],
+    "size_table": [],
     "model_shadow": [],
     "live_take_size": 1,
     "live_order_groups": false,

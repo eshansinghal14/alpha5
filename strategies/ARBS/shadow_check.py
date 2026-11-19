@@ -374,6 +374,14 @@ def main():
     for s in PM_ROOTS:                                   # not quoted with yet: collected for a PM edge/size model
         if os.path.isdir(os.path.join(LIVE_ROOT, s)):
             write_model(os.path.join(LIVE_ROOT, s), nxt)
+    from strategies.ARBS import size_table
+    roots = [os.path.join(LIVE_ROOT, s) for s in SERIES if s not in PM_ROOTS]
+    try:
+        for r in roots:
+            size_table.write_day(r, day)
+        size_table.write_table(roots, os.path.join(LIVE_ROOT, "ARBS"), nxt)
+    except Exception as e:                # the exit model above has shipped; the table waits a night
+        print(f"size table failed ({e!r})")
 
 
 def live_bias(root: str, before: str) -> tuple[float, float]:

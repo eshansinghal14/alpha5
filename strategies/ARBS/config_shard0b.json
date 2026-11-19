@@ -15,6 +15,7 @@
     "late_quote_cutoff_min": null,
     "live_quote_size": null,
     "model_series": null,
+    "size_table": null,
     "model_shadow": null,
     "live_take_size": null,
     "live_order_groups": null,

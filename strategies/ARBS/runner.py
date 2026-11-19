@@ -47,7 +47,7 @@ from infra.trading.engine import MARKET_PAUSE_RETRY_S
 from infra.runtime import disk, handoff as hand
 from infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
 from infra.runtime.persist import LIVE_ROOT, day_dir
-from strategies.ARBS import exit_cost
+from strategies.ARBS import exit_cost, size_table
 from strategies.ARBS import live_params as lparams, parts, pricing, replay, scanner
 from strategies.ARBS.execution import Frozen, Gateway
 from strategies.ARBS import venues
@@ -693,6 +693,9 @@ class ArbsRunner:
         self._cutoff_at: dict = {}           # (live_from, cutoff minutes) -> cutoff time (past_cutoff)
         self.exit_model: exit_cost.Model | None = None
         self._model_mtime: float | None = None
+        self.size_tab: size_table.Table | None = None
+        self._size_mtime: float | None = None
+        self._size_cut: dict[tuple[str, int], tuple[float, float]] = {}   # last table cut journaled per leg
         self.model_state: dict[tuple[str, int], dict] = {}
         self._model_cache: dict[tuple[str, int], tuple[float, tuple]] = {}
         # event -> {id, ticker, tripped_at, resetting, fills, used}: one order
@@ -2599,9 +2602,14 @@ class ArbsRunner:
         return self._model_names(self.cfg.trading.model_shadow, b, live)
 
     def _model_names(self, names, b: Basket, live: bool) -> bool:
+        if self.exit_model is None:
+            return False
+        return self._named(names, b, live)
+
+    def _named(self, names, b: Basket, live: bool) -> bool:
         """`b` named in `names` for its phase: a bare name or * live only,
         NAME:pre / NAME:live / *:pre / *:live that phase."""
-        if not names or self.exit_model is None:
+        if not names:
             return False
         t = b.legs[0].ticker
         m = self.meta.get(t)
@@ -2625,6 +2633,48 @@ class ArbsRunner:
         if model is None:
             self.alert("warn", None, "exit model file doesn't match this code's inputs; model quoting off")
         self.exit_model = model
+
+    def poll_size_table(self):
+        """Reload size_table.TABLE_FILE when the daily shadow check rewrites it."""
+        path = os.path.join(LIVE_ROOT, "ARBS", size_table.TABLE_FILE)
+        try:
+            m = os.path.getmtime(path)
+            if m == self._size_mtime:
+                return
+            with open(path, encoding="utf-8") as fh:
+                tab = size_table.Table(json.load(fh))
+        except (OSError, ValueError):
+            return
+        self._size_mtime = m
+        if not tab.ok:
+            self.alert("warn", None, "size table doesn't match this code's sizes; table sizing off")
+        self.size_tab = tab
+
+    def table_size(self, b: Basket, vs, j: int, price: float, size: float) -> float:
+        """`size` cut to the size table's best for leg j's quote at `price`
+        (size_table.py), from the inputs the table was fitted on."""
+        now, dmin, stable = time.time(), math.inf, True
+        for i, l in enumerate(b.legs):
+            if i == j:
+                continue
+            a = vs[i].asks
+            if not a:
+                return size
+            dmin = min(dmin, sum(q for p, q in a if p <= a[0][0] + size_table.SLACK + _EPS))
+            held = self._held_depth(l.ticker, l.side, now, 0.25)
+            stable = stable and held is not None and held >= 0.8 * a[0][1]
+        dist = None if vs[j].bid is None else 100 * (vs[j].bid - price)
+        cut = self.size_tab.size(size, True, dmin, dist, stable)
+        key = (b.basket_id, j)
+        if cut < size - _EPS and self._size_cut.get(key) != (size, cut):
+            if len(self._size_cut) > 20000:
+                self._size_cut.clear()
+            self._size_cut[key] = (size, cut)
+            self.n["size_table_cuts"] = self.n.get("size_table_cuts", 0) + 1
+            self.journal({"kind": "size_table", "basket_id": b.basket_id, "ticker": b.legs[j].ticker, "from": size,
+                          "to": cut, "price": round(price, 4), "dmin": round(dmin, 1),
+                          "dist_c": None if dist is None else round(dist, 1), "stable": stable})
+        return cut
 
     def model_pick(self, b: Basket, j: int, vs, now_ts: pd.Timestamp, live: bool = True, cap: float = 0.0,
                    shadow: bool = False, fixed: float | None = None):
@@ -2996,6 +3046,13 @@ class ArbsRunner:
                     room = min(room, max(self.aged_room(b, j), q.remaining if q is not None else 0.0))
                 size = pricing.depth_size(vs, j, b.payout, need_j, float(int(room + _EPS))) if room >= 1 else 0.0
                 plan = pricing.quote_leg(vs, j, b.payout, need_j, size) if size >= 1 else None
+                if (live and plan is not None and self.size_tab is not None
+                        and self._named(t.size_table, b, live)):
+                    cut = self.table_size(b, vs, j, plan.price, size)
+                    if cut < size - _EPS:
+                        size = cut
+                        room = min(room, cut)
+                        plan = pricing.quote_leg(vs, j, b.payout, need_j, size)
                 full = size
                 plan, size = self.cover_plan(b, vs, j, plan, size, need_j)
                 if q is not None:
@@ -4668,6 +4725,7 @@ class ArbsRunner:
                     picked |= set(self.pick_hot(bids, budget * self.plan_scale.get(s, 1.0), cost))
                 hot = [bid for bid in quotable if bid in picked]
                 self.poll_model()
+                self.poll_size_table()
                 self.hot_cost = round(sum(cost[bid] for bid in hot), 1)
                 self.hot_cost_by_shard = {str(s): round(sum(cost[b] for b in bids if b in picked), 1)
                                           for s, bids in by_shard.items()}

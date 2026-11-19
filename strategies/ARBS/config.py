@@ -70,6 +70,10 @@ class TradingParams:
                                     "which take their size from the model too; NAME:pre / *:pre is pre-game "
                                     "quotes, which keep quote_size. Widening and shrinking act at once; "
                                     "narrowing and growing wait (MODEL_*_HOLD_S). Empty = off.")
+    size_table: list[str] = param("Same names as model_series: live quotes there are cut to the size the "
+                                  "size table (size_table.json, refitted nightly by the shadow check) values "
+                                  "most at or under their size, from the other legs' depth near their tops "
+                                  "and how far under our leg's touch the quote rests. Empty = off.")
     model_shadow: list[str] = param("Same names as model_series: the model's pick is journaled (model_quote, "
                                     "shadow) beside the config edge, which the quote keeps. For comparing before "
                                     "a group moves to model_series. Empty = off.")
