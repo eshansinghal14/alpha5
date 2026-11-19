@@ -409,3 +409,39 @@ def test_takeover_keeps_quotes_on_markets_still_loading(root):
     sb.hold_until = time.monotonic() - 1.0         # past the hold: pulled as before
     asyncio.run(go())
     assert cancels == ["untradeable"]
+
+
+def test_takeover_is_marked_before_new_markets_load(root):
+    old, b = _runner()
+    _attach(old, Client())
+    old.live = True
+    _books(old)
+    sb, _ = _runner(standby="h1")
+    sc = Client()
+    _attach(sb, sc)
+    _books(sb)
+    sb.set_baskets([])                             # the held basket's markets are new to the standby
+    loads = []
+
+    def slow_meta(tickers=None):
+        loads.append(tickers)
+        time.sleep(1.0)                            # the standby's full load holding _meta_lock
+    sb.load_meta = slow_meta
+
+    async def no_audit():
+        return True
+    sb.audit = no_audit
+
+    async def go():
+        old.evaluate(b)
+        await drain(old)
+        assert await old.hand_off("h1")
+        sc.resting = []
+        t0 = time.monotonic()
+        await sb.take_over("h1")
+        took = time.monotonic() - t0
+        assert hand.has(R.LIVE_ROOT, "ARBS", "h1", "taken") and not loads[1:]
+        await drain(sb)
+        return took
+    assert asyncio.run(go()) < 0.5
+    assert loads and sorted(loads[0]) == ["X-A", "X-B"]

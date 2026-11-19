@@ -5521,13 +5521,11 @@ class ArbsRunner:
             except Exception as e:
                 _log(f"WARN: handoff fill poll failed ({e!r}); fill_poll_loop retries")
             if new:
-                try:
-                    await loop.run_in_executor(self.pool, self.load_meta, new)
-                    shards = {t: self.meta[t].shard for t in new if t in self.meta and self.meta[t].shard is not None}
-                    await loop.run_in_executor(self.pool, self.gw.setup, shards, self.write_cap)
-                except Exception as e:
-                    self.alert("warn", None, f"handoff: meta for {len(new)} new markets failed ({e!r})")
-                self.feed.add(new)
+                # Off the takeover: load_meta waits on _meta_lock, which the standby's
+                # full background load holds, and on shard 0 that outlasted the
+                # parent's TAKEN_TIMEOUT_S (ARBS0C 11-19 15:54, a cold start followed).
+                # The held baskets' quotes are kept meanwhile (holding).
+                self.spawn(self._load_new_markets(new))
             broken = {bid for bid, pos in self.ledger.baskets.items()
                       if bid in self.baskets and pos.unhedged(self.baskets[bid].tickers)}
             self.urgent |= broken
@@ -5543,6 +5541,17 @@ class ArbsRunner:
             hand.mark(LIVE_ROOT, self.S, hid, "taken", secs=round(dt, 3))
             self._hlog(f"{hid}: took over in {dt:.2f}s: live={self.live}, {len(self.quotes)} quotes, "
                        f"{n_buf} buffered events, {len(broken)} broken baskets")
+
+    async def _load_new_markets(self, new: list[str]):
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(self.pool, self.load_meta, new)
+            shards = {t: self.meta[t].shard for t in new if t in self.meta and self.meta[t].shard is not None}
+            await loop.run_in_executor(self.pool, self.gw.setup, shards, self.write_cap)
+        except Exception as e:
+            self.alert("warn", None, f"handoff: meta for {len(new)} new markets failed ({e!r})")
+        self.feed.add(new)
+        self.dirty |= {bid for t in new for bid in self.by_ticker.get(t, ())}
 
     def _reload_files(self):
         """Files the old process kept writing while this one warmed up."""
