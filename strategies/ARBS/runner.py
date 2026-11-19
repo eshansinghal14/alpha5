@@ -5430,25 +5430,35 @@ class ArbsRunner:
         loop = asyncio.get_running_loop()
         self._hlog(f"{hid}: go; finishing exits in flight")
         self.handing = True
-        flush = loop.run_in_executor(self.pool, self._io, self._write_final, self._final_rows())
-        await self._drain(HANDOFF_DRAIN_S)
-        self.gw.frozen = True
-        await self._drain(HANDOFF_SETTLE_S)
-        self._buffering = True
-        await asyncio.wait([flush], timeout=3.0)
-        locked = await loop.run_in_executor(None, self._io_lock.acquire, True, 3.0)
-        if hand.has(LIVE_ROOT, self.S, hid, "abort"):
+        locked = False
+        try:
+            flush = loop.run_in_executor(self.pool, self._io, self._write_final, self._final_rows())
+            await self._drain(HANDOFF_DRAIN_S)
+            self.gw.frozen = True
+            await self._drain(HANDOFF_SETTLE_S)
+            self._buffering = True
+            await asyncio.wait([flush], timeout=3.0)
+            locked = await loop.run_in_executor(None, self._io_lock.acquire, True, 3.0)
+            if hand.has(LIVE_ROOT, self.S, hid, "abort"):
+                self._resume(hid, locked)
+                return False
+            st = self.handoff_state(hid)
+            self.real_ledger.save()
+            self.shadow_ledger.save()
+            self.real_ledger.save_quote_ids(time.time())
+            _write_summary(hand.path(LIVE_ROOT, self.S, hid, "state.json"), st)
+            _write_summary(os.path.join(self.root, WARM_CACHE), st["warm"])
+            hand.mark(LIVE_ROOT, self.S, hid, "handed", quotes=len(st["quotes"]), tasks_left=len(self.tasks))
+        except Exception as e:
+            # Before <hid>.handed nothing is handed over: trade on. Uncaught, this
+            # left ARBSPM frozen with the I/O lock held and 3,288 quotes unmanaged,
+            # deaf to a disarm, until a restart (11-19 17:17 UTC).
+            traceback.print_exc()
+            self.alert("error", None, f"handoff {hid}: hand-over failed ({e!r}); trading on")
             self._resume(hid, locked)
             return False
-        st = self.handoff_state(hid)
-        self.real_ledger.save()
-        self.shadow_ledger.save()
-        self.real_ledger.save_quote_ids(time.time())
-        _write_summary(hand.path(LIVE_ROOT, self.S, hid, "state.json"), st)
-        _write_summary(os.path.join(self.root, WARM_CACHE), st["warm"])
         self.retired = True
         self.real_ledger.readonly = self.shadow_ledger.readonly = True
-        hand.mark(LIVE_ROOT, self.S, hid, "handed", quotes=len(st["quotes"]), tasks_left=len(self.tasks))
         self._hlog(f"{hid}: handed over {len(st['quotes'])} quotes, live={self.live}, after "
                    f"{time.monotonic() - t0:.2f}s ({len(self.tasks)} tasks still in flight); exiting")
         return True
