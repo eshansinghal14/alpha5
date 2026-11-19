@@ -44,12 +44,12 @@ from infra.kalshi.orders import (RealFill, error_code, http_status, is_market_pa
 from infra.kalshi.orders import KEEPALIVE_S, ReadBudgetLow, read_stats, write_budget_tokens_per_s
 from infra.polymarket import limits as pm_limits
 from infra.trading.engine import MARKET_PAUSE_RETRY_S
-from infra.runtime import disk
+from infra.runtime import disk, handoff as hand
 from infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
 from infra.runtime.persist import LIVE_ROOT, day_dir
 from strategies.ARBS import exit_cost
 from strategies.ARBS import live_params as lparams, parts, pricing, replay, scanner
-from strategies.ARBS.execution import Gateway
+from strategies.ARBS.execution import Frozen, Gateway
 from strategies.ARBS import venues
 from strategies.ARBS.venues import PM_SHARD, Feeds, is_pm, venue
 from strategies.ARBS.ledger import Ledger
@@ -98,6 +98,20 @@ BALANCE_BACKOFF_MAX_S = 300.0
 # third of a second of the account's 300/s), waiting up to BALANCE_WAIT_S.
 BALANCE_READ_RESERVE = 100.0
 BALANCE_WAIT_S = 10.0
+# Every market's meta, so a start (cold or standby) needn't wait on the paced
+# full read: ~550 GETs and 2-6 min for shard 0's 55k markets (11-18). Used up
+# to META_CACHE_MAX_AGE_S old; the full read still runs, in the background.
+META_CACHE, META_CACHE_EVERY_S, META_CACHE_MAX_AGE_S = "meta_cache.json", 600.0, 3600.0
+# The hot list and what ranks it, so a start quotes those baskets as soon as
+# their books are in instead of after a 2 min fixed wait.
+WARM_CACHE, WARM_CACHE_EVERY_S, WARM_CACHE_MAX_AGE_S = "warm_cache.json", 30.0, 3600.0
+HOT_READY_S = 120.0
+# Handing over: exits and in-flight orders get this long to finish before the
+# gateway freezes, then this long for what was already sent to answer.
+HANDOFF_DRAIN_S, HANDOFF_SETTLE_S = 3.0, 1.0
+# Pages of resting orders a reconcile reads (1,000 each): every ARBS process's
+# orders on the account come back, ~15k on shard 0 at a pull (11-19).
+RECONCILE_PAGES = 50
 
 
 def _log(msg: str):
@@ -563,8 +577,26 @@ class Meta:
 
 
 class ArbsRunner:
-    def __init__(self, series, *, live_trading: bool):
+    def __init__(self, series, *, live_trading: bool, standby: str | None = None, adopt: str | None = None):
         self.S = series.ticker
+        # Hot handoff (infra/runtime/handoff.py). `standby` is the handoff id
+        # while this process warms up beside the active one: it writes nothing
+        # (writer is False) until it takes over. `retired` once this process
+        # has handed over. `handing` from the go until then.
+        self.standby = standby
+        self.adopt = adopt
+        self.retired = False
+        self.handing = False
+        self._buffering = standby is not None        # private feed events held for the takeover
+        self._buffer: list[tuple] = []
+        self._io_lock = threading.Lock()
+        self._start_wall = time.time()
+        self._exit = os._exit
+        self.adopted: list[Quote] | None = None      # quotes a failed handoff left resting, until the arm
+        self._handled: set[str] = set()              # handoff ids this process has looked at
+        self._handoff_cids: set[str] = set()         # client ids of creates in flight at the hand-over
+        self._meta_task: asyncio.Task | None = None
+        self._loop_tasks: list[asyncio.Task] = []
         # This process's index among shard 0's (parts.py), or None for one that shares nothing.
         self.part_group = parts.group_of(self.S)
         self.part_idx = self.part_group.index(self.S) if self.part_group else None
@@ -578,6 +610,7 @@ class ArbsRunner:
         self.event_meta: dict[str, dict] = _read_json(os.path.join(self.root, EVENT_META)) or {}
         self.real_ledger = Ledger(os.path.join(self.root, "ledger.json"))
         self.shadow_ledger = Ledger(os.path.join(self.root, "ledger_shadow.json"))
+        self.real_ledger.readonly = self.shadow_ledger.readonly = standby is not None
         self.alerts: list[dict] = []
         self.live = False
         self.journal_dir = os.path.join(self.root, "journal")
@@ -625,6 +658,7 @@ class ArbsRunner:
         # log: sharing it, a quote's send -> answer was p99 105 ms (2026-10-30).
         self.write_pool = concurrent.futures.ThreadPoolExecutor(max_workers=16, thread_name_prefix="arbs-write")
         self.gw = Gateway(self.pool, self.write_pool)
+        self.gw.frozen = standby is not None
         self.feed = Feeds(self.tickers, self._on_quote, self._on_trade, label=self.S, on_fill=self._on_fill,
                           on_gone=self._on_gone, on_error=lambda m: self.alert("warn", None, m),
                           on_replace=self._on_replace)
@@ -761,6 +795,9 @@ class ArbsRunner:
         # Misses count only from 2 min after a start, once the hot list has
         # filled: until then every print looks like one (10-29 restarts, 9-92 s in).
         self.hot_ready = False
+        self.seeded: list[str] = []                # hot list from warm_cache.json, kept until hot_ready
+        self._warm_saved = (0.0, None)             # (when, what) warm_cache.json last got
+        self._meta_saved = 0.0
         self.rank_at: dict[str, float] = {}       # basket_id -> monotonic time its rank row was last priced
         self.spend: dict[str, _Rate] = {}         # basket_id -> write tokens/s its quotes spent
         self.top_moves: dict[str, _Rate] = {}     # ticker -> best bid/ask changes per second
@@ -791,6 +828,24 @@ class ArbsRunner:
         self.order_times: list[dict] = []
 
     # ------------------------------------------------------------------ util
+
+    @property
+    def writer(self) -> bool:
+        """This process owns the series' files: not a standby, not handed over."""
+        return self.standby is None and not self.retired
+
+    def _io(self, fn, *a):
+        """A file write from a pool thread, skipped unless writer. Under
+        _io_lock, which a handover takes before it exits, so no gzip append
+        is cut off half-written in a file the new process goes on appending to."""
+        if not self.writer:
+            return None
+        with self._io_lock:
+            if self.writer:
+                return fn(*a)
+
+    def _hlog(self, msg: str):
+        print(f"[{self.S}] handoff: {msg}", flush=True)
 
     @property
     def dirty(self) -> _Dirty:
@@ -848,6 +903,8 @@ class ArbsRunner:
     def journal(self, row: dict):
         """Called inside fill and order handling, so it never raises: a row
         the disk can't take is dropped and counted (journal_dropped)."""
+        if not self.writer:
+            return
         if not disk.recording_ok():
             self.n["journal_dropped"] = self.n.get("journal_dropped", 0) + 1
             return
@@ -914,7 +971,7 @@ class ArbsRunner:
 
     def _order_err(self, basket_id, what, exc, ticker: str):
         st, code = http_status(exc), error_code(exc)
-        if st == 429:
+        if st == 429 or isinstance(exc, Frozen):
             return
         if any(m in str(exc) for m in PM_LATENCY_REJECTS):
             # Polymarket's 5 s processing stopgap: a transient reject, not an error (docs, rate limits).
@@ -950,6 +1007,7 @@ class ArbsRunner:
         or task (completion, settlement and cancels look it up by id), only
         to finish: excluded() stops new quotes and takes on it."""
         new = {b.basket_id: b for b in baskets}
+        self.listed_baskets = list(baskets)
         self.listed = {b.relationship_id for b in baskets}
         self._live_from = {}
         # Quotes are keyed by leg index, and the scan orders a mecnet's legs by
@@ -963,7 +1021,8 @@ class ArbsRunner:
         # a fill racing a cancel books after the quote is gone (KeyError, ALGQSC 10-30).
         keep = set(self.real_ledger.baskets) | set(self.shadow_ledger.baskets) | self.busy | \
             {q.basket_id for q in self.quotes.values()} | \
-            {v["basket_id"] for v in self.real_ledger.quote_ids.values()}
+            {v["basket_id"] for v in self.real_ledger.quote_ids.values()} | \
+            {q.basket_id for q in self.adopted or ()}
         for bid in keep:
             if bid in new:
                 continue
@@ -1040,8 +1099,8 @@ class ArbsRunner:
                 rows = self.liq.flush(time.monotonic(), time.time())
                 orders, self.order_times = self.order_times, []
                 day = f"{_utc():%Y-%m-%d}"
-                await loop.run_in_executor(self.pool, self.liq.write, rows, day)
-                await loop.run_in_executor(self.pool, self.liq.write, orders, f"orders_{day}")
+                await loop.run_in_executor(self.pool, self._io, self.liq.write, rows, day)
+                await loop.run_in_executor(self.pool, self._io, self.liq.write, orders, f"orders_{day}")
             except Exception as e:
                 _log(f"WARN: liquidity log failed ({e!r})")
 
@@ -1144,7 +1203,7 @@ class ArbsRunner:
         if fetched:
             now = time.time()
             self.event_meta = {e: c for e, c in self.event_meta.items() if now - c.get("at", 0.0) < EVENT_META_TTL_S}
-            atomic_write_json(os.path.join(self.root, EVENT_META), self.event_meta, indent=None)
+            self._io(atomic_write_json, os.path.join(self.root, EVENT_META), self.event_meta, None)
         if ((self.cfg.runtime.live_params_shadow or self.cfg.trading.late_quote_cutoff_min)
                 and time.time() - self.series_group_at >= SERIES_GROUPS_S):
             try:
@@ -1192,6 +1251,7 @@ class ArbsRunner:
                 await asyncio.get_running_loop().run_in_executor(self.pool, self.load_meta)
                 self.dirty |= set(self.baskets)
                 self.settle()
+                self._save_meta_later()
             except Exception as e:
                 _log(f"WARN: meta refresh failed ({e!r})")
 
@@ -1862,25 +1922,25 @@ class ArbsRunner:
                         self.journal({"kind": "live_params", **self.lp_view, "size_mults": mults})
                         # lp is only touched by the one _shadow_live call at a time, awaited above.
                         edges = await loop.run_in_executor(self.pool, self.lp.state)
-                        await loop.run_in_executor(self.write_pool, self._save_lp_state, edges, self.lsizer.state())
+                        await loop.run_in_executor(self.write_pool, self._io, self._save_lp_state, edges, self.lsizer.state())
                 # The no-fill base rate: one resting quote's basket per flush.
                 resting = [q for q in self.quotes.values() if not q.pending and q.remaining > 0]
                 if resting and self.cfg.runtime.record_prints:
                     self._log_quote_context("control", random.choice(resting))
                 day = f"{_utc():%Y-%m-%d}"
-                await loop.run_in_executor(self.pool, self.prints.write, rows, day)
-                await loop.run_in_executor(self.pool, self.top_hist.write, self.top_hist.take(time.time()), day)
-                await loop.run_in_executor(self.write_pool, self.event_spend.write, self.event_spend.snapshot())
+                await loop.run_in_executor(self.pool, self._io, self.prints.write, rows, day)
+                await loop.run_in_executor(self.pool, self._io, self.top_hist.write, self.top_hist.take(time.time()), day)
+                await loop.run_in_executor(self.write_pool, self._io, self.event_spend.write, self.event_spend.snapshot())
                 if self.event_msgs is not None:
                     counts, self._msg_n = self._msg_n, {}
                     for ev, n in counts.items():
                         self.event_msgs.add(ev, float(n))
-                    await loop.run_in_executor(self.write_pool, self.event_msgs.write, self.event_msgs.snapshot())
+                    await loop.run_in_executor(self.write_pool, self._io, self.event_msgs.write, self.event_msgs.snapshot())
                 if self.event_cpu is not None:
                     secs, self._cpu_s = self._cpu_s, {}
                     for ev, s in secs.items():
                         self.event_cpu.add(ev, s)
-                    await loop.run_in_executor(self.write_pool, self.event_cpu.write, self.event_cpu.snapshot())
+                    await loop.run_in_executor(self.write_pool, self._io, self.event_cpu.write, self.event_cpu.snapshot())
             except Exception as e:
                 _log(f"WARN: print log failed ({e!r})")
 
@@ -2087,6 +2147,10 @@ class ArbsRunner:
             self.real_ledger.quote_ids[q.exchange_id]["retired_at"] = time.time()
             self.real_ledger.note_quote_id(q.exchange_id)
 
+    def _save_unbooked(self):
+        if self.writer:
+            atomic_write_json(os.path.join(self.root, UNBOOKED_POSITIONS), self.unbooked_pos, indent=None)
+
     def apply_real_fill(self, f: dict, source: str) -> bool:
         """A Kalshi fill dict (ws or REST). Booked only if it is one of our
         quotes and not seen before. False if its order id is unknown yet."""
@@ -2106,14 +2170,14 @@ class ArbsRunner:
             if held not in self.unbooked_pos and f.get("cum") is None:
                 n = float(f["size"])
                 self.unbooked_pos[held] = {"ticker": info["ticker"], "qty": n if info["side"] == "yes" else -n}
-                atomic_write_json(os.path.join(self.root, UNBOOKED_POSITIONS), self.unbooked_pos, indent=None)
+                self._save_unbooked()
             return True
         key = f"{oid}:{tid}"
         if key in self.real_ledger.seen_trades:
             return True
         self.real_ledger.seen_trades.add(key)
         if self.unbooked_pos.pop(key, None) is not None:
-            atomic_write_json(os.path.join(self.root, UNBOOKED_POSITIONS), self.unbooked_pos, indent=None)
+            self._save_unbooked()
         size, cost = float(f["size"]), float(f["price"]) * float(f["size"]) + float(f.get("fee") or 0.0)
         if f.get("cum") is not None:
             # Polymarket: booked up to the order's filled quantity, so a fill read
@@ -2147,6 +2211,9 @@ class ArbsRunner:
         return True
 
     def _on_fill(self, f: dict):
+        if self._buffering:
+            self._buffer.append(("fill", (f,)))
+            return
         if f.get("liquidity") != "maker":
             return
         # Booked armed or not: a fill of one of our real orders is real money.
@@ -2157,6 +2224,9 @@ class ArbsRunner:
     def _on_replace(self, oid: str, price: float):
         """A Polymarket modify took effect: its quote's move is confirmed, or
         kept for move_quote when it beat the modify's answer."""
+        if self._buffering:
+            self._buffer.append(("replace", (oid, price)))
+            return
         for q in [q for q in self.quotes.values() if q.exchange_id == oid]:
             if q.pm_from is not None and abs(q.price - price) <= _EPS:
                 q.pm_from = None
@@ -2181,6 +2251,9 @@ class ArbsRunner:
         rejected, an order no longer funded after a fill. Its filled quantity
         then is final: books any fill the websocket missed, and reconcile
         need not read the order again."""
+        if self._buffering:
+            self._buffer.append(("gone", (oid, why, reason, cum, avg)))
+            return
         info = self.real_ledger.quote_ids.get(oid)
         if info is not None:
             self._pm_final(oid, info, cum, avg, "ws_gone")
@@ -2206,22 +2279,24 @@ class ArbsRunner:
     async def fill_poll_loop(self):
         while True:
             await asyncio.sleep(self.cfg.runtime.fill_poll_s)
-            if self.live:
+            if self.live and not self.handing:
                 try:
                     await self.poll_fills()
                 except Exception as e:
                     _log(f"WARN: fill poll failed ({e!r})")
 
-    async def poll_fills(self):
+    async def poll_fills(self, since: float | None = None):
+        """`since` reads back at least to then (a takeover: just before the
+        old process stopped booking)."""
         pm = self.gw.clients.get(PM_SHARD)
         if pm is not None:
             await self.reconcile_pm(pm)
         c = self.gw.kalshi_client()
         if c is None:
             return
-        since = self.real_ledger.last_fill_ts or (time.time() - 3600)
-        fills = await self.gw.call(c.fills, "", min_ts=int(since) - 5)
-        newest = since
+        last = self.real_ledger.last_fill_ts or (time.time() - 3600)
+        fills = await self.gw.call(c.fills, "", min_ts=int(last if since is None else min(last, since)) - 5)
+        newest = last
         for f in fills:
             if f.get("liquidity") == "maker":
                 self.apply_real_fill(f, "rest")
@@ -2681,13 +2756,20 @@ class ArbsRunner:
         pos = self.ledger.baskets.get(b.basket_id)
         qs = self.basket_quotes(b.basket_id)
         live_qs = [q for q in qs if not q.pending]
-        if pos is not None and pos.unhedged(b.tickers):
-            self.resolve(b, pos, qs, now)
+        broken = pos is not None and pos.unhedged(b.tickers)
+        if self.handing:
+            # Handing over: only exits already under way finish (hand_off).
+            if broken and not self.gw.frozen:
+                self.resolve(b, pos, qs, now)
             return
-        self.end_exit(b.basket_id)
-        if any(q.kind != "arb" for q in live_qs):
-            self.spawn(self.cancel_quotes([q for q in live_qs if q.kind != "arb"], "whole"), b.basket_id)
-            return
+        if self.standby is None:
+            if broken:
+                self.resolve(b, pos, qs, now)
+                return
+            self.end_exit(b.basket_id)
+            if any(q.kind != "arb" for q in live_qs):
+                self.spawn(self.cancel_quotes([q for q in live_qs if q.kind != "arb"], "whole"), b.basket_id)
+                return
         # Excluded first: its views were built on every book tick only to be
         # thrown away (record_only, another process's shard, past the horizon).
         excl = self.excluded(b)
@@ -2699,6 +2781,8 @@ class ArbsRunner:
         if vs is None or now - self.rank_at.get(b.basket_id, 0.0) >= self.cfg.watch.rank_interval_s:
             self.rank_at[b.basket_id] = now
             self.rank_row(b, vs)
+        if self.standby is not None:
+            return                      # a standby only ranks
         blocked = self.blocked()
         # With both venues, a feed drop stops only the baskets trading on it:
         # a Kalshi websocket drop pulled every Polymarket quote (11-16).
@@ -4306,7 +4390,7 @@ class ArbsRunner:
                 data = (json.dumps(line) + "\n").encode()
             with gzip.open(path, "ab") as fh:
                 fh.write(data)
-        asyncio.get_running_loop().run_in_executor(self.pool, write)
+        asyncio.get_running_loop().run_in_executor(self.pool, self._io, write)
 
     def write_budget(self) -> float:
         cap = self.write_cap()
@@ -4388,7 +4472,7 @@ class ArbsRunner:
             dt = now - self._scale_at.get(s, now)
             self._scale_at[s] = now
             self.plan_scale[s] = cur + (want - cur) * min(1.0, dt / SPEND_WINDOW_S)
-        if self.spend_tps and now - self._spend_written_at >= WRITE_SPEND_EVERY_S:
+        if self.writer and self.spend_tps and now - self._spend_written_at >= WRITE_SPEND_EVERY_S:
             self._spend_written_at = now
             plans = [int(k) for k, v in self.hot_cost_by_shard.items() if v > 0 and k.lstrip("-").isdigit()]
             atomic_write_json(os.path.join(self.root, WRITE_SPEND), {
@@ -4472,11 +4556,13 @@ class ArbsRunner:
                 self.hot_cost = round(sum(cost[bid] for bid in hot), 1)
                 self.hot_cost_by_shard = {str(s): round(sum(cost[b] for b in bids if b in picked), 1)
                                           for s, bids in by_shard.items()}
-                if _utc() - self.started > pd.Timedelta(minutes=2):
-                    self.hot_ready = True
+                self.check_hot_ready()
                 self.update_plan_scale(time.time())
-                self.rank_dump(rows, quotable, picked, now)
+                if self.writer:
+                    self.rank_dump(rows, quotable, picked, now)
                 self.expire_reach(now)
+                if self.seeded and not self.hot_ready:
+                    hot = self.hot             # the cached list until its books are in
                 if hot != self.hot:
                     entered, left = set(hot) - self.hot_set, self.hot_set - set(hot)
                     if self.hot_ready and (entered or left):
@@ -4485,7 +4571,9 @@ class ArbsRunner:
                     self.hot = hot
                 while self.hot_churn and self.hot_churn[0][0] < time.time() - 3600:
                     self.hot_churn.popleft()
-                self.tidy_groups()
+                if self.writer and not self.handing:
+                    self.tidy_groups()
+                    self.save_warm()
             except Exception:
                 traceback.print_exc()
             await asyncio.sleep(self.cfg.watch.rank_interval_s)
@@ -4550,6 +4638,8 @@ class ArbsRunner:
     async def guard_loop(self):
         while True:
             await asyncio.sleep(1.0)
+            if self.handing:
+                continue
             down = self.feed.down_venues(self.cfg.runtime.feed_down_pull_s, time.monotonic())
             if down and any(venue(q.ticker) in down for q in self.quotes.values()):
                 self.alert("warn", None, f"{', '.join(sorted(down))} websocket down; pulling its quotes")
@@ -4558,7 +4648,7 @@ class ArbsRunner:
     async def audit_loop(self):
         while True:
             await asyncio.sleep(self.cfg.runtime.audit_s)
-            if self.live:
+            if self.live and not self.handing:
                 try:
                     await self.audit()
                 except Exception as e:
@@ -4633,6 +4723,8 @@ class ArbsRunner:
     # ------------------------------------------------------------------ settlement
 
     def settle(self):
+        if not self.writer:
+            return
         for led in (self.real_ledger, self.shadow_ledger):
             for bid, pos in list(led.baskets.items()):
                 legs = pos.legs
@@ -4682,23 +4774,45 @@ class ArbsRunner:
         # Live only once the checks pass: while live, the quoter places real
         # orders, and a failed arm left them resting untracked (594 on 11-15
         # after ten failed arms).
+        adopted = None
         try:
             await self.poll_fills()
-            await self.sweep("arm")
+            if self.adopted is not None:
+                # The quotes a failed handoff left resting stay, if still resting;
+                # everything else of ours on our markets goes, as the sweep would.
+                resting = await self.reconcile_resting(self.adopted, strict=False)
+                adopted = [q for q in self.adopted if resting is None or q.exchange_id in resting]
+            else:
+                await self.sweep("arm")
             await self.poll_fills()
             ok = await self.audit()
         except Exception as e:
             self.alert("error", None, f"arm failed ({e!r})")
+            await self._drop_adopted(adopted)
             return False
         if not ok:
+            await self._drop_adopted(adopted)
             self.alert("error", None, f"arm refused: ledger disagrees with Kalshi {self.audit_diff}")
             return False
         self.quotes.clear()               # shadow quotes placed while the checks ran
+        if adopted is not None:
+            for q in adopted:
+                self.quotes[q.key] = q
+                self.mark(q.basket_id)
+            self.adopted = None
+            self._hlog(f"armed with {len(adopted)} adopted quotes still resting")
         self.live = True
         self.order_errors = 0
         self.dirty |= set(self.baskets)
         self.alert("info", None, f"REAL TRADING ON (balances {bal})")
         return True
+
+    async def _drop_adopted(self, survived: list[Quote] | None):
+        """A refused arm leaves nothing untracked resting: the adopted quotes
+        are cancelled, and the next arm sweeps as usual."""
+        for q in (self.adopted or []) if survived is None else survived:
+            await self.gw.cancel(q.ticker, q.exchange_id, "adopt_refused")
+        self.adopted = None
 
     async def disarm(self, reason: str):
         try:
@@ -4719,6 +4833,8 @@ class ArbsRunner:
         retry_at = 0.0
         while True:
             await asyncio.sleep(self.cfg.runtime.control_poll_s)
+            if self.handing:
+                continue
             for c in self.store.poll():
                 _log(f"config: {c}")
                 self.dirty |= set(self.baskets)
@@ -4885,11 +5001,48 @@ class ArbsRunner:
             except Exception:
                 traceback.print_exc()
 
-    # ------------------------------------------------------------------ main
+    # ------------------------------------------------------------------ warm start
 
-    async def run(self, stop_requested: bool = False):
+    def save_meta_cache(self):
+        """Blocking. Every market's meta for the next start (META_CACHE)."""
+        rows = {t: [m.event, m.status, m.result, m.value, m.series, m.shard, m.taker_rate, m.maker_rate,
+                    None if m.ticks == pricing.CENT else [list(r) for r in m.ticks.ranges]]
+                for t, m in list(self.meta.items()) if m.status != "missing"}
+        _write_summary(os.path.join(self.root, META_CACHE), {"at": time.time(), "meta": rows})
+
+    def load_meta_cache(self) -> bool:
+        """Meta for this process's markets from META_CACHE, if it is fresh;
+        False when there is none to use."""
+        d = _read_json(os.path.join(self.root, META_CACHE))
+        if not d or time.time() - d.get("at", 0.0) > META_CACHE_MAX_AGE_S:
+            return False
+        rows, ticks = d.get("meta") or {}, {}
+        for t in self.tickers:
+            r = rows.get(t)
+            if r is None:
+                continue
+            ev, st, res, val, ser, sh, tr, mr, rg = r
+            tk = pricing.CENT
+            if rg:
+                key = tuple(tuple(x) for x in rg)
+                tk = ticks.get(key) or ticks.setdefault(key, pricing.Ticks(key))
+            self.meta[t] = Meta(ticker=t, event=ev, status=st, result=res, value=val, series=ser, shard=sh,
+                                taker_rate=tr, maker_rate=mr, ticks=tk)
+        return True
+
+    async def _meta_at_start(self):
         loop = asyncio.get_running_loop()
-        _log(f"{len(self.all_baskets)} baskets over {len(self.tickers)} markets")
+        if self.load_meta_cache():
+            missing = [t for t in self.tickers if t not in self.meta]
+            _log(f"{self.S}: meta for {len(self.tickers) - len(missing)} markets from {META_CACHE}; "
+                 f"reading {len(missing)} now, the rest in the background")
+            if missing:
+                try:
+                    await loop.run_in_executor(self.pool, self.load_meta, missing)
+                except Exception as e:
+                    _log(f"WARN: market load failed ({e!r}); the background read retries them")
+            self._meta_task = loop.create_task(self._meta_refresh())
+            return
         for attempt in range(10):
             try:
                 await loop.run_in_executor(self.pool, self.load_meta)
@@ -4901,6 +5054,465 @@ class ArbsRunner:
                     raise
                 _log(f"WARN: market load failed ({e!r}); retrying in 30s")
                 await asyncio.sleep(30.0)
+        self._save_meta_later()
+
+    async def _meta_refresh(self):
+        try:
+            await asyncio.get_running_loop().run_in_executor(self.pool, self.load_meta)
+        except Exception as e:
+            _log(f"WARN: background market load failed ({e!r}); meta_loop retries")
+            return
+        self.dirty |= set(self.baskets)
+        self.settle()
+        self._save_meta_later()
+        _log(f"{self.S}: background market load done")
+
+    def _save_meta_later(self, force: bool = False):
+        if self.writer and (force or time.time() - self._meta_saved >= META_CACHE_EVERY_S):
+            self._meta_saved = time.time()
+            asyncio.get_running_loop().run_in_executor(self.pool, self._io, self.save_meta_cache)
+
+    def warm_state(self) -> dict:
+        """What ranking needs to quote at once after a start: the hot list,
+        baskets with quotes resting, plan scales and per-basket write spend."""
+        now = time.time()
+        return {"at": now, "hot": list(self.hot), "quoted": list(self.quotes.n_by_basket),
+                "plan_scale": {str(s): v for s, v in self.plan_scale.items()},
+                "spend": {b: [r.v, r.t] for b, r in self.spend.items()
+                          if r.t is not None and now - r.t < 2 * WRITE_COST_TAU_S},
+                "spend_first": dict(self.spend_first)}
+
+    def save_warm(self, force: bool = False):
+        """WARM_CACHE when the hot list or quoted baskets changed, at most
+        every WARM_CACHE_EVERY_S."""
+        now = time.time()
+        key = (tuple(self.hot), frozenset(self.quotes.n_by_basket))
+        if not force and (key == self._warm_saved[1] or now - self._warm_saved[0] < WARM_CACHE_EVERY_S):
+            return
+        self._warm_saved = (now, key)
+        asyncio.get_running_loop().run_in_executor(self.pool, self._io, _write_summary,
+                                                    os.path.join(self.root, WARM_CACHE), self.warm_state())
+
+    def seed_warm(self):
+        """The last process's hot list (WARM_CACHE), if fresh: quoted as soon
+        as its books are in (check_hot_ready)."""
+        d = _read_json(os.path.join(self.root, WARM_CACHE))
+        if d and time.time() - d.get("at", 0.0) <= WARM_CACHE_MAX_AGE_S:
+            self.restore_warm(d)
+            _log(f"{self.S}: warm start, {len(self.seeded)} hot baskets from {WARM_CACHE}")
+
+    def restore_warm(self, d: dict):
+        ids = dict.fromkeys([*(d.get("hot") or []), *(d.get("quoted") or [])])
+        self.hot = self.seeded = [b for b in ids if b in self.baskets]
+        for s, v in (d.get("plan_scale") or {}).items():
+            self.plan_scale[int(s)] = min(PLAN_SCALE_MAX, max(PLAN_SCALE_MIN, float(v)))
+        for b, (v, t) in (d.get("spend") or {}).items():
+            r = self.spend[b] = _Rate()
+            r.v, r.t = v, t
+        self.spend_first.update(d.get("spend_first") or {})
+        self.dirty |= set(self.seeded)
+
+    def check_hot_ready(self):
+        """hot_ready HOT_READY_S after the start, or once every seeded basket
+        that can trade has its books (at least one must)."""
+        if self.hot_ready:
+            return
+        if (_utc() - self.started).total_seconds() > HOT_READY_S:
+            self.hot_ready = True
+            return
+        n = 0
+        for bid in self.seeded:
+            b = self.baskets.get(bid)
+            if b is None or self.excluded(b) or not self.tradeable(b):
+                continue
+            if self.views(b) is None:
+                return
+            n += 1
+        self.hot_ready = n > 0
+
+    # ------------------------------------------------------------------ handoff
+
+    def handoff_state(self, hid: str) -> dict:
+        """Everything the standby needs to manage what rests now (handoff.py)."""
+        qs = list(self.quotes.values())
+        bids = {q.basket_id for q in qs} | set(self.exit_hist) | set(self.completion_note)
+        return {
+            "id": hid, "at": time.time(), "series": self.S, "pid": os.getpid(),
+            "live": self.live, "arm_want": self.arm_want, "halt": self.halt, "audit_strikes": self.audit_strikes,
+            "cash": {"base": {str(s): v for s, v in self.cash_base.items()}, "at": self.cash_at,
+                     "read_total": self._cash_read_total, "pos_read": self._pos_read,
+                     "reread_at": self._cash_reread_at},
+            "quotes": [dataclasses.asdict(q) for q in qs],
+            "baskets": {b: basket_to_dict(self.baskets[b]) for b in bids if b in self.baskets},
+            "exit": {"hist": {b: [list(x) for x in h] for b, h in self.exit_hist.items()},
+                     "planned": self.exit_planned, "base": self.exit_base, "misses": self.exit_misses,
+                     "notes": self.completion_note},
+            "groups": {ev: {**g, "fills": [list(x) for x in g["fills"]]} for ev, g in self.groups.items()},
+            "flagged": self.flagged,
+            "model_state": [[k[0], k[1], k[2], v] for k, v in self.model_state.items()],
+            "alerts": self.alerts[-100:],
+            "orphans": [f for _, f in self.orphans],
+            "warm": self.warm_state(),
+        }
+
+    @staticmethod
+    def quotes_of(st: dict) -> list[Quote]:
+        out = []
+        for d in st.get("quotes") or []:
+            d = dict(d)
+            if d.get("pm_from") is not None:
+                d["pm_from"] = tuple(d["pm_from"])
+            out.append(Quote(**d))
+        return out
+
+    def _restore_baskets(self, st: dict):
+        """Baskets the state's quotes and exits are on, even ones the scan this
+        process read no longer lists; set_baskets keeps them while held."""
+        for bid, d in (st.get("baskets") or {}).items():
+            if bid not in self.baskets:
+                self.baskets[bid] = basket_from_dict(d)
+
+    def restore(self, st: dict) -> list[str]:
+        """Takes on handoff_state's state; returns tickers new to this process.
+        A quote whose create was still in flight is left out: its client id
+        goes to reconcile_resting, which cancels the order if it rests."""
+        self._restore_baskets(st)
+        self.quotes.clear()
+        qs = self.quotes_of(st)
+        for q in qs:
+            if not q.pending:
+                self.quotes[q.key] = q
+        self._handoff_cids = {q.cid for q in qs if q.pending}
+        new = self.set_baskets(self.listed_baskets)
+        self.live, self.arm_want, self.halt = st["live"], st["arm_want"], st["halt"]
+        self.audit_strikes = st.get("audit_strikes", 0)
+        c = st["cash"]
+        self.cash_base = {int(s): v for s, v in c["base"].items()}
+        self.cash_at, self._cash_read_total, self._pos_read = c["at"], c["read_total"], c["pos_read"]
+        self._cash_reread_at = c["reread_at"]
+        ex = st["exit"]
+        self.exit_hist = {b: collections.deque(tuple(x) for x in h) for b, h in ex["hist"].items()}
+        self.exit_planned, self.exit_base = dict(ex["planned"]), {b: list(v) for b, v in ex["base"].items()}
+        self.exit_misses, self.completion_note = dict(ex["misses"]), dict(ex["notes"])
+        self.groups = {ev: {**g, "fills": collections.deque(tuple(x) for x in g["fills"])}
+                       for ev, g in st["groups"].items()}
+        self._group_ev = {g["id"]: ev for ev, g in self.groups.items() if g["id"]}
+        self.flagged = dict(st["flagged"])
+        self.model_state = {(b, j, live): v for b, j, live, v in st["model_state"]}
+        self.alerts = (st.get("alerts") or []) + self.alerts
+        self._buffer[:0] = [("fill", (f,)) for f in st.get("orphans") or []]
+        self.restore_warm(st["warm"])
+        loop = asyncio.get_running_loop()
+        for q in self.quotes.values():
+            if q.pm_from is not None:
+                loop.call_later(PM_MODIFY_ECHO_S, self._pm_unconfirmed, q, q.pm_from[1])
+        return new
+
+    def load_adopt(self, hid: str):
+        """Cold start after a handoff that failed once the old process had
+        handed over: its quotes may still rest. Adopted at the arm, if they do."""
+        st = hand.read_json(hand.path(LIVE_ROOT, self.S, hid, "state.json"))
+        if not st or not hand.has(LIVE_ROOT, self.S, hid, "handed") or \
+                time.time() - st.get("at", 0.0) > WARM_CACHE_MAX_AGE_S:
+            self._hlog(f"{hid}: no handed-over state to adopt; a normal cold start")
+            return
+        self._restore_baskets(st)
+        self.adopted = [q for q in self.quotes_of(st) if q.exchange_id and not q.pending]
+        self.set_baskets(self.listed_baskets)
+        self._hlog(f"{hid}: adopting {len(self.adopted)} quotes the old process left resting "
+                   f"(checked against the exchange at the arm)")
+
+    async def reconcile_resting(self, quotes: list[Quote], strict: bool, cids=frozenset()) -> set[str] | None:
+        """Our resting orders against the quote table plus `quotes`. An order
+        of ours that neither holds is cancelled: strict (a takeover), only one
+        ours by order id (quote_ids) or by a create the old process had in
+        flight (`cids`), as other ARBS processes may rest on a market we hold;
+        otherwise anything on our markets, as the arm's sweep does. Returns
+        the exchange ids still resting, or None if a listing was cut short."""
+        resting, complete = set(), True
+        ours = set(self.tickers)
+        loop = asyncio.get_running_loop()
+        for c in self.gw.venue_clients():
+            info: dict = {}
+            rows = await self.gw.call(c._resting, "", RECONCILE_PAGES, info)
+            complete = complete and bool(info.get("complete"))
+            known = {q.exchange_id for q in [*self.quotes.values(), *quotes] if q.exchange_id}
+            pending = {q.cid for q in self.quotes.values() if q.pending}
+            stray = []
+            for oid, ticker, cid in rows:
+                resting.add(oid)
+                if oid in known or (cid and cid in pending):
+                    continue
+                if oid in self.real_ledger.quote_ids or (cid and cid in cids) or (not strict and ticker in ours):
+                    stray.append((oid, ticker))
+            for oid, ticker in stray:
+                if self.gw.client(ticker) is None:
+                    await loop.run_in_executor(self.pool, self.learn_shard, ticker)
+                _, exc, _ = await self.gw.cancel(ticker, oid, "reconcile")
+                if exc is not None and http_status(exc) != 404:
+                    self.alert("error", None, f"reconcile cancel {oid} on {ticker} failed ({exc!r})")
+                    continue
+                resting.discard(oid)
+                if oid in self.real_ledger.quote_ids:
+                    self.real_ledger.quote_ids[oid]["retired_at"] = time.time()
+                    self.real_ledger.note_quote_id(oid)
+            if stray:
+                self.alert("warn", None, f"reconcile: cancelled {len(stray)} resting orders of ours not tracked")
+        return resting if complete else None
+
+    async def _drain(self, secs: float):
+        end = time.monotonic() + secs
+        while self.tasks and time.monotonic() < end:
+            await asyncio.sleep(0.01)
+
+    def _final_rows(self) -> list[tuple]:
+        """(write fn, *args) for every recorder's rows not yet written: the
+        process handing over writes them, the one taking over drops its own."""
+        day = f"{_utc():%Y-%m-%d}"
+        orders, self.order_times = self.order_times, []
+        out = [(self.liq.write, self.liq.flush(time.monotonic(), time.time()), day),
+               (self.liq.write, orders, f"orders_{day}"),
+               (self.prints.write, self.prints.take(time.time()), day),
+               (self.top_hist.write, self.top_hist.take(time.time()), day),
+               (self.event_spend.write, self.event_spend.snapshot())]
+        out += [(e.write, e.snapshot()) for e in (self.event_msgs, self.event_cpu) if e is not None]
+        return out
+
+    def _write_final(self, rows: list[tuple]):
+        """Blocking."""
+        for fn, *a in rows:
+            try:
+                fn(*a)
+            except Exception as e:
+                _log(f"WARN: handoff flush failed ({e!r})")
+        self.save_meta_cache()
+
+    async def hand_off(self, hid: str) -> bool:
+        """Old process, on <hid>.go: lets exits under way finish, freezes
+        order writes, saves what the standby needs and writes <hid>.handed.
+        True: exit now, cancelling nothing. False: aborted, trading on."""
+        t0 = time.monotonic()
+        loop = asyncio.get_running_loop()
+        self._hlog(f"{hid}: go; finishing exits in flight")
+        self.handing = True
+        flush = loop.run_in_executor(self.pool, self._io, self._write_final, self._final_rows())
+        await self._drain(HANDOFF_DRAIN_S)
+        self.gw.frozen = True
+        await self._drain(HANDOFF_SETTLE_S)
+        self._buffering = True
+        await asyncio.wait([flush], timeout=3.0)
+        locked = await loop.run_in_executor(None, self._io_lock.acquire, True, 3.0)
+        if hand.has(LIVE_ROOT, self.S, hid, "abort"):
+            self._resume(hid, locked)
+            return False
+        st = self.handoff_state(hid)
+        self.real_ledger.save()
+        self.shadow_ledger.save()
+        self.real_ledger.save_quote_ids(time.time())
+        _write_summary(hand.path(LIVE_ROOT, self.S, hid, "state.json"), st)
+        _write_summary(os.path.join(self.root, WARM_CACHE), st["warm"])
+        self.retired = True
+        self.real_ledger.readonly = self.shadow_ledger.readonly = True
+        hand.mark(LIVE_ROOT, self.S, hid, "handed", quotes=len(st["quotes"]), tasks_left=len(self.tasks))
+        self._hlog(f"{hid}: handed over {len(st['quotes'])} quotes, live={self.live}, after "
+                   f"{time.monotonic() - t0:.2f}s ({len(self.tasks)} tasks still in flight); exiting")
+        return True
+
+    def _resume(self, hid: str, locked: bool):
+        """The parent aborted before we handed over: trade on."""
+        if locked:
+            self._io_lock.release()
+        self.gw.frozen = self.handing = self._buffering = False
+        self._replay_buffer()
+        self.dirty |= set(self.baskets)
+        self._hlog(f"{hid}: aborted by the parent; trading on")
+
+    def _replay_buffer(self):
+        buffered, self._buffer = self._buffer, []
+        on = {"fill": self._on_fill, "gone": self._on_gone, "replace": self._on_replace}
+        for kind, args in buffered:
+            on[kind](*args)
+        return len(buffered)
+
+    async def handoff_watch_loop(self):
+        """Active process: a <id>.go written after this process started hands it over."""
+        d = hand.hdir(LIVE_ROOT, self.S)
+        while True:
+            await asyncio.sleep(0.25)
+            try:
+                names = [n for n in os.listdir(d) if n.endswith(".go") and n[:-3] not in self._handled]
+            except OSError:
+                continue
+            for n in names:
+                hid = n[:-3]
+                self._handled.add(hid)
+                try:
+                    stale = os.path.getmtime(os.path.join(d, n)) < self._start_wall
+                except OSError:
+                    continue
+                if stale or any(hand.has(LIVE_ROOT, self.S, hid, k) for k in ("handed", "abort", "taken")):
+                    continue
+                if await self.hand_off(hid):
+                    self._exit(0)
+                    return
+
+    async def standby_loop(self, start_active):
+        """Standby: <id>.ready once warm, then on <id>.handed take over and
+        start the active loops. An <id>.abort at any point exits it unwritten."""
+        hid = self.standby
+        ready, check_at = False, 0.0
+        spec_at = self._mtime(self.scan_path)
+        while True:
+            await asyncio.sleep(0.05)
+            if hand.has(LIVE_ROOT, self.S, hid, "abort"):
+                self._hlog(f"{hid}: aborted by the parent; exiting without writing anything")
+                self._exit(0)
+                return
+            if ready:
+                if hand.has(LIVE_ROOT, self.S, hid, "handed"):
+                    try:
+                        await self.take_over(hid)
+                    except Exception:
+                        traceback.print_exc()
+                        self.alert("error", None, "handoff: a takeover step failed after going active; trading on")
+                    if self.writer:
+                        start_active()
+                    return
+                continue
+            if time.monotonic() < check_at:
+                continue
+            check_at = time.monotonic() + 1.0
+            # The old process's scans and owner moves, picked up as they land.
+            if (m := self._mtime(self.scan_path)) != spec_at:
+                spec_at = m
+                await self.reload_spec()
+            if self.part_idx is not None:
+                self.reload_owners()
+            self.check_hot_ready()
+            if self.hot_ready and self.feed.up:
+                hand.mark(LIVE_ROOT, self.S, hid, "ready", hot=len(self.hot))
+                ready = True
+                self._hlog(f"{hid}: warm ({len(self.hot)} hot baskets, {len(self.tickers)} markets); ready")
+
+    @staticmethod
+    def _mtime(p: str) -> float | None:
+        try:
+            return os.path.getmtime(p)
+        except OSError:
+            return None
+
+    async def take_over(self, hid: str):
+        """Standby, once the old process has handed over: its ledger and state,
+        the private feed events held since, a REST fill poll back to just
+        before the hand-over; then active. The resting-order reconcile and an
+        audit follow off the critical path (_after_takeover)."""
+        t0 = time.monotonic()
+        handed = hand.read_json(hand.path(LIVE_ROOT, self.S, hid, "handed")) or {}
+        st = hand.read_json(hand.path(LIVE_ROOT, self.S, hid, "state.json"))
+        try:
+            if not st:
+                raise RuntimeError("state file missing or unreadable")
+            self.real_ledger = Ledger(os.path.join(self.root, "ledger.json"))
+            self.shadow_ledger = Ledger(os.path.join(self.root, "ledger_shadow.json"))
+            new = self.restore(st)
+        except Exception:
+            traceback.print_exc()
+            self._hlog(f"{hid}: takeover failed before going active; exiting for the parent's cold start")
+            self._exit(3)
+            return
+        # Active from here: the old process wrote its last before <hid>.handed.
+        self.standby = None
+        self.gw.frozen = False
+        n_buf, broken = 0, set()
+        try:
+            self._final_rows()
+            self._reload_files()
+            loop = asyncio.get_running_loop()
+            if new:
+                try:
+                    await loop.run_in_executor(self.pool, self.load_meta, new)
+                    shards = {t: self.meta[t].shard for t in new if t in self.meta and self.meta[t].shard is not None}
+                    await loop.run_in_executor(self.pool, self.gw.setup, shards, self.write_cap)
+                except Exception as e:
+                    self.alert("warn", None, f"handoff: meta for {len(new)} new markets failed ({e!r})")
+                self.feed.add(new)
+            self._buffering = False
+            n_buf = self._replay_buffer()
+            try:
+                await asyncio.wait_for(self.poll_fills(since=handed.get("t", time.time()) - 5.0), 3.0)
+            except Exception as e:
+                _log(f"WARN: handoff fill poll failed ({e!r}); fill_poll_loop retries")
+            broken = {bid for bid, pos in self.ledger.baskets.items()
+                      if bid in self.baskets and pos.unhedged(self.baskets[bid].tickers)}
+            self.urgent |= broken
+            self.dirty |= set(self.baskets)
+            self.wake.set()
+            self._tidy_handoff_dir(hid)
+            self.spawn(self._after_takeover(hid))
+        finally:
+            # Written even if a step above failed: this process is the active one
+            # now, and the parent must not kill it for a cold start.
+            self._buffering = False
+            dt = time.monotonic() - t0
+            hand.mark(LIVE_ROOT, self.S, hid, "taken", secs=round(dt, 3))
+            self._hlog(f"{hid}: took over in {dt:.2f}s: live={self.live}, {len(self.quotes)} quotes, "
+                       f"{n_buf} buffered events, {len(broken)} broken baskets")
+
+    def _reload_files(self):
+        """Files the old process kept writing while this one warmed up."""
+        self.event_meta = {**(_read_json(os.path.join(self.root, EVENT_META)) or {}), **self.event_meta}
+        self.unbooked_pos = _read_json(os.path.join(self.root, UNBOOKED_POSITIONS)) or {}
+        self.foreign = _load_foreign()
+        self.event_spend = parts.EventSpend(self.root)
+        if self.part_group:
+            self.event_msgs = parts.EventSpend(self.root, parts.MSGS)
+            self.event_cpu = parts.EventSpend(self.root, parts.CPU, dp=4)
+        self._msg_n, self._cpu_s = {}, {}
+        self._load_lp_state()
+
+    def _tidy_handoff_dir(self, hid: str):
+        d = hand.hdir(LIVE_ROOT, self.S)
+        for n in os.listdir(d):
+            if not n.startswith(f"{hid}."):
+                try:
+                    os.remove(os.path.join(d, n))
+                except OSError:
+                    pass
+
+    async def _after_takeover(self, hid: str):
+        t0 = time.time()
+        try:
+            resting = await self.reconcile_resting([], strict=True, cids=self._handoff_cids)
+        except Exception as e:
+            self.alert("warn", None, f"handoff reconcile failed ({e!r}); audits and fill polls go on")
+            return
+        gone = []
+        if resting is not None:
+            # Only quotes placed or moved before the listing: a newer one may not be in it.
+            gone = [q for q in self.quotes.values() if q.exchange_id and not q.pending
+                    and q.exchange_id not in resting and max(q.placed_at, q.moved_at) < t0]
+            for q in gone:
+                self._retire(q)
+                self.mark(q.basket_id)
+        self._hlog(f"{hid}: reconciled with the exchanges in {time.time() - t0:.1f}s, "
+                   f"{len(gone)} quotes no longer resting dropped"
+                   + ("" if resting is not None else " (listing cut short: none dropped)"))
+        if self.live:
+            try:
+                await self.audit()
+            except Exception as e:
+                _log(f"WARN: post-handoff audit failed ({e!r})")
+
+    # ------------------------------------------------------------------ main
+
+    async def run(self, stop_requested: bool = False):
+        loop = asyncio.get_running_loop()
+        if self.standby:
+            self._hlog(f"{self.standby}: standby starting; no order or file writes until it takes over")
+        elif self.adopt:
+            self.load_adopt(self.adopt)
+        _log(f"{len(self.all_baskets)} baskets over {len(self.tickers)} markets")
+        await self._meta_at_start()
         shards = {t: m.shard for t, m in self.meta.items() if m.shard is not None}
         _log(f"markets by status {_count(m.status for m in self.meta.values())}; shards {sorted(set(shards.values()))}")
         try:
@@ -4913,26 +5525,40 @@ class ArbsRunner:
             await loop.run_in_executor(self.pool, self.seed_flow)
         except Exception as e:
             _log(f"WARN: fill-rate seed failed ({e!r})")
+        self.seed_warm()
+        if self.adopted and not self.arm_want:
+            await self._drop_adopted(None)            # nothing will arm to manage them
         trading, stopper, stop = TradingModeWatcher(self.S), StopWatcher(), asyncio.Event()
-        coros = [self.feed.run(), self.eval_loop(), self.rank_loop(), self.meta_loop(), self.fill_poll_loop(),
-                 self.audit_loop(), self.guard_loop(), self.summary_loop(), self.scan_loop(),
-                 self.liquidity_loop(), self.prints_loop(), self.exchange_loop(), self.write_share_loop(), self.ledger_flush_loop(),
-                 self.keepalive_loop(), self.balance_loop(), self.control_loop(trading, stopper, stop)]
-        tasks = [asyncio.create_task(c) for c in coros]
+        tasks = self._loop_tasks = [asyncio.create_task(c) for c in (
+            self.feed.run(), self.eval_loop(), self.rank_loop(), self.meta_loop(), self.exchange_loop(),
+            self.write_share_loop(), self.keepalive_loop())]
+
+        def start_active():
+            tasks.extend(asyncio.create_task(c) for c in (
+                self.fill_poll_loop(), self.audit_loop(), self.guard_loop(), self.summary_loop(), self.scan_loop(),
+                self.liquidity_loop(), self.prints_loop(), self.ledger_flush_loop(), self.balance_loop(), self.control_loop(trading, stopper, stop), self.handoff_watch_loop()))
+        if self.standby:
+            tasks.append(asyncio.create_task(self.standby_loop(start_active)))
+        else:
+            start_active()
         try:
             await stop.wait()
         finally:
             for t in tasks:
                 t.cancel()
-            try:
-                await self.disarm("shutdown")
-            except Exception:
-                _log("WARN: shutdown cleanup failed -- CHECK KALSHI BY HAND for resting orders:")
-                traceback.print_exc()
+            if self.writer:
+                self._io(_write_summary, os.path.join(self.root, WARM_CACHE), self.warm_state())
+                try:
+                    await self.disarm("shutdown")
+                except Exception:
+                    _log("WARN: shutdown cleanup failed -- CHECK KALSHI BY HAND for resting orders:")
+                    traceback.print_exc()
             await asyncio.gather(*tasks, return_exceptions=True)
-            self.real_ledger.save_quote_ids(time.time())
-            atomic_write_json(os.path.join(day_dir(self.S, f"{_utc():%Y-%m-%d}"), "summary.json"), self.summary(),
-                              indent=None)
+            if self.writer:
+                self.real_ledger.save_quote_ids(time.time())
+                atomic_write_json(os.path.join(day_dir(self.S, f"{_utc():%Y-%m-%d}"), "summary.json"),
+                                  self.summary(), indent=None)
+                self._io(self.save_meta_cache)
             self.pool.shutdown(wait=False)
             self.write_pool.shutdown(wait=False)
 
@@ -5003,13 +5629,15 @@ def _count(it) -> dict:
     return out
 
 
-async def run_arbs(series, *, live_trading: bool, resume_arm: bool = False):
-    if not live_trading and resume_arm:
+async def run_arbs(series, *, live_trading: bool, resume_arm: bool = False, standby: str | None = None,
+                   adopt: str | None = None):
+    # A standby takes its arm state from the process it replaces.
+    if not live_trading and resume_arm and not standby:
         why = resumable_arm(series.ticker)
         if why is not None:
             _log(f"resuming REAL TRADING after restart: {why}")
             live_trading = True
-    r = ArbsRunner(series, live_trading=live_trading)
+    r = ArbsRunner(series, live_trading=live_trading, standby=standby, adopt=adopt)
     try:
         await r.run()
     except asyncio.CancelledError:

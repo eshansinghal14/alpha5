@@ -36,7 +36,17 @@ PM_URGENT_OVERDRAW = 50.0
 KALSHI_CANCEL_OVERDRAW = 10.0
 
 
+class Frozen(RuntimeError):
+    """A write refused because this process is not the active one (a
+    standby, or one handing over): nothing went to the exchange."""
+
+
 class Gateway:
+    # No order writes at all while set (a standby, or a process handing over):
+    # creates, moves and IOCs answer "not sent", cancels and group calls fail
+    # with Frozen.
+    frozen = False
+
     def __init__(self, pool, write_pool=None):
         """`pool` runs reads (fills, positions, balance); `write_pool` the
         order writes, so a write never queues behind them."""
@@ -112,6 +122,8 @@ class Gateway:
         return await asyncio.get_running_loop().run_in_executor(self.pool, functools.partial(fn, *a, **kw))
 
     async def write(self, fn, *a, **kw):
+        if self.frozen:
+            raise Frozen("order writes frozen")
         return await asyncio.get_running_loop().run_in_executor(self.write_pool, functools.partial(fn, *a, **kw))
 
     def _note_ioc(self, oid: str | None):
@@ -123,6 +135,8 @@ class Gateway:
         self.ioc_ids.add(oid)
 
     async def ioc(self, ticker, side, price, size, *, force: bool, reason: str):
+        if self.frozen:
+            return None, None, False
         c = self.client(ticker)
         if c is None or not c.allow_now("order", force=force, reason=reason):
             return None, None, False
@@ -138,6 +152,8 @@ class Gateway:
         return fill, None, True
 
     async def rest(self, ticker, side, price, size, cid: str, group: str | None = None):
+        if self.frozen:
+            return None, None, False
         c = self.client(ticker)
         if c is None or not c.allow_now("order", reason="quote"):
             return None, None, False
@@ -150,6 +166,8 @@ class Gateway:
             return None, e, True
 
     async def amend(self, ticker, side, exchange_id, price, remaining, filled):
+        if self.frozen:
+            return None, None, False
         c = self.client(ticker)
         if c is None or not c.allow_now("amend", reason="move"):
             return None, None, False
@@ -163,6 +181,8 @@ class Gateway:
 
     async def group_call(self, ticker, method: str, *args):
         """(result, exc) of an order-group create/reset/delete on ticker's shard."""
+        if self.frozen:
+            return None, Frozen("order writes frozen")
         c = self.client(ticker)
         if c is None:
             return None, RuntimeError(f"no order client for {ticker}")
@@ -176,6 +196,8 @@ class Gateway:
         """Always sent, forced past the bucket if it must, but only while the
         overdraw allows (KALSHI_CANCEL_OVERDRAW, PM_URGENT_OVERDRAW): a refused
         cancel leaves risk on the book, and a 429'd one cancels nothing."""
+        if self.frozen:
+            return None, Frozen("order writes frozen"), False
         c = self.client(ticker)
         if c is None:
             return None, RuntimeError(f"no order client for {ticker}"), False

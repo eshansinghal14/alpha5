@@ -113,6 +113,9 @@ class Ledger:
         self.last_fill_ts: float | None = None
         self.seen_trades: set[str] = set()
         self.settled: list[dict] = []
+        # Set in a standby or a process that has handed over: the file belongs
+        # to the active process, so nothing here writes it.
+        self.readonly = False
         if path and os.path.exists(path):
             self._load()
 
@@ -139,7 +142,7 @@ class Ledger:
         self.settled = d.get("settled", [])
 
     def save(self, now: float | None = None):
-        if not self.path:
+        if not self.path or self.readonly:
             return
         atomic_write_json(self.path, {
             "baskets": {bid: {"legs": {t: dataclasses.asdict(l) for t, l in b.legs.items()},
@@ -157,7 +160,7 @@ class Ledger:
 
     def flush_quote_ids(self):
         """Append the noted ids' current records to the log."""
-        if not self.ids_log_path or not self._ids_pending:
+        if not self.ids_log_path or not self._ids_pending or self.readonly:
             return
         lines = "".join(json.dumps([oid, self.quote_ids[oid]]) + "\n"
                         for oid in self._ids_pending if oid in self.quote_ids)
@@ -168,7 +171,7 @@ class Ledger:
     def save_quote_ids(self, now: float):
         """Full write, then an empty log. Log records are whole, so a crash
         between the two only replays what the file already holds."""
-        if not self.ids_path:
+        if not self.ids_path or self.readonly:
             return
         # A retired quote's late fills arrive within seconds; an hour is ample.
         self.quote_ids = {k: v for k, v in self.quote_ids.items()

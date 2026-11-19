@@ -883,7 +883,8 @@ class KalshiOrderClient:
     def resting_orders(self, event_ticker: str, max_pages: int = 10) -> list[tuple[str, str]]:
         return [(oid, t) for oid, t, _ in self._resting(event_ticker, max_pages)]
 
-    def _resting(self, event_ticker: str, max_pages: int = 10) -> list[tuple[str, str, str | None]]:
+    def _resting(self, event_ticker: str, max_pages: int = 10,
+                 info: dict | None = None) -> list[tuple[str, str, str | None]]:
         """(exchange order id, market ticker, client order id) for every order
         this account still has resting in `event_ticker`, oldest first.
 
@@ -910,6 +911,8 @@ class KalshiOrderClient:
                     out.append((o["order_id"], ticker, o.get("client_order_id")))
             cursor = data.get("cursor")
             if not cursor or not batch:
+                if info is not None:
+                    info["complete"] = True
                 break
         return out
 

@@ -245,7 +245,10 @@ class PolymarketOrderClient(KalshiOrderClient):
         # even when low (pay="force"), like a cancel.
         return self._json("GET", "/v1/orders/open", pay="force").get("orders") or []
 
-    def _resting(self, event_ticker: str = "", max_pages: int = 10) -> list[tuple[str, str, str | None]]:
+    def _resting(self, event_ticker: str = "", max_pages: int = 10,
+                 info: dict | None = None) -> list[tuple[str, str, str | None]]:
+        if info is not None:
+            info["complete"] = True           # one request lists every open order
         return [(o["id"], o.get("marketSlug") or "", None) for o in self.open_orders()
                 if o.get("id") and (o.get("marketSlug") or "").startswith(event_ticker)]
 

@@ -246,12 +246,14 @@ class ServiceKeeper:
 
 def launch_many(units: list[list[str]], args) -> int:
     from infra.kalshi.markets import series_shard
+    from infra.runtime import handoff
+    from infra.runtime.persist import LIVE_ROOT
     reg = registry()
     # A runner strategy's ticker isn't a Kalshi series (no shard to look up);
     # it pins every write to its markets' shards, so the share doesn't apply.
     own = [u for u in units if reg[u[0]].runner is not None]
     shares = {**write_shares([u for u in units if u not in own], series_shard), **{u[0]: 1.0 for u in own}}
-    procs = []
+    procs, cmds = [], {}
     for unit in units:
         s = ", ".join(unit)
         share = shares[unit[0]]
@@ -264,22 +266,36 @@ def launch_many(units: list[list[str]], args) -> int:
             cmd.append("--no-carry-arm")
         if args.resume_arm:
             cmd.append("--resume-arm")
-        p = _popen(cmd, _child_env({WRITE_SHARE_ENV: f"{share:.6f}"}))
-        procs.append((s, p))
+        cmds[s] = (cmd, _child_env({WRITE_SHARE_ENV: f"{share:.6f}"}))
+        p = _popen(*cmds[s])
+        procs.append([s, p])
         print(f"[run] started {s} (pid {p.pid})", flush=True)
+
+    def spawn(name, extra):
+        cmd, env = cmds[name]
+        p = _popen(cmd + extra, env)
+        print(f"[run] started {name} {' '.join(extra)} (pid {p.pid})", flush=True)
+        return p
+    driver = handoff.Driver(LIVE_ROOT, procs, spawn, log=lambda m: print(m, flush=True))
     reported = set()
 
     def report():
+        # By process, not name: a handoff puts a new process under the old name.
         for s, p in procs:
-            if s not in reported and p.poll() is not None:
-                reported.add(s)
+            if p.pid not in reported and p.poll() is not None:
+                reported.add(p.pid)
                 print(f"[run] {s} exited with code {p.returncode}", flush=True)
 
     try:
-        while any(p.poll() is None for _, p in procs):
+        while any(p.poll() is None for _, p in procs) or driver.busy():
             report()
+            try:
+                driver.poll()
+            except Exception as e:
+                print(f"[run] WARN: handoff step failed ({e!r})", flush=True)
             time.sleep(0.5)
     except KeyboardInterrupt:
+        driver.stop()
         print(f"[run] Ctrl-C: waiting up to {SHUTDOWN_GRACE_S:.0f}s for series to pull quotes "
               f"(Ctrl-C again to force)", flush=True)
         deadline = time.monotonic() + SHUTDOWN_GRACE_S
@@ -319,6 +335,9 @@ def main(argv=None):
                     help="After a restart, start armed if the dashboard's last request was an arm and no STOP "
                          "(stop-all, balance watchdog) came after it. Default: always start in shadow.")
     ap.add_argument("--no-services", action="store_true", help=argparse.SUPPRESS)
+    # Hot handoff (infra/runtime/handoff.py), passed by launch_many only.
+    ap.add_argument("--standby", default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--adopt", default=None, help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
     series_list, services = resolve(ap, args.series, args.only, fmap)
     # What this process runs, for shared feeds that subscribe per series.
@@ -362,9 +381,13 @@ async def _run_unit(series, args):
     from infra.runtime.session import session_loop
     resume = args.resume_arm
 
+    extra = {k: v for k, v in (("standby", args.standby), ("adopt", args.adopt)) if v}
+    if extra and any(s.runner is None for s in series):
+        raise SystemExit("--standby/--adopt need a runner that supports a handoff (ARBS)")
+
     def one(s):
         if s.runner is not None:
-            return s.runner(s, live_trading=args.live_trading, resume_arm=resume)
+            return s.runner(s, live_trading=args.live_trading, resume_arm=resume, **extra)
         return session_loop(s, live_trading=args.live_trading, carry_arm=not args.no_carry_arm,
                             event_ticker=args.event_ticker, resume_arm=resume)
     await asyncio.gather(*(one(s) for s in series))
