@@ -344,6 +344,21 @@ EXIT_CREATE_WAIT_S = 0.005
 # at ~100 ms p75 on every process (11-18 19:15-20:00 UTC, 4-18 ms the day before);
 # a completion leg's depth can go without its top moving.
 LAZY_EVAL_S = 0.1
+# Shadow count of book updates that change no level a quote could reach
+# (_prefix_shadow), to size a skip before building it (11-19).
+PREFIX_SHADOW = True
+
+
+def _reach(bids: dict, cap: float) -> tuple:
+    """A side's bids from the best down until their size covers `cap`."""
+    out, got = [], 0.0
+    for p in sorted(bids, reverse=True):
+        q = bids[p]
+        out.append((p, q))
+        got += q
+        if got >= cap:
+            break
+    return tuple(out)
 # Relationship types whose bundles can pay more than their worst case:
 # complete sets and exact identities pay the same in every outcome.
 UPSIDE_TYPES = ("mutually_exclusive_no", "implication", "mutual_exclusion")
@@ -826,6 +841,8 @@ class ArbsRunner:
         self.top_moves: dict[str, _Rate] = {}     # ticker -> best bid/ask changes per second
         self.last_top: dict[str, tuple] = {}
         self.last_top_size: dict[str, tuple] = {}
+        self._pfx: dict[str, tuple] = {}                 # ticker -> both sides' levels a quote could reach
+        self.pfx_stats: dict[str, list] = {}             # series -> [top, within, beyond, beyond marks]
         self.hot_churn: collections.deque = collections.deque()   # (time, entered, left) per hot-list change
         self.hot_cost = 0.0                       # estimated write tokens/s of quoting the hot list
         self.hot_cost_by_shard: dict[str, float] = {}
@@ -1610,14 +1627,55 @@ class ArbsRunner:
             self._watch_pulls(book)
         deep = old == top
         size = (book.bid_depth, book.ask_depth)
-        below = deep and self.last_top_size.get(book.ticker) == size and self.cfg.trading.lazy_below_top
+        top_held = deep and self.last_top_size.get(book.ticker) == size
+        below = top_held and self.cfg.trading.lazy_below_top
         self.last_top_size[book.ticker] = size
+        if PREFIX_SHADOW:
+            try:
+                self._prefix_shadow(book.ticker, top_held)
+            except Exception:
+                self.n["pfx_errors"] = self.n.get("pfx_errors", 0) + 1
         now = time.time() if deep else 0.0
         for bid in self.by_ticker.get(book.ticker, ()):
             self._mark_book(bid, deep, now, below)
         for bid in self.via_by_ticker.get(book.ticker, ()):
             self._mark_book(bid, deep, now, below)
         return ev
+
+    def _prefix_shadow(self, ticker: str, top_held: bool):
+        """Shadow (counts only): did a book update that left the top's prices
+        and sizes alone change any level a quote on this market could reach?
+        Reach is each side's levels from the top until their size covers the
+        largest quote its baskets may rest (live_quote_size live, else
+        quote_size). `beyond` updates are the evaluations a skip would save."""
+        bids = self.by_ticker.get(ticker)
+        if not bids:
+            return
+        m = self.meta.get(ticker)
+        st = self.pfx_stats.setdefault((m.series if m and m.series else None) or ticker.split("-", 1)[0], [0, 0, 0, 0])
+        if not top_held:
+            st[0] += 1
+            self._pfx.pop(ticker, None)
+            return
+        bk = self.feed.ladder(ticker)
+        if bk is None:
+            return
+        t = self.cfg.trading
+        now = time.time()
+        cap = float(t.live_quote_size if all(self._live_at(b) <= now for b in bids) else t.quote_size)
+        pref = (_reach(bk.yes_bids, cap), _reach(bk.no_bids, cap))
+        old = self._pfx.get(ticker)
+        self._pfx[ticker] = pref
+        if old != pref:
+            st[1] += 1
+            return
+        st[2] += 1
+        st[3] += sum(1 for b in bids if b not in self.dirty and b not in self.quoted and b not in self.urgent)
+
+    def prefix_shadow_view(self) -> dict:
+        tot = [sum(v[i] for v in self.pfx_stats.values()) for i in range(4)]
+        top = sorted(self.pfx_stats.items(), key=lambda kv: -kv[1][2])[:12]
+        return {"cols": ["top", "within", "beyond", "beyond_marks"], "total": tot, "by_series": dict(top)}
 
     def _mark_book(self, bid: str, deep: bool, now: float, below: bool = False):
         """mark() for a book update; deferred up to LAZY_EVAL_S when only
@@ -5176,7 +5234,8 @@ class ArbsRunner:
             "missed": sorted(({**m, "usd": round(m["usd"], 2)} for m in self.missed.values()),
                              key=lambda m: -m["usd"])[:50],
             "settled": settled[-200:], "alerts": self.alerts[-100:], "audit_diff": self.audit_diff,
-            "order_errors": self.order_errors, "counts": self.n, "write_usage": self.gw.usage(), "write_cap": self.write_cap(),
+            "order_errors": self.order_errors, "counts": self.n, "prefix_shadow": self.prefix_shadow_view(),
+            "write_usage": self.gw.usage(), "write_cap": self.write_cap(),
             "config_status": self.store.status(), "scan": self.scan_status,
             "live_params": self.lp_view["groups"],
             "regime_shadow": sorted({ev for (ev, _), end in self.regime.items() if end > time.time()}),

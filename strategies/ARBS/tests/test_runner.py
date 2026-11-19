@@ -3325,6 +3325,28 @@ def test_lazy_below_top_defers_only_updates_under_an_unchanged_top(arbs, monkeyp
     asyncio.run(go())
 
 
+def test_prefix_shadow_counts_updates_beyond_the_reach_of_any_quote(arbs, monkeypatch):
+    import types
+    r, b = arbs
+    live = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
+    r.set_baskets([live])
+    monkeypatch.setattr(r, "liq", types.SimpleNamespace(on_book=lambda *a: None))
+    monkeypatch.setattr(r.cfg.runtime, "record_prints", False, raising=False)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, live_quote_size=15)
+    upd = types.SimpleNamespace(ticker="X-A", bid=0.40, ask=0.45, bid_depth=10, ask_depth=10)
+    no = [(0.55, 10), (0.50, 10)]
+    book(r, "X-A", [(0.40, 10), (0.38, 10), (0.30, 50)], no + [(0.40, 50)])
+    r._on_quote_inner(upd)                               # first sight: a top change
+    book(r, "X-A", [(0.40, 10), (0.38, 10), (0.30, 60)], no + [(0.40, 50)])
+    r._on_quote_inner(upd)                               # no reach recorded yet: within
+    book(r, "X-A", [(0.40, 10), (0.38, 10), (0.30, 70)], no + [(0.40, 40)])
+    r._on_quote_inner(upd)                               # 20 lots of reach cover 15; the change is past them
+    book(r, "X-A", [(0.40, 10), (0.38, 5), (0.30, 70)], no + [(0.40, 40)])
+    r._on_quote_inner(upd)                               # the second level is in reach
+    assert r.pfx_stats["X"][:3] == [1, 2, 1]
+    assert r.prefix_shadow_view()["total"][:3] == [1, 2, 1]
+
+
 def test_scan_markets_do_not_grow_while_kalshi_rate_limits_reads(arbs, monkeypatch):
     r, b = arbs
     r.markets, W, r.hot_ready = 4000, R.LOOP_CPU_WINDOW_S, True
