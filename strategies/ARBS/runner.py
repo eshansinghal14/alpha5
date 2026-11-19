@@ -5428,6 +5428,14 @@ class ArbsRunner:
             self._final_rows()
             self._reload_files()
             loop = asyncio.get_running_loop()
+            # Gap fills first: a meta read for new markets can take seconds, and
+            # the loop must not act on baskets whose fills aren't booked yet.
+            self._buffering = False
+            n_buf = self._replay_buffer()
+            try:
+                await asyncio.wait_for(self.poll_fills(since=handed.get("t", time.time()) - 5.0), 3.0)
+            except Exception as e:
+                _log(f"WARN: handoff fill poll failed ({e!r}); fill_poll_loop retries")
             if new:
                 try:
                     await loop.run_in_executor(self.pool, self.load_meta, new)
@@ -5436,12 +5444,6 @@ class ArbsRunner:
                 except Exception as e:
                     self.alert("warn", None, f"handoff: meta for {len(new)} new markets failed ({e!r})")
                 self.feed.add(new)
-            self._buffering = False
-            n_buf = self._replay_buffer()
-            try:
-                await asyncio.wait_for(self.poll_fills(since=handed.get("t", time.time()) - 5.0), 3.0)
-            except Exception as e:
-                _log(f"WARN: handoff fill poll failed ({e!r}); fill_poll_loop retries")
             broken = {bid for bid, pos in self.ledger.baskets.items()
                       if bid in self.baskets and pos.unhedged(self.baskets[bid].tickers)}
             self.urgent |= broken
