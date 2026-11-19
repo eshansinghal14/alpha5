@@ -769,48 +769,54 @@ def _top(r, t, bid, bid_depth, ask=None, ask_depth=0.0):
                                "ask_depth": ask_depth})())
 
 
-def test_live_quote_pulled_when_other_makers_pull(arbs):
+def test_live_quotes_pulled_when_a_leg_they_complete_with_moves_away(arbs):
     r, b = arbs
     b = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
     r.set_baskets([b])
     r.hot = [b.basket_id]
     r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_live_events=True, live_quote_size=5, live_edge_add=0.0,
-                                        pull_drop=0.5, pull_window_s=2.0, pull_hold_s=2.0)
+                                        pull_drop=0.5, pull_window_s=30.0, pull_hold_s=2.0)
     rows = []
     r.journal = rows.append
     book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
     book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
     _eval(r, b)
-    q = r.quotes[(b.basket_id, 0)]
-    _top(r, "X-A", q.price, q.size + 20)
-    _top(r, "X-A", q.price, q.size + 15)             # others 20 -> 15: not a pull
-    assert ("X-A", "yes") not in r.pulled
-    _top(r, "X-A", q.price, q.size + 8)              # 20 -> 8 at the same price
-    assert ("X-A", "yes") in r.pulled
+    assert (b.basket_id, 0) in r.quotes and (b.basket_id, 1) in r.quotes
+    _top(r, "X-A", 0.31, 20, 0.35, 10)
+    _top(r, "X-A", 0.31, 2, 0.35, 10)                 # A's own bids thin: not a completion leg's ask
+    assert not r.pulled
+    _top(r, "X-B", 0.40, 10, 0.55, 10)
+    _top(r, "X-B", 0.40, 10, 0.57, 10)                 # B's ask rises: A's quote completes through B
+    assert ("X-A", "yes") in r.pulled and ("X-B", "yes") not in r.pulled
     _eval(r, b)
     assert (b.basket_id, 0) not in r.quotes and (b.basket_id, 1) in r.quotes
-    assert [x for x in rows if x["kind"] == "pull"][0]["quoted"] == [b.basket_id]
+    pull = [x for x in rows if x["kind"] == "pull"][0]
+    assert (pull["ticker"], pull["by"], pull["quoted"]) == ("X-A", "X-B", [b.basket_id])
     r.pulled[("X-A", "yes")] = time.monotonic() - 0.01   # the hold ran out
     _eval(r, b)
     assert (b.basket_id, 0) in r.quotes
 
 
-def test_pull_ignores_a_price_change_and_non_live_baskets(arbs):
+def test_cross_pull_fires_on_a_vanishing_ask_and_never_for_pregame_baskets(arbs):
     r, b = arbs
     r.hot = [b.basket_id]
-    r.cfg.trading = dataclasses.replace(r.cfg.trading, pull_drop=0.5, pull_window_s=2.0, pull_hold_s=2.0)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, pull_drop=0.5, pull_window_s=30.0, pull_hold_s=2.0)
     book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
     book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
     _eval(r, b)
-    q = r.quotes[(b.basket_id, 0)]
-    _top(r, "X-A", q.price, q.size + 20)
-    _top(r, "X-A", q.price, q.size + 1)
-    assert not r.pulled                              # not live
-    w = R.PullWatch()
-    assert not w.fires(("T", "yes"), 0.0, 0.30, 20.0, 2.0, 0.5)
-    assert not w.fires(("T", "yes"), 0.1, 0.29, 2.0, 2.0, 0.5)    # the bid moved: not a pull
-    assert w.fires(("T", "yes"), 0.2, 0.30, 2.0, 2.0, 0.5)
-    assert not w.fires(("T", "yes"), 3.0, 0.30, 1.0, 2.0, 0.5)    # the peak is out of the window
+    _top(r, "X-B", 0.40, 10, 0.55, 10)
+    _top(r, "X-B", 0.40, 10, 0.70, 10)
+    assert not r.pulled                              # pre-game
+    w = R.AskWatch()
+    k = ("T", "no")
+    assert not w.fires(k, 0.0, 0.45, 10.0, 0.25, 0.5)
+    assert not w.fires(k, 0.05, 0.45, 6.0, 0.25, 0.5)        # 10 -> 6 at the same price: not halved
+    assert w.fires(k, 0.10, 0.45, 4.0, 0.25, 0.5)            # 10 -> 4: halved
+    k = ("T", "yes")
+    assert not w.fires(k, 0.0, 0.45, 10.0, 0.25, 0.5)
+    assert w.fires(k, 0.1, 0.44, 10.0, 0.25, 0.5)            # the bid fell: the ask rose
+    assert not w.fires(k, 1.0, 0.43, 10.0, 0.25, 0.5)        # its last high is out of the window
+    assert w.fires(k, 1.1, None, 0.0, 0.25, 0.5)             # the bids are gone
 
 
 def _second_basket(r, b, legs):
@@ -2240,7 +2246,7 @@ _OUR_QUOTE = {"basket_id": "complete_set:X:buy_all_yes", "price": 0.41, "left": 
               "age_s": 5.0, "pending": False, "tripped": False}
 
 
-def _live_print_row(b_ask_after_no_bid, ratio=None, quote=_OUR_QUOTE):
+def _live_print_row(b_ask_after_no_bid, ratio=None, quote=_OUR_QUOTE, pulled=False):
     after = {"X-A": {"yes": [[0.40, 100]], "no": [[0.55, 100]]},
              "X-B": {"yes": [[0.45, 100]], "no": [[b_ask_after_no_bid, 100]]}}
     return {"t": time.time(), "ticker": "X-A", "side": "yes", "prints": [[0.0, 0.40, 50]],
@@ -2249,7 +2255,7 @@ def _live_print_row(b_ask_after_no_bid, ratio=None, quote=_OUR_QUOTE):
                       "X-B": {"yes": [[0.45, 100]], "no": [[0.50, 100]]}},
             "pre": {"X-B": [[0.02, 0.45, 100, 0.50, 100]]},
             "after": {"0.03": after, "0.1": after, "1.0": after},
-            "pull": {"on": False, "ratio": ratio}, "quote": quote}
+            "pull": {"on": pulled, "ratio": ratio}, "quote": quote}
 
 
 def test_shadow_live_learns_an_event_and_reports_it(arbs):
@@ -2266,7 +2272,7 @@ def test_shadow_live_learns_an_event_and_reports_it(arbs):
 def test_shadow_live_counts_a_pulled_side_as_no_fill(arbs):
     r, b = arbs
     r.cfg.trading = dataclasses.replace(r.cfg.trading, pull_drop=0.5)
-    r._shadow_live([_live_print_row(0.50, ratio=0.2)])
+    r._shadow_live([_live_print_row(0.50, pulled=True)])
     assert sum(r.lp.nodes[()].f) == 0.0
 
 

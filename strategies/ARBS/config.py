@@ -82,10 +82,11 @@ class TradingParams:
     # Scored on fill_context 11-02..04: sports, others' depth -50% in 2 s with a
     # 2 s hold skipped $60 of losing fills for $30 of winners, 1.7% of quote
     # time; live elections about even (most losses there gave no warning).
-    pull_drop: float = param("Pull a live basket's quotes on a market side when other makers' size at its best "
-                             "bid falls by this fraction of its peak at that price within pull_window_s "
-                             "(0.5 = halved). 0 = off.", min=0.0, max=1.0, step=0.05)
-    pull_window_s: float = param("Seconds the pull's peak depth is taken over.", min=0.05, max=30.0, step=0.05)
+    pull_drop: float = param("Pull a live basket's quotes on its other legs when a leg it would complete with "
+                             "moves away within pull_window_s: its ask rises, or others' size at that ask falls by "
+                             "this fraction of its peak there (0.5 = halved). 0 = off.", min=0.0, max=1.0, step=0.05)
+    pull_window_s: float = param("Seconds a completion leg's ask is watched over for the pull.", min=0.05,
+                                 max=30.0, step=0.05)
     pull_hold_s: float = param("Seconds a pulled side stays unquoted after the last pull signal.", min=0.0,
                                max=60.0, step=0.5)
     near_min_size: int = param("Pre-game baskets: a second quote one tick under an arb quote that the other "

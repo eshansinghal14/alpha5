@@ -53,7 +53,7 @@ from strategies.ARBS.execution import Frozen, Gateway
 from strategies.ARBS import venues
 from strategies.ARBS.venues import PM_SHARD, Feeds, is_pm, venue
 from strategies.ARBS.ledger import Ledger
-from strategies.ARBS.depth import MoveWatch, PullWatch, TopHistory
+from strategies.ARBS.depth import AskWatch, MoveWatch, TopHistory
 from strategies.ARBS.liquidity import Liquidity
 from strategies.ARBS.prints import AFTER_S, Prints, top as prints_top
 from strategies.ARBS.spec import Basket, Leg, basket_from_dict, basket_to_dict, load_spec, parse_spec
@@ -722,7 +722,7 @@ class ArbsRunner:
         self.exchange_paused = False              # Kalshi's exchange-wide trading_active is off
         self.priority_trading: list[str] = []     # write_priority_series in session now
         self.last_exit: dict[str, tuple] = {}
-        self.pull_watch = PullWatch()
+        self.pull_watch = AskWatch()
         self.move_watch = MoveWatch()
         self.regime: dict[tuple[str, str], float] = {}   # (event, signal) -> wall time its shadow hold ends
         self.pulled: dict[tuple[str, str], float] = {}   # (ticker, side) -> monotonic time its pull ends
@@ -1652,27 +1652,46 @@ class ArbsRunner:
                           "pm_age_ms": round(1000 * (mono - self.book_time.get(p, mono)))})
 
     def _watch_pulls(self, book):
-        """Mark a market side pulled (see depth.PullWatch) while a live
-        basket's arb quote rests on it; manage_quotes cancels and holds."""
+        """Cross-leg pull: when the ask on a leg a live basket would complete
+        with moves away within pull_window_s (depth.AskWatch), the basket's arb
+        quotes on its other legs are marked pulled for pull_hold_s;
+        manage_quotes cancels and holds them. A fill there completes after the
+        other legs moved: -2 to -3c/lot replayed at every edge, mostly visible
+        50+ ms ahead, where the old own-leg depth pull did no better than
+        unpulled prints (live prints 11-15..19)."""
         t, c, now = book.ticker, self.cfg.trading, time.monotonic()
+        now_ts = _utc()
         no_bid = None if book.ask is None else 1.0 - book.ask
-        for side, price, depth in (("yes", book.bid, book.bid_depth), ("no", no_bid, book.ask_depth)):
-            key = (t, side)
-            quoted = [q.basket_id for q in self.quotes.on(t, side) if q.kind == "arb"
-                      and (b := self.baskets.get(q.basket_id)) is not None and self.live_now(b, _utc())]
-            if not quoted and key not in self.pulled:
+        for bid_side, bid, depth in (("yes", book.bid, book.bid_depth), ("no", no_bid, book.ask_depth)):
+            leg_side = OTHER[bid_side]                # these bids are the ask to buy this side
+            targets = []
+            for bid_id in self.by_ticker.get(t, ()):
+                if not self.quotes.n_by_basket.get(bid_id):
+                    continue
+                b = self.baskets.get(bid_id)
+                if b is None or not any(l.ticker == t and l.side == leg_side for l in b.legs):
+                    continue
+                if not self.live_now(b, now_ts):
+                    continue
+                for j, l in enumerate(b.legs):
+                    q = self.quotes.get((bid_id, j))
+                    if l.ticker != t and q is not None and q.kind == "arb":
+                        targets.append((l.ticker, l.side, bid_id))
+            key = (t, bid_side)
+            if not targets:
                 self.pull_watch.forget(key)
                 continue
-            price = None if price is None else round(price, 4)
-            others = 0.0 if price is None else (depth or 0.0) - self._own(t, side).get(price, 0.0)
-            if self.pull_watch.fires(key, now, price, others, c.pull_window_s, c.pull_drop):
-                if self.pulled.get(key, 0.0) <= now:
-                    self.n["pulls"] += 1
-                    self.journal({"kind": "pull", "ticker": t, "side": side, "price": price,
-                                  "depth": round(others, 2), "quoted": quoted})
-                self.pulled[key] = now + c.pull_hold_s
-            elif key in self.pulled and self.pulled[key] <= now:
-                del self.pulled[key]
+            bid = None if bid is None else round(bid, 4)
+            others = 0.0 if bid is None else (depth or 0.0) - self._own(t, bid_side).get(bid, 0.0)
+            if self.pull_watch.fires(key, now, bid, others, c.pull_window_s, c.pull_drop):
+                for tk, sd, bid_id in targets:
+                    if self.pulled.get((tk, sd), 0.0) <= now:
+                        self.n["pulls"] += 1
+                        self.journal({"kind": "pull", "ticker": tk, "side": sd, "by": t, "by_side": leg_side,
+                                      "price": bid, "depth": round(others, 2), "quoted": [bid_id]})
+                    self.pulled[(tk, sd)] = now + c.pull_hold_s
+        if len(self.pulled) > 5000:
+            self.pulled = {k: v for k, v in self.pulled.items() if v > now}
 
     def _on_trade(self, ticker, trade):
         self.liq.on_trade(ticker, trade.size)
@@ -1887,8 +1906,7 @@ class ArbsRunner:
                 s = replay.score(r, self._rates, self.lp.edges, t.live_quote_size, lag=SHADOW_LAG_S, live_only=True)
                 if s is None or not any(s["fills"]):
                     continue
-                ratio = (r.get("pull") or {}).get("ratio")
-                if t.pull_drop > 0 and ratio is not None and ratio < 1.0 - t.pull_drop:
+                if t.pull_drop > 0 and (r.get("pull") or {}).get("on"):
                     fills = pnl = [0.0] * len(s["fills"])       # the pull rule had this side cancelled
                 else:
                     fills, pnl = s["fills"], s["pnl"]
