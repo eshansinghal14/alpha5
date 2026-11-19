@@ -39,12 +39,26 @@ ship() {
   rm -rf -- "$@"
 }
 
+# The race's decision journal is ~2.4 GB/day (11-16..18), most of what the box
+# writes; two days covers the daily review (yesterday), older days restore from S3.
+RACE_KEEP_DAYS=${RACE_KEEP_DAYS:-2}
+race_cutoff=$(date -u -d "-$RACE_KEEP_DAYS days" +%F)
+
 fail=0
 for j in live/*/20??-??-??/journal; do
   day=$(basename "$(dirname "$j")")
-  if [ -d "$j" ] && [[ "$day" < "$cutoff" ]]; then
+  keep=$cutoff
+  [[ "$j" == live/KXCRYPTOLEAD15M/* ]] && keep=$race_cutoff
+  if [ -d "$j" ] && [[ "$day" < "$keep" ]]; then
     ship "$j.tar" "$j" || fail=1
   fi
+done
+# LIPFARM journals a file per day (journal/2026-11-06.jsonl) and no reader needs old days.
+for j in live/LIPFARM/journal/20??-??-??.jsonl; do
+  [ -e "$j" ] || continue
+  day=$(basename "$j" .jsonl)
+  [[ "$day" < "$cutoff" ]] || continue
+  ship "$(dirname "$j")/$day.tar" "$j" || fail=1
 done
 # Recorders keep either a folder per day (books/2026-10-14/) or files with the
 # day in the name (prints/BTC_2026-10-14_16.parquet).
