@@ -43,8 +43,11 @@ from infra.kalshi.orders import WRITE_SHARE_ENV
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Wait this long after Ctrl-C for children to pull quotes before force-killing
-# (a kill skips the quote pull, so this errs long).
-SHUTDOWN_GRACE_S = 60.0
+# (a kill skips the quote pull, so this errs long). At 60 s it killed shard 0's
+# processes mid-pull (~15k quotes at ~150 cancels/s need ~100 s), leaving orders
+# resting unwatched until the next processes armed (11-19 04:12). Kept under the
+# unit's TimeoutStopSec (300 s, deploy stop-timeout.conf).
+SHUTDOWN_GRACE_S = 240.0
 SERVICE_START_TIMEOUT_S = 20.0
 SERVICE_RESTART_S = 3.0
 
