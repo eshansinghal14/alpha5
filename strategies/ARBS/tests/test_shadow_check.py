@@ -96,6 +96,9 @@ def test_live_bias_is_the_lot_weighted_miss_of_live_nets_against_real_arbs(tmp_p
     monkeypatch.setattr(AP, "bundle_log", lambda series, days=2: log if series == "ARBS" else log.iloc[0:0])
     monkeypatch.setattr(SC, "BIAS_MIN_LOTS", 100.0)
     monkeypatch.setattr(SC, "BIAS_MAX_C", 100.0)
+    monkeypatch.setattr(SC, "BIAS_SINCE", t0 + 1)
+    assert SC.live_bias(str(root), "2026-11-19") == (0.0, 0.0)     # picks priced before the cutoff don't count
+    monkeypatch.setattr(SC, "BIAS_SINCE", 0.0)
     bias, lots = SC.live_bias(str(root), "2026-11-19")
     assert lots == 200.0 and abs(bias - (100 * (4.0 - 2.0) + 100 * 20.0) / 200) < 1e-9   # 11c
     monkeypatch.setattr(SC, "BIAS_MAX_C", 4.0)

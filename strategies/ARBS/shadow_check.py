@@ -51,6 +51,9 @@ TRAIN_DAYS = 14
 # BIAS_CLIP_C (one 500-lot news sweep was -27c/lot, 11-18), the estimate needs
 # BIAS_MIN_LOTS and is held to 0..BIAS_MAX_C.
 BIAS_CLIP_C, BIAS_MIN_LOTS, BIAS_MAX_C = 20.0, 1500.0, 4.0
+# Picks priced before exit_cost.expected_loss (live 2026-11-19 22:27 UTC) carry the
+# at-price optimism that change took out; counted, the bias would take it out twice.
+BIAS_SINCE = pd.Timestamp("2026-11-19 22:27", tz="UTC").timestamp()
 RULE_SIZES = (5.0, 20.0, 50.0, 100.0, 200.0, 500.0)
 
 
@@ -402,7 +405,8 @@ def live_bias(root: str, before: str) -> tuple[float, float]:
                 for line in fh:
                     if '"model_quote"' in line:
                         x = json.loads(line)
-                        if x.get("live") and not x.get("shadow") and x.get("net_c") is not None:
+                        if (x.get("live") and not x.get("shadow") and x.get("net_c") is not None
+                                and x["t"] >= BIAS_SINCE):
                             # The net before the bias then in force, so the estimate isn't of itself.
                             picks[(x["basket_id"], x["ticker"])].append((x["t"], x["net_c"] + (x.get("bias_c") or 0.0)))
                     elif '"fill_kind": "quote"' in line:
