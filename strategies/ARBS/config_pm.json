@@ -22,6 +22,7 @@
     "deep_min_gap_ticks": 5,
     "deep_live": false,
     "lazy_below_top": false,
+    "skip_beyond_reach": false,
     "depth_age_s": 5.0,
     "second_level_size": false,
     "pull_drop": 0.5,

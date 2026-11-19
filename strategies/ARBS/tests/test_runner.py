@@ -3325,26 +3325,67 @@ def test_lazy_below_top_defers_only_updates_under_an_unchanged_top(arbs, monkeyp
     asyncio.run(go())
 
 
-def test_prefix_shadow_counts_updates_beyond_the_reach_of_any_quote(arbs, monkeypatch):
+def _beyond_setup(r, b, monkeypatch, live=True):
     import types
-    r, b = arbs
-    live = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
-    r.set_baskets([live])
+    x = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC")) if live else b
+    r.set_baskets([x])
     monkeypatch.setattr(r, "liq", types.SimpleNamespace(on_book=lambda *a: None))
     monkeypatch.setattr(r.cfg.runtime, "record_prints", False, raising=False)
     r.cfg.trading = dataclasses.replace(r.cfg.trading, live_quote_size=15)
-    upd = types.SimpleNamespace(ticker="X-A", bid=0.40, ask=0.45, bid_depth=10, ask_depth=10)
-    no = [(0.55, 10), (0.50, 10)]
-    book(r, "X-A", [(0.40, 10), (0.38, 10), (0.30, 50)], no + [(0.40, 50)])
+    return x, types.SimpleNamespace(ticker="X-A", bid=0.40, ask=0.45, bid_depth=10, ask_depth=10)
+
+
+def test_beyond_reach_counts_updates_no_live_evaluation_reads(arbs, monkeypatch):
+    r, b = arbs
+    live, upd = _beyond_setup(r, b, monkeypatch)
+    no = [(0.55, 10), (0.53, 20)]
+    # Reach: the best, every level within 2c of it, then on until 15 lots under the best.
+    book(r, "X-A", [(0.40, 10), (0.38, 20), (0.30, 50)], no + [(0.40, 50)])
     r._on_quote_inner(upd)                               # first sight: a top change
-    book(r, "X-A", [(0.40, 10), (0.38, 10), (0.30, 60)], no + [(0.40, 50)])
+    book(r, "X-A", [(0.40, 10), (0.38, 20), (0.30, 60)], no + [(0.40, 50)])
     r._on_quote_inner(upd)                               # no reach recorded yet: within
-    book(r, "X-A", [(0.40, 10), (0.38, 10), (0.30, 70)], no + [(0.40, 40)])
-    r._on_quote_inner(upd)                               # 20 lots of reach cover 15; the change is past them
+    book(r, "X-A", [(0.40, 10), (0.38, 20), (0.30, 70)], no + [(0.40, 40)])
+    r._on_quote_inner(upd)                               # past 2c and past 15 lots: beyond
     book(r, "X-A", [(0.40, 10), (0.38, 5), (0.30, 70)], no + [(0.40, 40)])
-    r._on_quote_inner(upd)                               # the second level is in reach
+    r._on_quote_inner(upd)                               # inside 2c of the best: within
     assert r.pfx_stats["X"][:3] == [1, 2, 1]
-    assert r.prefix_shadow_view()["total"][:3] == [1, 2, 1]
+
+
+def test_skip_beyond_reach_marks_nothing_for_an_unread_update(arbs, monkeypatch):
+    r, b = arbs
+    live, upd = _beyond_setup(r, b, monkeypatch)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, skip_beyond_reach=True)
+    no = [(0.55, 10), (0.53, 20)]
+
+    async def go():
+        book(r, "X-A", [(0.40, 10), (0.38, 20), (0.30, 50)], no + [(0.40, 50)])
+        r._on_quote_inner(upd)
+        r._on_quote_inner(upd)                           # reach recorded
+        r.dirty.clear(); r.quoted.clear(); r.urgent.clear()
+        book(r, "X-A", [(0.40, 10), (0.38, 20), (0.30, 70)], no + [(0.40, 40)])
+        r._on_quote_inner(upd)                           # beyond reach: nothing marked
+        assert live.basket_id not in r.dirty and not r.lazy and r.n["marks_skipped"] == 1
+        book(r, "X-A", [(0.40, 10), (0.38, 25), (0.30, 70)], no + [(0.40, 40)])
+        r._on_quote_inner(upd)                           # within 2c: marked at once
+        assert live.basket_id in r.dirty
+        r.exit_hist[live.basket_id] = collections.deque()
+        book(r, "X-A", [(0.40, 10), (0.38, 25), (0.30, 80)], no + [(0.40, 40)])
+        r._on_quote_inner(upd)                           # beyond, but being exited: marked
+        assert live.basket_id in r.urgent
+    asyncio.run(go())
+
+
+def test_skip_beyond_reach_leaves_pre_game_markets_alone(arbs, monkeypatch):
+    r, b = arbs
+    pre, upd = _beyond_setup(r, b, monkeypatch, live=False)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, skip_beyond_reach=True)
+    no = [(0.55, 10), (0.53, 20)]
+    book(r, "X-A", [(0.40, 10), (0.38, 20), (0.30, 50)], no + [(0.40, 50)])
+    r._on_quote_inner(upd)
+    r._on_quote_inner(upd)
+    book(r, "X-A", [(0.40, 10), (0.38, 20), (0.30, 70)], no + [(0.40, 40)])
+    r._on_quote_inner(upd)                               # deep levels feed pre-game deep quotes
+    assert not r.n.get("marks_skipped") and r.pfx_stats["X"][4] >= 2
 
 
 def test_scan_markets_do_not_grow_while_kalshi_rate_limits_reads(arbs, monkeypatch):

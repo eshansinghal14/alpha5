@@ -121,6 +121,10 @@ class TradingParams:
                                  "(only levels under the top moved) re-evaluate live and quoted baskets at most "
                                  "every 0.1 s, as quiet ones already do. Top moves, size changes at the top and "
                                  "baskets being exited stay immediate.")
+    skip_beyond_reach: bool = param("A book update that leaves the top's prices and sizes alone and changes no "
+                                    "level a live evaluation reads (within 2c of the best, then down to "
+                                    "live_quote_size under it) marks none of the market's baskets, when all of "
+                                    "them are live. Baskets being exited are still marked.")
     second_level_size: bool = param("Two-leg baskets: hold every quote (arb, near, deep) to what the other leg "
                                     "still completes, without a loss, with its best ask level gone. In a "
                                     "two-outcome market the trader who fills the quote takes that level in "
