@@ -1455,7 +1455,7 @@ def _live_gap(r, b, a_yes_bids):
     r.set_baskets([live])
     r.hot = [live.basket_id]
     r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_live_events=True, live_quote_size=2, live_edge_add=0.0,
-                                        deep_min_gap_ticks=5, requote_cooldown_s=0.0)
+                                        deep_min_gap_ticks=5, requote_cooldown_s=0.0, deep_live=True)
     book(r, "X-A", a_yes_bids, [(0.35, 10)])
     book(r, "X-B", [(0.40, 10)], [(0.45, 10)])      # B's YES ask 0.55
     _eval(r, live)
@@ -1472,6 +1472,22 @@ def test_deep_quote_rests_one_tick_over_the_next_bid_behind(arbs):
     assert main.price == pytest.approx(0.40) and not main.deep
     # Held to the arb quote's live_quote_size of 2.
     assert deep.price == pytest.approx(0.21) and deep.size == 2 and deep.edge > main.edge
+
+
+def test_deep_live_off_keeps_live_baskets_to_their_arb_quotes(arbs):
+    r, b = arbs
+    live = _live_gap(r, b, [(0.45, 10), (0.20, 5)])
+    assert (live.basket_id, 0, "deep") in r.quotes
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, deep_live=False)
+    _eval(r, live)
+    assert (live.basket_id, 0) in r.quotes and (live.basket_id, 0, "deep") not in r.quotes
+
+
+def test_deep_live_off_leaves_pre_game_deep_quotes(arbs):
+    r, b = arbs
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, deep_live=False)
+    _slow_gap(r, b)
+    assert (b.basket_id, 0, "deep") in r.quotes
 
 
 def test_no_deep_quote_on_a_small_gap(arbs, monkeypatch):

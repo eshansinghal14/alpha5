@@ -3434,6 +3434,10 @@ class ArbsRunner:
                 continue
             if dq is not None and dq.pending:
                 continue
+            if live and not t.deep_live:
+                if dq is not None:
+                    acts.append(self.cancel_quote(dq, "deep_off"))
+                continue
             if j in pulled:
                 if dq is not None:
                     acts.append(self.cancel_quote(dq, "pull"))

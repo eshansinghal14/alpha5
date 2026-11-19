@@ -109,6 +109,10 @@ class TradingParams:
                                "this long (an existing quote keeps its size); 0 = off. Live fills 11-02..10 "
                                "over 50 lots made +2.1c/lot when that depth (5 s) covered them, -3.0c/lot "
                                "(-$322, 87 arbs) when it didn't.", min=0.0, max=10.0, step=0.5)
+    deep_live: bool = param("Deep and reach quotes on live baskets. Off: they rest pre-game only (near quotes are "
+                            "pre-game only either way). Real fills 11-09..19: live deep fills made +$23 on 1,430 "
+                            "lots and held the worst tails (KXNHL2P -$39, KXHIGHTSFO -$11), pre-game ones +$387 on "
+                            "10,444.")
     second_level_size: bool = param("Two-leg baskets: hold every quote (arb, near, deep) to what the other leg "
                                     "still completes, without a loss, with its best ask level gone. In a "
                                     "two-outcome market the trader who fills the quote takes that level in "
