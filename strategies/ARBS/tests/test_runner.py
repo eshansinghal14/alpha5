@@ -3319,6 +3319,17 @@ def test_a_fill_for_an_unlisted_basket_is_held_aside_for_the_audit_until_booked(
     assert r.unbooked_pos == {} and r.real_ledger.net_by_ticker().get("X-A") == 1.0
 
 
+def test_a_booked_fill_read_again_after_its_basket_left_the_scan_is_not_held_aside(arbs):
+    r, b = arbs
+    r.real_ledger.quote_ids["oid-7"] = {"basket_id": b.basket_id, "ticker": "X-A", "side": "yes", "retired_at": None}
+    f = {"order_id": "oid-7", "trade_id": "t1", "ticker": "X-A", "side": "yes", "price": 0.31, "size": 1.0,
+         "fee": 0.0, "liquidity": "maker"}
+    assert r.apply_real_fill(f, "rest")
+    r.real_ledger.quote_ids["oid-7"]["basket_id"] = "gone:basket"   # the scan dropped it; a restart polls again
+    assert r.apply_real_fill(f, "rest")
+    assert r.unbooked_pos == {} and r.real_ledger.net_by_ticker().get("X-A") == 1.0
+
+
 
 def test_a_basket_with_a_quote_resting_is_marked_on_every_book_update(arbs, monkeypatch):
     import types

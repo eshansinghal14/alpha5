@@ -2230,6 +2230,12 @@ class ArbsRunner:
         info = self.real_ledger.quote_ids.get(oid)
         if info is None:
             return False
+        key = f"{oid}:{tid}"
+        # Checked before the unlisted branch: a fill booked earlier whose basket
+        # the scan has since dropped, read again after a restart, went down as
+        # unbooked too and the audit counted it twice (KXHIGHMIA 11-19).
+        if key in self.real_ledger.seen_trades:
+            return True
         if info["basket_id"] not in self.baskets:
             # _book needs the basket; left unbooked (not marked seen) so the audit
             # shows it and a later read can book it once the basket is back.
@@ -2243,9 +2249,6 @@ class ArbsRunner:
                 n = float(f["size"])
                 self.unbooked_pos[held] = {"ticker": info["ticker"], "qty": n if info["side"] == "yes" else -n}
                 self._save_unbooked()
-            return True
-        key = f"{oid}:{tid}"
-        if key in self.real_ledger.seen_trades:
             return True
         self.real_ledger.seen_trades.add(key)
         if self.unbooked_pos.pop(key, None) is not None:
