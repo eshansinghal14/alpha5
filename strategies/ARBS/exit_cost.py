@@ -55,6 +55,11 @@ TRAIN_MAX_N = 500.0
 RIDGE = 50.0
 CLIP_C = (-10.0, 50.0)
 MAX_REACH = 30                      # ticks a sweep's depth is counted to, for fill odds
+# Half the loss averaged over deeper sweeps (expected_loss): out of sample on 11-15/16/18 Kalshi
+# prints at 5 lots it calibrated live nets to -0.3..+0.6c of the replay (at-price: +0.6..+1.6c
+# optimistic; full mix: 1-2c pessimistic) and its edge picks made live $348/$157/$83 vs $291/$95/-$24.
+REACH_MIX = 0.5
+MIX_MIN_P = 0.002                   # sweep depths rarer than this among those that fill are left out
 # Print volume bins (contracts), for the lots a filled quote of a given size can expect.
 VOL_EDGES = (0.0, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, math.inf)
 
@@ -231,6 +236,20 @@ class Stats:
             got = self._memo[k] = 0.0 if tot <= 0 else float(h[k[2]:].sum() / tot)
         return got
 
+    def reach_tail(self, live: bool, ticks: float) -> list[tuple[int, float]]:
+        """(ticks swept, share) of the prints that swept at least `ticks`:
+        how deep the sweep that fills a quote that far under the touch goes."""
+        lo = int(min(MAX_REACH, max(0, math.ceil(ticks - 1e-9))))
+        k = ("t", live, lo)
+        got = self._memo.get(k)
+        if got is None:
+            tail = self.reach["live" if live else "not_live"][lo:]
+            tot = float(tail.sum())
+            got = [(lo + i, float(c) / tot) for i, c in enumerate(tail) if tot > 0 and c / tot >= MIX_MIN_P]
+            kept = sum(p for _, p in got)
+            got = self._memo[k] = [(r, p / kept) for r, p in got] if kept > 0 else []
+        return got
+
     def expected_fill(self, live: bool, size: float) -> float:
         """Contracts a filled quote of `size` can expect: min(size, the print's
         volume), each bin at its lower edge (1 for the first). `size` itself
@@ -277,8 +296,8 @@ class Model:
     def value(self, f: dict, x: float, live: bool, size: float, maker_rate: float = 0.0) -> tuple[float, float]:
         """(expected $-cents of a quote at x for `size`: fill odds x expected
         lots x net, net c per lot after the predicted exit loss)."""
-        edge_c, reach_c = 100 * (f["payout"] - x - f["c0"]), max(0.0, 100 * (f["touch"] - x))
-        net = 100 * (f["payout"] - x - f["plan"] - maker_rate * x * (1 - x)) - _predict_at(self.w, f, edge_c, reach_c)
+        reach_c = max(0.0, 100 * (f["touch"] - x))
+        net = 100 * (f["payout"] - x - f["plan"] - maker_rate * x * (1 - x)) - expected_loss(self.w, self.stats, f, x, live)
         if live:
             net -= self.live_bias_c
         return self.stats.fill_prob(live, reach_c) * self.stats.expected_fill(live, size) * net, net
@@ -361,6 +380,47 @@ def _predict_at(w: np.ndarray, f: dict, edge_c: float, reach_c: float) -> float:
         else:
             vals.append(t)
     return sum(vals)                                # sum(), as predict: its float summation is compensated
+
+
+_OFFSET, _k = {}, 1
+for _name, _edges in BINS.items():
+    _OFFSET[_name] = _k
+    _k += len(_edges) - 2
+
+
+def _weight(wl: list, name: str, v: float) -> float:
+    b = _bin(BINS[name], v)
+    return wl[_OFFSET[name] + b - 1] if b > 0 else 0.0
+
+
+def expected_loss(w: np.ndarray, stats: Stats | None, f: dict, x: float, live: bool) -> float:
+    """Exit loss c/lot for a fill of a quote at x. The model is fitted on each
+    print at its own sweep depth; a sweep that fills a quote at x goes at least
+    that deep and often deeper, where exits cost most. Priced at exactly x the
+    loss came out 1.6c/lot low on live fills out of sample, up to 8c on sweeps
+    10c+ past the quote (11-18), so REACH_MIX of it is averaged over the sweep
+    depths at or past x, weighted by stats' reach histogram."""
+    edge_c, d = 100 * (f["payout"] - x - f["c0"]), max(0.0, 100 * (f["touch"] - x))
+    at = _predict_at(w, f, edge_c, d)
+    tail = stats.reach_tail(live, d) if stats is not None and REACH_MIX > 0 else None
+    if not tail:
+        return at
+    wl = _W_LIST[1]
+    # Only the two price terms move with the sweep's depth, and they depend on
+    # nothing but (d, edge_c): cached per weights at 0.1c, as a leg prices ~35
+    # edge/size pairs every MODEL_EVAL_S.
+    key = (live, round(d, 1), round(edge_c, 1))
+    if _MIX[0] is not wl or _MIX[2] is not stats or len(_MIX[1]) > 200_000:
+        _MIX[0], _MIX[1], _MIX[2] = wl, {}, stats
+    shift = _MIX[1].get(key)
+    if shift is None:
+        shift = _MIX[1][key] = sum(
+            p * (_weight(wl, "reach_c", max(d, r)) + _weight(wl, "edge_c", edge_c + max(d, r) - d))
+            for r, p in tail) - _weight(wl, "reach_c", d) - _weight(wl, "edge_c", edge_c)
+    return at + REACH_MIX * shift
+
+
+_MIX: list = [None, {}, None]                        # (weights, (live, d, edge_c) -> mixed - at-price terms, stats)
 
 
 def at_price(f: dict, x: float) -> dict:

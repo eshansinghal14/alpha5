@@ -89,3 +89,37 @@ def test_live_bias_comes_off_live_nets_only_and_survives_the_model_file():
     back = X.Model.from_json(m.to_json())
     assert back.live_bias_c == 1.5 and back.value(f, 0.30, True, 20.0)[1] == live_net
 
+
+
+def _mix_setup():
+    import numpy as np
+    from strategies.ARBS import exit_cost as ec
+    rng = np.random.default_rng(1)
+    w = rng.normal(size=ec.WIDTH)
+    f = {"top_r_min": 2.0, "aged_frac": 1.0, "depth2_r": 3.0, "reach_c": 0.0, "edge_c": 0.0, "spread_c": 0.0,
+         "n": 5.0, "unwind_top_r": 1.0, "n_other": 1, "stable": 1.0, "live": 1.0, "tte_h": 2.0,
+         "touch": 0.40, "c0": 0.55, "plan": 0.56, "payout": 1.0}
+    return ec, w, f
+
+
+def test_expected_loss_is_the_at_price_loss_when_every_sweep_stops_at_our_price():
+    ec, w, f = _mix_setup()
+    st = ec.Stats()
+    for _ in range(10):
+        st.add_reach(True, 3)                     # every sweep 3 ticks: a quote 3 under fills only on those
+    x = 0.37
+    want = ec.predict(w, ec.at_price(f, x))
+    assert abs(ec.expected_loss(w, st, f, x, True) - want) < 1e-9
+
+
+def test_expected_loss_averages_the_sweeps_that_reach_our_price():
+    ec, w, f = _mix_setup()
+    st = ec.Stats()
+    for t in (1, 3, 3, 12):                       # a quote 3 under fills on the 3, 3 and 12 tick sweeps
+        st.add_reach(True, t)
+    x = 0.37
+    at = ec.predict(w, ec.at_price(f, x))
+    deep = ec.predict(w, {**ec.at_price(f, x), "reach_c": 12.0, "edge_c": 100 * (1.0 - x - 0.55) + 9.0})
+    mixed = (2 * at + deep) / 3
+    got = ec.expected_loss(w, st, f, x, True)
+    assert abs(got - ((1 - ec.REACH_MIX) * at + ec.REACH_MIX * mixed)) < 1e-9

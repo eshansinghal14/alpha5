@@ -313,7 +313,7 @@ def rules(root: str, day: str, rows: list) -> dict:
         nets, evs = [], []
         for e in EDGES:
             x = exit_cost.quote_price(f, e)
-            net = 100 * e - exit_cost.predict(w, exit_cost.at_price(f, x))
+            net = 100 * e - exit_cost.expected_loss(w, prev, f, x, live)
             nets.append(net)
             evs.append(prev.fill_prob(live, 100 * (f["touch"] - x)) * prev.expected_fill(live, POLICY_SIZE) * net)
         k = next((k for k, v in enumerate(nets) if v >= RULE_MARGIN_C), None)
@@ -330,7 +330,7 @@ def rules(root: str, day: str, rows: list) -> dict:
                 x = exit_cost.quote_price(fn, e)
                 # Expected lots, not the size: a big quote fills only the print's volume.
                 v = prev.fill_prob(live, 100 * (fn["touch"] - x)) * prev.expected_fill(live, n) * \
-                    (100 * e - exit_cost.predict(w, exit_cost.at_price(fn, x)))
+                    (100 * e - exit_cost.expected_loss(w, prev, fn, x, live))
                 if best is None or v > best[0]:
                     best = (v, n, k, pn[k])
                 if at_n is None or v > at_n[0]:
