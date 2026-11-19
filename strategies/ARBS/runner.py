@@ -646,7 +646,7 @@ class ArbsRunner:
         self.loop_cpu: float | None = None           # event-loop thread's share of a core, last full window
         self._cpu_mark: tuple[float, float] | None = None   # (monotonic, thread CPU) the window started at
         self.listed: set[str] = set()                # relationship ids this process's own scan lists
-        self.set_baskets(self.scanned())
+        self.set_baskets(self.scanned() or [])
         for led in (self.real_ledger, self.shadow_ledger):
             for bid, pos in led.baskets.items():
                 if pos.spec is None and bid in self.baskets:
@@ -999,7 +999,7 @@ class ArbsRunner:
             return load_spec(self.scan_path)
         except Exception as e:
             self.alert("warn", None, f"scanned spec unreadable ({e!r})")
-            return []
+            return None
 
     def set_baskets(self, baskets: list[Basket]) -> list[str]:
         """Trade `baskets` from now on; returns the tickers new to us. A
@@ -1078,7 +1078,12 @@ class ArbsRunner:
 
     async def reload_spec(self):
         loop = asyncio.get_running_loop()
-        new = self.set_baskets(await loop.run_in_executor(self.pool, self.scanned))
+        got = await loop.run_in_executor(self.pool, self.scanned)
+        if got is None:
+            # Unreadable (a basket listed twice, 11-19 05:23): trading on an empty
+            # spec dropped every hot basket and pulled its quotes until the next scan.
+            return
+        new = self.set_baskets(got)
         if not new:
             return
         await loop.run_in_executor(self.pool, self.load_meta)
