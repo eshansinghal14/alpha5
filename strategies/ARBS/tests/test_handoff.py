@@ -211,6 +211,20 @@ def test_state_round_trips_the_quote_table_and_exit_state_exactly(root):
     assert sb.hot == old.hot
 
 
+def test_restored_quotes_keep_their_order_client(root):
+    old, b = _runner()
+    _quotes(old, b)
+    old.gw.shard_of["Y-NEW"] = 3                    # a market the standby hasn't read meta for
+    st = json.loads(json.dumps(old.handoff_state("h1")))
+    sb, _ = _runner(standby="h1")
+    sb.gw.shard_of.pop("Y-NEW", None)
+
+    async def go():
+        sb.restore(st)
+    asyncio.run(go())
+    assert sb.gw.shard_of["Y-NEW"] == 3
+
+
 def test_handoff_books_every_fill_once_and_the_old_process_cancels_nothing(root, monkeypatch):
     old, b = _runner()
     oc = Client()
@@ -272,7 +286,10 @@ def test_takeover_cancels_only_untracked_orders_of_ours(root):
                    max_price=0.32, exchange_id="o2", placed_at=1.0, pending=False)
     sb.quotes[q.key], sb.quotes[gone.key] = q, gone
     sb._handoff_cids = {"lost"}
-    sc.resting = [("o1", "X-B", "c"), ("o7", "X-A", None), ("o8", "X-A", "lost"), ("o9", "X-A", "sibling")]
+    sc.resting = [("o1", "X-B", "c"), ("o7", "X-A", None), ("o8", "X-A", "lost"), ("o9", "X-A", "sibling"),
+                  ("o6", "X-A", None)]
+    sb.real_ledger.quote_ids["o6"] = {"basket_id": b.basket_id, "ticker": "X-A", "side": "yes", "retired_at": None}
+    sb.recent_cancels["o6"] = time.monotonic()      # being cancelled already: not a stray
     sb.standby, sb.gw.frozen = None, False
 
     async def go():

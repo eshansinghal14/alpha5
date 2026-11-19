@@ -624,6 +624,7 @@ class ArbsRunner:
         # Baskets with a fill to exit: evaluated before anything in dirty.
         self.urgent: set[str] = set()
         self.fill_at: dict[str, float] = {}            # basket_id -> when its latest quote fill arrived
+        self.recent_cancels: dict[str, float] = {}     # exchange id -> when we sent its cancel (monotonic)
         self.exit_seen: dict[str, tuple] = {}          # ticker -> (fill arrived, exit decided) for its next exit IOC
         # Baskets with a quote resting whose books changed: after urgent, before
         # dirty. Behind thousands of quoteless baskets a book change took 4-7 ms
@@ -4193,6 +4194,9 @@ class ArbsRunner:
         if self.live and q.exchange_id:
             b = self.baskets.get(q.basket_id)
             t0, book = time.time(), self._last_book(b) if b else None
+            if len(self.recent_cancels) > 50000:
+                self.recent_cancels.clear()
+            self.recent_cancels[q.exchange_id] = time.monotonic()
             _, exc, _ = await self.gw.cancel(q.ticker, q.exchange_id, reason)
             self.order_times.append({"kind": "cancel", "reason": reason, "ticker": q.ticker, "sent": t0,
                                      "answered": time.time(), "book": book, "order_id": q.exchange_id})
@@ -5158,6 +5162,7 @@ class ArbsRunner:
             "alerts": self.alerts[-100:],
             "orphans": [f for _, f in self.orphans],
             "warm": self.warm_state(),
+            "shards": dict(self.gw.shard_of),
         }
 
     @staticmethod
@@ -5188,6 +5193,10 @@ class ArbsRunner:
             if not q.pending:
                 self.quotes[q.key] = q
         self._handoff_cids = {q.cid for q in qs if q.pending}
+        # Before going active: a restored quote on a market whose meta this process
+        # hadn't read yet had no order client, and its failed cancels tripped the
+        # order-error breaker, which pulled every quote (ARBS3B 11-19 05:39).
+        self.gw.shard_of.update({t: int(v) for t, v in (st.get("shards") or {}).items() if v is not None})
         new = self.set_baskets(self.listed_baskets)
         self.live, self.arm_want, self.halt = st["live"], st["arm_want"], st["halt"]
         self.audit_strikes = st.get("audit_strikes", 0)
@@ -5244,9 +5253,12 @@ class ArbsRunner:
             known = {q.exchange_id for q in [*self.quotes.values(), *quotes] if q.exchange_id}
             pending = {q.cid for q in self.quotes.values() if q.pending}
             stray = []
+            mono = time.monotonic()
             for oid, ticker, cid in rows:
                 resting.add(oid)
-                if oid in known or (cid and cid in pending):
+                # One we cancelled since the listing began isn't a stray: re-cancelling
+                # the breaker's 558 pulls drew a burst of 429s (ARBS3B 11-19 05:39).
+                if oid in known or (cid and cid in pending) or mono - self.recent_cancels.get(oid, -1e9) < 60.0:
                     continue
                 if oid in self.real_ledger.quote_ids or (cid and cid in cids) or (not strict and ticker in ours):
                     stray.append((oid, ticker))
@@ -5425,6 +5437,16 @@ class ArbsRunner:
             self._hlog(f"{hid}: takeover failed before going active; exiting for the parent's cold start")
             self._exit(3)
             return
+        # A restored quote whose market has no order client yet (an old process
+        # that didn't hand over its shard map): learned before going active.
+        lost = {q.ticker for q in self.quotes.values() if self.gw.client(q.ticker) is None}
+        if lost:
+            loop = asyncio.get_running_loop()
+            try:
+                await asyncio.wait_for(asyncio.gather(*(loop.run_in_executor(self.pool, self.learn_shard, t)
+                                                        for t in lost)), 3.0)
+            except Exception as e:
+                _log(f"WARN: handoff: shards for {len(lost)} markets not learned ({e!r})")
         # Active from here: the old process wrote its last before <hid>.handed.
         self.standby = None
         self.gw.frozen = False
