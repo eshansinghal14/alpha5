@@ -106,6 +106,10 @@ META_CACHE, META_CACHE_EVERY_S, META_CACHE_MAX_AGE_S = "meta_cache.json", 600.0,
 # their books are in instead of after a 2 min fixed wait.
 WARM_CACHE, WARM_CACHE_EVERY_S, WARM_CACHE_MAX_AGE_S = "warm_cache.json", 30.0, 3600.0
 HOT_READY_S = 120.0
+# After a takeover the new process had rank rows for 16 of ARBS3B's 364 hot
+# baskets and its first hot list pulled ~90% of the inherited quotes (11-19
+# 15:41 UTC); rows were back to ~370 within 5 min, most re-placed by ~35 s.
+TAKEOVER_HOLD_S = 120.0
 # Handing over: exits and in-flight orders get this long to finish before the
 # gateway freezes, then this long for what was already sent to answer.
 HANDOFF_DRAIN_S, HANDOFF_SETTLE_S = 3.0, 1.0
@@ -799,6 +803,8 @@ class ArbsRunner:
         # filled: until then every print looks like one (10-29 restarts, 9-92 s in).
         self.hot_ready = False
         self.seeded: list[str] = []                # hot list from warm_cache.json, kept until hot_ready
+        self.inherited: set[str] = set()           # baskets quoted at a takeover, held hot (holding)
+        self.hold_until = 0.0
         self._warm_saved = (0.0, None)             # (when, what) warm_cache.json last got
         self._meta_saved = 0.0
         self.rank_at: dict[str, float] = {}       # basket_id -> monotonic time its rank row was last priced
@@ -2824,6 +2830,11 @@ class ArbsRunner:
         if not pm_all:
             self.pm_stop = None
         if vs is None or blocked or feed_down or excl:
+            if (vs is None and live_qs and not (blocked or feed_down or excl) and b.basket_id in self.inherited
+                    and self.holding() and self._loading(b)):
+                # A takeover's new markets: meta and books arrive a few seconds after it.
+                self.later(b.basket_id, 0.25)
+                return
             if pm_all and self.live and any(is_pm(q.ticker) for q in live_qs) and self._pm_stop_all(pm_all):
                 live_qs = [q for q in live_qs if not is_pm(q.ticker)]
             if live_qs:
@@ -4599,6 +4610,8 @@ class ArbsRunner:
                 self.expire_reach(now)
                 if self.seeded and not self.hot_ready:
                     hot = self.hot             # the cached list until its books are in
+                elif self.holding():
+                    hot = hot + [b for b in self.inherited if b in self.baskets and b not in picked]
                 if hot != self.hot:
                     entered, left = set(hot) - self.hot_set, self.hot_set - set(hot)
                     if self.hot_ready and (entered or left):
@@ -5148,6 +5161,21 @@ class ArbsRunner:
         self.spend_first.update(d.get("spend_first") or {})
         self.dirty |= set(self.seeded)
 
+    def holding(self) -> bool:
+        """After a takeover, until every inherited basket has a rank row or
+        TAKEOVER_HOLD_S: those baskets stay hot, and ones whose markets are
+        still loading keep their quotes."""
+        if not self.inherited:
+            return False
+        if time.monotonic() >= self.hold_until or all(b in self.rank_rows for b in self.inherited
+                                                      if b in self.baskets):
+            self.inherited = set()
+            return False
+        return True
+
+    def _loading(self, b: Basket) -> bool:
+        return any(self.meta.get(t) is None or self.feed.book(t) is None for t in b.tickers)
+
     def check_hot_ready(self):
         """hot_ready HOT_READY_S after the start, or once every seeded basket
         that can trade has its books (at least one must)."""
@@ -5220,6 +5248,8 @@ class ArbsRunner:
             if not q.pending:
                 self.quotes[q.key] = q
         self._handoff_cids = {q.cid for q in qs if q.pending}
+        self.inherited = {q.basket_id for q in self.quotes.values()}
+        self.hold_until = time.monotonic() + TAKEOVER_HOLD_S
         # Before going active: a restored quote on a market whose meta this process
         # hadn't read yet had no order client, and its failed cancels tripped the
         # order-error breaker, which pulled every quote (ARBS3B 11-19 05:39).

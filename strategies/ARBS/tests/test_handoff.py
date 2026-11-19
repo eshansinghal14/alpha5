@@ -366,3 +366,46 @@ def test_meta_cache_round_trip_and_staleness(root):
         json.dump(d, fh)
     r.meta.clear()
     assert not r.load_meta_cache() and not r.meta
+
+
+def _taken_over(root):
+    old, b = _runner()
+    _quotes(old, b)
+    st = json.loads(json.dumps(old.handoff_state("h1")))
+    sb, _ = _runner(standby="h1")
+    sb.hot = []
+
+    async def go():
+        sb.restore(st)
+    asyncio.run(go())
+    sb.standby, sb.hot_ready = None, True
+    return sb, b
+
+
+def test_takeover_holds_inherited_baskets_until_they_are_ranked(root):
+    sb, b = _taken_over(root)
+    assert sb.inherited == {b.basket_id} and sb.holding()
+    sb.rank_rows[b.basket_id] = {"basket_id": b.basket_id}
+    assert not sb.holding() and not sb.inherited
+    sb, b = _taken_over(root)
+    sb.hold_until = time.monotonic() - 1.0
+    assert not sb.holding()
+
+
+def test_takeover_keeps_quotes_on_markets_still_loading(root):
+    sb, b = _taken_over(root)
+    cancels = []
+
+    async def cancel_quotes(qs, why):
+        cancels.append(why)
+    sb.cancel_quotes = cancel_quotes
+    sb.feed._books.pop("X-B")                      # its book isn't in yet
+
+    async def go():
+        sb.evaluate(b)
+        await drain(sb)
+    asyncio.run(go())
+    assert cancels == []
+    sb.hold_until = time.monotonic() - 1.0         # past the hold: pulled as before
+    asyncio.run(go())
+    assert cancels == ["untradeable"]
