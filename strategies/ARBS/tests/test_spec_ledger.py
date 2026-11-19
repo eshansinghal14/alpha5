@@ -69,3 +69,22 @@ def test_quote_id_changes_logged_and_replayed_until_the_next_full_write(tmp_path
     again.save_quote_ids(now=200.0)
     assert (tmp_path / "l_quote_ids.log.jsonl").read_text() == ""
     assert set(Ledger(str(tmp_path / "l.json")).quote_ids) == {"a", "n"}
+
+
+def test_fills_in_one_loop_step_save_the_ledger_once_after_it(tmp_path):
+    import asyncio
+    from strategies.ARBS.ledger import Ledger
+    path = str(tmp_path / "ledger.json")
+    led = Ledger(path)
+    saves = []
+    real = led.save
+    led.save = lambda now=None: (saves.append(1), real(now))
+
+    async def go():
+        led.record("b", ["A", "B"], "A", "yes", 1, 0.4, 1.0)
+        led.record("b", ["A", "B"], "B", "yes", 1, 0.5, 1.0)
+        assert saves == []                      # nothing written before the step ends
+        await asyncio.sleep(0)
+    asyncio.run(go())
+    assert saves == [1]
+    assert Ledger(path).baskets["b"].legs["A"].qty == 1

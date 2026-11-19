@@ -11,6 +11,7 @@ here: the pair's $1 is what the two legs would have paid at settlement.
 """
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import os
@@ -116,6 +117,7 @@ class Ledger:
         # Set in a standby or a process that has handed over: the file belongs
         # to the active process, so nothing here writes it.
         self.readonly = False
+        self._save_soon = False
         if path and os.path.exists(path):
             self._load()
 
@@ -140,6 +142,23 @@ class Ledger:
         self.last_fill_ts = d.get("last_fill_ts")
         self.seen_trades = set(d.get("seen_trades", []))
         self.settled = d.get("settled", [])
+
+    def save_soon(self):
+        """save() once the event loop's current step ends, coalescing a burst.
+        Called on every fill: a full save of ARBS's 2 MB ledger took ~21 ms
+        (box 11-19) and ran before the fill's exit was priced or sent."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.save()
+            return
+        if not self._save_soon:
+            self._save_soon = True
+            loop.call_soon(self._save_now)
+
+    def _save_now(self):
+        self._save_soon = False
+        self.save()
 
     def save(self, now: float | None = None):
         if not self.path or self.readonly:
@@ -203,7 +222,7 @@ class Ledger:
             b.broken_since = b.broken_since or now
         else:
             b.broken_since = None
-        self.save(now)
+        self.save_soon()
 
     def unwind(self, basket_id: str, tickers: list[str], ticker: str, qty: float, now: float) -> float:
         """Net `qty` contracts out of a leg (we bought the other side; Kalshi
@@ -222,7 +241,7 @@ class Ledger:
             del self.baskets[basket_id]
         else:
             b.broken_since = (b.broken_since or now) if b.unhedged(tickers) else None
-        self.save(now)
+        self.save_soon()
         return basis
 
     def net_by_ticker(self) -> dict[str, float]:

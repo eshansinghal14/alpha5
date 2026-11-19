@@ -2148,11 +2148,14 @@ class ArbsRunner:
                                         source=source, exch_t=exch_t)
             except Exception:
                 self.n["print_errors"] = self.n.get("print_errors", 0) + 1
+        ctx_at = time.time()
         if q.group:
             self._group_fill(q.group, size)
         bid = q.basket_id
         if q.kind == "arb":
             bid = q.booked_to = self.book_target(q, size)
+        target_at = time.time()
+        if q.kind == "arb":
             # Priced so the other legs cost payout - edge - this leg's cost a bundle.
             m = self.meta.get(q.ticker)
             per = q.edge + pricing.maker_cost(q.price, (m.maker_rate if m else None) or 0.0)
@@ -2166,7 +2169,9 @@ class ArbsRunner:
         self.fill_at[bid] = got_at
         self._fresh.append(bid)
         self.n["quote_fills"] += 1
-        kw = {}
+        # Where a fill's handling time goes, ms: context logging, booking target, the rest.
+        kw = {"ms": [round(1000 * (ctx_at - got_at), 1), round(1000 * (target_at - ctx_at), 1),
+                     round(1000 * (time.time() - target_at), 1)]}
         if bid != q.basket_id:
             self.n["alt_fills"] += 1
             self.dirty.add(q.basket_id)
