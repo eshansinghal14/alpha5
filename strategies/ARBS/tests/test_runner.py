@@ -3351,3 +3351,41 @@ def test_order_error_breaker_clears_after_a_quiet_cooldown(arbs):
     r.order_err_at -= 2
     assert r.blocked() is None and r.order_errors == 0
     assert any("breaker cleared" in a["msg"] for a in r.alerts)
+
+
+def test_a_quote_fill_sends_its_completion_before_the_fill_handler_returns(arbs):
+    r, b = arbs
+    log = []
+    live = _live_groups(r, b, log)
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    q = R.Quote(basket_id=live.basket_id, leg=0, ticker="X-A", side="yes", price=0.3, size=5, cid="a",
+                edge=0.05, max_price=0.3, pending=False, exchange_id="oa")
+    r.quotes[q.key] = q
+    sent = []
+
+    def place_ioc(o):
+        sent.append(o)
+        return None
+
+    class C:
+        def allow_now(self, *a, **k):
+            return True
+
+        def note_rate_limited(self, *a):
+            pass
+    C.place_ioc = staticmethod(place_ioc)
+    r.gw.client = lambda t: C()
+    del r.gw.ioc                                             # the real gateway path: a write thread
+
+    async def go():
+        r._quote_fill(q, 2, 0.6, None, "ws")
+        r._exit_fast()
+        t0 = time.monotonic()
+        while not sent and time.monotonic() - t0 < 1.0:     # the write thread, not the event loop
+            time.sleep(0.001)
+        n = len(sent)
+        await drain(r)
+        return n
+    assert asyncio.run(go()) == 1 and sent[0]
+    r.live = False

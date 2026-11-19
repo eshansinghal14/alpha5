@@ -629,6 +629,7 @@ class ArbsRunner:
         # Baskets with a fill to exit: evaluated before anything in dirty.
         self.urgent: set[str] = set()
         self.fill_at: dict[str, float] = {}            # basket_id -> when its latest quote fill arrived
+        self._fresh: list[str] = []                    # baskets a quote fill just broke (_exit_fast)
         self.recent_cancels: dict[str, float] = {}     # exchange id -> when we sent its cancel (monotonic)
         self.exit_seen: dict[str, tuple] = {}          # ticker -> (fill arrived, exit decided) for its next exit IOC
         # Baskets with a quote resting whose books changed: after urgent, before
@@ -925,7 +926,9 @@ class ArbsRunner:
         except OSError:
             self.n["journal_dropped"] = self.n.get("journal_dropped", 0) + 1
 
-    def spawn(self, coro, basket_id: str | None = None):
+    def spawn(self, coro, basket_id: str | None = None, eager: bool = False):
+        """`eager`: runs now up to its first real wait (an order sent to a write
+        thread) instead of after a turn of the event loop."""
         if basket_id is not None:
             self.busy.add(basket_id)
             self.busy_n[basket_id] = self.busy_n.get(basket_id, 0) + 1
@@ -947,7 +950,7 @@ class ArbsRunner:
                         del self.busy_n[basket_id]
                         self.busy.discard(basket_id)
                     self.mark(basket_id)
-        t = asyncio.get_running_loop().create_task(wrap())
+        t = asyncio.Task(wrap(), loop=asyncio.get_running_loop(), eager_start=eager)
         self.tasks.add(t)
         t.add_done_callback(self.tasks.discard)
 
@@ -2161,6 +2164,7 @@ class ArbsRunner:
         if len(self.fill_at) > 5000:
             self.fill_at.clear()
         self.fill_at[bid] = got_at
+        self._fresh.append(bid)
         self.n["quote_fills"] += 1
         kw = {}
         if bid != q.basket_id:
@@ -2259,6 +2263,28 @@ class ArbsRunner:
         if not self.apply_real_fill(f, "ws") and self.live and f.get("ticker") in self.meta:
             # Fill can beat the create's ack; replayed once the id is known.
             self.orphans.append((time.monotonic(), f))
+        if self._fresh:
+            self._exit_fast()
+
+    def _exit_fast(self):
+        """Baskets a fill just broke, priced and exited here rather than when
+        the eval loop next ran: that wait was most of fill -> exit decided
+        (16 ms p50, 44 ms p90 on ARBS, 11-18..19)."""
+        bids, self._fresh = self._fresh, []
+        if self.handing or self.standby is not None:
+            return
+        for bid in dict.fromkeys(bids):
+            b = self.baskets.get(bid)
+            if b is None or bid not in self.urgent or bid in self.busy:
+                continue
+            self.urgent.discard(bid)
+            self.quoted.discard(bid)
+            self.dirty.discard(bid)
+            try:
+                self.evaluate(b)
+            except Exception:
+                _log(f"eval error {bid}:")
+                traceback.print_exc()
 
     def _on_replace(self, oid: str, price: float):
         """A Polymarket modify took effect: its quote's move is confirmed, or
@@ -2753,6 +2779,7 @@ class ArbsRunner:
             await self.wake.wait()
             self.wake.clear()
             self._replay_orphans()
+            self._fresh.clear()           # fills booked off the websocket (REST poll): urgent covers them
             self._in_pass, self._commit_cache, self._broken_cache = True, None, None
             if len(self._lv_cache) > 20000:
                 self._lv_cache.clear()
@@ -3841,7 +3868,7 @@ class ArbsRunner:
             sig = (tuple(self.book_seq.get(t, 0) for t in b.tickers), tuple(pos.held(b.tickers)))
             if self.last_exit.get(bid) != sig:
                 self.last_exit[bid] = sig
-                self.spawn(self.exit_now(b, path, ex, legs, others, qs, cost, why), bid)
+                self.spawn(self.exit_now(b, path, ex, legs, others, qs, cost, why), bid, eager=True)
 
     def _finish_cost(self, b: Basket, held: list[float]) -> float:
         """Cash the cheaper exit costs from `held` at today's books, less the
@@ -3868,6 +3895,8 @@ class ArbsRunner:
                 if ex.excess[j] > _EPS]
 
     async def exit_now(self, b: Basket, path: str, ex: pricing.Exits, legs, others, qs, cost: float, why: str):
+        """Spawned eager: the IOCs reach the write threads before resolve returns,
+        and the journal row and alerts are written while they are in flight."""
         bid = b.basket_id
         decided_at = time.time()
         live_qs = [q for q in qs if not q.pending]
@@ -3877,29 +3906,32 @@ class ArbsRunner:
         # didn't stop that: the IOCs were sized before the cancels went out.
         lim = ex.complete_limits if path == "complete" else ex.unwind_limits
         orders = [(j, t, sd, n, v, lim[j]) for j, t, sd, n, v in self._exit_orders(b, path, ex, legs, others)]
-        self.n["completions" if path == "complete" else "unwinds"] += 1
-        planned = self.exit_planned.get(bid)
-        worse = None if planned is None else cost - planned
-        self.journal({"kind": path, "basket_id": bid, "why": why, "cost": round(cost, 4),
-                      "vs_plan": None if worse is None else round(worse, 4),
-                      "orders": {t: [sd, n, p] for _, t, sd, n, _, p in orders}})
-        if worse is not None and worse > _EPS:
-            self.alert("warn", bid, f"{path} ${worse:.2f} worse than planned ({why})")
-        # Not an unwind that doesn't lose: real arbs within 5 min of one made
-        # 3.8c/lot (225 arbs, 10-30..11-12), against -4.1c after a losing unwind.
-        if why == "fast move" or (path == "unwind" and why != "at plan"):
-            self.flag_live(b, f"a {why} {path}")
-        elif why == "at plan":
-            self.unflag_live(b)
         held = self.hold([(t, sd, n) for _, t, sd, n, _, _ in orders])
         try:
-            # Grouped quotes are pulled alongside: the fills that would overshoot
-            # trip the group, which Kalshi cancels before we could.
             seen = (self.fill_at.pop(bid, None), decided_at)
             for _, t, _, _, _, _ in orders:
                 self.exit_seen[t] = seen
-            res = await asyncio.gather(*(self._ioc(t, sd, p, n, path, v) for _, t, sd, n, v, p in orders),
-                                       *(self.cancel_quote(q, "exit") for q in live_qs))
+            loop = asyncio.get_running_loop()
+            sends = [asyncio.Task(self._ioc(t, sd, p, n, path, v), loop=loop, eager_start=True)
+                     for _, t, sd, n, v, p in orders]
+            # Grouped quotes are pulled alongside: the fills that would overshoot
+            # trip the group, which Kalshi cancels before we could.
+            pulls = [asyncio.Task(self.cancel_quote(q, "exit"), loop=loop, eager_start=True) for q in live_qs]
+            self.n["completions" if path == "complete" else "unwinds"] += 1
+            planned = self.exit_planned.get(bid)
+            worse = None if planned is None else cost - planned
+            self.journal({"kind": path, "basket_id": bid, "why": why, "cost": round(cost, 4),
+                          "vs_plan": None if worse is None else round(worse, 4),
+                          "orders": {t: [sd, n, p] for _, t, sd, n, _, p in orders}})
+            if worse is not None and worse > _EPS:
+                self.alert("warn", bid, f"{path} ${worse:.2f} worse than planned ({why})")
+            # Not an unwind that doesn't lose: real arbs within 5 min of one made
+            # 3.8c/lot (225 arbs, 10-30..11-12), against -4.1c after a losing unwind.
+            if why == "fast move" or (path == "unwind" and why != "at plan"):
+                self.flag_live(b, f"a {why} {path}")
+            elif why == "at plan":
+                self.unflag_live(b)
+            res = await asyncio.gather(*sends, *pulls)
             res = res[:len(orders)]
         finally:
             self.release(held)

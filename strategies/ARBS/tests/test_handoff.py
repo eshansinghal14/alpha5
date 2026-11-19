@@ -245,6 +245,7 @@ def test_handoff_books_every_fill_once_and_the_old_process_cancels_nothing(root,
     async def no_audit():
         return True
     sb.audit = no_audit
+    old._exit_fast = sb._exit_fast = lambda: None    # booking only: the exit is left to the eval loop
 
     async def go():
         old.evaluate(b)
