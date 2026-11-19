@@ -324,6 +324,7 @@ PRE_LIMIT_SLACK_TICKS = 1
 # lands mid-pass isn't even read until the pass yields (fill -> exit decision
 # p99 was 176 ms with whole passes, 10-30/31). A yield costs microseconds.
 EVAL_SLICE_S = 0.001
+ORDER_ERROR_COOLDOWN_S = 120.0
 EXIT_CREATE_WAIT_S = 0.005
 # A book update that leaves the top unchanged re-evaluates a pre-game basket at
 # most once per LAZY_EVAL_S: deep-level churn on KXNVDACEO-29JAN (2.75M updates
@@ -748,6 +749,7 @@ class ArbsRunner:
         self.exit_base: dict[str, list[float]] = {}
         self.exit_misses: dict[str, int] = {}     # basket_id -> consecutive exit takes that missed
         self.order_errors = 0
+        self.order_err_at = 0.0                          # monotonic, last counted order error
         self.unbooked: set[str] = set()                  # settled but unbookable, alerted once
         self.halt: str | None = None                     # until restart
         self.audit_strikes = 0
@@ -948,7 +950,13 @@ class ArbsRunner:
         if self.halt:
             return f"halted: {self.halt}"
         if self.order_errors >= self.cfg.runtime.max_order_errors:
-            return "order_error_breaker"
+            # Only a successful order reset it, and a tripped breaker sends none
+            # but completions: 5 Polymarket code-9 rejects in 2 s (11-19 11:11
+            # UTC) left ARBSPM pulled 4.5 h until a manual re-arm.
+            if time.monotonic() - self.order_err_at < ORDER_ERROR_COOLDOWN_S:
+                return "order_error_breaker"
+            self.order_errors = 0
+            self.alert("info", None, f"order error breaker cleared after {ORDER_ERROR_COOLDOWN_S:.0f}s with no new errors")
         if not self.feed.up and not self.feed.pm._tickers:
             return "feed_down"
         if self.exchange_paused:
@@ -988,6 +996,7 @@ class ArbsRunner:
             self.paused_until[ticker] = time.monotonic() + MARKET_PAUSE_RETRY_S
             return
         self.order_errors += 1
+        self.order_err_at = time.monotonic()
         self.alert("error", basket_id, f"{what} failed: {st} {code} {str(exc)[:200]}")
 
     # ------------------------------------------------------------------ spec

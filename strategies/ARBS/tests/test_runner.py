@@ -3337,3 +3337,17 @@ def test_live_model_sizes_stop_at_live_quote_size(arbs, monkeypatch):
     seen.clear(); r._model_cache.clear(); r.model_state.clear()
     assert r.model_pick(b, 0, vs, now_ts, True, 200.0)[1] == 200.0 and max(seen) == 200.0
 
+
+
+def test_order_error_breaker_clears_after_a_quiet_cooldown(arbs):
+    r, b = arbs
+    import requests
+    exc = requests.HTTPError('400 for x: {"code":9,"message":"The server was unable to process your request."}')
+    for _ in range(r.cfg.runtime.max_order_errors):
+        r._order_err(b.basket_id, "quote X-A", exc, "X-A")
+    assert r.blocked() == "order_error_breaker"
+    r.order_err_at -= R.ORDER_ERROR_COOLDOWN_S - 1
+    assert r.blocked() == "order_error_breaker"
+    r.order_err_at -= 2
+    assert r.blocked() is None and r.order_errors == 0
+    assert any("breaker cleared" in a["msg"] for a in r.alerts)
