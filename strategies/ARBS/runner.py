@@ -250,6 +250,12 @@ LOOP_CPU_TARGET, LOOP_CPU_WINDOW_S = 0.70, 600.0
 # Inside this band of the target the count holds; outside, it moves by the
 # CPU ratio, at most MARKETS_STEP a window either way.
 LOOP_CPU_BAND, MARKETS_STEP, MARKETS_MIN = 0.05, 0.25, 1000
+# Growth waits while this process's reads keep drawing 429s, in READ_429_MINUTES
+# of the window's minutes: one burst isn't the read limit binding. Any 429 used
+# to hold it, and restart and re-arm bursts kept ARBS0B at ~1.5k markets for
+# hours after a CPU cut at the 11-19 open, its read bucket full. MARKETS_MAX
+# keeps it short of where reads did bind (ARBS0C at 55k couldn't arm, 11-18).
+READ_429_MINUTES, MARKETS_MAX = 3, 20000
 # The ceiling only guards a runaway estimate: at 3 shard 0 stopped at ~1,515
 # hot baskets spending ~170 of 255 target tokens/s (11-15 20:37 UTC).
 PLAN_SCALE_MIN, PLAN_SCALE_MAX = 0.5, 10.0
@@ -4604,15 +4610,22 @@ class ArbsRunner:
         self._cpu_mark = (now, cpu_s)
         if abs(self.loop_cpu - LOOP_CPU_TARGET) > LOOP_CPU_BAND:
             f = min(1 + MARKETS_STEP, max(1 - MARKETS_STEP, LOOP_CPU_TARGET / max(self.loop_cpu, 1e-3)))
-            if f > 1 and time.time() - kalshi_api.LAST_429_AT[0] < LOOP_CPU_WINDOW_S:
-                # Kalshi's read limit binds before CPU: grown to 55k markets on a
-                # 63% loop, ARBS0C's meta reads drew 429s and it could not arm (11-18).
+            if f > 1 and self.reads_binding():
                 f = 1.0
             n = round(self.markets * f)
-            if f > 1 and self.listed_markets is not None:
-                n = min(n, max(self.markets, self.listed_markets))
+            if f > 1:
+                if self.listed_markets is not None:
+                    n = min(n, max(self.markets, self.listed_markets))
+                n = min(n, max(self.markets, MARKETS_MAX))
             self.markets = max(MARKETS_MIN, n)
         return self.markets
+
+    @staticmethod
+    def reads_binding(now: float | None = None) -> bool:
+        """This process's Kalshi reads drew 429s in READ_429_MINUTES distinct
+        minutes of the last LOOP_CPU_WINDOW_S."""
+        now = time.time() if now is None else now
+        return len({int(t // 60) for t in kalshi_api.RECENT_429 if now - t < LOOP_CPU_WINDOW_S}) >= READ_429_MINUTES
 
     def update_plan_scale(self, now: float):
         """Per Kalshi shard: moves the plan scale toward the one that puts

@@ -3301,12 +3301,17 @@ def test_live_baskets_are_marked_on_every_book_update(arbs, monkeypatch):
 def test_scan_markets_do_not_grow_while_kalshi_rate_limits_reads(arbs, monkeypatch):
     r, b = arbs
     r.markets, W, r.hot_ready = 4000, R.LOOP_CPU_WINDOW_S, True
-    monkeypatch.setattr(R.kalshi_api, "LAST_429_AT", [time.time()])
+    now = time.time()
+    hits = collections.deque([now - 5, now - 3, now - 1])        # one burst, one minute
+    monkeypatch.setattr(R.kalshi_api, "RECENT_429", hits)
     assert r.scan_markets(0.0, 0.0) == 4000
-    assert r.scan_markets(W, W * 0.2) == 4000                    # 20%: would grow, but reads are limited
-    assert r.scan_markets(2 * W, W * 0.2 + W * 0.95) == 3000     # shrinking still works (-25% at most)
-    R.kalshi_api.LAST_429_AT[0] = time.time() - 2 * W
-    assert r.scan_markets(3 * W, W * 1.35) == 3750               # no recent 429: grows again (+25%)
+    assert r.scan_markets(W, W * 0.2) == 5000                    # a single burst doesn't hold it (+25%)
+    hits.extend([now - 125, now - 245])                          # 429s in three separate minutes
+    assert r.scan_markets(2 * W, W * 0.4) == 5000                # 20%: would grow, but reads are limited
+    assert r.scan_markets(3 * W, W * 0.4 + W * 0.95) == 3750     # shrinking still works (-25% at most)
+    hits.clear()
+    r.markets = 19000
+    assert r.scan_markets(4 * W, W * 1.35 + W * 0.2) == R.MARKETS_MAX    # grows, no further than MARKETS_MAX
 
 
 def test_audit_rereads_only_the_markets_that_disagree(arbs, monkeypatch):

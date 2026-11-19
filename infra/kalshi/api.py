@@ -3,6 +3,7 @@ Kalshi REST helpers: authenticated/public GET with 429 backoff, market
 discovery, orderbook midpoints, historical candles, and the series lists the
 raw orderbook collector sweeps.
 """
+import collections
 import datetime
 import threading
 import time
@@ -99,9 +100,10 @@ def _json(resp) -> dict:
 RETRY_5XX = (500, 502, 503, 504)
 
 
-# When this process last saw a 429 from kalshi_get (time.time()): ARBS holds its
-# market count while Kalshi's read limit binds.
+# When this process last saw a 429 from kalshi_get (time.time()), and the recent
+# ones: ARBS holds its market count while Kalshi's read limit binds.
 LAST_429_AT = [0.0]
+RECENT_429: collections.deque = collections.deque(maxlen=512)
 
 
 def kalshi_get(path: str, params: dict = None, auth: bool = False, max_retries: int = 8) -> dict:
@@ -117,6 +119,7 @@ def kalshi_get(path: str, params: dict = None, auth: bool = False, max_retries: 
         resp = _session().get(BASE_URL + path, headers=headers, params=params, timeout=10)
         if resp.status_code == 429:
             LAST_429_AT[0] = time.time()
+            RECENT_429.append(LAST_429_AT[0])
         if resp.status_code == 429 and attempt < max_retries - 1:
             retry_after = resp.headers.get("Retry-After")
             if retry_after is not None:
