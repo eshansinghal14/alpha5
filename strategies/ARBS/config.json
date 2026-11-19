@@ -26,6 +26,7 @@
     "pull_drop": 0.5,
     "pull_window_s": 2.0,
     "pull_hold_s": 2.0,
+    "pull_only": ["KXEBASKETBALLGAME", "S:Soccer", "S:Hockey", "S:Tennis"],
     "max_bundles_per_basket": 50,
     "max_dollars": 500.0,
     "max_dollars_auto": true,

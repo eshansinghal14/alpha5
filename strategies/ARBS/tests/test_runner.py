@@ -775,7 +775,7 @@ def test_live_quotes_pulled_when_a_leg_they_complete_with_moves_away(arbs):
     r.set_baskets([b])
     r.hot = [b.basket_id]
     r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_live_events=True, live_quote_size=5, live_edge_add=0.0,
-                                        pull_drop=0.5, pull_window_s=30.0, pull_hold_s=2.0)
+                                        pull_drop=0.5, pull_window_s=30.0, pull_hold_s=2.0, pull_only=None)
     rows = []
     r.journal = rows.append
     book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
@@ -795,6 +795,26 @@ def test_live_quotes_pulled_when_a_leg_they_complete_with_moves_away(arbs):
     r.pulled[("X-A", "yes")] = time.monotonic() - 0.01   # the hold ran out
     _eval(r, b)
     assert (b.basket_id, 0) in r.quotes
+
+
+def test_cross_pull_runs_only_where_pull_only_covers_a_market(arbs):
+    r, b = arbs
+    b = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
+    r.set_baskets([b])
+    r.hot = [b.basket_id]
+    r.series_group = {"X": "S:Hockey"}
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_live_events=True, live_quote_size=5, live_edge_add=0.0,
+                                        pull_drop=0.5, pull_window_s=30.0, pull_hold_s=2.0, pull_only=["S:Soccer"])
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    _eval(r, b)
+    _top(r, "X-B", 0.40, 10, 0.55, 10)
+    _top(r, "X-B", 0.40, 10, 0.57, 10)
+    assert not r.pulled                              # hockey isn't listed
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, pull_only=["KXEBASKETBALLGAME", "S:Hockey"])
+    _top(r, "X-B", 0.40, 10, 0.55, 10)
+    _top(r, "X-B", 0.40, 10, 0.57, 10)
+    assert ("X-A", "yes") in r.pulled
 
 
 def test_cross_pull_fires_on_a_vanishing_ask_and_never_for_pregame_baskets(arbs):

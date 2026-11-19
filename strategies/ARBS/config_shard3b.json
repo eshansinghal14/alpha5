@@ -25,6 +25,7 @@
     "pull_drop": null,
     "pull_window_s": null,
     "pull_hold_s": null,
+    "pull_only": null,
     "max_bundles_per_basket": null,
     "max_dollars": null,
     "max_dollars_auto": null,

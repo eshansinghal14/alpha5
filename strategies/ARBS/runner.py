@@ -729,6 +729,10 @@ class ArbsRunner:
         self.priority_trading: list[str] = []     # write_priority_series in session now
         self.last_exit: dict[str, tuple] = {}
         self.pull_watch = AskWatch()
+        self._pull_scope_src: list | None = None
+        self._pull_scope_at = 0.0
+        self._pull_scope_names: frozenset = frozenset()
+        self._pull_scope: dict[str, bool] = {}
         self.move_watch = MoveWatch()
         self.regime: dict[tuple[str, str], float] = {}   # (event, signal) -> wall time its shadow hold ends
         self.pulled: dict[tuple[str, str], float] = {}   # (ticker, side) -> monotonic time its pull ends
@@ -1689,7 +1693,7 @@ class ArbsRunner:
                 b = self.baskets.get(bid_id)
                 if b is None or not any(l.ticker == t and l.side == leg_side for l in b.legs):
                     continue
-                if not self.live_now(b, now_ts):
+                if not self.pull_scoped(b) or not self.live_now(b, now_ts):
                     continue
                 for j, l in enumerate(b.legs):
                     q = self.quotes.get((bid_id, j))
@@ -1710,6 +1714,26 @@ class ArbsRunner:
                     self.pulled[(tk, sd)] = now + c.pull_hold_s
         if len(self.pulled) > 5000:
             self.pulled = {k: v for k, v in self.pulled.items() if v > now}
+
+    def pull_scoped(self, b: Basket) -> bool:
+        """trading.pull_only covers one of the basket's markets (or is empty).
+        Scoped because the pull's replayed value sat in a few markets: on
+        11-16..19 live prints, KXEBASKETBALLGAME, soccer, hockey and tennis held
+        $82 of the $85/day it saved at 5c, from ~1,000 of ~30,000 pulls/h."""
+        names = self.cfg.trading.pull_only
+        if not names:
+            return True
+        if self._pull_scope_src is not names or self._pull_scope_at != self.series_group_at:
+            self._pull_scope_src, self._pull_scope_at = names, self.series_group_at
+            self._pull_scope_names, self._pull_scope = frozenset(names), {}
+        got = self._pull_scope.get(b.basket_id)
+        if got is None:
+            paths = [self._lp_path(l.ticker) for l in b.legs]
+            got = any(k in self._pull_scope_names for p in paths for k in p if k)
+            # A market whose series group isn't read yet could still be in a listed group.
+            if got or all(p[0] != "unknown" for p in paths):
+                self._pull_scope[b.basket_id] = got
+        return got
 
     def _on_trade(self, ticker, trade):
         self.liq.on_trade(ticker, trade.size)

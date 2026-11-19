@@ -89,6 +89,9 @@ class TradingParams:
                                  max=30.0, step=0.05)
     pull_hold_s: float = param("Seconds a pulled side stays unquoted after the last pull signal.", min=0.0,
                                max=60.0, step=0.5)
+    pull_only: list[str] | None = param("Series, events or groups (S:Soccer) the pull runs in: a basket is "
+                                        "covered when any of its markets is. null or empty: every market.",
+                                        editable=False)
     near_min_size: int = param("Pre-game baskets: a second quote one tick under an arb quote that the other "
                                "legs hold under quote_size at its own price. It takes what is left of "
                                "quote_size, sized to the bundles they complete a tick lower, and is placed "
