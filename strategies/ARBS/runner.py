@@ -310,6 +310,7 @@ PRE_LIMIT_SLACK_TICKS = 1
 # lands mid-pass isn't even read until the pass yields (fill -> exit decision
 # p99 was 176 ms with whole passes, 10-30/31). A yield costs microseconds.
 EVAL_SLICE_S = 0.001
+EXIT_CREATE_WAIT_S = 0.005
 # A book update that leaves the top unchanged re-evaluates a pre-game basket at
 # most once per LAZY_EVAL_S: deep-level churn on KXNVDACEO-29JAN (2.75M updates
 # on 11-18, 12x the day before) re-evaluated its 6 baskets on every one, a
@@ -589,6 +590,8 @@ class ArbsRunner:
         self._dirty = _Dirty((), self.wake)
         # Baskets with a fill to exit: evaluated before anything in dirty.
         self.urgent: set[str] = set()
+        self.fill_at: dict[str, float] = {}            # basket_id -> when its latest quote fill arrived
+        self.exit_seen: dict[str, tuple] = {}          # ticker -> (fill arrived, exit decided) for its next exit IOC
         # Baskets with a quote resting whose books changed: after urgent, before
         # dirty. Behind thousands of quoteless baskets a book change took 4-7 ms
         # p50 and 10-30 ms p75 to reach a cancel (11-16, shard 0 and Polymarket).
@@ -821,6 +824,10 @@ class ArbsRunner:
             self.wake.set()
         else:
             self.dirty.add(basket_id)
+
+    def _mark_urgent(self, basket_id: str):
+        self.urgent.add(basket_id)
+        self.wake.set()
 
     def later(self, basket_id: str, delay: float):
         """Re-evaluate a basket after `delay` without spinning the eval loop."""
@@ -2026,6 +2033,7 @@ class ArbsRunner:
             d.pop(basket_id, None)
 
     def _quote_fill(self, q: Quote, size: float, cost: float, trade_id, source: str, exch_t: float | None = None):
+        got_at = time.time()
         q.filled += size
         for k, p in self.cross_of.get(q.ticker, ()):
             # Both exchanges' tops at our fill on a paired market (single-leg hedge research).
@@ -2050,6 +2058,10 @@ class ArbsRunner:
         elif q.kind in ("complete", "unwind"):
             self.exit_paid(q.basket_id, self.baskets[q.basket_id], q.side, q.ticker, size, cost)
         self.urgent.add(bid)
+        self.wake.set()                 # urgent alone waited for the next book update to wake the loop
+        if len(self.fill_at) > 5000:
+            self.fill_at.clear()
+        self.fill_at[bid] = got_at
         self.n["quote_fills"] += 1
         kw = {}
         if bid != q.basket_id:
@@ -3543,9 +3555,11 @@ class ArbsRunner:
             fee = kfees.fee(cost / got, got, view.taker_rate)
             return RealFill(price=cost / got, size=got, fee=fee, exchange_order_id=None), None
         t0 = time.time()
+        seen = self.exit_seen.pop(ticker, (None, None))
         fill, exc, sent = await self.gw.ioc(ticker, side, limit, size, force=True, reason=reason)
         self.order_times.append({"kind": "ioc", "reason": reason, "ticker": ticker, "sent": t0,
-                                 "answered": time.time(), "order_id": None if fill is None else fill.exchange_order_id})
+                                 "answered": time.time(), "order_id": None if fill is None else fill.exchange_order_id,
+                                 "fill_seen": seen[0], "decided": seen[1]})
         if not sent:
             return None, RuntimeError("no order client")
         if exc is None:
@@ -3645,7 +3659,10 @@ class ArbsRunner:
         # is refused), so the exit goes now rather than 50 ms on.
         grouped_ok = self.live_now(b, _utc())
         if any(q.pending and not (grouped_ok and q.group) for q in qs):
-            self.later(bid, 0.05)
+            # Re-checked urgently every EXIT_CREATE_WAIT_S: a flat 50 ms back in
+            # the dirty set outlasted the create (~10-15 ms) it waited for.
+            self.n["exit_create_waits"] = self.n.get("exit_create_waits", 0) + 1
+            asyncio.get_running_loop().call_later(EXIT_CREATE_WAIT_S, self._mark_urgent, bid)
             return
         legs = [self.leg_view(l.ticker, l.side) if self.is_open(l.ticker) else None for l in b.legs]
         others = [self.leg_view(l.ticker, OTHER[l.side]) if self.is_open(l.ticker) else None for l in b.legs]
@@ -3723,11 +3740,12 @@ class ArbsRunner:
 
     async def exit_now(self, b: Basket, path: str, ex: pricing.Exits, legs, others, qs, cost: float, why: str):
         bid = b.basket_id
+        decided_at = time.time()
         live_qs = [q for q in qs if not q.pending]
-        grouped = [q for q in live_qs if q.group]
-        if len(grouped) < len(live_qs):
-            # A resting exit bid filling alongside these IOCs would overshoot.
-            await self.cancel_quotes([q for q in live_qs if not q.group], "exit")
+        # Our other quotes on these legs are cancelled alongside the IOCs: a
+        # resting one filling meanwhile would overshoot. Awaiting the cancels
+        # first put a round trip (~8-15 ms) before every pre-game exit and
+        # didn't stop that: the IOCs were sized before the cancels went out.
         lim = ex.complete_limits if path == "complete" else ex.unwind_limits
         orders = [(j, t, sd, n, v, lim[j]) for j, t, sd, n, v in self._exit_orders(b, path, ex, legs, others)]
         self.n["completions" if path == "complete" else "unwinds"] += 1
@@ -3748,8 +3766,11 @@ class ArbsRunner:
         try:
             # Grouped quotes are pulled alongside: the fills that would overshoot
             # trip the group, which Kalshi cancels before we could.
+            seen = (self.fill_at.pop(bid, None), decided_at)
+            for _, t, _, _, _, _ in orders:
+                self.exit_seen[t] = seen
             res = await asyncio.gather(*(self._ioc(t, sd, p, n, path, v) for _, t, sd, n, v, p in orders),
-                                       *(self.cancel_quote(q, "exit") for q in grouped))
+                                       *(self.cancel_quote(q, "exit") for q in live_qs))
             res = res[:len(orders)]
         finally:
             self.release(held)

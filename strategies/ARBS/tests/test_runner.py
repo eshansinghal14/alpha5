@@ -1933,7 +1933,7 @@ def test_live_exit_does_not_wait_for_grouped_quotes_cancels(arbs):
     r.live = False
 
 
-def test_live_exit_waits_for_an_ungrouped_quotes_cancel(arbs):
+def test_live_exit_cancels_an_ungrouped_quote_alongside_its_iocs(arbs):
     r, b = arbs
     log = []
     live = _live_groups(r, b, log)
@@ -1944,7 +1944,8 @@ def test_live_exit_waits_for_an_ungrouped_quotes_cancel(arbs):
     r.quotes[q.key] = q
     _eval(r, live)
     kinds = [e[0] for e in log]
-    assert kinds.index("cancel_end") < kinds.index("ioc")
+    # Sent together: awaiting the cancel first put a round trip before the exit.
+    assert "ioc" in kinds and "cancel_end" in kinds and kinds.index("ioc") < kinds.index("cancel_end")
     r.live = False
 
 
