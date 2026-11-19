@@ -3298,6 +3298,33 @@ def test_live_baskets_are_marked_on_every_book_update(arbs, monkeypatch):
     asyncio.run(go())
 
 
+def test_lazy_below_top_defers_only_updates_under_an_unchanged_top(arbs, monkeypatch):
+    import types
+    r, b = arbs
+    live = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
+    r.set_baskets([live])
+    monkeypatch.setattr(r, "liq", types.SimpleNamespace(on_book=lambda *a: None))
+    monkeypatch.setattr(r.cfg.runtime, "record_prints", False, raising=False)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, lazy_below_top=True)
+    upd = lambda bq, aq: types.SimpleNamespace(ticker="X-A", bid=0.40, ask=0.45, bid_depth=bq, ask_depth=aq)  # noqa: E731
+
+    async def go():
+        r._on_quote_inner(upd(10, 10))
+        r.dirty.clear()
+        for _ in range(5):
+            r._on_quote_inner(upd(10, 10))                   # levels under the top only: one deferred mark
+        assert live.basket_id not in r.dirty and r.lazy == {live.basket_id}
+        r._on_quote_inner(upd(10, 4))                        # the size at the best ask changed: now
+        assert live.basket_id in r.dirty
+        await asyncio.sleep(R.LAZY_EVAL_S + 0.05)
+        assert not r.lazy
+        r.dirty.clear()
+        r.exit_hist[live.basket_id] = collections.deque()    # being exited: every update, at once
+        r._on_quote_inner(upd(10, 4))
+        assert live.basket_id in r.urgent and not r.lazy
+    asyncio.run(go())
+
+
 def test_scan_markets_do_not_grow_while_kalshi_rate_limits_reads(arbs, monkeypatch):
     r, b = arbs
     r.markets, W, r.hot_ready = 4000, R.LOOP_CPU_WINDOW_S, True

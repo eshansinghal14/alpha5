@@ -825,6 +825,7 @@ class ArbsRunner:
         self.spend: dict[str, _Rate] = {}         # basket_id -> write tokens/s its quotes spent
         self.top_moves: dict[str, _Rate] = {}     # ticker -> best bid/ask changes per second
         self.last_top: dict[str, tuple] = {}
+        self.last_top_size: dict[str, tuple] = {}
         self.hot_churn: collections.deque = collections.deque()   # (time, entered, left) per hot-list change
         self.hot_cost = 0.0                       # estimated write tokens/s of quoting the hot list
         self.hot_cost_by_shard: dict[str, float] = {}
@@ -1608,16 +1609,33 @@ class ArbsRunner:
         if self.cfg.trading.pull_drop > 0:
             self._watch_pulls(book)
         deep = old == top
+        size = (book.bid_depth, book.ask_depth)
+        below = deep and self.last_top_size.get(book.ticker) == size and self.cfg.trading.lazy_below_top
+        self.last_top_size[book.ticker] = size
         now = time.time() if deep else 0.0
         for bid in self.by_ticker.get(book.ticker, ()):
-            self._mark_book(bid, deep, now)
+            self._mark_book(bid, deep, now, below)
         for bid in self.via_by_ticker.get(book.ticker, ()):
-            self._mark_book(bid, deep, now)
+            self._mark_book(bid, deep, now, below)
         return ev
 
-    def _mark_book(self, bid: str, deep: bool, now: float):
+    def _mark_book(self, bid: str, deep: bool, now: float, below: bool = False):
         """mark() for a book update; deferred up to LAZY_EVAL_S when only
-        levels under the top moved on a basket not live with nothing resting."""
+        levels under the top moved on a basket not live with nothing resting,
+        or (`below`, trading.lazy_below_top) when the top's prices and sizes
+        both held, on any basket not being exited. Deferring top-size changes
+        too slowed edge cancels to ~100 ms p75 (11-18): a completion leg's
+        depth at its best price can go without the price moving."""
+        if below and bid not in self.exit_hist:
+            if bid not in self.lazy:
+                try:
+                    asyncio.get_running_loop().call_later(LAZY_EVAL_S, self._lazy_mark, bid)
+                except RuntimeError:
+                    self.mark(bid)
+                    return
+                self.lazy.add(bid)
+            self.n["marks_lazy_below"] = self.n.get("marks_lazy_below", 0) + 1
+            return
         if deep and bid not in self.quotes.n_by_basket and bid not in self.exit_hist and now < self._live_at(bid):
             if bid not in self.lazy:
                 try:

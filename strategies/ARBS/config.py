@@ -117,6 +117,10 @@ class TradingParams:
                             "pre-game only either way). Real fills 11-09..19: live deep fills made +$23 on 1,430 "
                             "lots and held the worst tails (KXNHL2P -$39, KXHIGHTSFO -$11), pre-game ones +$387 on "
                             "10,444.")
+    lazy_below_top: bool = param("Book updates that leave a market's best prices and the sizes at them unchanged "
+                                 "(only levels under the top moved) re-evaluate live and quoted baskets at most "
+                                 "every 0.1 s, as quiet ones already do. Top moves, size changes at the top and "
+                                 "baskets being exited stay immediate.")
     second_level_size: bool = param("Two-leg baskets: hold every quote (arb, near, deep) to what the other leg "
                                     "still completes, without a loss, with its best ask level gone. In a "
                                     "two-outcome market the trader who fills the quote takes that level in "
