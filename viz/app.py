@@ -421,6 +421,10 @@ def _pick(series: str):
 
 
 def main():
+    if st.query_params.get("view") == "phone":
+        from viz import arbs_page
+        arbs_page.phone()
+        return
     reg, groups = _registry(), _groups()
     every = [s for ms in groups.values() for s in ms]
     # A session from before (or a series since removed) can hold a page that's gone.

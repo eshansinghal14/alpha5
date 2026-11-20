@@ -408,6 +408,27 @@ def _pnl_chart(series: str):
     st.altair_chart(layers.properties(height=260), use_container_width=True)
 
 
+def phone(series: str = "ARBS"):
+    """The phone view (?view=phone): total PnL, the chart, the last few arbs."""
+    @st.fragment(run_every="15s")
+    def view():
+        ss = {p: x for p in parts(series) if (x := read_summary(p)) is not None}
+        if ss:
+            p = merge(ss).get("pnl") or {}
+            total = (p.get("settled") or 0.0) + (p.get("locked") or 0.0) + (p.get("broken") or 0.0)
+            st.metric("ARBS total PnL", _usd(total))
+        _pnl_chart(series)
+        log = _bundle_log(series)
+        if len(log):
+            st.dataframe(_local(log.head(8).copy(), "time"), hide_index=True, use_container_width=True,
+                         column_order=["time", "series", "bundles", "pnl"],
+                         column_config={"time": st.column_config.DatetimeColumn(format="MM-DD HH:mm")})
+        else:
+            st.caption("No arbs in the last two days.")
+
+    view()
+
+
 def render(series: str, stale_fn):
     st.title("Arbitrage · risk-free")
     st.caption("Whole baskets only: take every leg, or quote legs and complete the rest on a fill. "
