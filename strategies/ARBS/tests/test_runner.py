@@ -2326,6 +2326,43 @@ def test_shadow_live_counts_a_pulled_side_as_no_fill(arbs):
     assert sum(r.lp.nodes[()].f) == 0.0
 
 
+def test_a_print_a_5c_quote_would_lose_on_marks_its_event_hot(arbs):
+    r, b = arbs
+    # A fills at 0.43 (5c under B's 0.50 ask); B's ask is 0.70 1 s later: -4.7c/lot at best.
+    marks = r._hot_marks([_live_print_row(0.30), _live_print_row(0.50)])
+    assert [(m[0], m[2]) for m in marks] == [("X", "complete_set:X:buy_all_yes")] and marks[0][3] < -2.0
+
+
+def test_a_hot_event_pulls_its_live_baskets_quotes_while_on(arbs, monkeypatch):
+    r, b = arbs
+    monkeypatch.setattr(R.parts, "event_of", lambda bid: "X" if bid == b.basket_id else "")
+    r.part_idx = None                                              # no shard 0 event split here
+    live = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
+    r.set_baskets([live])
+    r.hot = [live.basket_id]
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_live_events=True, live_quote_size=5, live_edge_add=0.0,
+                                        hot_event_s=0.0, hot_event_only=["S:Esports"])
+    rows = []
+    r.journal = rows.append
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    _eval(r, live)
+    assert (live.basket_id, 0) in r.quotes
+    r._heat([("X", time.time(), live.basket_id, -5.0)])           # journaled while off, nothing pulled
+    assert rows[-1]["kind"] == "hot_event" and rows[-1]["on"] is False
+    _eval(r, live)
+    assert (live.basket_id, 0) in r.quotes
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, hot_event_s=300.0)   # X's group isn't S:Esports
+    _eval(r, live)
+    assert (live.basket_id, 0) in r.quotes
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, hot_event_only=["X"])  # by series
+    _eval(r, live)
+    assert (live.basket_id, 0) not in r.quotes and (live.basket_id, 1) not in r.quotes
+    r.hot_events["X"] = time.time() - 1.0                          # cooled off: quotes again
+    _eval(r, live)
+    assert (live.basket_id, 0) in r.quotes
+
+
 def test_shadow_live_learns_only_from_prints_we_were_quoting(arbs):
     r, b = arbs
     tripped = {**_OUR_QUOTE, "tripped": True, "tripped_s": 5.0}

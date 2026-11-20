@@ -125,6 +125,12 @@ class TradingParams:
                                     "level a live evaluation reads (within 2c of the best, then down to "
                                     "live_quote_size under it) marks none of the market's baskets, when all of "
                                     "them are live. Baskets being exited are still marked.")
+    hot_event_s: float = param("Seconds a live basket stops quoting after a recorded print in its event that a "
+                               "20-lot quote at a 5c edge would have lost over 2c/lot on. 0 = off (hot events "
+                               "are still journaled).", min=0.0, max=3600.0, step=30.0)
+    hot_event_only: list[str] | None = param("Series, events or groups (S:Esports) hot_event_s covers: a basket "
+                                             "is covered when any of its markets is. null or empty: every market.",
+                                             editable=False)
     second_level_size: bool = param("Two-leg baskets: hold every quote (arb, near, deep) to what the other leg "
                                     "still completes, without a loss, with its best ask level gone. In a "
                                     "two-outcome market the trader who fills the quote takes that level in "

@@ -396,6 +396,13 @@ SHADOW_PRUNE_S = 6 * 3600.0
 # 11-01..04 replay scored 5 and 30 min holds about the same.
 REGIME_HOLD_S = 1800.0
 PRINTS_FLUSH_S = 10.0
+# A recorded print a 20-lot quote at a 5c edge would have filled and lost more
+# than 2c/lot on (completed or unwound at the books 0.1/1 s later) marks its event
+# hot. Real live arbs within 5 min after one lost $91 (-4.3c/lot, 137 arbs)
+# against +$333 (+2.1c/lot, 1,085) for the rest (11-16..19), concentrated in
+# esports, tennis and weather; a wider edge didn't help (hot fills lost ~3c/lot
+# at 7.5c too). HOT_EVENT_SHADOW_S is the hold journaled while the switch is off.
+HOT_EDGE, HOT_SIZE, HOT_LOSS_C, HOT_EVENT_SHADOW_S = 0.05, 20.0, -2.0, 300.0
 IDS_COMPACT_S = 3600.0
 # Kalshi trips a group once MORE than this many contracts match in 15 s; 0 is
 # refused (invalid_parameters, 10-31), so a 1-lot fill doesn't trip it.
@@ -857,6 +864,7 @@ class ArbsRunner:
         self.last_top: dict[str, tuple] = {}
         self.last_top_size: dict[str, tuple] = {}
         self._meta_pending: set[str] = set()             # markets read in the background at start
+        self.hot_events: dict[str, float] = {}           # event -> until (time.time()), see HOT_EDGE
         self._pfx: dict[str, tuple] = {}                 # ticker -> both sides' levels a quote could reach
         self.pfx_stats: dict[str, list] = {}             # series -> [top, within, beyond, beyond marks]
         self.hot_churn: collections.deque = collections.deque()   # (time, entered, left) per hot-list change
@@ -2116,6 +2124,55 @@ class ArbsRunner:
             groups[g] = {"edge": e, "value": round(val, 4), "lcb": round(lcb, 4)}
         return {"groups": groups, "events": {ev: v[1] for ev, v in self.lp_seen.items()}}, errs
 
+    def hot_until(self, b: Basket, now: float) -> float:
+        """When a live basket's hot event (HOT_EDGE) lets it quote again, if it
+        is hot, trading.hot_event_s is on and hot_event_only covers one of its
+        markets; else 0."""
+        t = self.cfg.trading
+        if t.hot_event_s <= 0 or not self.hot_events:
+            return 0.0
+        until = self.hot_events.get(parts.event_of(b.basket_id), 0.0)
+        if until <= now or not self.live_now(b, _utc()):
+            return 0.0
+        names = t.hot_event_only
+        if names and not any(k in names for l in b.legs for k in self._lp_path(l.ticker) if k):
+            return 0.0
+        return until
+
+    def _hot_marks(self, rows: list[dict]) -> list[tuple]:
+        """Pool thread. (event, print time, basket, c/lot) for each recorded
+        print a HOT_SIZE quote at HOT_EDGE would have lost over -HOT_LOSS_C on."""
+        out = []
+        for r in rows:
+            try:
+                s = replay.score(r, self._rates, (HOT_EDGE,), HOT_SIZE, lag=SHADOW_LAG_S, live_only=True)
+            except Exception:
+                continue
+            if s is None or not s["fills"][0]:
+                continue
+            c = 100 * s["pnl"][0] / s["fills"][0]
+            if c < HOT_LOSS_C:
+                out.append((parts.event_of(s["basket_id"]), r["t"], s["basket_id"], round(c, 2)))
+        return out
+
+    def _heat(self, marks: list[tuple]):
+        t = self.cfg.trading
+        hold = t.hot_event_s if t.hot_event_s > 0 else HOT_EVENT_SHADOW_S
+        now = time.time()
+        for ev, ts, bid, c in marks:
+            if not ev:
+                continue
+            was = self.hot_events.get(ev, 0.0)
+            self.hot_events[ev] = max(was, ts + hold)
+            if was <= now:
+                self.n["hot_events"] = self.n.get("hot_events", 0) + 1
+                self.journal({"kind": "hot_event", "event": ev, "basket_id": bid, "pnl_c": c,
+                              "until": round(self.hot_events[ev], 1), "on": t.hot_event_s > 0})
+                if t.hot_event_s > 0:
+                    self.dirty |= {q for q in self.quotes.n_by_basket if parts.event_of(q) == ev}
+        if len(self.hot_events) > 5000:
+            self.hot_events = {k: v for k, v in self.hot_events.items() if v > now}
+
     async def prints_loop(self):
         loop = asyncio.get_running_loop()
         while True:
@@ -2123,6 +2180,8 @@ class ArbsRunner:
             try:
                 rows = self.prints.take(time.time())
                 self.n["prints_recorded"], self.n["prints_dropped"] = self.prints.rows, self.prints.dropped
+                if rows:
+                    self._heat(await loop.run_in_executor(self.pool, self._hot_marks, rows))
                 if rows and self.cfg.runtime.live_params_shadow:
                     self.lp_view, errs = await loop.run_in_executor(self.pool, self._shadow_live, rows)
                     self.n["shadow_errors"] = self.n.get("shadow_errors", 0) + errs
@@ -3095,6 +3154,12 @@ class ArbsRunner:
             if live_qs:
                 why = blocked or ("feed_down" if feed_down else "excluded" if excl else "untradeable")
                 self.spawn(self.cancel_quotes(live_qs, why), b.basket_id)
+            return
+        hot = self.hot_until(b, now)
+        if hot:
+            if live_qs:
+                self.spawn(self.cancel_quotes(live_qs, "hot_event"), b.basket_id)
+            self.later(b.basket_id, hot - now + 0.05)
             return
         t = self.cfg.trading
         if (t.enable_takes and (t.take_live_events or not self.live_now(b, _utc()))
