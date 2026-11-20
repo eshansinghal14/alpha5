@@ -1016,13 +1016,28 @@ class ArbsRunner:
             broken = self._broken_cache
         else:
             now = time.time()
-            broken = sum(1 for b in self.ledger.baskets.values()
-                         if b.broken_since is not None and now - b.broken_since >= BROKEN_STOP_S)
+            broken = sum(1 for bid, b in self.ledger.baskets.items()
+                         if b.broken_since is not None and now - b.broken_since >= BROKEN_STOP_S
+                         and self._exitable(bid, b))
         if self._in_pass:
             self._broken_cache = broken
         if broken >= self.cfg.completion.max_broken_baskets:
             return f"{broken} broken baskets"
         return None
+
+    def _exitable(self, basket_id: str, pos) -> bool:
+        """Can a broken basket still be completed or unwound: are its missing
+        legs' markets, or else its excess legs', all still open? One that can do
+        neither just waits to settle, and stopping every quote for it helped
+        nothing: three KXART auction ladders filled at the lot's close held ARBS
+        unquoted 30 min (11-20)."""
+        b = self.baskets.get(basket_id)
+        tickers = b.tickers if b is not None else list(getattr(pos, "legs", None) or ())
+        if not tickers or not hasattr(pos, "unhedged"):
+            return True                     # nothing to judge it by: it counts, as it always did
+        excess = pos.unhedged(tickers)
+        is_open = lambda t: (m := self.meta.get(t)) is None or m.status in ("active", "unknown")  # noqa: E731
+        return all(is_open(t) for t in tickers if t not in excess) or all(is_open(t) for t in excess)
 
     def _order_ok(self):
         self.order_errors = 0

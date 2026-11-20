@@ -153,6 +153,20 @@ def test_broken_basket_rests_on_the_cheaper_exit(arbs):
     assert note["action"] == "rest" and note["path"] == "unwind"
 
 
+def test_a_broken_basket_that_can_only_settle_does_not_block_quoting(arbs):
+    r, b = arbs
+    _broken(r, b)                                        # 5 YES A held, B missing
+    r.cfg.completion = dataclasses.replace(r.cfg.completion, max_broken_baskets=1)
+    r.ledger.baskets[b.basket_id].broken_since = time.time() - R.BROKEN_STOP_S - 1
+    assert r.blocked() == "1 broken baskets"             # both markets open: it can still exit
+    r.meta["X-B"].status = "closed"                      # can't complete, can still unwind A
+    assert r.blocked() == "1 broken baskets"
+    r.meta["X-A"].status = "closed"                      # neither: it waits to settle
+    assert r.blocked() is None
+    r.meta["X-B"].status = "active"                      # B reopened: it can complete again
+    assert r.blocked() == "1 broken baskets"
+
+
 def test_broken_basket_takes_when_the_exit_moves_away(arbs):
     r, b = arbs
     _broken(r, b)
