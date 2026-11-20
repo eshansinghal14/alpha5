@@ -273,11 +273,43 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
             "relationships": rels}
 
 
+# An event whose loop CPU stayed under CHEAP_EVENT_S on every recent day (today's
+# too) doesn't count against the CPU-held market count. 82-88% of shard 0's
+# events took under 1 s a day on 11-18, and cutting the count dropped them first
+# while the busy few kept the CPU: ARBS0B went from 10.6k events to 1.1k at the
+# same 11-12 core-hours a day (11-19). TOTAL_MARKETS_MAX holds each process's
+# scan where shard 0's reads held (~31k across its processes on 11-17), well
+# short of where they didn't (ARBS0C alone at 55k couldn't arm, 11-18).
+CHEAP_EVENT_S, TOTAL_MARKETS_MAX = 10.0, 15000
+
+
+def cheap_events(procs: tuple[str, ...], root: str | None = None, days: int = parts.SPEND_DAYS) -> set[str]:
+    """Events `procs` timed in their loops on the last `days` UTC days whose
+    CPU (summed over the processes) stayed under CHEAP_EVENT_S on each one.
+    An event with no record isn't cheap."""
+    per: dict[tuple[str, str], float] = {}
+    for p in procs:
+        try:
+            with open(os.path.join(root or parts.LIVE_ROOT, p, parts.CPU), encoding="utf-8") as fh:
+                by_day = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        for day in sorted(by_day)[-days:]:
+            for ev, x in by_day[day].items():
+                per[(ev, day)] = per.get((ev, day), 0.0) + x
+    worst: dict[str, float] = {}
+    for (ev, _), x in per.items():
+        worst[ev] = max(worst.get(ev, 0.0), x)
+    return {ev for ev, x in worst.items() if x < CHEAP_EVENT_S}
+
+
 def select(doc: dict, *, now: pd.Timestamp, days: float | None, max_markets: int | None, known_tickers: set[str] = frozenset(),
-           held: set[str] = frozenset(), exclude: set[str] = frozenset()) -> dict:
+           held: set[str] = frozenset(), exclude: set[str] = frozenset(), cheap: set[str] = frozenset(),
+           max_total: int | None = None) -> dict:
     """The part of a scan to trade: relationships settling within `days` (None: any), the
     most traded per market first (24h volume),
-    until max_markets markets beyond `known_tickers` (None: no limit).
+    until max_markets markets beyond `known_tickers` (None: no limit), not
+    counting `cheap` events' markets, and max_total markets in all.
     Relationships holding a basket in `held` are always kept."""
     # Per market, not in total: on 11-05 a 400-market Nasdaq ladder and the
     # 14-market election-margin ladders outranked 3-market games trading
@@ -287,19 +319,22 @@ def select(doc: dict, *, now: pd.Timestamp, days: float | None, max_markets: int
         return (r.get("volume_24h") or 0.0) / max(n, 1)
 
     horizon = None if days is None else now + pd.Timedelta(days=days)
-    out, used = [], set()
+    out, used, every = [], set(), set()
     for r in sorted(doc["relationships"], key=lambda r: -per_market(r)):
         ts = {l["ticker"] for b in r["baskets"] for l in b["legs"]} - known_tickers
+        costly = set() if r["relationship_id"].split(":", 1)[-1] in cheap else ts
         if any(b["basket_id"] in held for b in r["baskets"]):
             out.append(r)
-            used |= ts
+            used |= costly
+            every |= ts
             continue
         s = r.get("expected_settlement_utc")
         if (s and horizon is not None and pd.Timestamp(s) > horizon) or r.get("cluster") in exclude                 or r["relationship_id"].split(":", 1)[-1] in exclude:
             continue
-        if max_markets is None or len(used | ts) <= max_markets:
+        if (max_markets is None or len(used | costly) <= max_markets) and                 (max_total is None or len(every | ts) <= max_total):
             out.append(r)
-            used |= ts
+            used |= costly
+            every |= ts
     return {**doc, "relationships": out}
 
 
@@ -395,8 +430,10 @@ def scan_and_select(root: str, config_path: str | None = None, markets: int | No
         idx = group.index(name)
         owns = lambda ev: parts.owner(st, ev) == idx  # noqa: E731
     doc = run(cfg, os.path.join(root, "scanned_spec.json"), held, owns=owns, events=events)
+    cheap = cheap_events(group) if group is not None else set()
     sel = select(doc, now=pd.Timestamp.now(tz="UTC"), days=cfg.trading.days_till_expiry, max_markets=markets,
-                 held=held, exclude=set(cfg.watch.exclude))
+                 held=held, exclude=set(cfg.watch.exclude), cheap=cheap, max_total=TOTAL_MARKETS_MAX)
+    info["cheap_events"] = len(cheap)
     atomic_write_json(os.path.join(root, SELECTED), sel, indent=None)
     if owns is not None:
         # Owned events only the CPU-held count left out (not the horizon or

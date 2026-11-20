@@ -233,6 +233,29 @@ def test_live_window_by_category():
     assert not any(b.is_live(pd.Timestamp("2026-11-08", tz="UTC")) for b in later.values())
 
 
+def test_cheap_events_do_not_count_against_the_market_cap_but_do_against_the_total():
+    a = event("A-1", "MECNET", [mkt("A-1-X", vol=100), mkt("A-1-Y", vol=100)])
+    b = event("B-1", "MECNET", [mkt("B-1-X", vol=10), mkt("B-1-Y", vol=10)])
+    c = event("C-1", "MECNET", [mkt("C-1-X", vol=1), mkt("C-1-Y", vol=1)])
+    doc = scanner.scan([a, b, c], now=NOW, mecnet_max_legs=6, ladder_span=3, complete_set_exclude=[], overrides={})
+    ids = lambda got: sorted(r["relationship_id"] for r in got["relationships"])  # noqa: E731
+    assert ids(scanner.select(doc, now=NOW, days=90, max_markets=2)) == ["mecnet:A-1"]
+    got = scanner.select(doc, now=NOW, days=90, max_markets=2, cheap={"A-1", "C-1"})
+    assert ids(got) == ["mecnet:A-1", "mecnet:B-1", "mecnet:C-1"]          # only B's 2 markets count
+    got = scanner.select(doc, now=NOW, days=90, max_markets=2, cheap={"A-1", "C-1"}, max_total=4)
+    assert ids(got) == ["mecnet:A-1", "mecnet:B-1"]                         # 6 markets in all is past 4
+
+
+def test_cheap_events_are_those_under_the_cpu_bar_every_recent_day(tmp_path):
+    for p, by_day in (("P1", {"2026-11-18": {"A-1": 2.0, "B-1": 3.0}, "2026-11-19": {"A-1": 1.0, "B-1": 40.0}}),
+                      ("P2", {"2026-11-19": {"A-1": 8.5, "D-1": 0.5}})):
+        (tmp_path / p).mkdir()
+        (tmp_path / p / scanner.parts.CPU).write_text(json.dumps(by_day))
+    got = scanner.cheap_events(("P1", "P2"), root=str(tmp_path))
+    # A: 9.5 s on 11-19 across both, under 10; B: 40 s once; D: under; E: never timed.
+    assert got == {"A-1", "D-1"}
+
+
 def test_select_skips_an_excluded_event():
     a = event("A-1", "MECNET", [mkt("A-1-X"), mkt("A-1-Y")])
     b = event("B-1", "MECNET", [mkt("B-1-X"), mkt("B-1-Y")])
