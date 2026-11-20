@@ -1,0 +1,9 @@
+[Unit]
+Description=alpha5: shard cash top-up, every minute
+
+[Timer]
+OnCalendar=*-*-* *:*:20
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
