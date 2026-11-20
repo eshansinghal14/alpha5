@@ -24,7 +24,7 @@ Change details with measurements are in `docs/CHANGES.md` (2026-10-19/20 entries
 - SG `sg-0216e64cd58ee302c` allows SSH from `73.13.41.0/24` and `165.123.0.0/16`.
   Your IP changes; add a /32 with `aws ec2 authorize-security-group-ingress
   --group-id sg-0216e64cd58ee302c --protocol tcp --port 22 --cidr <ip>/32`.
-- Dashboard: `ssh -i $env:USERPROFILE\.ssh\alpha5-live-key.pem -N -L 8502:127.0.0.1:8502 ubuntu@13.185.15.92`.
+- Dashboard: https://alpha5-live.tailcc599c.ts.net from a device on the owner's Tailscale network (`tailscale serve` on the box, since 2026-11-19). Fallback: `ssh -i $env:USERPROFILE.sshlpha5-live-key.pem -N -L 8502:127.0.0.1:8502 ubuntu@13.185.15.92`.
 - Box code: `ec2-live` at `bf09f77`. Deploy = push, then on the box
   `git fetch && git merge --ff-only origin/ec2-live` **after confirming
   origin has the new sha** (twice a pull ran before GitHub had the push and
