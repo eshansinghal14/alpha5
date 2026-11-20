@@ -147,3 +147,19 @@ def test_dashboard_pnl_history_adds_the_processes():
     c = ap.combine([a, b])
     assert list(c.settled) == [1.0, 6.0, 7.0] and list(c.total) == [1.5, 7.5, 8.5]
     assert list(c.capital) == [100.0, 100.0, 110.0]
+
+
+def test_journal_rows_reads_only_new_lines_and_waits_for_a_partial_one(tmp_path):
+    import os
+    from viz.arbs_pnl import journal_rows
+    p = tmp_path / "2026-11-20.jsonl"
+    p.write_text('{"kind": "fill", "t": 1}\n{"kind": "quote", "t": 2}\n{"kind": "settled", "t": 3')
+    assert [r["t"] for r in journal_rows(str(p))] == [1]
+    with open(p, "a") as fh:
+        fh.write(', "pnl": 1}\n{"kind": "balance", "t": 4}\n')
+    assert [r["t"] for r in journal_rows(str(p))] == [1, 3, 4]
+    # Replaced in place (the archive's slimming): read again from the start.
+    q = tmp_path / "new.jsonl"
+    q.write_text('{"kind": "fill", "t": 9}\n')
+    os.replace(q, p)
+    assert [r["t"] for r in journal_rows(str(p))] == [9]

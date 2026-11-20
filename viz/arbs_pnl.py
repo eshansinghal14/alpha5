@@ -8,6 +8,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import threading
 
 import pandas as pd
 
@@ -141,21 +142,51 @@ def replay(rows: list[dict], info: dict[str, tuple[float, int]]) -> pd.DataFrame
     return pd.DataFrame(out, columns=["time", "settled", "total", "capital"])
 
 
+# path -> (inode, bytes read, rows). A day's journal is ~300 MB (11-20) and the
+# dashboard re-read every day of every process each refresh (~50 s on its two
+# cores), so each file is read once and after that only its new lines.
+_ROWS: dict[str, tuple[int, int, list[dict]]] = {}
+_ROWS_LOCK = threading.Lock()
+
+
+def journal_rows(path: str) -> list[dict]:
+    """The journal's fill, settled and balance rows. Shared across calls, so
+    callers must not mutate them. A file replaced in place (the nightly
+    archive slims old days) is read again from the start."""
+    with _ROWS_LOCK:
+        st = os.stat(path)
+        ino, off, rows = _ROWS.get(path, (st.st_ino, 0, []))
+        if ino != st.st_ino or st.st_size < off:
+            ino, off, rows = st.st_ino, 0, []
+        if st.st_size > off:
+            with open(path, "rb") as fh:
+                fh.seek(off)
+                data = fh.read()
+            end = data.rfind(b"\n") + 1      # a partly written last line waits for the next call
+            rows = rows + [r for line in data[:end].decode("utf-8", "replace").splitlines()
+                           if ('"fill"' in line or '"settled"' in line or '"balance"' in line)
+                           and (r := _parse(line)) is not None]
+            off += end
+        _ROWS[path] = (ino, off, rows)
+        return rows
+
+
+def _parse(line: str) -> dict | None:
+    try:
+        return json.loads(line)
+    except ValueError:
+        return None
+
+
 def load(series: str) -> pd.DataFrame:
     root = os.path.join(LIVE_ROOT, series)
     rows, bal = [], []
     for f in sorted(glob.glob(os.path.join(root, "journal", "*.jsonl"))):
-        with open(f, encoding="utf-8") as fh:
-            for line in fh:
-                if '"fill"' in line or '"settled"' in line or '"balance"' in line:
-                    try:
-                        r = json.loads(line)
-                    except ValueError:
-                        continue
-                    if r.get("kind") == "balance":
-                        bal.append((pd.Timestamp(r["t"], unit="s", tz="UTC"), sum((r.get("positions") or {}).values())))
-                    else:
-                        rows.append(r)
+        for r in journal_rows(f):
+            if r.get("kind") == "balance":
+                bal.append((pd.Timestamp(r["t"], unit="s", tz="UTC"), sum((r.get("positions") or {}).values())))
+            else:
+                rows.append(r)
     return with_positions(replay(rows, basket_info(root)), bal)
 
 
@@ -198,15 +229,7 @@ def bundle_log(series: str, days: int = 2) -> pd.DataFrame:
     root = os.path.join(LIVE_ROOT, series)
     rows = []
     for f in sorted(glob.glob(os.path.join(root, "journal", "*.jsonl")))[-days:]:
-        with open(f, encoding="utf-8") as fh:
-            for line in fh:
-                if '"fill"' in line:
-                    try:
-                        r = json.loads(line)
-                    except ValueError:
-                        continue
-                    if r.get("kind") == "fill" and r.get("live"):
-                        rows.append(r)
+        rows += [r for r in journal_rows(f) if r.get("kind") == "fill" and r.get("live")]
     info = basket_info(root)
     settles = basket_settles(root)
     arbs: list[dict] = []
