@@ -123,3 +123,12 @@ def test_expected_loss_averages_the_sweeps_that_reach_our_price():
     mixed = (2 * at + deep) / 3
     got = ec.expected_loss(w, st, f, x, True)
     assert abs(got - ((1 - ec.REACH_MIX) * at + ec.REACH_MIX * mixed)) < 1e-9
+
+
+def test_expected_loss_is_the_at_price_loss_pre_game():
+    ec, w, f = _mix_setup()
+    st = ec.Stats()
+    for t in (1, 3, 3, 12):
+        st.add_reach(False, t)
+    x = 0.37
+    assert abs(ec.expected_loss(w, st, f, x, False) - ec.predict(w, ec.at_price(f, x))) < 1e-9

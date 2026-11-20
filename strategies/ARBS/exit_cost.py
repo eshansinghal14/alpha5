@@ -402,7 +402,10 @@ def expected_loss(w: np.ndarray, stats: Stats | None, f: dict, x: float, live: b
     depths at or past x, weighted by stats' reach histogram."""
     edge_c, d = 100 * (f["payout"] - x - f["c0"]), max(0.0, 100 * (f["touch"] - x))
     at = _predict_at(w, f, edge_c, d)
-    tail = stats.reach_tail(live, d) if stats is not None and REACH_MIX > 0 else None
+    # Live only: pre-game the mix's deep-sweep losses, learned almost all from live rows (the
+    # model has no phase interaction), priced 3-4c quotes at -0.5c/lot against +0.4..+0.6c
+    # replayed and moved 81% of pre-game picks to 20c (11-19 prints, 11-20 morning).
+    tail = stats.reach_tail(live, d) if stats is not None and REACH_MIX > 0 and live else None
     if not tail:
         return at
     wl = _W_LIST[1]
