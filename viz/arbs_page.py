@@ -305,32 +305,38 @@ def _metrics(s: dict):
 
 @st.cache_data(ttl=5, show_spinner=False)
 def _bundle_log(series: str) -> pd.DataFrame:
-    return arbs_pnl.bundle_log_all(parts(series), days=2)
+    """The last 24 hours' arbs, newest first (two journal days cover it across midnight)."""
+    log = arbs_pnl.bundle_log_all(parts(series), days=2)
+    return log[log.time >= pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=24)] if len(log) else log
+
+
+def _first(log: pd.DataFrame, key: str, step: int = 10) -> pd.DataFrame:
+    """The rows shown so far: the newest `step`, plus `step` per press of _more.
+    Streamlit has no load-on-scroll, so rows not yet asked for are never sent."""
+    return log.head(st.session_state.get(key, step))
+
+
+def _more(log: pd.DataFrame, key: str, step: int = 10):
+    n = st.session_state.get(key, step)
+    if len(log) > n:
+        st.button(f"Show {min(step, len(log) - n)} more of {len(log)}", key=key + "_btn",
+                  on_click=lambda: st.session_state.__setitem__(key, n + step))
 
 
 def _tables(series: str, s: dict):
-    st.markdown("##### Bundles bought (newest first)")
+    st.markdown("##### Bundles bought, last 24 hours (newest first)")
     log = _bundle_log(series)
     if len(log):
         small = st.column_config.Column(width="small")
-        st.dataframe(_local(log.head(200).copy(), "time"), use_container_width=True, hide_index=True,
+        rows = _first(log, f"arbs_rows_{series}")
+        st.dataframe(_local(rows.copy(), "time"), use_container_width=True, hide_index=True,
                      column_order=["time", "tte", "series", "basket_id", "how", "bundles", "cost", "pnl", "return",
                                    "fills"],
                      column_config={"time": st.column_config.DatetimeColumn(format="MM-DD HH:mm:ss", width="small"),
                                     "tte": small, "series": small, "basket_id": st.column_config.Column(width="medium"),
                                     "how": small, "bundles": small, "cost": small, "pnl": small, "return": small,
                                     "fills": st.column_config.Column(width="medium")})
-    else:
-        st.caption("None.")
-    st.markdown("##### Resting quotes")
-    q = s.get("quotes") or []
-    if q:
-        df = pd.DataFrame(q)
-        if "ret" in df:
-            df["return"] = df["ret"].map(lambda v: f"{v:.2%}")
-        cols = ["shard", "basket_id", "ticker", "side", "price", "max_price", "size", "filled", "edge", "return",
-                "age_s", "pending"]
-        st.dataframe(df[[c for c in cols if c in df]], use_container_width=True, hide_index=True)
+        _more(log, f"arbs_rows_{series}")
     else:
         st.caption("None.")
     with st.expander("Opportunity ranking (return on bundle cost of taking every leg now, fees incl.)"):
@@ -409,7 +415,7 @@ def _pnl_chart(series: str):
 
 
 def phone(series: str = "ARBS"):
-    """The phone view (?view=phone): total PnL, the chart, the last few arbs."""
+    """The phone view (?view=phone): total PnL, the chart, the last 24 hours' arbs."""
     @st.fragment(run_every="15s")
     def view():
         ss = {p: x for p in parts(series) if (x := read_summary(p)) is not None}
@@ -420,11 +426,13 @@ def phone(series: str = "ARBS"):
         _pnl_chart(series)
         log = _bundle_log(series)
         if len(log):
-            st.dataframe(_local(log.head(8).copy(), "time"), hide_index=True, use_container_width=True,
+            rows = _first(log, f"arbs_phone_rows_{series}", step=5)
+            st.dataframe(_local(rows.copy(), "time"), hide_index=True, use_container_width=True,
                          column_order=["time", "series", "bundles", "pnl"],
                          column_config={"time": st.column_config.DatetimeColumn(format="MM-DD HH:mm")})
+            _more(log, f"arbs_phone_rows_{series}", step=5)
         else:
-            st.caption("No arbs in the last two days.")
+            st.caption("No arbs in the last 24 hours.")
 
     view()
 
