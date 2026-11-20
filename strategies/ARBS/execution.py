@@ -16,7 +16,7 @@ import pandas as pd
 
 from backtest.core import Order
 from infra.kalshi.orders import KalshiOrderClient, http_status
-from infra.polymarket.orders import PM_SHARD, PolymarketOrderClient
+from infra.polymarket.orders import CANCEL_BATCH, PM_SHARD, PolymarketOrderClient
 
 PM_CANCEL_WAIT_S = 2.0
 # Polymarket cancels that may wait PM_CANCEL_WAIT_S for the bucket: the quote
@@ -202,34 +202,13 @@ class Gateway:
         if c is None:
             return None, RuntimeError(f"no order client for {ticker}"), False
         if c.shard == PM_SHARD:
-            # Paced on Polymarket's per-IP bucket: pulling a game's quotes at
-            # once sent dozens of cancels in a second and 2,023 drew 429s
-            # (11-15 19:40-19:56). Never forced past PM_URGENT_OVERDRAW: a
-            # 2,000-quote stop forced each after its wait, drew 15,708 429s and
-            # left the bucket at -64k, blocking quotes and the scan ~30 min
-            # (11-16 05:55). A 429'd cancel cancels nothing anyway.
-            routine = reason in PM_ROUTINE_CANCELS
-            loop = asyncio.get_running_loop()
-            t0 = loop.time()
-            end = t0 + PM_CANCEL_WAIT_S
-            if not c.allow_now("cancel", reason=reason):        # counted refused once, not per check
-                while True:
-                    # An urgent cancel is held only by the per-IP bucket, not by
-                    # this process's quoting cap: with the cap spent, pulls waited
-                    # while Polymarket's own limit had room (11-18).
-                    if routine and loop.time() < end:
-                        if c.can_afford("cancel"):
-                            c.allow_now("cancel", force=True, reason=reason)
-                            break
-                    elif (c.tokens_now() if routine else c.budget.tokens_now()) > -PM_URGENT_OVERDRAW:
-                        c.allow_now("cancel", force=True, reason=reason)
-                        break
-                    await asyncio.sleep(0.05)
-                w = self.cancel_wait.setdefault(reason, [0, 0.0, 0.0])
-                dt = loop.time() - t0
-                w[0] += 1
-                w[1] += dt
-                w[2] = max(w[2], dt)
+            fut = asyncio.get_running_loop().create_future()
+            q = self.__dict__.setdefault("_pm_q", [])
+            q.append((exchange_id, ticker, reason, asyncio.get_running_loop().time(), fut))
+            if not self.__dict__.get("_pm_flushing"):
+                self._pm_flushing = True
+                asyncio.get_running_loop().create_task(self._pm_flush(c))
+            return await fut
         elif not c.allow_now("cancel", reason=reason):
             # Counted refused once, not per check: per check, the waits showed
             # as 300k+ "refused" cancels a process in a few hours (11-17).
@@ -243,6 +222,83 @@ class Gateway:
                 c.note_rate_limited("cancel")
             return None, e, True
 
+    async def _pm_flush(self, c):
+        """Send queued Polymarket cancels, up to CANCEL_BATCH a request,
+        urgent ones first; each request paces on the bucket as one cancel did.
+        Paced on Polymarket's per-IP bucket: pulling a game's quotes at once
+        sent dozens of cancels in a second and 2,023 drew 429s (11-15
+        19:40-19:56). Never forced past PM_URGENT_OVERDRAW: a 2,000-quote stop
+        forced each after its wait, drew 15,708 429s and left the bucket at
+        -64k, blocking quotes and the scan ~30 min (11-16 05:55). One cancel a
+        request, 2,400 no_edge cancels in 2.5 min queued up to 5 s behind the
+        25/s limit with those quotes still resting (11-20 13:37 ET)."""
+        loop = asyncio.get_running_loop()
+        q = self._pm_q
+        try:
+            while q:
+                urgent = [e for e in q if e[2] not in PM_ROUTINE_CANCELS]
+                head = (urgent or q)[0]
+                t0 = min(e[3] for e in q)
+                if not c.allow_now("cancel", reason=head[2]):       # counted refused once, not per check
+                    while True:
+                        # Re-read each check: an urgent cancel arriving while
+                        # routine ones wait takes the request at once.
+                        routine = not any(e[2] not in PM_ROUTINE_CANCELS for e in q)
+                        # An urgent cancel is held only by the per-IP bucket, not by
+                        # this process's quoting cap: with the cap spent, pulls waited
+                        # while Polymarket's own limit had room (11-18).
+                        if routine and loop.time() < t0 + PM_CANCEL_WAIT_S:
+                            if c.can_afford("cancel"):
+                                break
+                        elif (c.tokens_now() if routine else c.budget.tokens_now()) > -PM_URGENT_OVERDRAW:
+                            break
+                        await asyncio.sleep(0.05)
+                    c.allow_now("cancel", force=True, reason=head[2])
+                    now = loop.time()
+                    for e in q[:CANCEL_BATCH]:
+                        w = self.cancel_wait.setdefault(e[2], [0, 0.0, 0.0])
+                        w[0] += 1
+                        w[1] += now - e[3]
+                        w[2] = max(w[2], now - e[3])
+                # Taken after the wait, so cancels queued during it ride along.
+                q.sort(key=lambda e: e[2] in PM_ROUTINE_CANCELS)
+                batch = q[:CANCEL_BATCH]
+                del q[:CANCEL_BATCH]
+                loop.create_task(self._pm_send(c, batch))
+        finally:
+            self._pm_flushing = False
+
+    async def _pm_send(self, c, batch: list):
+        def done(e, res):
+            if not e[4].done():
+                e[4].set_result(res)
+        if len(batch) == 1:
+            e = batch[0]
+            try:
+                done(e, (await self.write(c.cancel, e[0], e[1]), None, True))
+            except Exception as exc:
+                if http_status(exc) == 429:
+                    c.note_rate_limited("cancel")
+                done(e, (None, exc, True))
+            return
+        try:
+            await self.write(c.cancel_many, [(e[0], e[1]) for e in batch])
+        except Exception as exc:
+            if http_status(exc) == 429 or isinstance(exc, Frozen):
+                if http_status(exc) == 429:
+                    c.note_rate_limited("cancel")
+                for e in batch:
+                    done(e, (None, exc, True))
+                return
+            # Anything else: each on its own, so one bad order can't hold the rest.
+            for e in batch:
+                c.allow_now("cancel", force=True, reason=e[2])
+            await asyncio.gather(*(self._pm_send(c, [e]) for e in batch))
+            return
+        self.pm_batches = getattr(self, "pm_batches", 0) + 1
+        for e in batch:
+            done(e, (True, None, True))
+
     def usage(self) -> dict:
         out = {str(s): {"tokens_now": round(c.tokens_now(), 1), "tokens_per_s": c.tokens_per_s,
                         "http_429": (u := c.usage()).get("http_429"), "refused": u.get("refused")}
@@ -251,4 +307,6 @@ class Gateway:
             out[str(PM_SHARD)]["cancel_wait"] = {r: {"n": n, "mean_ms": round(1000 * tot / n, 1),
                                                     "max_ms": round(1000 * mx, 1)}
                                                 for r, (n, tot, mx) in self.cancel_wait.items()}
+        if str(PM_SHARD) in out:
+            out[str(PM_SHARD)]["cancel_batches"] = getattr(self, "pm_batches", 0)
         return out

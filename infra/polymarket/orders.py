@@ -30,6 +30,9 @@ ORDER_TIMEOUT_S = 10.0
 RECONCILE_READS = 5
 # An IOC waits this long for its executions in the create response (max 5).
 IOC_BLOCK_S = "2"
+# /v1/orders/batched/cancel's limit. A batch is one request against the
+# per-IP 25/s: two 20-order batches back to back drew no 429 (probe 11-20).
+CANCEL_BATCH = 20
 INTENT = {"yes": "ORDER_INTENT_BUY_LONG", "no": "ORDER_INTENT_BUY_SHORT"}
 # Order states whose quantity can't fill any more.
 DONE = ("ORDER_STATE_FILLED", "ORDER_STATE_CANCELED", "ORDER_STATE_REJECTED", "ORDER_STATE_EXPIRED",
@@ -225,6 +228,15 @@ class PolymarketOrderClient(KalshiOrderClient):
             return False
         _raise_with_body(r)
         return True
+
+    def cancel_many(self, orders: list[tuple[str, str]]) -> list[str]:
+        """Up to CANCEL_BATCH (order id, market) cancels in one request. The
+        ids answered aren't confirmation: an order already gone is listed too,
+        and one listed was still open 0.5 s later (probe 11-20); the private
+        websocket's cancel is the record."""
+        r = self._json("POST", "/v1/orders/batched/cancel", session=self._cancel_session, pay="paid",
+                       body={"orders": [{"orderId": oid, "marketSlug": m} for oid, m in orders]})
+        return list(r.get("canceledOrderIds") or [])
 
     def find_by_client_id(self, event_ticker: str, client_order_id: str) -> tuple[str, str] | None:
         body = self._bodies.get(client_order_id)

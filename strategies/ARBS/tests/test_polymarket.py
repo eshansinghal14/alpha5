@@ -358,6 +358,61 @@ def test_polymarket_cancels_wait_for_the_bucket_then_go(monkeypatch):
     assert calls[-1] is True                     # sent anyway after the wait
 
 
+def _batch_gw(fail=None):
+    from strategies.ARBS import execution
+    sent = []
+
+    class C:
+        shard = 100
+        budget = None
+
+        def allow_now(self, kind, force=False, reason=""):
+            return True
+
+        def cancel(self, oid, ticker):
+            sent.append([oid])
+            return True
+
+        def cancel_many(self, orders):
+            if fail is not None:
+                raise fail
+            sent.append([o for o, _ in orders])
+            return [o for o, _ in orders]
+
+        def note_rate_limited(self, why):
+            pass
+    gw = execution.Gateway.__new__(execution.Gateway)
+    gw.client = lambda t: C()
+    gw.cancel_wait = {}
+
+    async def write(fn, *a):
+        return fn(*a)
+    gw.write = write
+    return gw, sent
+
+
+def test_polymarket_cancels_in_one_pass_go_in_batches_urgent_first():
+    gw, sent = _batch_gw()
+
+    async def burst():
+        cs = [gw.cancel("pm-a", f"r{i}", "not_hot") for i in range(5)] + \
+             [gw.cancel("pm-a", f"u{i}", "no_edge") for i in range(30)]
+        return await asyncio.gather(*cs)
+    got = asyncio.run(burst())
+    assert all(g == (True, None, True) for g in got)
+    assert [len(s) for s in sent] == [20, 15]                  # 35 cancels, 2 requests
+    assert all(o.startswith("u") for o in sent[0])             # urgent ones take the first batch
+
+
+def test_a_failed_polymarket_batch_falls_back_to_single_cancels():
+    gw, sent = _batch_gw(fail=ValueError("bad order in batch"))
+
+    async def burst():
+        return await asyncio.gather(*(gw.cancel("pm-a", f"o{i}", "no_edge") for i in range(3)))
+    got = asyncio.run(burst())
+    assert all(g == (True, None, True) for g in got) and sorted(sent) == [["o0"], ["o1"], ["o2"]]
+
+
 def test_kalshi_cancels_are_forced_only_within_the_overdraw():
     from strategies.ARBS import execution
     calls, tokens = [], [-5.0]
@@ -451,7 +506,7 @@ def test_urgent_polymarket_cancels_go_now_within_the_overdraw(monkeypatch):
             await gw.cancel("pm-a", "o1", reason)
             await t
             return time.monotonic() - t1
-        assert asyncio.run(go()) >= 0.3, reason
+        assert asyncio.run(go()) >= 0.28, reason     # Windows' ~15 ms timer can wake the refill early
         assert calls[-1] is True and calls.count(True) == 1
 
     # This process's quoting cap spent but the per-IP bucket has room: a pull
