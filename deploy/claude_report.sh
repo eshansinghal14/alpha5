@@ -25,7 +25,7 @@ if [ "$MODE" = hourly ]; then
   HOURS=1 CHART_HOURS=6 MODEL=sonnet TURNS=15 LIMIT=12m
 else
   flock -w 900 9 || { echo "lock wait timed out"; exit 1; }
-  HOURS=24 CHART_HOURS=24 MODEL=opus TURNS=60 LIMIT=32m
+  HOURS=24 CHART_HOURS=24 MODEL=opus TURNS=100 LIMIT=32m
 fi
 
 send() {  # subject, body file
