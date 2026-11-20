@@ -412,6 +412,64 @@ def test_takeover_keeps_quotes_on_markets_still_loading(root):
     assert cancels == ["untradeable"]
 
 
+def test_quotes_hold_while_their_markets_meta_is_read_after_the_takeover_hold(root):
+    sb, b = _taken_over(root)
+    cancels = []
+
+    async def cancel_quotes(qs, why):
+        cancels.append(why)
+    sb.cancel_quotes = cancel_quotes
+    sb.hold_until = time.monotonic() - 1.0         # the takeover hold is over
+    sb.meta.pop("X-B")
+    sb._meta_pending = {"X-B"}                     # its meta is still being read
+
+    async def go():
+        sb.evaluate(b)
+        await drain(sb)
+    asyncio.run(go())
+    assert cancels == []
+    sb._meta_pending = set()                       # the read ended without it: pulled
+    asyncio.run(go())
+    assert cancels == ["untradeable"]
+
+
+def test_start_reads_markets_missing_from_the_meta_cache_in_the_background(root, monkeypatch):
+    old, _ = _runner()
+    old.save_meta_cache()
+    r, _ = _runner()
+    r.meta.clear()
+    r.tickers.append("X-NEW")
+    calls, release = [], None
+
+    def slow(tickers=None):
+        calls.append(None if tickers is None else list(tickers))
+        if tickers is not None:
+            release.wait(5)
+    monkeypatch.setattr(r, "load_meta", slow)
+
+    async def go():
+        nonlocal release
+        import threading
+        release = threading.Event()
+        await asyncio.wait_for(r._meta_at_start(), 1.0)   # returns without waiting on the read
+        assert r._meta_pending == {"X-NEW"} and "X-A" in r.meta
+        release.set()
+        await r._meta_task
+        assert not r._meta_pending and calls == [["X-NEW"], None]
+    asyncio.run(go())
+
+
+def test_exposed_tickers_are_hot_quoted_and_held_legs(root):
+    r, b = _runner()
+    r.hot = []
+    assert r.exposed_tickers() == []
+    r.hot = [b.basket_id]
+    assert r.exposed_tickers() == sorted(b.tickers)
+    r.hot = []
+    r.real_ledger.record("gone:basket", ["Y-1", "Y-2"], "Y-1", "yes", 1, 0.4, time.time())
+    assert r.exposed_tickers() == ["Y-1"]
+
+
 def test_takeover_is_marked_before_new_markets_load(root):
     old, b = _runner()
     _attach(old, Client())

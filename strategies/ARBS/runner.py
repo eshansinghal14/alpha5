@@ -416,6 +416,12 @@ PM_RECONCILE_WINDOW_S = 3600.0
 # Between load_meta's market GETs (100 tickers each): ~95 of them per process,
 # six processes, under Kalshi's read limit when they all start together.
 META_GET_GAP_S = 0.25
+# Market status comes only from meta reads. Between full reads (every
+# META_FULL_EVERY-th refresh) one reads just the markets we're exposed on: hot or
+# quoted baskets' legs and every held basket's. At ~46k shard 0 markets the full
+# read every 300 s drew 189 meta-refresh 429s in 10 min (11-20 21:37-47 UTC) and
+# held a standby's warm-up past the handoff's 600 s.
+META_FULL_EVERY = 3
 # A basket counts toward max_broken_baskets once broken this long. Mid-exit
 # breaks last p90 0.6 s; counting them, one basket stuck 50 min plus brief
 # breaks elsewhere stopped ARBSPM 18 times in 46 min, each a cancel-all and a
@@ -850,6 +856,7 @@ class ArbsRunner:
         self.top_moves: dict[str, _Rate] = {}     # ticker -> best bid/ask changes per second
         self.last_top: dict[str, tuple] = {}
         self.last_top_size: dict[str, tuple] = {}
+        self._meta_pending: set[str] = set()             # markets read in the background at start
         self._pfx: dict[str, tuple] = {}                 # ticker -> both sides' levels a quote could reach
         self.pfx_stats: dict[str, list] = {}             # series -> [top, within, beyond, beyond marks]
         self.hot_churn: collections.deque = collections.deque()   # (time, entered, left) per hot-list change
@@ -1322,17 +1329,37 @@ class ArbsRunner:
             self.meta[t] = mt
 
     async def meta_loop(self):
+        n = 0
         while True:
             await asyncio.sleep(self.cfg.runtime.meta_refresh_s)
-            if self._meta_lock.locked():
+            n += 1
+            tickers = None if n % META_FULL_EVERY == 0 else self.exposed_tickers()
+            if tickers is None and self._meta_lock.locked():
                 continue                              # a full read is already under way
             try:
-                await asyncio.get_running_loop().run_in_executor(self.pool, self.load_meta)
-                self.dirty |= set(self.baskets)
+                await asyncio.get_running_loop().run_in_executor(self.pool, self.load_meta, tickers)
+                if tickers is None:
+                    self.dirty |= set(self.baskets)
+                else:
+                    self.dirty |= {bid for t in tickers for bid in self.by_ticker.get(t, ())}
                 self.settle()
                 self._save_meta_later()
             except Exception as e:
                 _log(f"WARN: meta refresh failed ({e!r})")
+
+    def exposed_tickers(self) -> list[str]:
+        """Legs of hot and quoted baskets and of every basket either ledger holds."""
+        out: set[str] = set()
+        for bid in {*self.hot, *self.quotes.n_by_basket, *self.real_ledger.baskets, *self.shadow_ledger.baskets}:
+            b = self.baskets.get(bid)
+            if b is not None:
+                out.update(b.tickers)
+            else:
+                for led in (self.real_ledger, self.shadow_ledger):
+                    pos = led.baskets.get(bid)
+                    if pos is not None:
+                        out.update(getattr(pos, "legs", None) or ())
+        return sorted(out)
 
     def market_paused(self, ticker: str) -> bool:
         return time.monotonic() < self.paused_until.get(ticker, 0.0)
@@ -3057,8 +3084,9 @@ class ArbsRunner:
         if not pm_all:
             self.pm_stop = None
         if vs is None or blocked or feed_down or excl:
-            if (vs is None and live_qs and not (blocked or feed_down or excl) and b.basket_id in self.inherited
-                    and self.holding() and self._loading(b)):
+            if (vs is None and live_qs and not (blocked or feed_down or excl)
+                    and ((b.basket_id in self.inherited and self.holding() and self._loading(b))
+                         or any(t in self._meta_pending and t not in self.meta for t in b.tickers))):
                 # A takeover's new markets: meta and books arrive a few seconds after it.
                 self.later(b.basket_id, 0.25)
                 return
@@ -5337,12 +5365,11 @@ class ArbsRunner:
             missing = [t for t in self.tickers if t not in self.meta]
             _log(f"{self.S}: meta for {len(self.tickers) - len(missing)} markets from {META_CACHE}; "
                  f"reading {len(missing)} now, the rest in the background")
-            if missing:
-                try:
-                    await loop.run_in_executor(self.pool, self.load_meta, missing)
-                except Exception as e:
-                    _log(f"WARN: market load failed ({e!r}); the background read retries them")
-            self._meta_task = loop.create_task(self._meta_refresh())
+            # Read in the background, not awaited: under 429s the wait held a
+            # standby past the handoff's 600 s (ARBS0C 11-20 21:47 UTC). Their
+            # baskets aren't tradeable until it lands; resting quotes on them hold.
+            self._meta_pending = set(missing)
+            self._meta_task = loop.create_task(self._meta_missing_then_refresh(missing))
             return
         for attempt in range(10):
             try:
@@ -5356,6 +5383,17 @@ class ArbsRunner:
                 _log(f"WARN: market load failed ({e!r}); retrying in 30s")
                 await asyncio.sleep(30.0)
         self._save_meta_later()
+
+    async def _meta_missing_then_refresh(self, missing: list[str]):
+        if missing:
+            try:
+                await asyncio.get_running_loop().run_in_executor(self.pool, self.load_meta, missing)
+            except Exception as e:
+                _log(f"WARN: market load failed ({e!r}); the background read retries them")
+            finally:
+                self._meta_pending = set()
+            self.dirty |= {bid for t in missing for bid in self.by_ticker.get(t, ())}
+        await self._meta_refresh()
 
     async def _meta_refresh(self):
         try:
