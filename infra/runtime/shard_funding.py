@@ -88,6 +88,19 @@ def alert(subject: str, body: str):
         log(f"alert failed: {e!r}")
 
 
+def read_balance(client: KalshiOrderClient, shard: int, tries: int = 8) -> float | None:
+    """The shard's balance, or None. ARBS keeps the account's read bucket near
+    empty, so a single read 429s often (11-20)."""
+    for i in range(tries):
+        try:
+            return client.balance(exchange_index=shard)
+        except Exception as e:
+            if i == tries - 1:
+                log(f"shard {shard} balance read failed: {e!r}")
+            time.sleep(1.0 + i)
+    return None
+
+
 def transfer(client: KalshiOrderClient, src: int, dst: int, dollars: float) -> str:
     body = {"client_transfer_id": str(uuid.uuid4()), "source": "event_contract",
             "destination": "event_contract", "amount": int(round(dollars * 10000)),  # centicents
@@ -107,9 +120,11 @@ def main():
     client = KalshiOrderClient(tokens_per_s=1)
     balances = {}
     for s in SHARDS:
-        # Unreadable shard: skip the run rather than fund on a guess.
-        balances[s] = client.balance(exchange_index=s)
-        time.sleep(0.3)
+        balances[s] = read_balance(client, s)
+        if balances[s] is None:
+            # Unreadable shard: skip the run rather than fund on a guess.
+            log(f"shard {s} balance unreadable; skipped this run")
+            return
 
     try:
         state = json.load(open(STATE_PATH))
