@@ -652,6 +652,12 @@ def test_futures_event_is_traded_only_when_one_market_can_win():
     assert not pm_scan.exclusive([_fut("e", "Oscar Nominees: Best Director", "a", "If X is nominated, Yes.")])
     assert not pm_scan.exclusive([_fut("e", "2027 Ryder Cup Winner", "tie", "Yes if the 2027 Ryder Cup ends in a tie.")])
     assert not pm_scan.exclusive([_fut("e", "NBA Teams 50+ Regular Season Wins", "a", "")])
+    ladder = [{**_fut("e", "Traffic through the Malacca Strait next week?", f"ge{n}",
+                      f"Yes if the total number of transit calls ... is at least {n}."), "title": f"{n}+ Ships"}
+              for n in (1450, 1500)]
+    assert not pm_scan.exclusive(ladder)
+    assert not pm_scan.exclusive([{**r, "title": ""} for r in ladder])        # the rule alone
+    assert not pm_scan.exclusive([{**r, "rules": ""} for r in ladder])        # the title alone
 
 
 def test_futures_scan_quotes_no_on_the_likeliest_like_kalshis_mecnet():

@@ -5143,7 +5143,7 @@ class ArbsRunner:
                 paid = sum(lp.qty * pays[t] for t, lp in legs.items())
                 cost = pos.cost()
                 row = {"basket_id": bid, "type": b.type if b else "", "settled_at": _utc().isoformat(),
-                       "bundles": pos.bundles(list(legs)), "payout": round(paid, 4), "cost": round(cost, 4),
+                       "bundles": pos.bundles(b.tickers if b else list(legs)), "payout": round(paid, 4), "cost": round(cost, 4),
                        "pnl": round(paid - cost, 4), "results": res, "live": led is self.real_ledger}
                 if led is self.real_ledger and b is not None:
                     self.check_payout(b, pos, pays, res)
@@ -5332,7 +5332,7 @@ class ArbsRunner:
         led = self.real_ledger if self.live or self.real_ledger.baskets else self.shadow_ledger
         holdings = []
         for bid, pos in led.baskets.items():
-            b = self.baskets.get(bid)
+            b = self.baskets.get(bid) or (basket_from_dict(pos.spec) if pos.spec else None)
             tickers = b.tickers if b else list(pos.legs)
             n = pos.bundles(tickers)
             locked = (n * b.payout - (pos.cost() - pos.broken_spent(tickers))) if b else None

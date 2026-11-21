@@ -128,12 +128,26 @@ MULTI_TITLE = re.compile(r"(nominees|seeds|finishers|\bteams\b|\bplayers\b|\btop
                          r"\bhow\b|margin|\branks?\b|ranking|total|announce|qualif|make the|advance|\bby\b)", re.I)
 MULTI_RULE = re.compile(r"(\btie|\bmultiple\b|each such|jointly|\bshared?\b|\bco-)", re.I)
 SPLIT_RULE = re.compile(r"divided by the number of", re.I)
+# A threshold ladder ("28+ Ships", "at least 28") has every market at or under the
+# value resolve YES. "Traffic through the Malacca Strait next week?" passed on
+# "next", and ARBSPM held NO-on-k "mecnet" baskets on it that pay $0 on a busy week (11-21).
+THRESHOLD = re.compile(r"(\d[\d,.]*\+|\d[\d,.]*%? or (?:more|higher|above|over|fewer|less|lower|below)\b"
+                       r"|\bat (?:least|most) \$?\d[\d,.]*)", re.I)
+
+
+def _ladder(rs: list[dict], field: str) -> bool:
+    """Most markets state a threshold, and not all the same one: a bucket set
+    has one "8+" tail, a stat leader's rules all say "at least 350 attempts"."""
+    hits = [m.group(0).lower() for r in rs if (m := THRESHOLD.search(r.get(field) or ""))]
+    return len(hits) * 2 > len(rs) and len(set(hits)) > 1
 
 
 def exclusive(rs: list[dict]) -> bool:
     """At most one of an event's markets can resolve YES (or a tie splits $1)."""
     title = rs[0].get("event_title") or ""
     if not SINGLE_TITLE.search(title) or MULTI_TITLE.search(title):
+        return False
+    if _ladder(rs, "title") or _ladder(rs, "rules"):
         return False
     return all(not MULTI_RULE.search(r.get("rules") or "") or SPLIT_RULE.search(r.get("rules") or "") for r in rs)
 
