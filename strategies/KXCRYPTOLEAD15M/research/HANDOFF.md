@@ -15,6 +15,17 @@ BTC B only +5% lots. Caveat: A always ran the :00/:30 events and B the :15/:45
 ones; the untreated 11-07..13 week puts that slot gap at ~-1.2c mo60, about the
 whole pooled markout gap, but near zero for each coin's result above.
 
+**Quote size 15 since 2026-11-21 17:28 UTC** (`quoting.order_lots` 10 -> 15,
+`order_group_limit` 9 -> 14 so one full fill still trips the group,
+`max_position` 40 -> 60 so the lean per fill is unchanged; backup
+`/tmp/race_config_before_size15_11211728.json` on the box). Why: fills 11-14..21
+matched to Kalshi public trades: when the taker swept past our 10 lots
+(884 fills) we marked out +3.2c at 60s / +3.6c settled, while takers that took
+exactly our 10 marked out -0.5c / +1.4c. Filling the swept-past volume at our
+price estimates +$15-20/day at 15 lots, about the same in both halves of the week. Check after 3-4 days: fills
+above 10 lots near +3c mo60, and no growth in the share of takers sized exactly
+to our quote.
+
 Everything below the line further down is historical (pre-2026-10-09 reorg).
 Change details with measurements are in `docs/CHANGES.md` (2026-10-19/20 entries).
 
