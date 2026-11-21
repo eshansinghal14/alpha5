@@ -86,6 +86,8 @@ FOREIGN_POSITIONS = "foreign_positions.json"
 # subtracts them like foreign positions. Counted against the ledger, one lot
 # held ARBS0C unarmed with three broken baskets unmanaged (11-18).
 UNBOOKED_POSITIONS = "unbooked_positions.json"
+# {"match": [basket id substrings]}: those baskets are sold off (close_out), not held.
+CLOSE_OUT = "close_out.json"
 # Every ARBS process trading on this one Kalshi account. A process's audit
 # takes the others' ledgers off Kalshi's positions: the Polymarket process's
 # cross-exchange legs sit on markets ARBS trades too.
@@ -650,6 +652,8 @@ class ArbsRunner:
         self.part_idx = self.part_group.index(self.S) if self.part_group else None
         self.owners = parts.load(procs=self.part_group) if self.part_group else {"owners": {}}
         self._owners_mtime = 0.0
+        self._close_mtime: float | None = None
+        self._close_match: tuple[str, ...] = ()
         self.store = ConfigStore(series.config_cls, series.config_path, series.config_key)
         self.cfg = self.store.config
         self.root = os.path.join(LIVE_ROOT, self.S)
@@ -3115,6 +3119,9 @@ class ArbsRunner:
                 self.resolve(b, pos, qs, now)
             return
         if self.standby is None:
+            if pos is not None and self.closing(b.basket_id):
+                self.close_out(b, pos, live_qs)
+                return
             if broken:
                 self.resolve(b, pos, qs, now)
                 return
@@ -4104,6 +4111,63 @@ class ArbsRunner:
     def is_open(self, ticker: str) -> bool:
         m = self.meta.get(ticker)
         return m is not None and m.status in TRADEABLE
+
+    def reload_close_out(self):
+        """close_out.json's "match" (basket id substrings), re-read when the file changes."""
+        path = os.path.join(self.root, CLOSE_OUT)
+        try:
+            m = os.path.getmtime(path)
+        except OSError:
+            m = None
+        if m != self._close_mtime:
+            self._close_mtime = m
+            self._close_match = tuple((_read_json(path) or {}).get("match") or ()) if m else ()
+            self.dirty |= set(self.ledger.baskets) & set(self.baskets)
+            if self._close_match:
+                self.alert("info", None, f"closing out baskets matching {list(self._close_match)}")
+
+    def closing(self, basket_id: str) -> bool:
+        """Held positions of a basket close_out.json matches are sold off by
+        close_out instead of completed or held to settlement."""
+        return any(s in basket_id for s in self._close_match)
+
+    def close_out(self, b: Basket, pos, live_qs: list[Quote]):
+        """Net out every leg held by buying its other side at the asks (IOC, as
+        deep as the book goes): the loss is taken now. Repeats each pass until
+        the ledger no longer holds the basket."""
+        bid = b.basket_id
+        for q in live_qs:
+            self.spawn(self.cancel_quote(q, "close_out"), bid)
+        if not self.live or bid in self.busy:
+            return
+        orders = []
+        for t, lp in pos.legs.items():
+            other = OTHER[lp.side]
+            v = self.leg_view(t, other) if self.is_open(t) else None
+            if v is None or not v.asks or lp.qty <= _EPS:
+                continue
+            n = min(lp.qty, v.depth())
+            limit = v.ladder_price(n)
+            if limit is not None and n > _EPS:
+                orders.append((t, other, limit, n, v))
+        if not orders:
+            return
+
+        async def go():
+            held = self.hold([(t, sd, n) for t, sd, _, n, _ in orders])
+            try:
+                res = await asyncio.gather(*(self._ioc(t, sd, p, n, "close_out", v) for t, sd, p, n, v in orders))
+            finally:
+                self.release(held)
+            for (t, sd, _, _, _), (fill, exc) in zip(orders, res):
+                if exc is not None:
+                    self._ioc_exc(b, t, exc, "close_out")
+                if fill is not None and fill.size > 0:
+                    self._book(bid, t, sd, fill.size, fill.price * fill.size + fill.fee, "close_out",
+                               order_id=fill.exchange_order_id)
+            self.journal({"kind": "close_out", "basket_id": bid,
+                          "orders": {t: [sd, n, p] for t, sd, p, n, _ in orders}})
+        self.spawn(go(), bid, eager=True)
 
     def resolve(self, b: Basket, pos, qs: list[Quote], now: float):
         """A broken basket, on every change to its legs' books. Its cheaper exit
@@ -5263,6 +5327,7 @@ class ArbsRunner:
                 self.dirty |= set(self.baskets)
             for c in self.store.apply_pending():
                 _log(f"config: {c}")
+            self.reload_close_out()
             if self.part_idx is not None:
                 self.reload_owners()
             if (reason := stopper.poll()) is not None:

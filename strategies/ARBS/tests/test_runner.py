@@ -266,6 +266,34 @@ def test_paying_the_guarantee_or_more_is_quiet(arbs, monkeypatch):
     assert b.basket_id not in r.real_ledger.baskets and not sent
 
 
+def test_close_out_sells_every_held_leg_and_skips_completion(arbs, monkeypatch):
+    r, b = arbs
+    from infra.kalshi.orders import RealFill
+    for t in b.tickers:
+        r.real_ledger.record(b.basket_id, b.tickers, t, "yes", 3, 1.5, time.time())
+    book(r, "X-A", [(0.40, 2)], [(0.55, 10)])     # NO ask 0.60, only 2 deep
+    book(r, "X-B", [(0.30, 10)], [(0.65, 10)])    # NO ask 0.70
+    sent = []
+
+    async def ioc(t, sd, p, n, reason, v):
+        sent.append((t, sd, p, n, reason))
+        return RealFill(price=p, size=n, fee=0.0, exchange_order_id=None), None
+    monkeypatch.setattr(r, "_ioc", ioc)
+    r.live = True
+    with open(os.path.join(r.root, R.CLOSE_OUT), "w") as fh:
+        json.dump({"match": ["t:b"]}, fh)
+    r.reload_close_out()
+
+    async def go():
+        r.evaluate(b)
+        await drain(r)
+        r.evaluate(b)        # the book held 2 of A's 3: the next pass sells the last one
+        await drain(r)
+    asyncio.run(go())
+    assert [x[:4] for x in sent] == [("X-A", "no", 0.60, 2), ("X-B", "no", 0.70, 3), ("X-A", "no", 0.60, 1)]
+    assert b.basket_id not in r.real_ledger.baskets and not r.quotes
+
+
 def test_resting_quotes_are_not_capital_used(arbs):
     r, b = arbs
     book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
