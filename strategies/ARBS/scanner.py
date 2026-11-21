@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 
 import pandas as pd
@@ -42,6 +43,13 @@ from strategies.ARBS import parts
 
 UP = ("greater", "greater_or_equal")
 DOWN = ("less", "less_or_equal")
+# Sports spread/total ladders, which Kalshi doesn't net (cash stays locked to
+# settlement): recorded, never traded, until a replay says they pay. Shard 3
+# held 1,000 of the 1,295 pairs with 3c+ of quote room (college basketball, NBA;
+# 11-21 snapshot) and has scan budget to spare; they fill only what's left.
+SPREAD_PREFIX = "spread:"
+SPREAD_SHARDS = (3,)
+SPREAD_CROSS = 3          # each team's lowest strikes paired across teams
 
 
 def fetch_events() -> list[dict]:
@@ -185,6 +193,47 @@ def mecnet(event: dict, markets: list[dict], max_legs: int, complete: bool) -> l
     return rels
 
 
+def spread_event(e: dict, skip_series) -> bool:
+    s = e.get("series_ticker") or ""
+    return (not e.get("collateral_return_type") and e.get("category") == "Sports"
+            and s.endswith(("SPREAD", "TOTAL")) and not s.endswith("TEAMTOTAL")
+            and e.get("exchange_index") in SPREAD_SHARDS and s not in skip_series)
+
+
+def spreads(event: dict, markets: list[dict], span: int) -> list[dict]:
+    """A spread event: per team, "wins by over b" implies "over a" for a < b
+    (YES a + NO b pays >= 1), and the two teams can't both cover a positive
+    spread (NO on each pays >= 1). A total: the over ladder."""
+    et, series = event["event_ticker"], event["series_ticker"]
+    groups: dict[str, list[tuple[float, str]]] = {}
+    for m in markets:
+        if m.get("strike_type") not in UP or m.get("floor_strike") is None:
+            continue
+        team = re.fullmatch(r"([A-Z]+)\d+", _sfx(et, m["ticker"])) if series.endswith("SPREAD") else None
+        key = team.group(1) if team else ("" if not series.endswith("SPREAD") else None)
+        if key is not None:
+            groups.setdefault(key, []).append((float(m["floor_strike"]), m["ticker"]))
+    baskets = []
+    for rungs in groups.values():
+        rungs.sort()
+        for i, (ka, a) in enumerate(rungs):
+            for kb, b in rungs[i + 1:i + 1 + span]:
+                if kb - ka > 1e-9:
+                    baskets.append({"basket_id": f"{SPREAD_PREFIX}{et}:{_sfx(et, b)}=>{_sfx(et, a)}", "payout": 1,
+                                    "legs": _legs((a, "yes"), (b, "no"))})
+    if len(groups) == 2 and "" not in groups:
+        lows = [[t for k, t in sorted(g) if k > 0][:SPREAD_CROSS] for g in groups.values()]
+        for a in lows[0]:
+            for b in lows[1]:
+                baskets.append({"basket_id": f"{SPREAD_PREFIX}{et}:no:" + "+".join(sorted((_sfx(et, a), _sfx(et, b)))),
+                                "payout": 1, "legs": _legs((a, "no"), (b, "no"))})
+    if not baskets:
+        return []
+    return [{"relationship_id": f"{SPREAD_PREFIX}{et}", "type": "implication", "cluster": series,
+             "description": f"{et}: spread/total ladder (not netted by Kalshi); recorded only.",
+             "baskets": baskets}]
+
+
 def ladder(event: dict, markets: list[dict], span: int) -> list[dict]:
     """b implies a for strikes ordered by `key`: buy YES a and NO b, pays >= 1.
     Equal strikes (> x vs >= x) are skipped rather than ordered by strictness."""
@@ -225,14 +274,18 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
     `early_h`: series -> hours before its start an event turns live."""
     rels, tickers = [], set()
     for e in events:
-        if not tradeable_event(e, shards, skip_series) or (owns is not None and not owns(e.get("event_ticker") or "")):
+        spread = spread_event(e, skip_series) and e.get("exchange_index") in shards
+        if not (tradeable_event(e, shards, skip_series) or spread) or (
+                owns is not None and not owns(e.get("event_ticker") or "")):
             continue
         ms = [m for m in e.get("markets") or []
               if m.get("status") == "active" and m.get("market_type", "binary") == "binary"]
         s = settles(e, overrides)
         if len(ms) < 2 or s is None:
             continue
-        if e["collateral_return_type"] == "MECNET":
+        if spread:
+            got = spreads(e, ms, ladder_span)
+        elif e["collateral_return_type"] == "MECNET":
             complete = len(ms) == len(e["markets"]) and coverage_step(ms) is not None \
                 and e["series_ticker"] not in complete_set_exclude
             got = mecnet(e, ms, mecnet_max_legs, complete)
@@ -320,7 +373,8 @@ def select(doc: dict, *, now: pd.Timestamp, days: float | None, max_markets: int
 
     horizon = None if days is None else now + pd.Timedelta(days=days)
     out, used, every = [], set(), set()
-    for r in sorted(doc["relationships"], key=lambda r: -per_market(r)):
+    # Recorded-only spreads last: they take only the budget traded markets leave.
+    for r in sorted(doc["relationships"], key=lambda r: (r["relationship_id"].startswith(SPREAD_PREFIX), -per_market(r))):
         ts = {l["ticker"] for b in r["baskets"] for l in b["legs"]} - known_tickers
         costly = set() if r["relationship_id"].split(":", 1)[-1] in cheap else ts
         if any(b["basket_id"] in held for b in r["baskets"]):

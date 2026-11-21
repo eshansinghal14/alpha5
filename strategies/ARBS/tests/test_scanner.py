@@ -262,3 +262,24 @@ def test_select_skips_an_excluded_event():
     doc = scanner.scan([a, b], now=NOW, mecnet_max_legs=6, ladder_span=3, complete_set_exclude=[], overrides={})
     got = scanner.select(doc, now=NOW, days=90, max_markets=1000, exclude={"A-1"})
     assert [r["relationship_id"] for r in got["relationships"]] == ["mecnet:B-1"]
+
+
+def _spread_event(shard=3):
+    ms = [mkt(f"NBS-1-{t}{k}", 0.5, strike_type="greater", floor_strike=k - 0.5) for t in ("PHX", "UTA") for k in (2, 5, 8, 11)]
+    return {**event("NBS-1", "", ms, series="KXNBASPREAD", shard=shard), "category": "Sports"}
+
+
+def test_spreads_are_ladders_per_team_and_both_teams_covering_is_impossible():
+    bs = baskets(run([_spread_event()], shards={3}))
+    assert bs["spread:NBS-1:PHX8=>PHX2"].legs == (Leg("NBS-1-PHX2", "yes"), Leg("NBS-1-PHX8", "no"))
+    assert not any("PHX" in k and "UTA" in k and "=>" in k for k in bs)        # no ladder across teams
+    no = bs["spread:NBS-1:no:PHX2+UTA2"]
+    assert no.payout == 1 and {l.side for l in no.legs} == {"no"}
+    assert "spread:NBS-1:no:PHX11+UTA11" not in bs                             # past SPREAD_CROSS
+
+
+def test_spreads_only_on_spread_shards_and_after_traded_markets_in_the_budget():
+    assert not baskets(run([_spread_event(shard=0)], shards={0}))
+    traded = event("EV-1", "MECNET", [mkt("EV-1-A", 0.4, vol=1), mkt("EV-1-B", 0.5, vol=1)], shard=3)
+    sel = run([_spread_event(), traded], shards={3}, max_markets=2)
+    assert [r["relationship_id"] for r in sel["relationships"]] == ["mecnet:EV-1"]
