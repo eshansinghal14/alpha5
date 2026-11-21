@@ -2439,6 +2439,8 @@ class ArbsRunner:
             self._retire(q)
 
     def basket_quotes(self, basket_id: str) -> list[Quote]:
+        if basket_id not in self.quotes.n_by_basket:
+            return []                   # most baskets on most evaluations: no lookup per leg
         b = self.baskets.get(basket_id)
         if b is None:
             return []

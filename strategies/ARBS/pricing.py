@@ -6,6 +6,7 @@ order's fee (Kalshi ceils the whole order's fee, not each contract's).
 """
 from __future__ import annotations
 
+import bisect
 import dataclasses
 import functools
 import math
@@ -13,6 +14,7 @@ import math
 from infra.kalshi.fees import fee
 
 _EPS = 1e-9
+_MEMO_MAX = 100_000
 
 
 _TICKS: dict[tuple, "Ticks"] = {}    # price_ranges -> its Ticks (from_market)
@@ -57,10 +59,39 @@ class Ticks:
                 return round(s + math.floor((p - s) / st + 1e-6) * st, 4)
         raise AssertionError
 
+    # up/down are only asked of grid prices (bids, asks, the walk down from a
+    # cap), a few hundred per grid, so each answer is kept: with their round()
+    # they were ~5% of a quoting pass (offline replay of golf, UFC, ANTH and
+    # TOKENUSE baskets, 11-21).
+    @functools.cached_property
+    def _memo(self) -> tuple[dict, dict]:
+        return {}, {}
+
+    @functools.cached_property
+    def _costs(self) -> dict:
+        """rate -> (grid prices, each one's price + fee1) ascending, or None
+        if the costs ever fall along the grid (max_price_within then walks)."""
+        return {}
+
     def down(self, p: float) -> float:
-        return self.floor(p - 1e-6)
+        m = self._memo[0]
+        got = m.get(p)
+        if got is None:
+            if len(m) > _MEMO_MAX:
+                m.clear()
+            got = m[p] = self.floor(p - 1e-6)
+        return got
 
     def up(self, p: float) -> float:
+        m = self._memo[1]
+        got = m.get(p)
+        if got is None:
+            if len(m) > _MEMO_MAX:
+                m.clear()
+            got = m[p] = self._up(p)
+        return got
+
+    def _up(self, p: float) -> float:
         for s, e, st in self.ranges:
             if p < e - _EPS:
                 return round(min(e, s + (math.floor((p - s) / st + 1e-6) + 1) * st), 4)
@@ -106,23 +137,60 @@ class LegView:
         return sum(q for _, q in self.asks)
 
 
+_FEE1: dict[tuple[float, float], float] = {}
+
+
+def fee1(p: float, rate: float) -> float:
+    """fee(p, 1.0, rate), kept per (price, rate): prices sit on the grid and
+    rates are a handful, and the ceil was ~4% of a quoting pass (same replay)."""
+    got = _FEE1.get((p, rate))
+    if got is None:
+        if len(_FEE1) > _MEMO_MAX:
+            _FEE1.clear()
+        got = _FEE1[(p, rate)] = fee(p, 1.0, rate)
+    return got
+
+
 def taker_cost(p: float, rate: float) -> float:
-    return p + fee(p, 1.0, rate)
+    return p + fee1(p, rate)
 
 
 def maker_cost(p: float, rate: float) -> float:
-    return p + fee(p, 1.0, rate)
+    return p + fee1(p, rate)
 
 
 def max_price_within(budget: float, rate: float, ticks: Ticks = CENT) -> float | None:
     """Highest grid price p with p + fee(p) <= budget, or None below the
     lowest one."""
+    # p + fee(p) only rises along the grid (a tick adds 1c, the fee moves
+    # under 0.15c), so the answer is a bisect of the grid's costs. The walk
+    # down from the budget, a fee and a tick per step, was ~9% of a quoting
+    # pass (offline replay, 11-21).
+    if math.isfinite(budget):
+        got = ticks._costs.get(rate, False)
+        if got is False:
+            got = ticks._costs[rate] = _cost_grid(rate, ticks)
+        if got is not None:
+            i = bisect.bisect_right(got[1], budget + _EPS) - 1
+            return got[0][i] if i >= 0 else None
     p = ticks.floor(min(ticks.hi, budget + _EPS))
     while p >= ticks.lo - _EPS:
-        if p + fee(p, 1.0, rate) <= budget + _EPS:
+        if p + fee1(p, rate) <= budget + _EPS:
             return p
         p = ticks.down(p)
     return None
+
+
+def _cost_grid(rate: float, ticks: Ticks) -> tuple[list[float], list[float]] | None:
+    ps, p = [], ticks.lo
+    while p <= ticks.hi + _EPS:
+        ps.append(p)
+        nxt = ticks.up(p)
+        if nxt <= p + _EPS:
+            break
+        p = nxt
+    cs = [x + fee1(x, rate) for x in ps]
+    return (ps, cs) if all(a <= b for a, b in zip(cs, cs[1:])) else None
 
 
 def gap(legs: list[LegView], payout: float) -> float | None:

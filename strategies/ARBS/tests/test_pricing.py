@@ -228,3 +228,36 @@ def test_depth_sizes_and_shared_walks_match_one_quote_leg_per_edge_and_size():
             assert P.prices_at(legs, j, payout, edges, o) == [
                 None if (p := P.plan_at(legs, j, payout, e, o)) is None else p.price for e in edges]
 
+
+
+TAPERED = pricing.Ticks(((0.0, 0.1, 0.001), (0.1, 0.9, 0.01), (0.9, 1.0, 0.001)))
+
+
+def _walk(budget, rate, ticks):
+    """max_price_within as it was: down the grid from the budget, a fee a step."""
+    p = ticks.floor(min(ticks.hi, budget + pricing._EPS))
+    while p >= ticks.lo - pricing._EPS:
+        if p + fee(p, 1.0, rate) <= budget + pricing._EPS:
+            return p
+        p = ticks.floor(p - 1e-6)
+    return None
+
+
+def test_max_price_within_bisect_matches_the_walk_on_every_grid():
+    import math
+    import random
+    rng = random.Random(0)
+    for ticks in (pricing.CENT, TAPERED):
+        pts = pricing._cost_grid(0.07, ticks)[0]
+        for rate in (0.0, 0.0175, 0.035, 0.07, 0.14):
+            budgets = [x + d for x in pts for d in (-1e-7, 0.0, 1e-9, 0.0001, 0.0175)]
+            budgets += [rng.uniform(-0.2, 1.3) for _ in range(500)] + [math.inf, math.nan]
+            for b in budgets:
+                assert pricing.max_price_within(b, rate, ticks) == _walk(b, rate, ticks), (ticks, rate, b)
+
+
+def test_kept_fees_and_ticks_match_their_formulas():
+    for ticks in (pricing.CENT, TAPERED):
+        for p in pricing._cost_grid(0.07, ticks)[0]:
+            assert ticks.down(p) == ticks.floor(p - 1e-6) and ticks.up(p) == ticks._up(p)
+            assert pricing.fee1(p, 0.07) == fee(p, 1.0, 0.07) and pricing.taker_cost(p, 0.07) == p + fee(p, 1.0, 0.07)

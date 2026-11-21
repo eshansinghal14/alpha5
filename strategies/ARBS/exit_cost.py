@@ -16,6 +16,7 @@ fill: a big apparent arb is mostly other legs about to reprice.
 """
 from __future__ import annotations
 
+import bisect
 import math
 
 import numpy as np
@@ -346,7 +347,11 @@ _AT_PRICE = ("edge_c", "reach_c")
 
 
 def _bin(edges: list, v: float) -> int:
-    return next((i for i in range(len(edges) - 1) if v <= edges[i + 1]), len(edges) - 2)
+    """The first i with v <= edges[i + 1], else the last bin (NaN lands there
+    too). A bisect, not a scan: ~4% of a quoting pass (offline replay, 11-21)."""
+    if v != v:
+        return len(edges) - 2
+    return bisect.bisect_left(edges, v, 1, len(edges) - 1) - 1
 
 
 def _predict_at(w: np.ndarray, f: dict, edge_c: float, reach_c: float) -> float:

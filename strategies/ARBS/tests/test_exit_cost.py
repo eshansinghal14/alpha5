@@ -132,3 +132,16 @@ def test_expected_loss_is_the_at_price_loss_pre_game():
         st.add_reach(False, t)
     x = 0.37
     assert abs(ec.expected_loss(w, st, f, x, False) - ec.predict(w, ec.at_price(f, x))) < 1e-9
+
+
+def test_bin_bisect_matches_the_scan():
+    import math
+    import random
+    from strategies.ARBS import exit_cost
+    rng = random.Random(0)
+    for edges in exit_cost.BINS.values():
+        fin = [e for e in edges if math.isfinite(e)]
+        vals = [math.inf, -math.inf, math.nan] + [e + d for e in fin for d in (-1e-9, 0.0, 1e-9, 0.5)]
+        for v in vals + [rng.uniform(min(fin) - 5, max(fin) * 2 + 5) for _ in range(300)]:
+            scan = next((i for i in range(len(edges) - 1) if v <= edges[i + 1]), len(edges) - 2)
+            assert exit_cost._bin(edges, v) == scan, (edges, v)
