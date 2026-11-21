@@ -242,6 +242,30 @@ def test_voided_event_settles_at_scalar_values(arbs):
     assert r.shadow_ledger.settled[-1]["pnl"] == pytest.approx(2 * 0.3 + 2 * 0.7 - 1.8)
 
 
+def test_real_basket_paying_under_its_guarantee_alerts_and_emails(arbs, monkeypatch):
+    r, b = arbs
+    sent = []
+    monkeypatch.setattr(R.notify, "email_async", lambda subj, body, on_error=None: sent.append(body))
+    for t in b.tickers:
+        r.real_ledger.record(b.basket_id, b.tickers, t, "yes", 2, 0.9, time.time())
+        r.meta[t].status, r.meta[t].result = "finalized", "no"     # a complete set where nothing won
+    r.settle()
+    assert b.basket_id not in r.real_ledger.baskets
+    assert len(sent) == 1 and "expected at least $1.00" in sent[0]
+    assert r.alerts[-1]["payout"] and r.alerts[-1]["level"] == "error"
+
+
+def test_paying_the_guarantee_or_more_is_quiet(arbs, monkeypatch):
+    r, b = arbs
+    sent = []
+    monkeypatch.setattr(R.notify, "email_async", lambda *a, **k: sent.append(a))
+    for t, res in zip(b.tickers, ("yes", "no")):
+        r.real_ledger.record(b.basket_id, b.tickers, t, "yes", 2, 0.9, time.time())
+        r.meta[t].status, r.meta[t].result = "finalized", res
+    r.settle()
+    assert b.basket_id not in r.real_ledger.baskets and not sent
+
+
 def test_resting_quotes_are_not_capital_used(arbs):
     r, b = arbs
     book(r, "X-A", [(0.30, 10)], [(0.35, 10)])

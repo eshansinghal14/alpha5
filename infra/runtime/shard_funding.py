@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import time
 import uuid
 
@@ -21,6 +20,7 @@ import pandas as pd
 
 from infra.config import atomic_write_json
 from infra.kalshi.orders import BASE_URL, KalshiOrderClient
+from infra.runtime import notify
 from infra.runtime.persist import LIVE_ROOT
 
 # shard -> (floor, target) in dollars of available cash (Kalshi's balance,
@@ -40,8 +40,6 @@ COOLDOWN_S = 600
 TRANSFER_PATH = "/trade-api/v2/portfolio/intra_exchange_instance_transfer"
 STATE_PATH = os.path.join(LIVE_ROOT, "shard_funding.json")
 LOG_PATH = os.path.join(LIVE_ROOT, "shard_funding.log")
-REGION = "us-east-2"
-TOPIC_PATH = "/etc/alpha5/report-topic-arn"
 
 
 def plan(balances: dict[int, float], shards: dict = SHARDS, max_transfer: float = MAX_TRANSFER,
@@ -79,13 +77,8 @@ def log(msg: str):
 
 
 def alert(subject: str, body: str):
-    try:
-        topic = open(TOPIC_PATH).read().strip()
-        subprocess.run(["aws", "sns", "publish", "--region", REGION, "--topic-arn", topic,
-                        "--subject", subject[:99], "--message", body, "--output", "text"],
-                       capture_output=True, timeout=30, check=True)
-    except Exception as e:
-        log(f"alert failed: {e!r}")
+    if err := notify.email(subject, body):
+        log(f"alert failed: {err}")
 
 
 def read_balance(client: KalshiOrderClient, shard: int, tries: int = 8) -> float | None:

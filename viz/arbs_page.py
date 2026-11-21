@@ -178,6 +178,13 @@ def _cleared(series: str) -> str:
         return ""
 
 
+def _payout_banners(al: list[dict]):
+    """Uncleared payout alerts (runner.payout_alert), one banner each."""
+    for a in (a for a in al if a.get("payout")):
+        st.error(f"💸 **Basket paid out differently than expected** ({a.get('shard')}, {a['time'][:16]} UTC) "
+                 f"`{a['basket_id']}`: {a['msg'].removeprefix('PAYOUT: ')} Clear under Alerts once handled.")
+
+
 def _alerts(series: str, s: dict):
     if s.get("halt_reason"):
         st.error(f"⛔ **Halted until restart -- {s['halt_reason']}.** Completions of broken baskets still run.")
@@ -212,6 +219,7 @@ def _alerts(series: str, s: dict):
     cuts = {SHARD_OF.get(p, p): _cleared(p) for p in parts(series)}
     al = [a for a in (s.get("alerts") or []) if a["level"] in ("error", "warn")
           and a["time"] > cuts.get(a.get("shard"), _cleared(series))]
+    _payout_banners(al)
     if al:
         # Never opened by the page: an `expanded` that turned True on a new
         # error re-opened the panel on every one. Open or closed stays the viewer's.
@@ -420,7 +428,11 @@ def phone(series: str = "ARBS"):
     def view():
         ss = {p: x for p in parts(series) if (x := read_summary(p)) is not None}
         if ss:
-            p = merge(ss).get("pnl") or {}
+            m = merge(ss)
+            cuts = {SHARD_OF.get(n, n): _cleared(n) for n in parts(series)}
+            _payout_banners([a for a in m.get("alerts") or []
+                             if a["time"] > cuts.get(a.get("shard"), _cleared(series))])
+            p = m.get("pnl") or {}
             total = (p.get("settled") or 0.0) + (p.get("locked") or 0.0) + (p.get("broken") or 0.0)
             st.metric("ARBS total PnL", _usd(total))
         _pnl_chart(series)

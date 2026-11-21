@@ -44,7 +44,7 @@ from infra.kalshi.orders import (RealFill, error_code, http_status, is_market_pa
 from infra.kalshi.orders import KEEPALIVE_S, ReadBudgetLow, read_stats, write_budget_tokens_per_s
 from infra.polymarket import limits as pm_limits
 from infra.trading.engine import MARKET_PAUSE_RETRY_S
-from infra.runtime import disk, handoff as hand
+from infra.runtime import disk, handoff as hand, notify
 from infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
 from infra.runtime.persist import LIVE_ROOT, day_dir
 from strategies.ARBS import exit_cost, size_table
@@ -5135,17 +5135,47 @@ class ArbsRunner:
                     if bid not in self.unbooked:
                         self.unbooked.add(bid)
                         self.alert("error", bid, f"settled with result {res}; not booked, check by hand")
+                        if led is self.real_ledger:
+                            self.payout_alert(bid, f"settled with results Kalshi didn't give as yes/no/scalar: {res}. "
+                                                   "Not booked; check by hand.")
                     continue
-                b = self.baskets.get(bid)
+                b = self.baskets.get(bid) or (basket_from_dict(pos.spec) if pos.spec else None)
                 paid = sum(lp.qty * pays[t] for t, lp in legs.items())
                 cost = pos.cost()
                 row = {"basket_id": bid, "type": b.type if b else "", "settled_at": _utc().isoformat(),
                        "bundles": pos.bundles(list(legs)), "payout": round(paid, 4), "cost": round(cost, 4),
                        "pnl": round(paid - cost, 4), "results": res, "live": led is self.real_ledger}
+                if led is self.real_ledger and b is not None:
+                    self.check_payout(b, pos, pays, res)
                 led.close(bid, row)
                 if led is self.real_ledger:
                     self._cash_reread_at = self._cash_reread_at or time.time() + SETTLE_REREAD_S
                 self.journal({"kind": "settled", **row})
+
+    def check_payout(self, b: Basket, pos, pays: dict[str, float], res: dict[str, str]):
+        """Alert when complete bundles paid less than the basket guarantees.
+        More is normal (a MECNET set where nothing resolves YES pays k, not k-1)."""
+        ts = b.tickers
+        n = pos.bundles(ts)
+        if n <= _EPS or any(t not in pays for t in ts):
+            return
+        per = sum(pays[t] for t in ts)
+        if per < b.payout - 1e-6:
+            self.payout_alert(b.basket_id, f"{n:g} bundles paid ${per:.2f} each, expected at least "
+                                           f"${b.payout:.2f} (short ${(b.payout - per) * n:,.2f}). Results: "
+                              + ", ".join(f"{t} {pos.legs[t].side.upper()} -> {res[t]}" for t in ts))
+
+    def payout_alert(self, basket_id: str, msg: str):
+        """An error alert tagged for the dashboard's payout banner, and an email."""
+        row = {"time": _utc().isoformat(), "level": "error", "basket_id": basket_id, "msg": f"PAYOUT: {msg}",
+               "live": self.live, "payout": True}
+        self.alerts.append(row)
+        del self.alerts[:-MAX_ALERTS]
+        self.journal({"kind": "alert", **row})
+        _log(f"ERROR {basket_id} PAYOUT: {msg}")
+        notify.email_async(f"alpha5 {self.S}: basket paid out differently than expected",
+                           f"{basket_id}\n\n{msg}",
+                           on_error=lambda e: _log(f"payout email failed: {e}"))
 
     # ------------------------------------------------------------------ arm / control
 
