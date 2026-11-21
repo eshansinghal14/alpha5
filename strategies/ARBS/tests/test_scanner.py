@@ -301,7 +301,8 @@ def _totals(shard=3, exp="2026-11-15T00:00:00Z"):
 def test_unnetted_baskets_keep_to_locked_days_and_record_shards():
     def watched(doc):
         return [k for k in baskets(doc) if k.startswith(scanner.RECORD_PREFIXES)]
-    assert {k.split(":")[0] for k in watched(run(_totals(), shards={3}, days=None))} == {"spread", "watch"}
-    late = (NOW + pd.Timedelta(days=scanner.LOCKED_DAYS + 1)).isoformat()
-    assert not watched(run(_totals(exp=late), shards={3}, days=None))
-    assert not watched(run(_totals(shard=0), shards={0}, days=None))
+    assert {k.split(":")[0] for k in watched(run(_totals(), shards={3}, days=None, locked_days=120.0))}         == {"spread", "watch"}
+    late = (NOW + pd.Timedelta(days=121)).isoformat()
+    assert not watched(run(_totals(exp=late), shards={3}, days=None, locked_days=120.0))
+    assert watched(run(_totals(exp=late), shards={3}, days=None, locked_days=None))
+    assert not watched(run(_totals(shard=0), shards={0}, days=None, locked_days=120.0))

@@ -53,9 +53,6 @@ SPREAD_PREFIX = "spread:"
 RECORD_PREFIXES = (SPREAD_PREFIX, watch.WATCH_PREFIX)
 RECORD_SHARDS = (3,)
 SPREAD_CROSS = 3          # each team's lowest strikes paired across teams
-# Unnetted baskets lock their cash to settlement, so they keep to PM's
-# days_till_expiry (120, config_pm.json 11-21); Kalshi's netted ones have none.
-LOCKED_DAYS = 120.0
 
 
 def fetch_events() -> list[dict]:
@@ -269,7 +266,7 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
          skip_series: set[str] = frozenset(), starts: dict[str, str] | None = None,
          freqs: dict[str, str] | None = None, live_windows: dict[str, list[str]] | None = None,
          settle_lead: pd.Timedelta | None = None, early_h: dict[str, float] | None = None,
-         owns=None) -> dict:
+         owns=None, locked_days: float | None = None) -> dict:
     """Every relationship found, each with its event's expected settlement,
     24h volume for `select`. `owns(event)`: only the events it accepts (shard
     0's split, parts.py). `starts`: event -> when it goes live
@@ -277,9 +274,11 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
     `live_windows`: Kalshi category -> [from, until], its events live from
     `from` while the scan runs before `until`; `settle_lead`: an event
     without a kickoff is live from this long before its expected settlement;
-    `early_h`: series -> hours before its start an event turns live."""
+    `early_h`: series -> hours before its start an event turns live;
+    `locked_days`: record-only baskets (RECORD_PREFIXES) come only from events
+    settling within this many days, None for no limit."""
     rels, tickers = [], set()
-    locked_until = now + pd.Timedelta(days=LOCKED_DAYS)
+    locked_until = now + pd.Timedelta(days=locked_days) if locked_days is not None else None
 
     def active(e):
         return [m for m in e.get("markets") or []
@@ -292,7 +291,7 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
             continue
         ms = active(e)
         s = settles(e, overrides)
-        if len(ms) < 2 or s is None or (spread and s > locked_until):
+        if len(ms) < 2 or s is None or (spread and locked_until is not None and s > locked_until):
             continue
         if spread:
             got = spreads(e, ms, ladder_span)
@@ -310,7 +309,7 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
         rels += got
     # Record-only baskets across events (watch.py): settled when the last of
     # their events is, live once the first one is.
-    pool = watch_pool(events, shards, overrides, now)
+    pool = watch_pool(events, shards, overrides, now, locked_days)
     for anchor, r, evs_in in watch.build([e for e, _ in pool.values()], RECORD_SHARDS, skip_series,
                                          recorded=lambda e: spread_event(e, skip_series)):
         if owns is not None and not owns(anchor):
@@ -328,14 +327,15 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
             "relationships": rels}
 
 
-def watch_pool(events: list[dict], shards, overrides: dict[str, str], now: pd.Timestamp) -> dict[str, tuple]:
+def watch_pool(events: list[dict], shards, overrides: dict[str, str], now: pd.Timestamp,
+               locked_days: float | None) -> dict[str, tuple]:
     """event -> (event, expected settlement) for the events watch.build gets:
-    on `shards` and RECORD_SHARDS, settling within LOCKED_DAYS."""
-    until = now + pd.Timedelta(days=LOCKED_DAYS)
+    on `shards` and RECORD_SHARDS, settling within `locked_days` (None: any)."""
+    until = now + pd.Timedelta(days=locked_days) if locked_days is not None else None
     out = {}
     for e in events:
         if (e.get("exchange_index") in shards and e.get("exchange_index") in RECORD_SHARDS
-                and (s := settles(e, overrides)) is not None and s <= until):
+                and (s := settles(e, overrides)) is not None and (until is None or s <= until)):
             out[e["event_ticker"]] = (e, s)
     return out
 
@@ -460,7 +460,8 @@ def tradeable_event(e: dict, shards, skip_series) -> bool:
             and e.get("exchange_index") in shards)
 
 
-def run(cfg, spec_path: str, held: set[str] = frozenset(), owns=None, events: list[dict] | None = None) -> dict:
+def run(cfg, spec_path: str, held: set[str] = frozenset(), owns=None, events: list[dict] | None = None,
+        locked_days: float | None = None) -> dict:
     """Blocking: fetch (unless `events` are given), scan, write the file;
     returns the doc. Relationships of the previous file holding a basket in
     `held` are carried over, so a position the scan no longer lists survives
@@ -472,7 +473,7 @@ def run(cfg, spec_path: str, held: set[str] = frozenset(), owns=None, events: li
                shards=set(cfg.scan.shards), skip_series=other_series(), starts=fetch_starts(now),
                freqs=fetch_frequencies(), live_windows=cfg.scan.live_windows,
                settle_lead=pd.Timedelta(hours=cfg.scan.live_before_settle_h) if cfg.scan.live_before_settle_h > 0 else None,
-               early_h=cfg.scan.live_early_h,
+               early_h=cfg.scan.live_early_h, locked_days=locked_days,
                overrides=settlement_overrides())
     have = {r["relationship_id"] for r in doc["relationships"]}
     try:
@@ -498,10 +499,13 @@ def scan_and_select(root: str, config_path: str | None = None, markets: int | No
     (`select` up to `markets`, the runner's CPU-held count, None for all;
     held baskets kept) to SELECTED, which is all the runner reads. Returns
     counts."""
-    from infra.config import ConfigStore
-    from strategies.ARBS.config import CONFIG_PATH, ArbsConfig
+    from infra.config import ConfigStore, load
+    from strategies.ARBS.config import CONFIG_PATH, CONFIGPM_PATH, ArbsConfig
 
     cfg = ConfigStore(ArbsConfig, config_path or CONFIG_PATH, None).config
+    # Record-only baskets aren't netted, so their cash is locked to settlement
+    # as on Polymarket: they keep to PM's trading.days_till_expiry.
+    locked_days = load(ArbsConfig, CONFIGPM_PATH).trading.days_till_expiry
     held = set()
     for name in ("ledger.json", "ledger_shadow.json"):
         try:
@@ -524,7 +528,8 @@ def scan_and_select(root: str, config_path: str | None = None, markets: int | No
             now = time.time()
             skip = other_series()
             listed = [e["event_ticker"] for e in events if scanned_event(e, set(cfg.scan.shards), skip)]
-            pool = watch_pool(events, set(cfg.scan.shards), settlement_overrides(), pd.Timestamp.now(tz="UTC"))
+            pool = watch_pool(events, set(cfg.scan.shards), settlement_overrides(), pd.Timestamp.now(tz="UTC"),
+                              locked_days)
             listed += sorted({a for a, _, _ in watch.build([e for e, _ in pool.values()], RECORD_SHARDS, skip,
                                                           recorded=lambda e: spread_event(e, skip))} - set(listed))
             cpu = parts.spend(procs=group, name=parts.CPU)
@@ -537,7 +542,7 @@ def scan_and_select(root: str, config_path: str | None = None, markets: int | No
             info = {"moved": len(moves), "load": st.get("load")}
         idx = group.index(name)
         owns = lambda ev: parts.owner(st, ev) == idx  # noqa: E731
-    doc = run(cfg, os.path.join(root, "scanned_spec.json"), held, owns=owns, events=events)
+    doc = run(cfg, os.path.join(root, "scanned_spec.json"), held, owns=owns, events=events, locked_days=locked_days)
     cheap = cheap_events(group) if group is not None else set()
     sel = select(doc, now=pd.Timestamp.now(tz="UTC"), days=cfg.trading.days_till_expiry, max_markets=markets,
                  held=held, exclude=set(cfg.watch.exclude), cheap=cheap, max_total=TOTAL_MARKETS_MAX)
