@@ -2836,8 +2836,12 @@ class ArbsRunner:
         return any(k is not None and ((live and k in names) or f"{k}:{phase}" in names) for k in keys)
 
     def poll_model(self):
-        """Reload exit_cost.MODEL_FILE when the daily shadow check rewrites it."""
-        path = os.path.join(LIVE_ROOT, "ARBS", exit_cost.MODEL_FILE)
+        """Reload exit_cost.MODEL_FILE when the daily shadow check rewrites it:
+        ARBSPM's own (fitted on Polymarket prints only) on Polymarket. Out of
+        sample 11-14..20 its 5-lot edge picks on PM prints made +$8.8 where
+        a fixed 3c lost $42.7 and the best fixed edge (15c) made $5.1."""
+        venue = "ARBSPM" if PM_SHARD in self.cfg.scan.shards else "ARBS"
+        path = os.path.join(LIVE_ROOT, venue, exit_cost.MODEL_FILE)
         try:
             m = os.path.getmtime(path)
             if m == self._model_mtime:

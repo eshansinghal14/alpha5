@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import time
 
 import pandas as pd
@@ -899,3 +900,14 @@ def test_pm_deep_quotes_are_reach_only_and_switched_off(pm_arbs, monkeypatch):
     r.manage_deep(b, None, {}, 0.0, time.time(), True, False)
     # off: the PM leg's reach quote comes down; a Kalshi leg never holds one from this process
     assert sorted(cancelled) == [("K-A", "venue"), ("pm-ev-a", "deep_off")]
+
+
+def test_polymarket_quotes_with_its_own_exit_model(pm_arbs, tmp_path, monkeypatch):
+    r, _ = pm_arbs
+    loaded = []
+    monkeypatch.setattr(R.exit_cost.Model, "from_json", staticmethod(lambda d: loaded.append(d) or object()))
+    for venue in ("ARBS", "ARBSPM"):
+        os.makedirs(tmp_path / venue, exist_ok=True)
+        (tmp_path / venue / R.exit_cost.MODEL_FILE).write_text(json.dumps({"venue": venue}))
+    r.poll_model()
+    assert loaded == [{"venue": "ARBSPM"}] and r.exit_model is not None
