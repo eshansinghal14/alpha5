@@ -111,3 +111,21 @@ def test_event_close_reads_the_repeated_fall_back_hour_as_standard_time():
     assert perf.event_close("KXCRYPTOLEAD15M-26NOV010115-BTC") == pd.Timestamp("2026-11-01 06:15", tz="UTC")
     assert perf.event_close("KXCRYPTOLEAD15M-26MAR080215-BTC") == pd.Timestamp("2026-03-08 07:00", tz="UTC")
     assert perf.event_close("KXCRYPTOLEAD15M-26OCT120300-BTC") == pd.Timestamp("2026-10-12 07:00", tz="UTC")
+
+
+def _marked(hours_s, pnl_c):
+    return pd.DataFrame({"time": [T0 + pd.Timedelta(seconds=s) for s in hours_s], "size": 2.0,
+                         "pnl_c": pnl_c, "mo1": 1.0, "mo10": 1.0, "mo60": 1.0})
+
+
+def test_history_keeps_hours_the_fills_no_longer_cover_and_the_chart_starts_from_them(tmp_path, monkeypatch):
+    monkeypatch.setattr(perf, "LIVE_ROOT", str(tmp_path))
+    os.makedirs(perf.out_dir("S"))
+    perf.update_history("S", _marked([0, 3700], [50.0, 10.0]))            # $1 in hour 0, $0.20 in hour 1
+    later = _marked([3800, 7300], [20.0, 30.0])                            # state reset: hour 0 is gone
+    h = perf.update_history("S", later)
+    assert list(h.pnl.round(2)) == [1.0, 0.4, 0.6]
+    c = perf.curves(later, None, None, perf.read_history("S"))
+    pnl = c[c.line == "PnL (settled; open at mid)"]
+    assert pnl.usd.iloc[1] == 1.0                                          # hour 0, from history
+    assert round(pnl.usd.iloc[-1], 2) == 2.0                               # 1.0 + 0.4 + 0.6

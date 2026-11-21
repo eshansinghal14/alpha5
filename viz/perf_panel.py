@@ -33,8 +33,9 @@ def _c(v: float) -> str:
     return "n/a" if v is None or (isinstance(v, float) and math.isnan(v)) else f"{v:+.2f}c"
 
 
-def _chart(df: pd.DataFrame, since: pd.Timestamp | None, window: pd.Timedelta | None, lip: pd.DataFrame | None = None):
-    c = perf.curves(df, since, lip)
+def _chart(df: pd.DataFrame, since: pd.Timestamp | None, window: pd.Timedelta | None, lip: pd.DataFrame | None = None,
+           history: pd.DataFrame | None = None):
+    c = perf.curves(df, since, lip, history)
     if c.empty:
         st.caption("No real fills in this window.")
         return
@@ -189,7 +190,7 @@ def render(series: str, lip: bool = False):
         if lip:
             with cols[3]:
                 _lip(sp["lip"])
-        _chart(df, since, WINDOWS[win], lf)
+        _chart(df, since, WINDOWS[win], lf, perf.read_history(series))
         _edge_share(perf.summarize_edge(df, r.prints, since))
         if s.get("fills"):
             st.caption(f"Settled {_usd(s['settled_usd'])} · open {_usd(s['open_usd'])} on {s['unsettled']} fills · "

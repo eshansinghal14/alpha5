@@ -548,9 +548,45 @@ class Result:
     error: str | None
 
 
+# Hourly $ per chart line, kept for good: the state's fills can be lost (a
+# STATE_VERSION bump rescans only the journals still on disk, ~2-5 days), and
+# the "All" chart reads hours before its first fill from here.
+HISTORY = "history.parquet"
+_HIST = {"pnl": "pnl_c", "mo1": "mo1", "mo10": "mo10", "mo60": "mo60"}
+
+
+def hourly(fills: pd.DataFrame) -> pd.DataFrame:
+    """time (hour), pnl/mo1/mo10/mo60 ($), fills, contracts."""
+    if fills.empty:
+        return pd.DataFrame(columns=["time", *_HIST, "fills", "contracts"])
+    x = pd.DataFrame({"time": fills.time.dt.floor("h"), "fills": 1, "contracts": fills["size"]})
+    for k, c in _HIST.items():
+        x[k] = fills[c].fillna(0) * fills["size"] / 100 if c in fills else 0.0
+    return x.groupby("time", as_index=False).sum()
+
+
+def update_history(series: str, fills: pd.DataFrame) -> pd.DataFrame:
+    """Hours the fills cover are rewritten (open fills still move); earlier
+    hours are kept as last written."""
+    path = os.path.join(out_dir(series), HISTORY)
+    new = hourly(fills)
+    try:
+        old = pd.read_parquet(path)
+    except (OSError, ValueError):
+        old = new.iloc[:0]
+    if len(new):
+        old = old[old.time < new.time.min()]
+    h = pd.concat([old, new], ignore_index=True).sort_values("time")
+    tmp = f"{path}.tmp-{os.getpid()}"
+    h.to_parquet(tmp, index=False)
+    os.replace(tmp, path)
+    return h
+
+
 def write_result(p: Perf, fills: pd.DataFrame, error: str | None = None) -> None:
     d = out_dir(p.series)
     os.makedirs(d, exist_ok=True)
+    update_history(p.series, fills)
     for name, df in (("fills", fills), ("lip", p.lip_frame()), ("prints", p.prints_frame())):
         tmp = os.path.join(d, f"{name}.parquet.tmp-{os.getpid()}")
         df.to_parquet(tmp, index=False)
@@ -714,24 +750,45 @@ def summarize_edge(df: pd.DataFrame, prints: pd.DataFrame, since: pd.Timestamp |
     return out
 
 
-def curves(df: pd.DataFrame, since: pd.Timestamp | None = None, lip: pd.DataFrame | None = None) -> pd.DataFrame:
+def read_history(series: str) -> pd.DataFrame | None:
+    try:
+        return pd.read_parquet(os.path.join(out_dir(series), HISTORY))
+    except (OSError, ValueError):
+        return None
+
+
+def curves(df: pd.DataFrame, since: pd.Timestamp | None = None, lip: pd.DataFrame | None = None,
+           history: pd.DataFrame | None = None) -> pd.DataFrame:
     """Long frame (time, line, usd): cumulative PnL and 1s/10s/60s markout $
-    by fill time; with `lip`, also cumulative LIP reward and PnL incl. LIP."""
+    by fill time; with `lip`, also cumulative LIP reward and PnL incl. LIP.
+    `history` (update_history) supplies the hours in the window before the
+    first fill `df` still has, one point an hour."""
     d = window(df, since)
     L = window(lip, since) if lip is not None and len(lip) else None
+    first = d.time.min() if len(d) else None
+    pre = None
+    if history is not None and len(history):
+        pre = window(history, since)
+        # Whole hours before the one the first fill is in: that hour is in `df`.
+        pre = pre[pre.time < first.floor("h")] if first is not None else pre
+        pre = pre.sort_values("time") if len(pre) else None
     # A series with no real fills has a column-less empty frame.
-    if d.empty and L is None:
+    if d.empty and L is None and pre is None:
         return pd.DataFrame(columns=["time", "line", "usd"])
-    times = [x.time.min() for x in (d, L) if x is not None and len(x)]
+    times = [x.time.min() for x in (d, L, pre) if x is not None and len(x)]
     start = since if since is not None else min(times)
     out = []
-    if len(d):
-        d = d.sort_values("time")
-        lines = {"PnL (settled; open at mid)": d.pnl_c, "1s markout": d.mo1, "10s markout": d.mo10,
-                 "60s markout": d.mo60}
-        for name, c in lines.items():
-            v = (c.fillna(0) * d["size"] / 100).cumsum()
-            out.append(pd.DataFrame({"time": [start] + list(d.time), "line": name, "usd": [0.0] + list(v)}))
+    names = {"PnL (settled; open at mid)": ("pnl_c", "pnl"), "1s markout": ("mo1", "mo1"),
+             "10s markout": ("mo10", "mo10"), "60s markout": ("mo60", "mo60")}
+    base = {}
+    for name, (col, hcol) in names.items():
+        ht, hv = ([], []) if pre is None else (list(pre.time + pd.Timedelta("1h")), list(pre[hcol].fillna(0).cumsum()))
+        base[name] = hv[-1] if hv else 0.0
+        if len(d):
+            d = d.sort_values("time")
+            v = (d[col].fillna(0) * d["size"] / 100).cumsum() + base[name]
+            ht, hv = ht + list(d.time), hv + list(v)
+        out.append(pd.DataFrame({"time": [start] + ht, "line": name, "usd": [0.0] + hv}))
     if L is not None:
         L = L.sort_values("time")
         out.append(pd.DataFrame({"time": [start] + list(L.time), "line": "LIP reward",
@@ -739,7 +796,7 @@ def curves(df: pd.DataFrame, since: pd.Timestamp | None = None, lip: pd.DataFram
         ev = pd.concat([d[["time"]].assign(v=d.pnl_c.fillna(0) * d["size"] / 100) if len(d) else None,
                         L[["time"]].assign(v=L.usd)]).sort_values("time")
         out.append(pd.DataFrame({"time": [start] + list(ev.time), "line": "PnL incl. LIP",
-                                 "usd": [0.0] + list(ev.v.cumsum())}))
+                                 "usd": [0.0] + list(ev.v.cumsum() + base["PnL (settled; open at mid)"])}))
     return pd.concat(out, ignore_index=True)
 
 
