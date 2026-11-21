@@ -88,6 +88,9 @@ FOREIGN_POSITIONS = "foreign_positions.json"
 UNBOOKED_POSITIONS = "unbooked_positions.json"
 # {"match": [basket id substrings]}: those baskets are sold off (close_out), not held.
 CLOSE_OUT = "close_out.json"
+# scanner.SPREAD_PREFIX, kept here: a runner deployed before the scanner that lists
+# spreads must already refuse to trade them, and can't import the new name (11-21).
+SPREAD_PREFIX = "spread:"
 # Sweeping thin Polymarket books in one go paid $349 over each market's best
 # price closing out the shipping ladders (11-21): one level at a time, this far apart.
 CLOSE_OUT_GAP_S = 60.0
@@ -1395,7 +1398,7 @@ class ArbsRunner:
         if ex and (b.basket_id in ex or b.relationship_id in ex or b.cluster in ex
                    or b.relationship_id.split(":", 1)[-1] in ex):
             return True
-        if b.relationship_id.startswith(scanner.SPREAD_PREFIX):
+        if b.relationship_id.startswith(SPREAD_PREFIX):
             return True                   # recorded only (scanner.spreads)
         every, by_phase = self.record_only_sets()
         if every or by_phase:

@@ -283,3 +283,8 @@ def test_spreads_only_on_spread_shards_and_after_traded_markets_in_the_budget():
     traded = event("EV-1", "MECNET", [mkt("EV-1-A", 0.4, vol=1), mkt("EV-1-B", 0.5, vol=1)], shard=3)
     sel = run([_spread_event(), traded], shards={3}, max_markets=2)
     assert [r["relationship_id"] for r in sel["relationships"]] == ["mecnet:EV-1"]
+
+
+def test_runner_refuses_the_prefix_the_scanner_lists_spreads_under():
+    from strategies.ARBS import runner
+    assert runner.SPREAD_PREFIX == scanner.SPREAD_PREFIX
