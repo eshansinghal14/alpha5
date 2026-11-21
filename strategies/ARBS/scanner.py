@@ -428,7 +428,10 @@ def select(doc: dict, *, now: pd.Timestamp, days: float | None, max_markets: int
         s = r.get("expected_settlement_utc")
         if (s and horizon is not None and pd.Timestamp(s) > horizon) or r.get("cluster") in exclude                 or r["relationship_id"].split(":", 1)[-1] in exclude:
             continue
-        if (max_markets is None or len(used | costly) <= max_markets) and                 (max_total is None or len(every | ts) <= max_total):
+        # Adding no new costly market fits however far over the count `used`
+        # is: a held basket past the cap otherwise shut out every cheap event
+        # after it (11-21: ARBS 13k -> 1.7k markets, ARBS0C 15k -> 1.5k).
+        if (max_markets is None or costly <= used or len(used | costly) <= max_markets) and                 (max_total is None or len(every | ts) <= max_total):
             out.append(r)
             used |= costly
             every |= ts
