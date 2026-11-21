@@ -287,4 +287,21 @@ def test_spreads_only_on_spread_shards_and_after_traded_markets_in_the_budget():
 
 def test_runner_refuses_the_prefix_the_scanner_lists_spreads_under():
     from strategies.ARBS import runner
-    assert runner.SPREAD_PREFIX == scanner.SPREAD_PREFIX
+    assert runner.SPREAD_PREFIX == scanner.SPREAD_PREFIX and runner.RECORD_PREFIXES == scanner.RECORD_PREFIXES
+
+
+def _totals(shard=3, exp="2026-11-15T00:00:00Z"):
+    tail = "originally scheduled for Nov 14, 2026, then the market resolves to Yes."
+    return [{**event(et, "", [mkt(f"{et}-{k}", 0.5, strike_type="greater", floor_strike=k - 0.5, expected_expiration_time=exp,
+                                  rules_primary=f"If over {k - 0.5} total points are scored in the A vs B game {tail}")
+                              for k in ks], shard=shard), "category": "Sports"}
+            for et, ks in (("KXNBATOTAL-1", (200, 202)), ("KXNBATOTALPRECISE-1", (201, 202)))]
+
+
+def test_unnetted_baskets_keep_to_locked_days_and_record_shards():
+    def watched(doc):
+        return [k for k in baskets(doc) if k.startswith(scanner.RECORD_PREFIXES)]
+    assert {k.split(":")[0] for k in watched(run(_totals(), shards={3}, days=None))} == {"spread", "watch"}
+    late = (NOW + pd.Timedelta(days=scanner.LOCKED_DAYS + 1)).isoformat()
+    assert not watched(run(_totals(exp=late), shards={3}, days=None))
+    assert not watched(run(_totals(shard=0), shards={0}, days=None))

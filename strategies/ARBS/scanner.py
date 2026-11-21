@@ -39,17 +39,23 @@ import pandas as pd
 
 from infra.kalshi.api import kalshi_get
 from infra.config import atomic_write_json
-from strategies.ARBS import parts
+from strategies.ARBS import parts, watch
 
 UP = ("greater", "greater_or_equal")
 DOWN = ("less", "less_or_equal")
-# Sports spread/total ladders, which Kalshi doesn't net (cash stays locked to
-# settlement): recorded, never traded, until a replay says they pay. Shard 3
-# held 1,000 of the 1,295 pairs with 3c+ of quote room (college basketball, NBA;
-# 11-21 snapshot) and has scan budget to spare; they fill only what's left.
+# Sports spread/total ladders and watch.py's baskets, which Kalshi doesn't net
+# (cash stays locked to settlement): recorded, never traded, until a replay says
+# they pay. They sort last in select, so they only take the budget traded
+# markets leave: none on shard 0, whose processes sit at their CPU-held count
+# (11-21: 0 recorded there; building its ~110k such baskets added ~20 MB to
+# every scan doc).
 SPREAD_PREFIX = "spread:"
-SPREAD_SHARDS = (3,)
+RECORD_PREFIXES = (SPREAD_PREFIX, watch.WATCH_PREFIX)
+RECORD_SHARDS = (3,)
 SPREAD_CROSS = 3          # each team's lowest strikes paired across teams
+# Unnetted baskets lock their cash to settlement, so they keep to PM's
+# days_till_expiry (120, config_pm.json 11-21); Kalshi's netted ones have none.
+LOCKED_DAYS = 120.0
 
 
 def fetch_events() -> list[dict]:
@@ -197,7 +203,7 @@ def spread_event(e: dict, skip_series) -> bool:
     s = e.get("series_ticker") or ""
     return (not e.get("collateral_return_type") and e.get("category") == "Sports"
             and s.endswith(("SPREAD", "TOTAL")) and not s.endswith("TEAMTOTAL")
-            and e.get("exchange_index") in SPREAD_SHARDS and s not in skip_series)
+            and e.get("exchange_index") in RECORD_SHARDS and s not in skip_series)
 
 
 def spreads(event: dict, markets: list[dict], span: int) -> list[dict]:
@@ -273,15 +279,20 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
     without a kickoff is live from this long before its expected settlement;
     `early_h`: series -> hours before its start an event turns live."""
     rels, tickers = [], set()
+    locked_until = now + pd.Timedelta(days=LOCKED_DAYS)
+
+    def active(e):
+        return [m for m in e.get("markets") or []
+                if m.get("status") == "active" and m.get("market_type", "binary") == "binary"]
+
     for e in events:
         spread = spread_event(e, skip_series) and e.get("exchange_index") in shards
         if not scanned_event(e, shards, skip_series) or (
                 owns is not None and not owns(e.get("event_ticker") or "")):
             continue
-        ms = [m for m in e.get("markets") or []
-              if m.get("status") == "active" and m.get("market_type", "binary") == "binary"]
+        ms = active(e)
         s = settles(e, overrides)
-        if len(ms) < 2 or s is None:
+        if len(ms) < 2 or s is None or (spread and s > locked_until):
             continue
         if spread:
             got = spreads(e, ms, ladder_span)
@@ -291,39 +302,71 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
             got = mecnet(e, ms, mecnet_max_legs, complete)
         else:
             got = ladder(e, ms, ladder_span)
-        vol = round(sum(_f(m.get("volume_24h_fp")) for m in ms), 2)
-        # A resting quote on a live game is picked off the moment the score
-        # changes (CFCDLG 10-29 00:42). occurrence_datetime is a game's
-        # expected END, not its kickoff, hence the milestone start.
-        live = [pd.Timestamp(t) for t in [m.get("occurrence_datetime") for m in ms]
-                + [(starts or {}).get(e["event_ticker"])] if t]
-        early = (early_h or {}).get(e.get("series_ticker"))
-        if early and (starts or {}).get(e["event_ticker"]):
-            live.append(pd.Timestamp(starts[e["event_ticker"]]) - pd.Timedelta(hours=early))
-        # Not for an event with a kickoff: Kalshi files CS2 maps as daily, which
-        # made 61 matches live up to a day before they started (10-30).
-        period = PERIODS.get((freqs or {}).get(e.get("series_ticker")))
-        if period is not None and e.get("strike_date") and not (starts or {}).get(e["event_ticker"]):
-            live.append(pd.Timestamp(e["strike_date"]) - period)
-        # Kalshi dates most election events to the seat's start (Jan 2027), so
-        # occurrence_datetime never makes results night live: the window does.
-        # Past `until` it drops out, so a later race isn't held at live size.
-        w = (live_windows or {}).get(e.get("category"))
-        if w and now < pd.Timestamp(w[1]):
-            live.append(pd.Timestamp(w[0]))
-        # News lands hardest near settlement: a weekly Hormuz/Bab el-Mandeb ladder
-        # quoted as not live lost $108 to one headline 1.7h out (11-10 13:18).
-        if settle_lead is not None and not (starts or {}).get(e["event_ticker"]):
-            live.append(s - settle_lead)
+        s, live_from, vol = _timing(e, ms, s, now, starts, freqs, live_windows, settle_lead, early_h)
         for r in got:
             r.update(expected_settlement_utc=s.isoformat(), quote_until_utc=None, resume_quoting_utc=None,
-                     live_from_utc=min(live).isoformat() if live else None, volume_24h=vol)
-            ts = {l["ticker"] for b in r["baskets"] for l in b["legs"]}
-            tickers |= ts
+                     live_from_utc=live_from, volume_24h=vol)
+            tickers |= {l["ticker"] for b in r["baskets"] for l in b["legs"]}
         rels += got
+    # Record-only baskets across events (watch.py): settled when the last of
+    # their events is, live once the first one is.
+    pool = watch_pool(events, shards, overrides, now)
+    for anchor, r, evs_in in watch.build([e for e, _ in pool.values()], RECORD_SHARDS, skip_series,
+                                         recorded=lambda e: spread_event(e, skip_series)):
+        if owns is not None and not owns(anchor):
+            continue
+        ts = [_timing(pool[et][0], active(pool[et][0]), pool[et][1], now, starts, freqs, live_windows,
+                      settle_lead, early_h) for et in evs_in]
+        lives = [t[1] for t in ts if t[1]]
+        r.update(expected_settlement_utc=max(t[0] for t in ts).isoformat(), quote_until_utc=None,
+                 resume_quoting_utc=None, live_from_utc=min(lives) if lives else None,
+                 volume_24h=round(sum(t[2] for t in ts), 2))
+        tickers |= {l["ticker"] for b in r["baskets"] for l in b["legs"]}
+        rels.append(r)
     return {"generated_at_utc": now.isoformat(), "source": "strategies.ARBS.scanner",
             "n_events": len({r["relationship_id"].split(":", 1)[1] for r in rels}), "n_markets": len(tickers),
             "relationships": rels}
+
+
+def watch_pool(events: list[dict], shards, overrides: dict[str, str], now: pd.Timestamp) -> dict[str, tuple]:
+    """event -> (event, expected settlement) for the events watch.build gets:
+    on `shards` and RECORD_SHARDS, settling within LOCKED_DAYS."""
+    until = now + pd.Timedelta(days=LOCKED_DAYS)
+    out = {}
+    for e in events:
+        if (e.get("exchange_index") in shards and e.get("exchange_index") in RECORD_SHARDS
+                and (s := settles(e, overrides)) is not None and s <= until):
+            out[e["event_ticker"]] = (e, s)
+    return out
+
+
+def _timing(e, ms, s, now, starts, freqs, live_windows, settle_lead, early_h):
+    """(expected settlement, live_from iso or None, 24h volume) for one event."""
+    vol = round(sum(_f(m.get("volume_24h_fp")) for m in ms), 2)
+    # A resting quote on a live game is picked off the moment the score
+    # changes (CFCDLG 10-29 00:42). occurrence_datetime is a game's
+    # expected END, not its kickoff, hence the milestone start.
+    live = [pd.Timestamp(t) for t in [m.get("occurrence_datetime") for m in ms]
+            + [(starts or {}).get(e["event_ticker"])] if t]
+    early = (early_h or {}).get(e.get("series_ticker"))
+    if early and (starts or {}).get(e["event_ticker"]):
+        live.append(pd.Timestamp(starts[e["event_ticker"]]) - pd.Timedelta(hours=early))
+    # Not for an event with a kickoff: Kalshi files CS2 maps as daily, which
+    # made 61 matches live up to a day before they started (10-30).
+    period = PERIODS.get((freqs or {}).get(e.get("series_ticker")))
+    if period is not None and e.get("strike_date") and not (starts or {}).get(e["event_ticker"]):
+        live.append(pd.Timestamp(e["strike_date"]) - period)
+    # Kalshi dates most election events to the seat's start (Jan 2027), so
+    # occurrence_datetime never makes results night live: the window does.
+    # Past `until` it drops out, so a later race isn't held at live size.
+    w = (live_windows or {}).get(e.get("category"))
+    if w and now < pd.Timestamp(w[1]):
+        live.append(pd.Timestamp(w[0]))
+    # News lands hardest near settlement: a weekly Hormuz/Bab el-Mandeb ladder
+    # quoted as not live lost $108 to one headline 1.7h out (11-10 13:18).
+    if settle_lead is not None and not (starts or {}).get(e["event_ticker"]):
+        live.append(s - settle_lead)
+    return s, (min(live).isoformat() if live else None), vol
 
 
 # An event whose loop CPU stayed under CHEAP_EVENT_S on every recent day (today's
@@ -373,8 +416,8 @@ def select(doc: dict, *, now: pd.Timestamp, days: float | None, max_markets: int
 
     horizon = None if days is None else now + pd.Timedelta(days=days)
     out, used, every = [], set(), set()
-    # Recorded-only spreads last: they take only the budget traded markets leave.
-    for r in sorted(doc["relationships"], key=lambda r: (r["relationship_id"].startswith(SPREAD_PREFIX), -per_market(r))):
+    # Recorded-only baskets last: they take only the budget traded markets leave.
+    for r in sorted(doc["relationships"], key=lambda r: (r["relationship_id"].startswith(RECORD_PREFIXES), -per_market(r))):
         ts = {l["ticker"] for b in r["baskets"] for l in b["legs"]} - known_tickers
         costly = set() if r["relationship_id"].split(":", 1)[-1] in cheap else ts
         if any(b["basket_id"] in held for b in r["baskets"]):
@@ -479,7 +522,11 @@ def scan_and_select(root: str, config_path: str | None = None, markets: int | No
             # The one writer of the owners map: assigns new events, rebalances hourly
             # on writes and book updates, and hands on events an owner's scan dropped.
             now = time.time()
-            listed = [e["event_ticker"] for e in events if scanned_event(e, set(cfg.scan.shards), other_series())]
+            skip = other_series()
+            listed = [e["event_ticker"] for e in events if scanned_event(e, set(cfg.scan.shards), skip)]
+            pool = watch_pool(events, set(cfg.scan.shards), settlement_overrides(), pd.Timestamp.now(tz="UTC"))
+            listed += sorted({a for a, _, _ in watch.build([e for e, _ in pool.values()], RECORD_SHARDS, skip,
+                                                          recorded=lambda e: spread_event(e, skip))} - set(listed))
             cpu = parts.spend(procs=group, name=parts.CPU)
             if sum(cpu.values()) < parts.CPU_MIN_S:
                 cpu = parts.spend(procs=group, name=parts.MSGS)
