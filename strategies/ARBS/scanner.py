@@ -275,7 +275,7 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
     rels, tickers = [], set()
     for e in events:
         spread = spread_event(e, skip_series) and e.get("exchange_index") in shards
-        if not (tradeable_event(e, shards, skip_series) or spread) or (
+        if not scanned_event(e, shards, skip_series) or (
                 owns is not None and not owns(e.get("event_ticker") or "")):
             continue
         ms = [m for m in e.get("markets") or []
@@ -405,6 +405,13 @@ def other_series() -> set[str]:
     return {t for t, s in registry().items() if t != "ARBS"}
 
 
+def scanned_event(e: dict, shards, skip_series) -> bool:
+    """Listed by scan(): a netted event, or a recorded-only spread. The owners
+    map must list the spreads too, or no process of a split shard takes them."""
+    return tradeable_event(e, shards, skip_series) or (spread_event(e, skip_series)
+                                                       and e.get("exchange_index") in shards)
+
+
 def tradeable_event(e: dict, shards, skip_series) -> bool:
     return (e.get("collateral_return_type") in ("MECNET", "DIRECNET") and e.get("series_ticker") not in skip_series
             and e.get("exchange_index") in shards)
@@ -472,7 +479,7 @@ def scan_and_select(root: str, config_path: str | None = None, markets: int | No
             # The one writer of the owners map: assigns new events, rebalances hourly
             # on writes and book updates, and hands on events an owner's scan dropped.
             now = time.time()
-            listed = [e["event_ticker"] for e in events if tradeable_event(e, set(cfg.scan.shards), other_series())]
+            listed = [e["event_ticker"] for e in events if scanned_event(e, set(cfg.scan.shards), other_series())]
             cpu = parts.spend(procs=group, name=parts.CPU)
             if sum(cpu.values()) < parts.CPU_MIN_S:
                 cpu = parts.spend(procs=group, name=parts.MSGS)
