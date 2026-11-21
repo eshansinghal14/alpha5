@@ -131,6 +131,10 @@ class TradingParams:
     hot_event_only: list[str] | None = param("Series, events or groups (S:Esports) hot_event_s covers: a basket "
                                              "is covered when any of its markets is. null or empty: every market.",
                                              editable=False)
+    dormant_skip: bool = param("Shard 0 stops quoting series on the dormant list (dormant.py: 100k+ write "
+                               "tokens over 3 days, no finished arb) until a print through the price it would "
+                               "quote wakes the event for 15 min. Off: the summary and journal (dormant_wake) "
+                               "say what it would skip.")
     second_level_size: bool = param("Two-leg baskets: hold every quote (arb, near, deep) to what the other leg "
                                     "still completes, without a loss, with its best ask level gone. In a "
                                     "two-outcome market the trader who fills the quote takes that level in "

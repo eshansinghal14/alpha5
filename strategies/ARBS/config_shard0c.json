@@ -26,6 +26,7 @@
     "skip_beyond_reach": null,
     "hot_event_s": null,
     "hot_event_only": null,
+    "dormant_skip": null,
     "depth_age_s": null,
     "second_level_size": null,
     "pull_drop": null,

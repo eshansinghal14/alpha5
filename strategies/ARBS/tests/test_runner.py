@@ -1193,6 +1193,46 @@ def test_quote_score_counts_only_legs_that_trade(arbs):
     assert row["quote_usd_h"] > 0 and row["wait_s"] is not None
 
 
+def test_a_dormant_series_sleeps_until_a_print_through_its_quote_price(arbs):
+    r, b = arbs
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    _eval(r, b)
+    rows = []
+    r.journal = rows.append
+    now = time.time()
+    assert r.dormant_split([b.basket_id], now) == ([b.basket_id], set())          # no list yet
+    r.dormant = frozenset({"X"})
+    assert r.dormant_split([b.basket_id], now) == ([b.basket_id], {b.basket_id})  # shadow: still quotable
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, dormant_skip=True)
+    assert r.dormant_split([b.basket_id], now) == ([], {b.basket_id})
+    px = r.quote_px[b.basket_id][0][0]
+    trade = lambda p: Trade(ticker="X-A", time=pd.Timestamp.now(tz="UTC"), price=p, size=3.0, taker_side="no")  # noqa: E731
+    r._on_trade("X-A", trade(px + 0.01))                                         # above our price: still asleep
+    assert not [x for x in rows if x["kind"] == "dormant_wake"]
+    r._on_trade("X-A", trade(px))
+    wake = [x for x in rows if x["kind"] == "dormant_wake"]
+    assert len(wake) == 1 and wake[0]["event"] == "X" and wake[0]["skip"] is True
+    assert r.dormant_split([b.basket_id], time.time()) == ([b.basket_id], set())
+    assert r.dormant_split([b.basket_id], time.time() + R.DORMANT_WAKE_S + 1) == ([], {b.basket_id})
+    for t in r.tickers:                                                          # only shard 0 sleeps
+        r.meta[t].shard = 3
+    assert r.dormant_split([b.basket_id], time.time() + R.DORMANT_WAKE_S + 1) == ([b.basket_id], set())
+
+
+def test_dormant_list_reloads_when_rewritten(arbs, tmp_path):
+    r, b = arbs
+    os.makedirs(tmp_path / "ARBS", exist_ok=True)
+    path = tmp_path / "ARBS" / R.dormant.LIST_FILE
+    path.write_text(json.dumps({"for": "2026-11-22", "series": {"X": {"since": "2026-11-22", "tokens": 2e5}}}))
+    r.poll_dormant()
+    assert r.dormant == frozenset({"X"})
+    path.write_text(json.dumps({"for": "2026-11-23", "series": {}}))
+    os.utime(path, (time.time() + 5, time.time() + 5))
+    r.poll_dormant()
+    assert r.dormant == frozenset()
+
+
 def test_print_through_an_unquoted_basket_is_logged_as_missed(arbs):
     r, b = arbs
     book(r, "X-A", [(0.30, 10)], [(0.35, 10)])

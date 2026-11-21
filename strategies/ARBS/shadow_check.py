@@ -385,6 +385,14 @@ def main():
         size_table.write_table(roots, os.path.join(LIVE_ROOT, "ARBS"), nxt)
     except Exception as e:                # the exit model above has shipped; the table waits a night
         print(f"size table failed ({e!r})")
+    from strategies.ARBS import dormant
+    try:
+        for s in dormant.ROOTS:
+            dormant.write_day(os.path.join(LIVE_ROOT, s), day)
+        doc = dormant.write_list(LIVE_ROOT, nxt)
+        print(json.dumps({"dormant_for": nxt, "series": len(doc["series"])}))
+    except Exception as e:
+        print(f"dormant list failed ({e!r})")
 
 
 def live_bias(root: str, before: str) -> tuple[float, float]:

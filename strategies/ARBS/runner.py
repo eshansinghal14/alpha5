@@ -47,7 +47,7 @@ from infra.trading.engine import MARKET_PAUSE_RETRY_S
 from infra.runtime import disk, handoff as hand, notify
 from infra.runtime.control import StopWatcher, TradingModeWatcher, resumable_arm
 from infra.runtime.persist import LIVE_ROOT, day_dir
-from strategies.ARBS import exit_cost, size_table
+from strategies.ARBS import dormant, exit_cost, size_table
 from strategies.ARBS import live_params as lparams, parts, pricing, replay, scanner
 from strategies.ARBS.execution import Frozen, Gateway
 from strategies.ARBS import venues
@@ -398,6 +398,11 @@ QUOTE_GONE_S = 1.0
 # 8.5/~18 ms (order log, 11-04, 185k amends + 186k cancels).
 SHADOW_LAG_S = 0.02
 SHADOW_LOG_S = 300.0
+# A dormant series' event quotes this long after a print through its would-be quote
+# price. Replayed 11-16..21 it kept 39-47% of those series' replayed gains (their losses
+# too: both sums are near zero) for 1-1.5% of their writes; waking on any trade, a 2c
+# move or a quoting burst kept 30-55% of the writes for no more.
+DORMANT_WAKE_S = 900.0
 SHADOW_EVENT_KEEP_S = 600.0     # events in the summary: a print this recently
 SERIES_GROUPS_S = 3600.0
 # An event idle this long leaves the estimator: 12 of its 30-min half-lives.
@@ -751,6 +756,10 @@ class ArbsRunner:
         self._model_mtime: float | None = None
         self.size_tab: size_table.Table | None = None
         self._size_mtime: float | None = None
+        self.dormant: frozenset[str] = frozenset()      # series, see dormant.py
+        self._dormant_mtime: float | None = None
+        self.awake_until: dict[str, float] = {}         # dormant series' event -> quoting until (time.time())
+        self.dormant_view: dict = {}
         self._size_cut: dict[tuple[str, int], tuple[float, float]] = {}   # last table cut journaled per leg
         self.model_state: dict[tuple[str, int], dict] = {}
         self._model_cache: dict[tuple[str, int], tuple[float, tuple]] = {}
@@ -1913,6 +1922,8 @@ class ArbsRunner:
             self.flow.add(ticker, maker, trade.size, time.time())
             self.flow_recent.add(ticker, maker, trade.size, time.time())
             self.note_missed(ticker, maker, trade)
+            if self.dormant:
+                self.note_wake(ticker, maker, trade)
             if self.cfg.runtime.record_prints:
                 # Research logging: never in the way of the trade handling.
                 try:
@@ -2872,6 +2883,61 @@ class ArbsRunner:
         if not tab.ok:
             self.alert("warn", None, "size table doesn't match this code's sizes; table sizing off")
         self.size_tab = tab
+
+    def poll_dormant(self):
+        """Reload dormant.LIST_FILE when the nightly job rewrites it."""
+        path = os.path.join(LIVE_ROOT, "ARBS", dormant.LIST_FILE)
+        try:
+            m = os.path.getmtime(path)
+            if m == self._dormant_mtime:
+                return
+            with open(path, encoding="utf-8") as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError):
+            return
+        self._dormant_mtime = m
+        self.dormant = frozenset(doc.get("series") or ())
+
+    def asleep(self, b: Basket, now: float) -> bool:
+        """A shard 0 basket of a dormant series whose event no print has woken."""
+        if not self.dormant or self.basket_shard(b) != 0:
+            return False
+        _, series, event = self._lp_path(b.legs[0].ticker)
+        return series in self.dormant and self.awake_until.get(event, 0.0) <= now
+
+    def note_wake(self, ticker: str, side: str, trade):
+        """A print through the price we'd quote on a dormant series' basket
+        wakes its event for DORMANT_WAKE_S (journaled whether or not
+        trading.dormant_skip is on)."""
+        _, series, event = self._lp_path(ticker)
+        if series not in self.dormant:
+            return
+        for bid in self.by_ticker.get(ticker, ()):
+            px, b = self.quote_px.get(bid), self.baskets.get(bid)
+            if px is None or b is None:
+                continue
+            for leg, p in zip(b.legs, px):
+                if p is None or leg.ticker != ticker or leg.side != side or trade.price > p[0] + _EPS:
+                    continue
+                now = time.time()
+                self.journal({"kind": "dormant_wake", "event": event, "series": series, "basket_id": bid,
+                              "ticker": ticker, "side": side, "price": trade.price, "size": trade.size,
+                              "quote_price": p[0], "awake": self.awake_until.get(event, 0.0) > now,
+                              "skip": self.cfg.trading.dormant_skip})
+                self.awake_until[event] = now + DORMANT_WAKE_S
+                return
+
+    def dormant_split(self, quotable: list[str], now: float) -> tuple[list[str], set[str]]:
+        """(the baskets the hot list may pick, the asleep ones): the asleep
+        are left out only with trading.dormant_skip on."""
+        if not self.dormant:
+            return quotable, set()
+        if len(self.awake_until) > 5000:
+            self.awake_until = {k: v for k, v in self.awake_until.items() if v > now}
+        asleep = {bid for bid in quotable if self.asleep(self.baskets[bid], now)}
+        if self.cfg.trading.dormant_skip and asleep:
+            quotable = [bid for bid in quotable if bid not in asleep]
+        return quotable, asleep
 
     def table_size(self, b: Basket, vs, j: int, price: float, size: float) -> float:
         """`size` cut to the size table's best for leg j's quote at `price`
@@ -5011,6 +5077,8 @@ class ArbsRunner:
                 self.ranking = rows
                 quotable = [r["basket_id"] for r in rows if self.may_quote(self.baskets[r["basket_id"]], now_ts)]
                 now = time.time()
+                self.poll_dormant()
+                quotable, asleep = self.dormant_split(quotable, now)
                 cost = {bid: self.write_cost(self.baskets[bid], now) for bid in quotable}
                 for r in rows:
                     r["write_tps"] = round(cost.get(r["basket_id"], 0.0), 2)
@@ -5028,6 +5096,13 @@ class ArbsRunner:
                 self.hot_cost = round(sum(cost[bid] for bid in hot), 1)
                 self.hot_cost_by_shard = {str(s): round(sum(cost[b] for b in bids if b in picked), 1)
                                           for s, bids in by_shard.items()}
+                if self.dormant:
+                    # Shadow: what the skip would take off the hot list (0 with it on).
+                    held = [bid for bid in hot if bid in asleep]
+                    self.dormant_view = {"skip": self.cfg.trading.dormant_skip, "series": len(self.dormant),
+                                         "asleep": len(asleep), "asleep_hot": len(held),
+                                         "asleep_hot_tps": round(sum(cost[bid] for bid in held), 1),
+                                         "awake_events": sum(1 for v in self.awake_until.values() if v > now)}
                 self.check_hot_ready()
                 self.update_plan_scale(time.time())
                 if self.writer:
@@ -5465,6 +5540,7 @@ class ArbsRunner:
             "hot_churn": {f"{m}m": sum(e for t, e, _ in self.hot_churn if t >= time.time() - 60 * m)
                           for m in (1, 10, 60)},
             "hot_cost_tps": self.hot_cost, "hot_cost_by_shard": self.hot_cost_by_shard,
+            "dormant": self.dormant_view,
             "write_plan_scale": {str(s): round(v, 3) for s, v in self.plan_scale.items()},
             "scan_markets": self.markets, "loop_cpu": None if self.loop_cpu is None else round(self.loop_cpu, 3),
             "write_spend_tps": {str(s): round(v, 1) for s, v in self.spend_tps.items()},
