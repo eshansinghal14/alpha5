@@ -266,12 +266,12 @@ def test_paying_the_guarantee_or_more_is_quiet(arbs, monkeypatch):
     assert b.basket_id not in r.real_ledger.baskets and not sent
 
 
-def test_close_out_sells_every_held_leg_and_skips_completion(arbs, monkeypatch):
+def test_close_out_takes_one_level_at_a_time_and_skips_completion(arbs, monkeypatch):
     r, b = arbs
     from infra.kalshi.orders import RealFill
     for t in b.tickers:
         r.real_ledger.record(b.basket_id, b.tickers, t, "yes", 3, 1.5, time.time())
-    book(r, "X-A", [(0.40, 2)], [(0.55, 10)])     # NO ask 0.60, only 2 deep
+    book(r, "X-A", [(0.40, 2), (0.10, 5)], [(0.55, 10)])     # NO asks 0.60 x2, then 0.90
     book(r, "X-B", [(0.30, 10)], [(0.65, 10)])    # NO ask 0.70
     sent = []
 
@@ -287,7 +287,10 @@ def test_close_out_sells_every_held_leg_and_skips_completion(arbs, monkeypatch):
     async def go():
         r.evaluate(b)
         await drain(r)
-        r.evaluate(b)        # the book held 2 of A's 3: the next pass sells the last one
+        r.evaluate(b)        # within CLOSE_OUT_GAP_S: nothing
+        await drain(r)
+        r._close_at[b.basket_id] -= R.CLOSE_OUT_GAP_S
+        r.evaluate(b)        # A's last one at the best level again, not at 0.90
         await drain(r)
     asyncio.run(go())
     assert [x[:4] for x in sent] == [("X-A", "no", 0.60, 2), ("X-B", "no", 0.70, 3), ("X-A", "no", 0.60, 1)]

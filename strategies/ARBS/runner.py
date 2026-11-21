@@ -88,6 +88,9 @@ FOREIGN_POSITIONS = "foreign_positions.json"
 UNBOOKED_POSITIONS = "unbooked_positions.json"
 # {"match": [basket id substrings]}: those baskets are sold off (close_out), not held.
 CLOSE_OUT = "close_out.json"
+# Sweeping thin Polymarket books in one go paid $349 over each market's best
+# price closing out the shipping ladders (11-21): one level at a time, this far apart.
+CLOSE_OUT_GAP_S = 60.0
 # Every ARBS process trading on this one Kalshi account. A process's audit
 # takes the others' ledgers off Kalshi's positions: the Polymarket process's
 # cross-exchange legs sit on markets ARBS trades too.
@@ -654,6 +657,7 @@ class ArbsRunner:
         self._owners_mtime = 0.0
         self._close_mtime: float | None = None
         self._close_match: tuple[str, ...] = ()
+        self._close_at: dict[str, float] = {}
         self.store = ConfigStore(series.config_cls, series.config_path, series.config_key)
         self.cfg = self.store.config
         self.root = os.path.join(LIVE_ROOT, self.S)
@@ -1391,6 +1395,8 @@ class ArbsRunner:
         if ex and (b.basket_id in ex or b.relationship_id in ex or b.cluster in ex
                    or b.relationship_id.split(":", 1)[-1] in ex):
             return True
+        if b.relationship_id.startswith(scanner.SPREAD_PREFIX):
+            return True                   # recorded only (scanner.spreads)
         every, by_phase = self.record_only_sets()
         if every or by_phase:
             group, series, event = self._lp_path(b.legs[0].ticker)
@@ -4132,13 +4138,14 @@ class ArbsRunner:
         return any(s in basket_id for s in self._close_match)
 
     def close_out(self, b: Basket, pos, live_qs: list[Quote]):
-        """Net out every leg held by buying its other side at the asks (IOC, as
-        deep as the book goes): the loss is taken now. Repeats each pass until
-        the ledger no longer holds the basket."""
+        """Net out every leg held by buying its other side at its best ask only
+        (IOC), then again after CLOSE_OUT_GAP_S once the book has refilled,
+        until the ledger no longer holds the basket."""
         bid = b.basket_id
         for q in live_qs:
             self.spawn(self.cancel_quote(q, "close_out"), bid)
-        if not self.live or bid in self.busy:
+        now = time.time()
+        if not self.live or bid in self.busy or now - self._close_at.get(bid, 0.0) < CLOSE_OUT_GAP_S:
             return
         orders = []
         for t, lp in pos.legs.items():
@@ -4146,12 +4153,13 @@ class ArbsRunner:
             v = self.leg_view(t, other) if self.is_open(t) else None
             if v is None or not v.asks or lp.qty <= _EPS:
                 continue
-            n = min(lp.qty, v.depth())
-            limit = v.ladder_price(n)
-            if limit is not None and n > _EPS:
+            limit, depth = v.asks[0]
+            n = min(lp.qty, depth)
+            if n > _EPS:
                 orders.append((t, other, limit, n, v))
         if not orders:
             return
+        self._close_at[bid] = now
 
         async def go():
             held = self.hold([(t, sd, n) for t, sd, _, n, _ in orders])
