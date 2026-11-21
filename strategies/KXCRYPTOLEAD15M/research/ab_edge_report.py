@@ -1,5 +1,8 @@
 """Result of the constant-edge A/B (ab_edge.py): per arm, lots and $ per event, 10s/60s markout and
-settled c/lot with event-clustered standard errors, and the same per coin. Run from /opt/alpha5."""
+settled c/lot with event-clustered standard errors, and the same per coin. Run from /opt/alpha5.
+
+The arm is fixed to the slot (A = events starting :00/:30, B = :15/:45). With no change made, 11-07..13
+:15/:45 events marked out ~1.2c/lot worse at 60s, so a pooled markout gap that size is not the edge."""
 import json
 
 import numpy as np
@@ -24,7 +27,7 @@ def per_event(g, cols=("mo10", "mo60")):
     for arm, a in g.groupby("arm"):
         ev = a.groupby("close").apply(lambda e: pd.Series({
             "lots": e["size"].sum(), **{c: (e[c] * e["size"]).sum() for c in cols},
-            "settled": e.pnl_c.sum()}))
+            "settled": (e.pnl_c * e["size"]).sum()}))
         lots = ev.lots.sum()
         row = {"events": int(n_ev.get(arm, 0)), "lots/ev": lots / max(n_ev.get(arm, 1), 1)}
         for c in (*cols, "settled"):

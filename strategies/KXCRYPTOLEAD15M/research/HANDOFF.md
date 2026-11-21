@@ -1,16 +1,19 @@
 # CURRENT STATE — 2026-10-20 ~18:00 UTC (read this first)
 
-**Running since 2026-11-13 23:30 UTC: constant-edge A/B** (`research/ab_edge.py`,
-`alpha5-race-ab.timer`). Every other 15-min event quotes BTC/ETH/SOL 1c closer
-(`pricing.btc/eth/sol_constant_edge` 0.035/0.055/0.04 -> 0.025/0.045/0.03; XRP
-unchanged); the arm per event is in `data/live/KXCRYPTOLEAD15M/ab_edge.jsonl`.
-Those three values flipping every event is the experiment, not a fault. Why:
-from 11-10 the race books tightened from 9-10c to 7-8c while our distance from
-fair stayed put, so we sit 1-2c further behind the touch (volume share
-4.5-5% -> 2.3-3.2%). Read it with `research/ab_edge_report.py`; a placebo run
-put the SE at 1-2c/lot with ~90 events per arm, so judge markouts after ~a week,
-not before. Stop: disable the timer, then `ab_edge.py --stop` (restores A).
-A hand edit of those three values also stops the switching.
+**Constant-edge A/B stopped 2026-11-21 17:17 UTC; edges now BTC 3.5c, ETH 5.5c,
+SOL 3c** (`pricing.*_constant_edge`; XRP 6.5c unchanged). The A/B
+(`research/ab_edge.py`, `alpha5-race-ab.timer`, now disabled) ran 11-13 23:30
+to 11-21 17:15 UTC, alternating events between those edges at 3.5/5.5/4c (A)
+and 1c closer (B), 370 events per arm; per-event arms in
+`data/live/KXCRYPTOLEAD15M/ab_edge.jsonl`, read with `research/ab_edge_report.py`.
+Why it ran: from 11-10 the race books tightened 9-10c -> 7-8c while our
+distance from fair stayed put. Result: B sat ~1.5c closer at fill and got
++11% lots (share 2.55 -> 3.07%), with $/event unchanged within noise
+(-$0.07 +/- 0.48). Per coin: ETH B lost in both halves (+$0.40 -> -$0.15/event,
+mo60 6.3 -> 0.9c, t -2.4, no volume gain); SOL B +33% lots and mo60 no worse;
+BTC B only +5% lots. Caveat: A always ran the :00/:30 events and B the :15/:45
+ones; the untreated 11-07..13 week puts that slot gap at ~-1.2c mo60, about the
+whole pooled markout gap, but near zero for each coin's result above.
 
 Everything below the line further down is historical (pre-2026-10-09 reorg).
 Change details with measurements are in `docs/CHANGES.md` (2026-10-19/20 entries).
