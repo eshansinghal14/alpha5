@@ -32,12 +32,14 @@ from __future__ import annotations
 
 import json
 import os
+import pickle
 import re
 import time
 
 import pandas as pd
 
 from infra.kalshi.api import kalshi_get
+from infra.kalshi.orders import _flock
 from infra.config import atomic_write_json
 from strategies.ARBS import parts, watch
 
@@ -98,6 +100,47 @@ def fetch_starts(now: pd.Timestamp) -> dict[str, str]:
 # 50-lot NO for -$7.16 while quoted as not live).
 PERIODS = {"daily": pd.Timedelta(days=1), "hourly": pd.Timedelta(hours=1),
            "fifteen_min": pd.Timedelta(minutes=15)}
+
+
+# Every scan (each ARBS process, every interval) read all ~23k open events
+# itself, ~115 unauthenticated pages a scan and most of the box's public Kalshi
+# reads; with the runners' meta reads that kept those in 429 backoff 74-82% of
+# the time and held the CPU-held market count at its floor (11-21). A fetch
+# younger than SHARED_MAX_AGE_S, one scan interval, is reused by the rest.
+SHARED_DIR, SHARED_MAX_AGE_S = "scan_cache", 120.0
+
+
+def shared(name: str, fetch, max_age_s: float = SHARED_MAX_AGE_S, root: str | None = None):
+    """fetch()'s result, shared by every scan on the box through
+    <live root>/scan_cache/<name>.pkl: the saved one while younger than
+    max_age_s, else a fresh fetch, saved. A scan that arrives while another
+    fetches waits for its result rather than fetching too."""
+    d = os.path.join(root or parts.LIVE_ROOT, SHARED_DIR)
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"{name}.pkl")
+    fh = None
+    with open(path + ".lock", "a+b") as lk:
+        _flock(lk.fileno(), True)
+        try:
+            try:
+                if time.time() - os.path.getmtime(path) < max_age_s:
+                    fh = open(path, "rb")   # under the lock: a later replace can't tear what this reads
+            except OSError:
+                fh = None
+            if fh is None:
+                got = fetch()
+                tmp = f"{path}.{os.getpid()}.tmp"
+                with open(tmp, "wb") as out:
+                    pickle.dump(got, out, protocol=pickle.HIGHEST_PROTOCOL)
+                os.replace(tmp, path)
+                return got
+        finally:
+            _flock(lk.fileno(), False)
+    with fh:
+        try:
+            return pickle.load(fh)
+        except (EOFError, pickle.UnpicklingError, ValueError):
+            return fetch()
 
 
 def fetch_frequencies() -> dict[str, str]:
@@ -464,17 +507,19 @@ def tradeable_event(e: dict, shards, skip_series) -> bool:
 
 
 def run(cfg, spec_path: str, held: set[str] = frozenset(), owns=None, events: list[dict] | None = None,
-        locked_days: float | None = None) -> dict:
-    """Blocking: fetch (unless `events` are given), scan, write the file;
-    returns the doc. Relationships of the previous file holding a basket in
+        locked_days: float | None = None, starts: dict[str, str] | None = None,
+        freqs: dict[str, str] | None = None) -> dict:
+    """Blocking: fetch (unless `events`, `starts`, `freqs` are given), scan,
+    write the file; returns the doc. Relationships of the previous file holding a basket in
     `held` are carried over, so a position the scan no longer lists survives
     a restart."""
     now = pd.Timestamp.now(tz="UTC")
     doc = scan(fetch_events() if events is None else events, now=now, mecnet_max_legs=cfg.scan.mecnet_max_legs,
                owns=owns,
                ladder_span=cfg.scan.ladder_span, complete_set_exclude=cfg.scan.complete_set_exclude,
-               shards=set(cfg.scan.shards), skip_series=other_series(), starts=fetch_starts(now),
-               freqs=fetch_frequencies(), live_windows=cfg.scan.live_windows,
+               shards=set(cfg.scan.shards), skip_series=other_series(),
+               starts=fetch_starts(now) if starts is None else starts,
+               freqs=fetch_frequencies() if freqs is None else freqs, live_windows=cfg.scan.live_windows,
                settle_lead=pd.Timedelta(hours=cfg.scan.live_before_settle_h) if cfg.scan.live_before_settle_h > 0 else None,
                early_h=cfg.scan.live_early_h, locked_days=locked_days,
                overrides=settlement_overrides())
@@ -520,10 +565,10 @@ def scan_and_select(root: str, config_path: str | None = None, markets: int | No
     if PM_SHARD in cfg.scan.shards:
         from strategies.ARBS import pm_scan
         return pm_scan.scan_and_select(root, cfg, held, markets)
-    owns, events, info = None, None, {}
+    owns, info = None, {}
+    events = shared("events", fetch_events)
     name = os.path.basename(os.path.normpath(root))
     if (group := parts.group_of(name)) is not None:
-        events = fetch_events()
         st = parts.load(procs=group)
         if name == group[0]:
             # The one writer of the owners map: assigns new events, rebalances hourly
@@ -545,7 +590,9 @@ def scan_and_select(root: str, config_path: str | None = None, markets: int | No
             info = {"moved": len(moves), "load": st.get("load")}
         idx = group.index(name)
         owns = lambda ev: parts.owner(st, ev) == idx  # noqa: E731
-    doc = run(cfg, os.path.join(root, "scanned_spec.json"), held, owns=owns, events=events, locked_days=locked_days)
+    now = pd.Timestamp.now(tz="UTC")
+    doc = run(cfg, os.path.join(root, "scanned_spec.json"), held, owns=owns, events=events, locked_days=locked_days,
+              starts=shared("starts", lambda: fetch_starts(now)), freqs=shared("frequencies", fetch_frequencies))
     cheap = cheap_events(group) if group is not None else set()
     sel = select(doc, now=pd.Timestamp.now(tz="UTC"), days=cfg.trading.days_till_expiry, max_markets=markets,
                  held=held, exclude=set(cfg.watch.exclude), cheap=cheap, max_total=TOTAL_MARKETS_MAX)

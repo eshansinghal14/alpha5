@@ -316,3 +316,17 @@ def test_unnetted_baskets_keep_to_locked_days_and_record_shards():
     assert not watched(run(_totals(exp=late), shards={3}, days=None, locked_days=120.0))
     assert watched(run(_totals(exp=late), shards={3}, days=None, locked_days=None))
     assert not watched(run(_totals(shard=0), shards={0}, days=None, locked_days=120.0))
+
+
+def test_shared_fetch_is_reused_until_it_ages_out(tmp_path):
+    calls = []
+
+    def fetch():
+        calls.append(1)
+        return [{"event_ticker": f"EV-{len(calls)}"}]
+    assert scanner.shared("events", fetch, root=str(tmp_path)) == [{"event_ticker": "EV-1"}]
+    assert scanner.shared("events", fetch, root=str(tmp_path)) == [{"event_ticker": "EV-1"}]
+    assert len(calls) == 1
+    assert scanner.shared("events", fetch, max_age_s=0.0, root=str(tmp_path)) == [{"event_ticker": "EV-2"}]
+    (tmp_path / scanner.SHARED_DIR / "events.pkl").write_bytes(b"torn")
+    assert scanner.shared("events", fetch, root=str(tmp_path)) == [{"event_ticker": "EV-3"}]

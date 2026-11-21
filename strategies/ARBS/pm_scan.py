@@ -410,10 +410,10 @@ def add_volume(doc: dict, vol: dict[str, float]):
 
 
 def scan_and_select(root: str, cfg, held: set[str], markets: int | None = None) -> dict:
-    from strategies.ARBS.scanner import SELECTED, fetch_events, select
+    from strategies.ARBS.scanner import SELECTED, fetch_events, select, shared
     now = pd.Timestamp.now(tz="UTC")
     pm = list_open(prices=True)
-    doc = scan(pm, fetch_events(), now=now, max_legs=cfg.scan.mecnet_max_legs)
+    doc = scan(pm, shared("events", fetch_events), now=now, max_legs=cfg.scan.mecnet_max_legs)
     add_volume(doc, volume_24h(now))
     path = os.path.join(root, "scanned_spec.json")
     try:
