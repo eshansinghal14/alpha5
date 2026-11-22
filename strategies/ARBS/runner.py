@@ -435,6 +435,11 @@ PM_CLOSED_REJECTS = ("This market is closed for trading",)
 # Retired Polymarket orders reconcile may still read: their cancel echo
 # normally marks them final within a second; this bounds the backlog.
 PM_RECONCILE_WINDOW_S = 3600.0
+# Orders per market the audit reads again before counting a Polymarket diff.
+PM_REREAD_MAX = 10
+# Consecutive failures of a read loop before it is logged: one 429 is retried
+# at the next pass (balance, meta, fill poll and audit 429s, 11-20..21).
+READ_FAILS_LOGGED = 2
 # Between load_meta's market GETs (100 tickers each): ~95 of them per process,
 # six processes, under Kalshi's read limit when they all start together.
 META_GET_GAP_S = 0.25
@@ -831,6 +836,7 @@ class ArbsRunner:
         self.halt: str | None = None                     # until restart
         self.audit_strikes = 0
         self.audit_diff: dict | None = None
+        self.read_fails: dict[str, int] = {}             # loop -> consecutive failures
         self.orphans: list[tuple[float, dict]] = []
         self.tasks: set[asyncio.Task] = set()
         self.n = {"takes": 0, "take_bundles": 0.0, "quotes_placed": 0, "quote_moves": 0, "quote_cancels": 0,
@@ -1374,8 +1380,9 @@ class ArbsRunner:
                     self.dirty |= {bid for t in tickers for bid in self.by_ticker.get(t, ())}
                 self.settle()
                 self._save_meta_later()
+                self.read_fails.pop("meta refresh", None)
             except Exception as e:
-                _log(f"WARN: meta refresh failed ({e!r})")
+                self._read_failed("meta refresh", e)
 
     def exposed_tickers(self) -> list[str]:
         """Legs of hot and quoted baskets and of every basket either ledger holds."""
@@ -2614,8 +2621,9 @@ class ArbsRunner:
             if self.live and not self.handing:
                 try:
                     await self.poll_fills()
+                    self.read_fails.pop("fill poll", None)
                 except Exception as e:
-                    _log(f"WARN: fill poll failed ({e!r})")
+                    self._read_failed("fill poll", e)
 
     async def poll_fills(self, since: float | None = None):
         """`since` reads back at least to then (a takeover: just before the
@@ -2674,17 +2682,36 @@ class ArbsRunner:
         if not open_ids and not closed:
             return
         for r in await self.gw.call(c.reconcile, open_ids, [oid for _, oid in sorted(closed)]):
-            info = self.real_ledger.quote_ids.get(r["order_id"])
-            if info is None:
-                continue
-            if r.get("done"):
-                self._pm_final(r["order_id"], info, r["cum"], r["avg"], "reconcile")
-            elif r["avg"] is not None and r["cum"] - info.get("booked", 0.0) > _EPS:
-                new = r["cum"] - info.get("booked", 0.0)
-                px = (r["avg"] * r["cum"] - info.get("booked_px", 0.0)) / new
-                self.apply_real_fill({"ticker": info["ticker"], "side": info["side"], "price": px, "size": new,
-                                      "fee": 0.0, "liquidity": "maker", "order_id": r["order_id"],
-                                      "trade_id": f"cum:{r['cum']}", "cum": r["cum"]}, "reconcile")
+            self._pm_row(r, "reconcile")
+
+    def _pm_row(self, r: dict, source: str):
+        """One order read by reconcile: book its filled quantity not yet booked."""
+        info = self.real_ledger.quote_ids.get(r["order_id"])
+        if info is None:
+            return
+        if r.get("done"):
+            self._pm_final(r["order_id"], info, r["cum"], r["avg"], source)
+        elif r["avg"] is not None and r["cum"] - info.get("booked", 0.0) > _EPS:
+            new = r["cum"] - info.get("booked", 0.0)
+            px = (r["avg"] * r["cum"] - info.get("booked_px", 0.0)) / new
+            self.apply_real_fill({"ticker": info["ticker"], "side": info["side"], "price": px, "size": new,
+                                  "fee": 0.0, "liquidity": "maker", "order_id": r["order_id"],
+                                  "trade_id": f"cum:{r['cum']}", "cum": r["cum"]}, source)
+
+    async def reread_pm(self, tickers: set[str]):
+        """Our tracked orders on these Polymarket markets read again, final ones
+        included, booking any filled quantity not yet booked. An order marked
+        final with nothing booked kept a 13-lot fill off the ledger and halted
+        ARBSPM (devdam 11-22 05:42 UTC); reconcile never reads a final order."""
+        c = self.gw.clients.get(PM_SHARD)
+        if c is None:
+            return
+        oids = [oid for oid, v in self.real_ledger.quote_ids.items() if v.get("ticker") in tickers]
+        oids = oids[-PM_REREAD_MAX * len(tickers):]
+        if not oids:
+            return
+        for r in await self.gw.call(c.reconcile, [], oids, len(oids)):
+            self._pm_row(r, "audit_reread")
 
     # ------------------------------------------------------------------ limits
 
@@ -3126,8 +3153,9 @@ class ArbsRunner:
                     if before:
                         self.journal({"kind": "balance_drift", "drift": {
                             str(s): round(before.get(s, 0.0) - v, 2) for s, v in self.cash_now().items()}})
+                    self.read_fails.pop("balance read", None)
                 except Exception as e:
-                    _log(f"WARN: balance read failed ({e!r})")
+                    self._read_failed("balance read", e)
             if self.cash_base and now - logged >= BALANCE_LOG_S:
                 logged = now
                 cash = self.cash_now()
@@ -5202,8 +5230,14 @@ class ArbsRunner:
             if self.live and not self.handing:
                 try:
                     await self.audit()
+                    self.read_fails.pop("audit", None)
                 except Exception as e:
-                    _log(f"WARN: audit failed ({e!r})")
+                    self._read_failed("audit", e)
+
+    def _read_failed(self, what: str, e: Exception):
+        n = self.read_fails[what] = self.read_fails.get(what, 0) + 1
+        if n >= READ_FAILS_LOGGED:
+            _log(f"WARN: {what} failed {n}x in a row ({e!r})")
 
     async def audit(self) -> bool:
         """Ledger vs Kalshi on our tickers. Two misses in a row halt new
@@ -5224,6 +5258,10 @@ class ArbsRunner:
         if diff and any(not q.pending for q in self.quotes.values()):
             # A fill in flight can show at Kalshi first; confirm after a fills poll.
             await self.poll_fills()
+            mine = self.real_ledger.net_by_ticker()
+            diff = {t: d for t, d in diff.items() if abs(real.get(t, 0.0) - mine.get(t, 0.0)) > 1e-6}
+        if pm := {t for t in diff if is_pm(t)}:
+            await self.reread_pm(pm)
             mine = self.real_ledger.net_by_ticker()
             diff = {t: d for t, d in diff.items() if abs(real.get(t, 0.0) - mine.get(t, 0.0)) > 1e-6}
         if diff:
@@ -5524,7 +5562,8 @@ class ArbsRunner:
                      "ws_errors": self.feed.n_errors, "refreshes": self.feed.n_refreshes, "last_msg_s": self.feed.seconds_since_message()},
             "n_baskets": len(self.all_baskets), "n_tickers": len(self.tickers),
             "n_tradeable": self._n_tradeable(),
-            "market_status": _count(m.status for m in self.meta.values()),
+            # A copy: meta is refreshed off the loop (load_meta in the pool).
+            "market_status": _count(m.status for m in list(self.meta.values())),
             "pnl": {"settled": round(sum(r["pnl"] for r in settled), 4),
                     "locked": round(sum(h["locked_pnl"] or 0.0 for h in holdings), 4),
                     "broken": round(sum(h["broken_pnl"] for h in holdings), 4),
@@ -5755,7 +5794,7 @@ class ArbsRunner:
             "baskets": {b: basket_to_dict(self.baskets[b]) for b in bids if b in self.baskets},
             "exit": {"hist": {b: [list(x) for x in h] for b, h in self.exit_hist.items()},
                      "planned": self.exit_planned, "base": self.exit_base, "misses": self.exit_misses,
-                     "notes": self.completion_note},
+                     "notes": self.completion_note, "unpriced": self.unpriced_alert_at},
             "groups": {ev: {**g, "fills": [list(x) for x in g["fills"]]} for ev, g in self.groups.items()},
             "flagged": self.flagged,
             "model_state": [[k[0], k[1], k[2], v] for k, v in self.model_state.items()],
@@ -5810,6 +5849,9 @@ class ArbsRunner:
         self.exit_hist = {b: collections.deque(tuple(x) for x in h) for b, h in ex["hist"].items()}
         self.exit_planned, self.exit_base = dict(ex["planned"]), {b: list(v) for b, v in ex["base"].items()}
         self.exit_misses, self.completion_note = dict(ex["misses"]), dict(ex["notes"])
+        # Kept: an unpriced basket alerted once per break, not again at every handoff
+        # (KXART 11-20 ladders waiting on settlement, 36 alerts over 6 handoffs).
+        self.unpriced_alert_at = dict(ex.get("unpriced") or {})
         self.groups = {ev: {**g, "fills": collections.deque(tuple(x) for x in g["fills"])}
                        for ev, g in st["groups"].items()}
         self._group_ev = {g["id"]: ev for ev, g in self.groups.items() if g["id"]}

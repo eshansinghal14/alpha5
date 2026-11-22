@@ -243,6 +243,29 @@ def test_cancel_echo_books_the_final_fill_and_ends_reads(pm_arbs):
     assert asked == [([], ["o4"])]           # o3 final from its echo; o4 final after one read
 
 
+def test_audit_rereads_a_final_order_and_books_its_missed_fill(pm_arbs):
+    r, b = pm_arbs
+    r.live = True
+    r.real_ledger.quote_ids["o5"] = {"basket_id": b.basket_id, "ticker": "pm-ev-a", "side": "no",
+                                     "retired_at": time.time(), "final": True}
+    asked = []
+
+    class Poly:
+        def positions_all(self):
+            return {"pm-ev-a": -13.0}
+
+        def reconcile(self, open_ids, closed_ids, max_reads=5):
+            asked.append(closed_ids)
+            return [{"order_id": "o5", "done": True, "cum": 13.0, "avg": 0.83, "state": "ORDER_STATE_FILLED"}]
+
+    async def call(fn, *a):
+        return fn(*a)
+    p = Poly()
+    r.gw.venue_clients, r.gw.call, r.gw.clients = lambda: [p], call, {R.PM_SHARD: p}
+    assert asyncio.run(r.audit()) and r.audit_diff is None
+    assert asked == [["o5"]] and r.real_ledger.net_by_ticker() == {"pm-ev-a": -13.0}
+
+
 def test_failed_arm_stays_disarmed(pm_arbs):
     r, b = pm_arbs
     r.gw.clients = {100: object()}

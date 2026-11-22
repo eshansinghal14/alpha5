@@ -57,6 +57,9 @@ them where they differ.
 - **Held orphans**: `atc-ligaf-dep-bar-2026-11-15-bar` YES 10 and
   `atc-ligaf-vcf-gcf-2026-11-15-vcf` NO 2.57 from the incident are in
   `data/live/ARBS/foreign_positions.json`; remove after they settle.
+  Also `tec-cfb-heisman-2026-12-13-w-devdam` NO 13 (at 0.83): a fill marked
+  final unbooked, found by the audit 11-22 05:42 UTC after its order id had
+  aged out; settles 12-13. The audit now re-reads a disagreeing market's orders.
 - **No order groups** on Polymarket (only cancel-all and FIX
   cancel-on-disconnect), so live-event fills rely on our own cancels.
   Confirmed live: an IOC's synchronous executions come back in the create
