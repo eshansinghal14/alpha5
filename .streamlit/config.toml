@@ -8,6 +8,14 @@ base = "dark"
 # through the EC2 SSH tunnel on 2026-10-14.
 gatherUsageStats = false
 
+[global]
+# Never send cached-message references: after a websocket drop (phone or laptop
+# sleeping) the browser asked for messages the server had already dropped, logged
+# as "HTTP request for cached message could not be fulfilled" and shown as an
+# error in the page (4 on 2026-11-22, each right after a drop). Hidden option,
+# Streamlit 1.39.
+minCachedMessageSize = 1e15
+
 [server]
 # Serves viz/static/ at /app/static/ -- how the live chart fetches its own
 # data snapshot same-origin, without a second web server or CORS setup.
