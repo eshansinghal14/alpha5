@@ -138,6 +138,20 @@ def test_dashboard_merges_the_arbs_processes():
                                               {"label": "PM", "real": False, "pnl": 5.0}]
 
 
+def test_phone_groups_arbs_by_market_biggest_pnl_first():
+    from viz import arbs_page as ap
+    t = pd.Timestamp("2026-11-22T01:00Z")
+    rows = ([{"basket_id": "complete_set:EV-A:buy_all_yes", "time": t, "cost": 90.0, "pnl": 5.0}]
+            + [{"basket_id": f"mecnet:EV-B:no:X+Y{i}", "time": t + pd.Timedelta(minutes=i), "cost": 2.0, "pnl": 0.6}
+               for i in range(10)]
+            + [{"basket_id": "ladder:EV-C:T2=>T1", "time": t, "cost": 4.0, "pnl": -2.0},
+               {"basket_id": "ladder:EV-D:T2=>T1", "time": t, "cost": 3.0, "pnl": None}])
+    m = ap.by_market(pd.DataFrame(rows))
+    assert list(m.market) == ["EV-B", "EV-A", "EV-C", "EV-D"]      # ten small arbs adding to $6 lead
+    assert m.arbs.tolist() == [10, 1, 1, 1] and m.pnl.tolist() == [6.0, 5.0, -2.0, 0.0]
+    assert m.time.iloc[0] == t + pd.Timedelta(minutes=9)
+
+
 def test_dashboard_pnl_history_adds_the_processes():
     from viz import arbs_page as ap
     t = lambda s: pd.Timestamp(s, tz="UTC")

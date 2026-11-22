@@ -318,6 +318,19 @@ def _bundle_log(series: str) -> pd.DataFrame:
     return log[log.time >= pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=24)] if len(log) else log
 
 
+def by_market(log: pd.DataFrame) -> pd.DataFrame:
+    """Arbs per market (the event a basket is on), largest |PnL| first: one big
+    arb and many small ones that add up rank alike. An unfinished arb adds its
+    cost, not PnL."""
+    if log.empty:
+        return pd.DataFrame(columns=["market", "arbs", "cost", "pnl", "time"])
+    market = log.basket_id.str.split(":").str[1].fillna(log.basket_id)
+    g = log.assign(market=market).groupby("market").agg(
+        arbs=("basket_id", "size"), cost=("cost", "sum"), pnl=("pnl", "sum"), time=("time", "max"))
+    g = g.round({"cost": 2, "pnl": 2})
+    return g.loc[g.pnl.abs().sort_values(ascending=False, kind="stable").index].reset_index()
+
+
 def _first(log: pd.DataFrame, key: str, step: int = 10) -> pd.DataFrame:
     """The rows shown so far: the newest `step`, plus `step` per press of _more.
     Streamlit has no load-on-scroll, so rows not yet asked for are never sent."""
@@ -423,7 +436,7 @@ def _pnl_chart(series: str):
 
 
 def phone(series: str = "ARBS"):
-    """The phone view (?view=phone): total PnL, the chart, the last 24 hours' arbs."""
+    """The phone view (?view=phone): total PnL, the chart, the last 24 hours' arbs by market."""
     @st.fragment(run_every="15s")
     def view():
         ss = {p: x for p in parts(series) if (x := read_summary(p)) is not None}
@@ -438,11 +451,15 @@ def phone(series: str = "ARBS"):
         _pnl_chart(series)
         log = _bundle_log(series)
         if len(log):
-            rows = _first(log, f"arbs_phone_rows_{series}", step=5)
+            st.markdown("##### Last 24 hours by market (biggest PnL first)")
+            mk = by_market(log)
+            rows = _first(mk, f"arbs_phone_rows_{series}", step=8)
             st.dataframe(_local(rows.copy(), "time"), hide_index=True, use_container_width=True,
-                         column_order=["time", "series", "bundles", "pnl"],
-                         column_config={"time": st.column_config.DatetimeColumn(format="MM-DD HH:mm")})
-            _more(log, f"arbs_phone_rows_{series}", step=5)
+                         column_order=["market", "arbs", "pnl", "cost", "time"],
+                         column_config={"time": st.column_config.DatetimeColumn("last", format="HH:mm"),
+                                        "pnl": st.column_config.NumberColumn(format="%+.2f"),
+                                        "cost": st.column_config.NumberColumn(format="%.0f")})
+            _more(mk, f"arbs_phone_rows_{series}", step=8)
         else:
             st.caption("No arbs in the last 24 hours.")
 
