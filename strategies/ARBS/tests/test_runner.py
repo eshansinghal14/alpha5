@@ -1193,6 +1193,29 @@ def test_quote_score_counts_only_legs_that_trade(arbs):
     assert row["quote_usd_h"] > 0 and row["wait_s"] is not None
 
 
+def test_a_quiet_pre_game_leg_is_valued_by_its_volume_and_distance_from_the_touch(arbs):
+    r, b = arbs
+    r.cfg.watch = dataclasses.replace(r.cfg.watch, queue_window_s=3600.0)
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    r.volume_24h = {"X-A": 4800.0, "X-B": 4800.0}                # 100 contracts an hour to each side
+    # 1c under a 0.30 touch: 13.77% of the side's volume reaches it, capped at 4x the size an hour
+    assert r.quiet_fills("X-A", 0.30, 0.29, 5) == pytest.approx(min(20.0, 100 * R.QUIET_REACH[1]))
+    assert r.quiet_fills("X-A", 0.30, 0.30, 500) == pytest.approx(100.0)       # at the touch: all of it
+    assert r.quiet_fills("X-A", 0.30, 0.25, 500) < r.quiet_fills("X-A", 0.30, 0.28, 500)
+    assert r.quiet_fills("X-C", 0.30, 0.29, 5) == 0.0                           # no volume known
+    _eval(r, b)
+    row = r.rank_rows[b.basket_id]
+    assert row["quote_usd_h"] == 0 and row["quiet_usd_h"] > 0                  # shadow: ranked as before
+    r.flow.add("X-A", "yes", 3600.0, time.time())
+    r.flow.add("X-B", "yes", 3600.0, time.time())
+    r.rank_at.clear()
+    _eval(r, b)
+    row = r.rank_rows[b.basket_id]
+    assert row["quote_usd_h"] > 0
+    assert row["quiet_usd_h"] == pytest.approx(row["quote_usd_h"])              # legs with flow keep queue_wait
+
+
 def test_a_dormant_series_sleeps_until_a_print_through_its_quote_price(arbs):
     r, b = arbs
     book(r, "X-A", [(0.30, 10)], [(0.35, 10)])

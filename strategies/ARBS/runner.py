@@ -56,7 +56,7 @@ from strategies.ARBS.ledger import Ledger
 from strategies.ARBS.depth import AskWatch, MoveWatch, TopHistory
 from strategies.ARBS.liquidity import Liquidity
 from strategies.ARBS.prints import AFTER_S, Prints, top as prints_top
-from strategies.ARBS.spec import Basket, Leg, basket_from_dict, basket_to_dict, load_spec, parse_spec
+from strategies.ARBS.spec import Basket, Leg, basket_from_dict, basket_to_dict, parse_spec
 
 _EPS = 1e-9
 OTHER = {"yes": "no", "no": "yes"}
@@ -236,6 +236,25 @@ RANK_PARTS_EVERY, RANK_PARTS_TOP = 3, 500
 #   FLOW_RECENT_S: queue_wait's flow rate over this many seconds, not watch.queue_window_s.
 COST_FROM_SPEND, EST_SCALE = True, 0.4
 FLOW_RECENT_S: float | None = None
+# A pre-game leg with nothing sold into its side over watch.queue_window_s gets
+# $0/h from queue_wait, so the hot list cut fell among ties (83% of pre-game leg
+# snapshots, 11-18..22). Such a leg is valued instead by the takes its market
+# draws: its Kalshi 24h volume, half to each side, times QUIET_REACH[d], the
+# share of a side's contracts printed at least d cents under the touch (pooled
+# public trades, 220k takes on 3,070 pre-game leg markets, 11-17..19). Scored on
+# 11-20..22 (1.6M leg snapshots, fills = contracts printed through the quote's
+# price in the next 15 min): the top 25% held 97.4% of fills against 95.3% for
+# queue_wait alone; legs with flow keep queue_wait, which ranked them better.
+# "shadow" logs it beside today's $/h (rank_row "quiet_usd_h"); "on" ranks by it.
+QUIET_FILLS = "shadow"
+QUIET_REACH = (1.0, 0.1377, 0.05034, 0.02908, 0.01919, 0.01397, 0.01019, 0.008317, 0.007022, 0.006048,
+               0.005023, 0.004448, 0.00406, 0.003556, 0.003264, 0.002924, 0.002683, 0.00245, 0.002295, 0.002173,
+               0.001996, 0.00186, 0.001634, 0.001423, 0.001295, 0.001217, 0.00111, 0.0009996, 0.0009693, 0.0009467,
+               0.0008255, 0.0007739, 0.0006943, 0.0006574, 0.0006395, 0.0005667, 0.0005401, 0.0005032, 0.0004498,
+               0.0004394, 0.0004363, 0.0004149, 0.0004094, 0.0003927, 0.000383, 0.000375, 0.0003491, 0.0003488,
+               0.0003424, 0.0003341, 0.0003332)
+# The estimate was scored per 15 min with a quote filling at most its size in each.
+QUIET_FILLS_PER_H = 4.0
 # Write tokens per order or move, per cancel (Kalshi's write budget).
 ORDER_TOKENS, CANCEL_TOKENS = 10.0, 2.0
 # write_cost's estimates ran 2.3-2.5x what the same baskets really spent
@@ -719,6 +738,8 @@ class ArbsRunner:
         self.loop_cpu: float | None = None           # event-loop thread's share of a core, last full window
         self._cpu_mark: tuple[float, float] | None = None   # (monotonic, thread CPU) the window started at
         self.listed: set[str] = set()                # relationship ids this process's own scan lists
+        self.volume_24h: dict[str, float] = {}       # ticker -> contracts traded over 24h, from the last scan
+        self.quiet_score: dict[str, float] = {}      # basket_id -> $/h with quiet legs valued by quiet_fills
         self.set_baskets(self.scanned() or [])
         for led in (self.real_ledger, self.shadow_ledger):
             for bid, pos in led.baskets.items():
@@ -1113,7 +1134,11 @@ class ArbsRunner:
         if not self.cfg.scan.enable or not os.path.exists(self.scan_path):
             return []
         try:
-            return load_spec(self.scan_path)
+            with open(self.scan_path, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            baskets = parse_spec(doc)
+            self.volume_24h = doc.get("volumes") or {}
+            return baskets
         except Exception as e:
             self.alert("warn", None, f"scanned spec unreadable ({e!r})")
             return None
@@ -1189,6 +1214,7 @@ class ArbsRunner:
                 self.event_markets.setdefault(et, set()).update(b.tickers)
         self.dirty = {d for d in self.dirty if d in new} | changed
         self.rank_rows = {k: v for k, v in self.rank_rows.items() if k in new}
+        self.quiet_score = {k: v for k, v in self.quiet_score.items() if k in new}
         self.hot = [h for h in self.hot if h in new]
         self.ranking = [r for r in self.ranking if r["basket_id"] in new]
         return [t for t in self.tickers if t not in old]
@@ -1528,7 +1554,7 @@ class ArbsRunner:
         t = self.cfg.trading
         live = self.live_now(b, _utc())
         need = edge_dollars(b.payout, t.min_edge + t.quote_edge_add) + (t.live_edge_add if live else 0.0)
-        score, fastest = 0.0, float("inf")
+        score, quiet, fastest = 0.0, 0.0, float("inf")
         px, parts = [], []
         for j, leg in enumerate(b.legs):
             size = max(1.0, pricing.depth_size(vs, j, b.payout, need, float(t.quote_size)))
@@ -1541,13 +1567,33 @@ class ArbsRunner:
             qp = self.queue_parts(leg.ticker, leg.side, plan.price)
             wait = self._wait(qp, size)
             fastest = min(fastest, wait)
-            if wait < float("inf"):
-                score += plan.edge * size * 3600.0 / max(wait, 1.0)
+            flow = plan.edge * size * 3600.0 / max(wait, 1.0) if wait < float("inf") else 0.0
+            score += flow
+            if not live and qp is not None and qp[1] <= 0:
+                quiet += plan.edge * self.quiet_fills(leg.ticker, vs[j].bid, plan.price, size)
+            else:
+                quiet += flow
             parts.append(None if qp is None else [round(plan.price, 4), round(plan.edge, 4), size,
                                                   round(qp[0], 1), round(qp[1], 5), round(qp[2], 5)])
         self.quote_px[b.basket_id] = px
         self.quote_parts[b.basket_id] = [int(live)] + parts
-        return score, fastest
+        self.quiet_score[b.basket_id] = quiet
+        return (quiet if QUIET_FILLS == "on" else score), fastest
+
+    def quiet_fills(self, ticker: str, bid: float | None, price: float, size: float) -> float:
+        """Contracts an hour a bid at `price` should fill on a market side nothing
+        has sold into lately: half the market's 24h volume an hour, times the share
+        of takes reaching `price` from the touch (`bid`, the best other bid)."""
+        vol = self.volume_24h.get(ticker)
+        if not vol:
+            return 0.0
+        d = 0.0 if bid is None else max(0.0, (bid - price) * 100.0)
+        i = int(d)
+        if i >= len(QUIET_REACH) - 1:
+            reach = QUIET_REACH[-1]
+        else:
+            reach = QUIET_REACH[i] + (QUIET_REACH[i + 1] - QUIET_REACH[i]) * (d - i)
+        return min(QUIET_FILLS_PER_H * size, vol / 48.0 * reach)
 
     def note_missed(self, ticker: str, side: str, trade):
         """A print through the price we'd have quoted on a basket outside the
@@ -4878,6 +4924,7 @@ class ArbsRunner:
         score, wait = self.quote_score(b, vs)
         self.rank_rows[b.basket_id] = {
             "basket_id": b.basket_id, "type": b.type, "quote_usd_h": round(score, 4),
+            "quiet_usd_h": round(self.quiet_score.get(b.basket_id, 0.0), 4),
             "wait_s": None if wait == float("inf") else round(wait), "ret": round(edge_return(b.payout, g), 4),
             "gap": round(g, 4),
             "payout": b.payout, "asks": [v.best_ask for v in vs], "legs": len(b.legs),
@@ -4914,7 +4961,7 @@ class ArbsRunner:
     def rank_dump(self, rows: list[dict], quotable: list[str], picked: set, now: float):
         """Every RANK_DUMP_S, one gzip line per quotable basket set into
         data/live/<S>/rank_dump/<day>.jsonl.gz: [basket_id, quote_usd_h,
-        est tokens/s, spent tokens/s, hot, legs]. For checking the ranking's
+        est tokens/s, spent tokens/s, hot, legs, s since first spend, quiet_usd_h]. For checking the ranking's
         $/h and write-cost estimates against fills and real spend."""
         if now - self._rank_dump_at < RANK_DUMP_S or not self.hot_ready:
             return
@@ -4928,7 +4975,7 @@ class ArbsRunner:
             est, spent = self.write_cost_parts(self.baskets[bid], now)
             first = self.spend_first.get(bid)
             out.append([bid, round(r["quote_usd_h"], 4), round(est, 3), round(spent, 3), int(bid in picked),
-                        r.get("legs"), None if first is None else round(now - first)])
+                        r.get("legs"), None if first is None else round(now - first), r.get("quiet_usd_h")])
         line = {"t": round(now, 1), "scale": {str(k): round(v, 3) for k, v in self.plan_scale.items()},
                 "budget": self.write_budget(), "rows": out}
         self._rank_dumps += 1

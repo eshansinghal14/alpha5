@@ -114,6 +114,7 @@ def test_scan_lists_everything_and_select_keeps_held():
     assert doc["n_markets"] == 4 and [r["volume_24h"] for r in doc["relationships"]] == [20.0, 1000.0]
     got = scanner.select(doc, now=NOW, days=90, max_markets=0, held={"mecnet:FAR-1:no:A+B"})
     assert [r["relationship_id"] for r in got["relationships"]] == ["mecnet:FAR-1"]
+    assert got["volumes"] == {"FAR-1-A": 10.0, "FAR-1-B": 10.0}              # each kept market's 24h volume
     got = scanner.select(doc, now=NOW, days=90, max_markets=None)              # no count: every market
     assert [r["relationship_id"] for r in got["relationships"]] == ["mecnet:BIG-1"]   # FAR settles past 90 days
     got = scanner.select(doc, now=NOW, days=None, max_markets=None)            # no horizon: FAR too

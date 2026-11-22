@@ -365,9 +365,11 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
                  volume_24h=round(sum(t[2] for t in ts), 2))
         tickers |= {l["ticker"] for b in r["baskets"] for l in b["legs"]}
         rels.append(r)
+    volumes = {m["ticker"]: _f(m.get("volume_24h_fp")) for e in events for m in e.get("markets") or []
+               if m.get("ticker") in tickers}
     return {"generated_at_utc": now.isoformat(), "source": "strategies.ARBS.scanner",
             "n_events": len({r["relationship_id"].split(":", 1)[1] for r in rels}), "n_markets": len(tickers),
-            "relationships": rels}
+            "relationships": rels, "volumes": volumes}
 
 
 def watch_pool(events: list[dict], shards, overrides: dict[str, str], now: pd.Timestamp,
@@ -478,7 +480,9 @@ def select(doc: dict, *, now: pd.Timestamp, days: float | None, max_markets: int
             out.append(r)
             used |= costly
             every |= ts
-    return {**doc, "relationships": out}
+    vols = doc.get("volumes") or {}
+    kept = {l["ticker"] for r in out for b in r["baskets"] for l in b["legs"]}
+    return {**doc, "relationships": out, "volumes": {t: v for t, v in vols.items() if t in kept}}
 
 
 def settlement_overrides() -> dict[str, str]:

@@ -414,7 +414,9 @@ def scan_and_select(root: str, cfg, held: set[str], markets: int | None = None) 
     now = pd.Timestamp.now(tz="UTC")
     pm = list_open(prices=True)
     doc = scan(pm, shared("events", fetch_events), now=now, max_legs=cfg.scan.mecnet_max_legs)
-    add_volume(doc, volume_24h(now))
+    vol = volume_24h(now)
+    add_volume(doc, vol)
+    doc["volumes"] = vol
     path = os.path.join(root, "scanned_spec.json")
     try:
         with open(path, encoding="utf-8") as fh:
