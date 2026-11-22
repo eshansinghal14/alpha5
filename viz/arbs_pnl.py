@@ -159,14 +159,19 @@ def journal_rows(path: str) -> list[dict]:
         if ino != st.st_ino or st.st_size < off:
             ino, off, rows = st.st_ino, 0, []
         if st.st_size > off:
+            new = []
+            # Line by line, not read whole: 11-21's 450 MB journal read in one
+            # piece put the report service over its 1.5 GB cap every run.
             with open(path, "rb") as fh:
                 fh.seek(off)
-                data = fh.read()
-            end = data.rfind(b"\n") + 1      # a partly written last line waits for the next call
-            rows = rows + [r for line in data[:end].decode("utf-8", "replace").splitlines()
-                           if ('"fill"' in line or '"settled"' in line or '"balance"' in line)
-                           and (r := _parse(line)) is not None]
-            off += end
+                for line in fh:
+                    if not line.endswith(b"\n"):
+                        break                # a partly written last line waits for the next call
+                    off += len(line)
+                    if (b'"fill"' in line or b'"settled"' in line or b'"balance"' in line) \
+                            and (r := _parse(line.decode("utf-8", "replace"))) is not None:
+                        new.append(r)
+            rows = rows + new
         _ROWS[path] = (ino, off, rows)
         return rows
 
