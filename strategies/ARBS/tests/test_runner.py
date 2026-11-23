@@ -1216,6 +1216,58 @@ def test_a_quiet_pre_game_leg_is_valued_by_its_volume_and_distance_from_the_touc
     assert row["quiet_usd_h"] == pytest.approx(row["quote_usd_h"])              # legs with flow keep queue_wait
 
 
+def test_a_basket_whose_books_barely_move_is_cheap(arbs, monkeypatch):
+    import types
+    r, b = arbs
+    bid = b.basket_id
+    monkeypatch.setattr(r, "liq", types.SimpleNamespace(on_book=lambda *a: None))
+    monkeypatch.setattr(r.cfg.runtime, "record_prints", False, raising=False)
+    upd = lambda t, bb, ask: types.SimpleNamespace(ticker=t, bid=bb, ask=ask, bid_depth=1, ask_depth=1)  # noqa: E731
+    r._on_quote_inner(upd("X-A", 0.40, 0.45))
+    r._on_quote_inner(upd("X-B", 0.50, 0.55))
+    assert not r.top_recent                                    # first sight isn't a move
+    assert not r.is_cheap(b, time.time())                      # watched under an hour
+    r.top_seen = {t: v - R.CHEAP_WINDOW_S for t, v in r.top_seen.items()}
+    now = time.time()
+    assert r.is_cheap(b, now) and r.cheap_split([bid], now) == ([], {bid})
+    r._on_quote_inner(upd("X-A", 0.38, 0.45))                  # one move: 10 tokens, the cap for 2 legs
+    now = time.time()
+    assert len(r.top_recent["X-A"]) == 1 and r.is_cheap(b, now)
+    r.top_recent["X-B"] = collections.deque([now - 60])        # a second: 20
+    assert not r.is_cheap(b, now)
+    later = now + R.CHEAP_WINDOW_S
+    assert r.is_cheap(b, later)                                # both an hour old
+    q = R.Quote(basket_id=bid, leg=0, ticker="X-A", side="yes", price=0.30, size=5.0, cid="c", edge=0.02,
+                max_price=0.31, pending=False)
+    asyncio.run(r.cancel_quote(q, "not_hot"))                  # the hot list's own cancel: not upkeep
+    assert bid not in r.upkeep
+    asyncio.run(r.cancel_quote(q, "no_edge"))                  # its book's: the cancel and the re-place
+    assert [x for _, x in r.upkeep[bid]] == [R.CANCEL_TOKENS + R.ORDER_TOKENS]
+    assert not r.is_cheap(b, time.time() + 1)
+    monkeypatch.setattr(R, "CHEAP_HOT", False)
+    assert r.cheap_split([bid], later) == ([bid], set())
+
+
+def test_a_cheap_basket_is_hot_with_no_write_budget_left(arbs, monkeypatch):
+    r, b = arbs
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    _eval(r, b)
+    r.hot = []
+    monkeypatch.setattr(r, "write_budget", lambda: 0.0)
+
+    async def one_pass():
+        t = asyncio.create_task(r.rank_loop())
+        await asyncio.sleep(0.2)
+        t.cancel()
+    r.top_seen = {"X-A": time.time() - 2 * R.CHEAP_WINDOW_S, "X-B": time.time() - 2 * R.CHEAP_WINDOW_S}
+    asyncio.run(one_pass())
+    assert r.hot == [b.basket_id] and r.cheap == {b.basket_id} and r.hot_cost == 0.0
+    r.top_seen = {}                                            # not watched long enough: ranked, and no room
+    asyncio.run(one_pass())
+    assert r.hot == [] and r.cheap == set()
+
+
 def test_a_dormant_series_sleeps_until_a_print_through_its_quote_price(arbs):
     r, b = arbs
     book(r, "X-A", [(0.30, 10)], [(0.35, 10)])

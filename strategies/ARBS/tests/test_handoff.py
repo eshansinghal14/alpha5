@@ -191,10 +191,15 @@ def test_state_round_trips_the_quote_table_and_exit_state_exactly(root):
     old._group_ev = {"g1": "X"}
     old.flagged = {"X-A": 10.0}
     old.model_state = {(b.basket_id, 0, True): {"edge": 0.05, "size": 20.0, "narrow": None, "grow": 3.0}}
+    now = time.time()
+    old.top_seen = {"X-A": now - 7200.0, "X-B": now - 100.0, "GONE": now - 9000.0}
+    old.top_recent = {"X-A": collections.deque([now - 4000.0, now - 60.0])}
+    old.upkeep = {b.basket_id: collections.deque([(now - 5000.0, 10.0), (now - 30.0, 12.0)])}
     st = json.loads(json.dumps(old.handoff_state("h1")))
 
     sb, _ = _runner(standby="h1")
     sb.baskets.pop(b.basket_id)                    # a basket only the state still knows
+    sb.top_seen = {"X-A": now - 50.0}              # the standby's own first sight, later than the old one's
 
     async def go():
         sb.restore(st)
@@ -209,6 +214,10 @@ def test_state_round_trips_the_quote_table_and_exit_state_exactly(root):
     assert sb.groups["X"]["fills"] == old.groups["X"]["fills"] and sb.groups["X"]["id"] == "g1"
     assert (sb.live, sb.arm_want, sb.audit_strikes, sb.cash_at) == (True, True, 1, 99.0)
     assert sb.hot == old.hot
+    # is_cheap's hour: markets no basket trades and writes past the window aren't handed over
+    assert sb.top_seen == {"X-A": now - 7200.0, "X-B": now - 100.0}
+    assert list(sb.top_recent["X-A"]) == [now - 60.0]
+    assert list(sb.upkeep[b.basket_id]) == [(now - 30.0, 12.0)]
 
 
 def test_restored_quotes_keep_their_order_client(root):

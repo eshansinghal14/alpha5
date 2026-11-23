@@ -858,7 +858,11 @@ the election-night section below supersedes it where they differ.
 - **Quotes**: hot list = ranking by expected quote $/h (edge × size / time for
   recent flow to clear the queue ahead), filled while each basket's write cost
   fits the write budget (incumbents kept within 1.1×). Zero-flow baskets fill
-  leftover budget. Size = largest the other legs' **depth** can complete at
+  leftover budget. "Cheap" baskets (`CHEAP_HOT`, 11-23) are hot outside the
+  ranking and its budget: legs watched ≥1 h, and both their top-of-book moves
+  and the basket's own upkeep writes over that hour ≤ 5 tokens a leg (below
+  that, the budget cut dropping and re-placing one cost more than keeping it).
+  Size = largest the other legs' **depth** can complete at
   the required edge at the quote's price (not just their touch), capped by
   quote_size / live size / per-basket bundles / dollars; resting quotes grow in
   place when room doubles. Resting quotes are not counted as capital.

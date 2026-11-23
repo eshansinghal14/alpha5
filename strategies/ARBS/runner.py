@@ -255,6 +255,17 @@ QUIET_REACH = (1.0, 0.1377, 0.05034, 0.02908, 0.01919, 0.01397, 0.01019, 0.00831
                0.0003424, 0.0003341, 0.0003332)
 # The estimate was scored per 15 min with a quote filling at most its size in each.
 QUIET_FILLS_PER_H = 4.0
+# A quotable "cheap" basket is hot whatever its rank, outside the plan budget: over the
+# last CHEAP_WINDOW_S its legs' quote-moving top changes (a move each) and its
+# own upkeep writes each came to at most CHEAP_TOKENS_PER_LEG a leg. Shard 0,
+# 11-18..22: a still book the budget cut dropped stayed out 120 min on average
+# and 82% came back (a cancel and re-place, 12 tokens a leg), so dropping one
+# saved tokens only above ~5 a leg an hour; the cut was 95% such books.
+CHEAP_HOT = True
+CHEAP_TOKENS_PER_LEG, CHEAP_WINDOW_S = 5.0, 3600.0
+CHEAP_KEPT = 16             # per market / basket: enough to exceed the cap on up to 32 legs
+# Cancels a basket's own books cause; each is counted with the re-place it implies.
+UPKEEP_CANCELS = frozenset({"no_edge", "reach_no_edge", "move_refused", "move_failed", "duplicate", "pull"})
 # Write tokens per order or move, per cancel (Kalshi's write budget).
 ORDER_TOKENS, CANCEL_TOKENS = 10.0, 2.0
 # write_cost's estimates ran 2.3-2.5x what the same baskets really spent
@@ -740,6 +751,10 @@ class ArbsRunner:
         self.listed: set[str] = set()                # relationship ids this process's own scan lists
         self.volume_24h: dict[str, float] = {}       # ticker -> contracts traded over 24h, from the last scan
         self.quiet_score: dict[str, float] = {}      # basket_id -> $/h with quiet legs valued by quiet_fills
+        self.top_seen: dict[str, float] = {}         # ticker -> its first book update (or the handed-over one's)
+        self.top_recent: dict[str, collections.deque] = {}   # ticker -> times of its last quote-moving top changes
+        self.upkeep: dict[str, collections.deque] = {}       # basket_id -> (time, tokens) of its upkeep writes
+        self.cheap: set[str] = set()                 # baskets hot by is_cheap, last rank pass
         self.set_baskets(self.scanned() or [])
         for led in (self.real_ledger, self.shadow_ledger):
             for bid, pos in led.baskets.items():
@@ -917,7 +932,7 @@ class ArbsRunner:
         self._pfx: dict[str, tuple] = {}                 # ticker -> both sides' levels a quote could reach
         self.pfx_stats: dict[str, list] = {}             # series -> [top, within, beyond, beyond marks]
         self.hot_churn: collections.deque = collections.deque()   # (time, entered, left) per hot-list change
-        self.hot_cost = 0.0                       # estimated write tokens/s of quoting the hot list
+        self.hot_cost = 0.0                       # estimated write tokens/s of quoting the ranked hot list
         self.hot_cost_by_shard: dict[str, float] = {}
         self.plan_scale: dict[int, float] = self.last_plan_scale()   # shard -> plan budget over write budget
         self.spend_tps: dict[int, float] = {}     # shard -> real write tokens/s over SPEND_WINDOW_S
@@ -1215,6 +1230,9 @@ class ArbsRunner:
         self.dirty = {d for d in self.dirty if d in new} | changed
         self.rank_rows = {k: v for k, v in self.rank_rows.items() if k in new}
         self.quiet_score = {k: v for k, v in self.quiet_score.items() if k in new}
+        self.upkeep = {k: v for k, v in self.upkeep.items() if k in new}
+        self.top_seen = {t: v for t, v in self.top_seen.items() if t in self.by_ticker}
+        self.top_recent = {t: v for t, v in self.top_recent.items() if t in self.by_ticker}
         self.hot = [h for h in self.hot if h in new]
         self.ranking = [r for r in self.ranking if r["basket_id"] in new]
         return [t for t in self.tickers if t not in old]
@@ -1733,10 +1751,18 @@ class ArbsRunner:
         ev = None
         top = (book.bid, book.ask)
         old = self.last_top.get(book.ticker)
+        if book.ticker not in self.top_seen:
+            self.top_seen[book.ticker] = time.time()
         if old != top:
             self.last_top[book.ticker] = top
             if self._moves_quotes(old, top):
-                self.top_moves.setdefault(book.ticker, _Rate()).add(1.0, time.time())
+                now = time.time()
+                self.top_moves.setdefault(book.ticker, _Rate()).add(1.0, now)
+                if old is not None:     # first sight isn't a move: a takeover would see every market move
+                    d = self.top_recent.get(book.ticker)
+                    if d is None:
+                        d = self.top_recent[book.ticker] = collections.deque(maxlen=CHEAP_KEPT)
+                    d.append(now)
         self.book_seq[book.ticker] = self.book_seq.get(book.ticker, 0) + 1
         if self.event_msgs is not None:
             ev = self._ev_of.get(book.ticker)
@@ -4781,6 +4807,7 @@ class ArbsRunner:
         self.n["quote_moves"] += 1
         if not q.near:                  # see NEAR_RESERVE
             self.charge(q.basket_id, ORDER_TOKENS)
+        self.note_upkeep(q.basket_id, ORDER_TOKENS)
         self.journal({"kind": "move", "basket_id": q.basket_id, "ticker": q.ticker, "from": old, "to": plan.price,
                       "size": q.size, **_deep(q)})
 
@@ -4788,6 +4815,8 @@ class ArbsRunner:
         self.n["quote_cancels"] += 1
         if not q.near:
             self.charge(q.basket_id, CANCEL_TOKENS)
+        if reason in UPKEEP_CANCELS:
+            self.note_upkeep(q.basket_id, CANCEL_TOKENS + ORDER_TOKENS)
         if self.live and q.exchange_id:
             b = self.baskets.get(q.basket_id)
             t0, book = time.time(), self._last_book(b) if b else None
@@ -4938,6 +4967,57 @@ class ArbsRunner:
         self.spend.setdefault(basket_id, _Rate()).add(tokens, now)
         self.event_spend.add(parts.event_of(basket_id), tokens)
 
+    def note_upkeep(self, basket_id: str, tokens: float):
+        """A write keeping `basket_id` quoted (not a first placement, nor a
+        cancel the hot list or a stop made), for is_cheap."""
+        d = self.upkeep.get(basket_id)
+        if d is None:
+            d = self.upkeep[basket_id] = collections.deque(maxlen=CHEAP_KEPT)
+        d.append((time.time(), tokens))
+
+    def is_cheap(self, b: Basket, now: float) -> bool:
+        """Every leg's book watched for CHEAP_WINDOW_S, and over it both its
+        legs' quote-moving top changes (a move each) and its own upkeep came
+        to at most CHEAP_TOKENS_PER_LEG a leg."""
+        cut, cap = now - CHEAP_WINDOW_S, CHEAP_TOKENS_PER_LEG * len(b.legs)
+        spent = 0.0
+        for leg in b.legs:
+            seen = self.top_seen.get(leg.ticker)
+            if seen is None or seen > cut:
+                return False
+            d = self.top_recent.get(leg.ticker)
+            if d:
+                spent += ORDER_TOKENS * sum(1 for t in d if t >= cut)
+                if spent > cap:
+                    return False
+        d = self.upkeep.get(b.basket_id)
+        return not d or sum(x for t, x in d if t >= cut) <= cap
+
+    def cheap_split(self, quotable: list[str], now: float) -> tuple[list[str], set[str]]:
+        """(the baskets left to rank, the cheap ones), cheap only with CHEAP_HOT."""
+        if not CHEAP_HOT:
+            return quotable, set()
+        cheap = {bid for bid in quotable if self.is_cheap(self.baskets[bid], now)}
+        return [bid for bid in quotable if bid not in cheap], cheap
+
+    def cheap_state(self) -> dict:
+        """is_cheap's last hour of books and writes, for the process taking over:
+        without it every basket waits an hour after each handoff to qualify."""
+        cut = time.time() - CHEAP_WINDOW_S
+        return {"seen": {t: v for t, v in self.top_seen.items() if t in self.by_ticker},
+                "moves": {t: [x for x in d if x >= cut] for t, d in self.top_recent.items()
+                          if d and d[-1] >= cut and t in self.by_ticker},
+                "upkeep": {b: [list(x) for x in d if x[0] >= cut] for b, d in self.upkeep.items()
+                           if d and d[-1][0] >= cut and b in self.baskets}}
+
+    def restore_cheap(self, d: dict | None):
+        for t, v in ((d or {}).get("seen") or {}).items():
+            self.top_seen[t] = min(v, self.top_seen.get(t, v))
+        for t, xs in ((d or {}).get("moves") or {}).items():
+            self.top_recent[t] = collections.deque(sorted({*xs, *self.top_recent.get(t, ())}), maxlen=CHEAP_KEPT)
+        for b, xs in ((d or {}).get("upkeep") or {}).items():
+            self.upkeep[b] = collections.deque(sorted(tuple(x) for x in xs), maxlen=CHEAP_KEPT)
+
     def write_cost(self, b: Basket, now: float) -> float:
         """Write tokens/s quoting `b` takes: what its quotes spent lately, or
         if more, a move per leg each time its best bid/ask changes (at most
@@ -4961,7 +5041,7 @@ class ArbsRunner:
     def rank_dump(self, rows: list[dict], quotable: list[str], picked: set, now: float):
         """Every RANK_DUMP_S, one gzip line per quotable basket set into
         data/live/<S>/rank_dump/<day>.jsonl.gz: [basket_id, quote_usd_h,
-        est tokens/s, spent tokens/s, hot, legs, s since first spend, quiet_usd_h]. For checking the ranking's
+        est tokens/s, spent tokens/s, hot, legs, s since first spend, quiet_usd_h, cheap]. For checking the ranking's
         $/h and write-cost estimates against fills and real spend."""
         if now - self._rank_dump_at < RANK_DUMP_S or not self.hot_ready:
             return
@@ -4975,7 +5055,8 @@ class ArbsRunner:
             est, spent = self.write_cost_parts(self.baskets[bid], now)
             first = self.spend_first.get(bid)
             out.append([bid, round(r["quote_usd_h"], 4), round(est, 3), round(spent, 3), int(bid in picked),
-                        r.get("legs"), None if first is None else round(now - first), r.get("quiet_usd_h")])
+                        r.get("legs"), None if first is None else round(now - first), r.get("quiet_usd_h"),
+                        int(bid in self.cheap)])
         line = {"t": round(now, 1), "scale": {str(k): round(v, 3) for k, v in self.plan_scale.items()},
                 "budget": self.write_budget(), "rows": out}
         self._rank_dumps += 1
@@ -5159,18 +5240,21 @@ class ArbsRunner:
                 cost = {bid: self.write_cost(self.baskets[bid], now) for bid in quotable}
                 for r in rows:
                     r["write_tps"] = round(cost.get(r["basket_id"], 0.0), 2)
+                # Cheap baskets are hot outside the plan: what they really spend still
+                # reaches the plan scale through the shard's spend.
+                ranked, self.cheap = self.cheap_split(quotable, now)
                 # Kalshi bills each shard's writes to that shard's own bucket.
                 by_shard: dict = collections.defaultdict(list)
-                for bid in quotable:
+                for bid in ranked:
                     by_shard[self.basket_shard(self.baskets[bid])].append(bid)
-                picked = set()
+                picked = set(self.cheap)
                 budget = self.write_budget()
                 for s, bids in by_shard.items():
                     picked |= set(self.pick_hot(bids, budget * self.plan_scale.get(s, 1.0), cost))
                 hot = [bid for bid in quotable if bid in picked]
                 self.poll_model()
                 self.poll_size_table()
-                self.hot_cost = round(sum(cost[bid] for bid in hot), 1)
+                self.hot_cost = round(sum(cost[bid] for bid in hot if bid not in self.cheap), 1)
                 self.hot_cost_by_shard = {str(s): round(sum(cost[b] for b in bids if b in picked), 1)
                                           for s, bids in by_shard.items()}
                 if self.dormant:
@@ -5629,6 +5713,7 @@ class ArbsRunner:
                           for m in (1, 10, 60)},
             "hot_cost_tps": self.hot_cost, "hot_cost_by_shard": self.hot_cost_by_shard,
             "dormant": self.dormant_view,
+            "cheap_hot": len(self.cheap),
             "write_plan_scale": {str(s): round(v, 3) for s, v in self.plan_scale.items()},
             "scan_markets": self.markets, "loop_cpu": None if self.loop_cpu is None else round(self.loop_cpu, 3),
             "write_spend_tps": {str(s): round(v, 1) for s, v in self.spend_tps.items()},
@@ -5848,6 +5933,7 @@ class ArbsRunner:
             "alerts": self.alerts[-100:],
             "orphans": [f for _, f in self.orphans],
             "warm": self.warm_state(),
+            "cheap": self.cheap_state(),
             "shards": dict(self.gw.shard_of),
         }
 
@@ -5907,6 +5993,7 @@ class ArbsRunner:
         self.alerts = (st.get("alerts") or []) + self.alerts
         self._buffer[:0] = [("fill", (f,)) for f in st.get("orphans") or []]
         self.restore_warm(st["warm"])
+        self.restore_cheap(st.get("cheap"))
         loop = asyncio.get_running_loop()
         for q in self.quotes.values():
             if q.pm_from is not None:
