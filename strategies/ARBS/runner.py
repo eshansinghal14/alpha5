@@ -3167,7 +3167,9 @@ class ArbsRunner:
             elif pn > n:
                 since = st.get("grow") or now
                 st["grow"] = since
-                up = MODEL_SIZES[MODEL_SIZES.index(n) + 1]
+                # Pre-game picks are keyed by the quote_size cap, not a MODEL_SIZES step: indexing
+                # it raised on every evaluation once quote_size grew, leaving the quotes unmanaged.
+                up = MODEL_SIZES[MODEL_SIZES.index(n) + 1] if live and n in MODEL_SIZES else pn
                 if now - since >= MODEL_GROW_HOLD_S and (e, up) in cands:
                     n, why, st["grow"] = up, why or "grow", None
             else:

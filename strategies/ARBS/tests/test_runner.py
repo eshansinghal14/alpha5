@@ -2992,6 +2992,32 @@ def test_model_pick_keeps_its_holds_when_the_held_pick_cannot_be_priced(arbs, mo
     assert st()["grow"] is None and st()["narrow"] is None
 
 
+def test_model_pick_pre_game_grows_to_a_bigger_quote_size(arbs, monkeypatch):
+    import types
+    r, b = arbs
+
+    class Stub:
+        def value(self, f, x, live, n, maker_rate=0.0):
+            return (1.0, 2.0)
+
+    r.exit_model = Stub()
+    monkeypatch.setattr(R.exit_cost, "live_features", lambda *a, **k: {})
+    monkeypatch.setattr(R.pricing, "others_cost", lambda vs, j, n: n)
+    monkeypatch.setattr(R.pricing, "depth_sizes", lambda vs, j, payout, edges, cap: [cap] * len(edges))
+    monkeypatch.setattr(R.pricing, "plan_at", lambda vs, j, payout, e, o: types.SimpleNamespace(price=e))
+    now_ts = pd.Timestamp.now(tz="UTC")
+    vs = [types.SimpleNamespace(maker_rate=0.0)] * 2
+
+    def pick(cap):
+        r._model_cache.clear()
+        return r.model_pick(b, 0, vs, now_ts, live=False, cap=cap)
+
+    assert pick(1000.0)[1] == 1000.0
+    assert pick(2000.0)[1] == 1000.0                                        # bigger cap: waits the hold
+    r.model_state[(b.basket_id, 0, False)]["grow"] -= R.MODEL_GROW_HOLD_S
+    assert pick(2000.0)[1] == 2000.0                                        # then takes the new cap
+
+
 def test_live_features_match_the_training_inputs():
     from strategies.ARBS.pricing import LegView
     vs = [LegView(asks=[(0.55, 100)], bid=0.40, taker_rate=0.07, maker_rate=0.0),
