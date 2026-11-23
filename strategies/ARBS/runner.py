@@ -491,13 +491,18 @@ BROKEN_STOP_S = 30.0
 # taken as not made: a modify that would cross is dropped silently, the order
 # left at its old price (probe 11-15). The echo came 11 ms after the answer.
 PM_MODIFY_ECHO_S = 2.0
-# Most other baskets sharing a quote's market side priced per leg per pass:
-# MECNET subsets put one market in dozens of baskets.
-MAX_ALTS = 8
 # A leg's best alternative basket (best_plan) is searched for at most this
 # often; between searches only the chosen one is re-priced, on fresh books.
 # The search was 22% of ARBS's CPU on every book change (py-spy 11-11).
 ALT_SEARCH_S = 0.5
+# best_plan also prices a MECNET NO leg through its greedy subset: that market
+# plus the cheapest other NO asks among its event's listed markets, up to
+# scan.mecnet_max_legs. Each further market adds its $1 less its ask, fee and
+# the edge that $1 needs, so the best k-market set is the k-1 cheapest. The
+# scan lists the k likeliest by YES price, which keeps long shots whose NO
+# costs more than that: at top of book on 11-23 the greedy subset priced
+# 3-13% of quotable NO legs on shards 0 and 3 higher, by ~3 ticks.
+GREEDY_SUBSETS = True
 # Rested depth (aged_room) is re-read after a book change or this long.
 HELD_CACHE_S = 0.25
 # Live quotes in trading.model_series: edge and size from the exit-cost model,
@@ -794,6 +799,10 @@ class ArbsRunner:
         # the market are unchanged.
         self._lv_cache: dict[tuple[str, str], tuple] = {}
         self._alt_pick: dict[tuple[str, int], tuple[float, str | None]] = {}   # (basket, leg) -> (searched at, via)
+        # Unlisted greedy subsets a quote may be priced through (see GREEDY_SUBSETS),
+        # by id; book_target registers one only when a fill is booked into it.
+        self._subsets: dict[str, Basket] = {}
+        self._no_rank: dict[str, tuple[float, list[tuple[float, str]]]] = {}   # event -> (at, [(NO cost, ticker)])
         self._near_at: dict[tuple[str, int], float] = {}     # (basket, leg) -> last check for a near quote
         self._held_cache: dict[tuple, tuple] = {}
         self._meta_lock = threading.Lock()           # one full load_meta at a time
@@ -3616,7 +3625,7 @@ class ArbsRunner:
         if via is not None:
             # The arb quote is priced through another basket: so is this one.
             leg = b.legs[j]
-            y = self.baskets.get(via)
+            y = self._basket(via)
             k = None if y is None else next((i for i, l in enumerate(y.legs)
                                              if l.ticker == leg.ticker and l.side == leg.side), None)
             vy = self.views(y) if k is not None else None
@@ -4074,8 +4083,6 @@ class ArbsRunner:
             if k is None or not self.can_book(y, now_ts):
                 continue
             out.append((y, k))
-            if len(out) >= MAX_ALTS:
-                break
         return out
 
     def can_book(self, y: Basket, now_ts: pd.Timestamp) -> bool:
@@ -4107,12 +4114,81 @@ class ArbsRunner:
             ts = [leg.ticker] + [t for _, t in others[:k - 1]]
             if len(ts) == len(markets):
                 break  # every market: the complete set's buy_all_no
-            bid = f"mecnet:{et}:no:" + "+".join(sorted(scanner._sfx(et, t) for t in ts))
-            y = self.baskets.get(bid) or dataclasses.replace(
-                b, basket_id=bid, relationship_id=f"mecnet:{et}", type="mutually_exclusive_no",
-                legs=tuple(Leg(t, "no") for t in ts), payout=float(k - 1))
+            y = self._subset(b, et, ts)
             out.append((y, y.tickers.index(leg.ticker)))
         return out
+
+    def _subset(self, b: Basket, et: str, ts: list[str]) -> Basket:
+        """The MECNET basket of NO on `ts` (event `et`, `b` one of its baskets):
+        the listed one, or one built from b and kept in _subsets."""
+        bid = f"mecnet:{et}:no:" + "+".join(sorted(scanner._sfx(et, t) for t in ts))
+        y = self.baskets.get(bid) or self._subsets.get(bid)
+        if y is None:
+            y = self._subsets[bid] = dataclasses.replace(
+                b, basket_id=bid, relationship_id=f"mecnet:{et}", type="mutually_exclusive_no",
+                legs=tuple(Leg(t, "no") for t in ts), payout=float(len(ts) - 1))
+        return y
+
+    def _basket(self, bid: str | None) -> Basket | None:
+        """A listed basket, or an unlisted subset a quote is priced through."""
+        return None if bid is None else self.baskets.get(bid) or self._subsets.get(bid)
+
+    def _no_ranked(self, et: str, now: float) -> list[tuple[float, str]]:
+        """(cost of 1 NO at the best ask with taker fee, ticker) for event et's
+        open markets, cheapest first. Re-read at most every ALT_SEARCH_S: it
+        only picks the subset, which is then priced on fresh books."""
+        hit = self._no_rank.get(et)
+        if hit is not None and now - hit[0] < ALT_SEARCH_S:
+            return hit[1]
+        out = []
+        for t in self.event_markets.get(et, ()):
+            m = self.meta.get(t)
+            bk = self.feed.ladder(t) if m is not None and m.status in TRADEABLE and m.taker_rate is not None else None
+            if bk is None or bk.last_snapshot_time["yes"] is None or not bk.yes_bids:
+                continue
+            own = self._own(t, "yes")
+            if own:
+                bids = [p for p, q in bk.yes_bids.items() if q - own.get(p, 0.0) > _EPS]
+                if not bids:
+                    continue
+                top = max(bids)
+            else:
+                top = max(bk.yes_bids)
+            ask = round(1.0 - top, 4)                 # a YES bid is a NO ask
+            out.append((pricing.taker_cost(ask, m.taker_rate), t))
+        out.sort()
+        if len(self._no_rank) > 50000:
+            self._no_rank.clear()
+        self._no_rank[et] = (now, out)
+        return out
+
+    def greedy_subset(self, b: Basket, j: int, need_of) -> tuple[Basket, int] | None:
+        """(basket, its leg) for NO on leg j's market plus the other markets of
+        its event that let leg j rest highest at today's best NO asks, or None
+        when leg j isn't a MECNET NO leg or no subset prices. need_of(payout)
+        is the dollar edge a basket of that payout must clear. See
+        GREEDY_SUBSETS."""
+        leg = b.legs[j]
+        kind, _, et = b.relationship_id.partition(":")
+        if leg.side != "no" or kind not in ("mecnet", "complete_set") or not b.exact:
+            return None
+        n_mk = len(self.event_markets.get(et, ()))
+        others = [x for x in self._no_ranked(et, time.time()) if x[1] != leg.ticker]
+        best, best_k, cum = None, 0, 0.0
+        for k in range(2, min(len(others) + 1, self.cfg.scan.mecnet_max_legs) + 1):
+            if k == n_mk:
+                break  # every market: listed already (mecnet or the complete set's buy_all_no)
+            cum += others[k - 2][0]
+            room = (k - 1) - need_of(float(k - 1)) - cum
+            if best is None or room > best + _EPS:
+                best, best_k = room, k
+        if best is None:
+            return None
+        if len(self._subsets) > 20000:
+            keep = set(self.via.values())
+            self._subsets = {k: v for k, v in self._subsets.items() if k in keep}
+        y = self._subset(b, et, [leg.ticker] + [t for _, t in others[:best_k - 1]])
+        return y, y.tickers.index(leg.ticker)
 
     def add_basket(self, y: Basket):
         """Trade an unlisted basket from now on; set_baskets keeps it while it
@@ -4135,7 +4211,7 @@ class ArbsRunner:
         cands = None
         hit = self._alt_pick.get((b.basket_id, j))
         if hit is not None and time.time() - hit[0] < ALT_SEARCH_S:
-            y = self.baskets.get(hit[1]) if hit[1] is not None else None
+            y = self._basket(hit[1])
             if hit[1] is None:
                 cands = []
             elif y is not None and self.can_book(y, now_ts):
@@ -4145,6 +4221,13 @@ class ArbsRunner:
         searched = cands is None
         if searched:
             cands = self.alternatives(b, j)
+            if GREEDY_SUBSETS:
+                add = t.live_edge_add if self.live_now(b, now_ts) else 0.0
+                g = self.greedy_subset(b, j, lambda pay: max(
+                    edge_dollars(pay, t.min_edge + t.quote_edge_add) + add, min_need))
+                if (g is not None and g[0].basket_id != b.basket_id
+                        and all(y.basket_id != g[0].basket_id for y, _ in cands) and self.can_book(g[0], now_ts)):
+                    cands.append(g)
         for y, k in cands:
             vy = self.views(y)
             if vy is None:
@@ -4176,8 +4259,9 @@ class ArbsRunner:
             b = self.baskets.get(basket_id)
             still = (any(self.via.get((basket_id, k)) == old for k in range(len(b.legs))) if b is not None
                      else old in {v for (bid, _), v in self.via.items() if bid == basket_id})
-            if old in self.baskets and not still:
-                for t in self.baskets[old].tickers:
+            ob = self._basket(old)
+            if ob is not None and not still:
+                for t in ob.tickers:
                     self.via_by_ticker.get(t, set()).discard(basket_id)
         if y is not None:
             self.via[(basket_id, j)] = y.basket_id

@@ -2694,6 +2694,60 @@ def test_fill_booked_into_the_best_subset_at_todays_books_even_if_unlisted(arbs)
     assert ac.basket_id in r.baskets
 
 
+def _event_e(r):
+    """Event E: A+B and A+B+D listed, the complete set ABCD; D has no NO ask,
+    C's NO ask (0.60) is under B's (0.70)."""
+    from backtest.book import L2Book
+    mk = lambda bid, rel, ts, payout: Basket(basket_id=bid, relationship_id=rel, type="mutually_exclusive_no",
+                                             cluster="E", legs=tuple(Leg(f"E-{t}", "no") for t in ts), payout=payout,
+                                             quote_until=None, resume_quoting=None)
+    ab = mk("mecnet:E:no:A+B", "mecnet:E", "AB", 1.0)
+    abd = mk("mecnet:E:no:A+B+D", "mecnet:E", "ABD", 2.0)
+    full = mk("complete_set:E:buy_all_no", "complete_set:E", "ABCD", 3.0)
+    for t in ("E-A", "E-B", "E-C", "E-D"):
+        r.feed._books[t] = L2Book(t)
+        r.meta[t] = R.Meta(ticker=t, event="E", status="active", shard=0, taker_rate=0.07, maker_rate=0.0)
+    r.set_baskets([ab, abd, full])
+    r.hot = [ab.basket_id]
+    book(r, "E-A", [(0.45, 10)], [(0.20, 10)])     # A's NO ask 0.55, NO bid 0.20
+    book(r, "E-B", [(0.30, 10)], [(0.60, 10)])
+    book(r, "E-C", [(0.40, 10)], [(0.50, 10)])
+    book(r, "E-D", [], [(0.90, 10)])
+    return ab
+
+
+def test_quote_priced_through_the_greedy_subset_even_if_unlisted(arbs):
+    r, _ = arbs
+    ab = _event_e(r)
+    _eval(r, ab)
+    q = r.quotes[(ab.basket_id, 0)]
+    # A+B+C pays $2: 2 - 0.0583 edge - (0.70 + 0.60 + fees) leaves 0.61, capped
+    # under A's NO ask at 0.54. Listed A+B leaves 0.25; A+B+D and ABCD can't price.
+    assert r.via[(ab.basket_id, 0)] == "mecnet:E:no:A+B+C"
+    assert q.max_price == pytest.approx(0.54) and q.price == pytest.approx(0.21)
+    assert "mecnet:E:no:A+B+C" not in r.baskets                 # priced through, not registered
+    assert ab.basket_id in r.via_by_ticker["E-C"]                # C's book now moves this quote
+    _eval(r, ab)                                                 # within ALT_SEARCH_S: the kept pick
+    assert r.via[(ab.basket_id, 0)] == "mecnet:E:no:A+B+C"
+    # C's NO ask 0.60 -> 0.98: its $1 adds less than the 2.9c it needs, so A+B
+    # (the quote's own basket) is best again.
+    book(r, "E-C", [(0.02, 10)], [(0.90, 10)])
+    r._alt_pick.clear()
+    r._no_rank.clear()
+    _eval(r, ab)
+    assert r.via.get((ab.basket_id, 0)) != "mecnet:E:no:A+B+C"
+    assert ab.basket_id not in r.via_by_ticker.get("E-C", set())
+
+
+def test_greedy_subsets_off_prices_through_listed_baskets_only(arbs, monkeypatch):
+    monkeypatch.setattr(R, "GREEDY_SUBSETS", False)
+    r, _ = arbs
+    ab = _event_e(r)
+    _eval(r, ab)
+    assert (ab.basket_id, 0) not in r.via
+    assert r.quotes[(ab.basket_id, 0)].max_price == pytest.approx(0.25)
+
+
 def test_a_finished_near_arb_teaches_the_shadow_sizer(arbs):
     r, b = arbs
     soon = pd.Timestamp.now(tz="UTC") + pd.Timedelta(hours=3)
