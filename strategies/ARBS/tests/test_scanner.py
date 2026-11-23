@@ -290,10 +290,19 @@ def test_spreads_are_ladders_per_team_and_both_teams_covering_is_impossible():
 
 
 def test_spreads_only_on_spread_shards_and_after_traded_markets_in_the_budget():
-    assert not baskets(run([_spread_event(shard=0)], shards={0}))
+    assert not baskets(run([_spread_event(shard=2)], shards={2}))
+    assert baskets(run([_spread_event(shard=0)], shards={0}))
     traded = event("EV-1", "MECNET", [mkt("EV-1-A", 0.4, vol=1), mkt("EV-1-B", 0.5, vol=1)], shard=3)
     sel = run([_spread_event(), traded], shards={3}, max_markets=2)
     assert [r["relationship_id"] for r in sel["relationships"]] == ["mecnet:EV-1"]
+
+
+def test_traded_unnetted_baskets_compete_for_the_budget_by_volume():
+    traded = event("EV-1", "MECNET", [mkt("EV-1-A", 0.4, vol=1), mkt("EV-1-B", 0.5, vol=1)], shard=3)
+    doc = scanner.scan([_spread_event(), traded], now=NOW, mecnet_max_legs=6, ladder_span=3, complete_set_exclude=[],
+                       overrides={}, shards={3})
+    got = scanner.select(doc, now=NOW, days=90, max_markets=8, unnetted_last=False)
+    assert [r["relationship_id"] for r in got["relationships"]] == ["spread:NBS-1"]
 
 
 def test_runner_refuses_the_prefix_the_scanner_lists_spreads_under():
@@ -316,7 +325,18 @@ def test_unnetted_baskets_keep_to_locked_days_and_record_shards():
     late = (NOW + pd.Timedelta(days=121)).isoformat()
     assert not watched(run(_totals(exp=late), shards={3}, days=None, locked_days=120.0))
     assert watched(run(_totals(exp=late), shards={3}, days=None, locked_days=None))
-    assert not watched(run(_totals(shard=0), shards={0}, days=None, locked_days=120.0))
+    assert not watched(run(_totals(shard=2), shards={2}, days=None, locked_days=120.0))
+    assert watched(run(_totals(shard=0), shards={0}, days=None, locked_days=120.0))
+
+
+def test_a_cross_event_basket_is_listed_only_where_every_event_is_owned():
+    def legs(owned):
+        doc = scanner.scan(_totals(), now=NOW, mecnet_max_legs=6, ladder_span=3, complete_set_exclude=[], overrides={},
+                           shards={3}, locked_days=120.0, owns=lambda ev: ev in owned)
+        return [{l["ticker"].rsplit("-", 1)[0] for l in b["legs"]} for r in doc["relationships"] for b in r["baskets"]
+                if b["basket_id"].startswith("watch:")]
+    assert {"KXNBATOTAL-1", "KXNBATOTALPRECISE-1"} in legs({"KXNBATOTAL-1", "KXNBATOTALPRECISE-1"})
+    assert legs({"KXNBATOTAL-1"}) == [{"KXNBATOTAL-1"}]       # the other event's owner may quote its legs
 
 
 def test_shared_fetch_is_reused_until_it_ages_out(tmp_path):

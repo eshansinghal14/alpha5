@@ -46,14 +46,12 @@ from strategies.ARBS import parts, watch
 UP = ("greater", "greater_or_equal")
 DOWN = ("less", "less_or_equal")
 # Sports spread/total ladders and watch.py's baskets, which Kalshi doesn't net
-# (cash stays locked to settlement): recorded, never traded, until a replay says
-# they pay. They sort last in select, so they only take the budget traded
-# markets leave: none on shard 0, whose processes sit at their CPU-held count
-# (11-21: 0 recorded there; building its ~110k such baskets added ~20 MB to
-# every scan doc).
+# (cash stays locked to settlement, so only events settling within the locked
+# days are listed). Traded with trading.quote_unnetted; otherwise recorded only
+# and sorted last in select. Shard 0's ~56k of them add ~20 MB to its scan docs.
 SPREAD_PREFIX = "spread:"
 RECORD_PREFIXES = (SPREAD_PREFIX, watch.WATCH_PREFIX)
-RECORD_SHARDS = (3,)
+RECORD_SHARDS = (0, 3)
 SPREAD_CROSS = 3          # each team's lowest strikes paired across teams
 
 
@@ -276,7 +274,7 @@ def spreads(event: dict, markets: list[dict], span: int) -> list[dict]:
     if not baskets:
         return []
     return [{"relationship_id": f"{SPREAD_PREFIX}{et}", "type": "implication", "cluster": series,
-             "description": f"{et}: spread/total ladder (not netted by Kalshi); recorded only.",
+             "description": f"{et}: spread/total ladder (not netted by Kalshi).",
              "baskets": baskets}]
 
 
@@ -353,10 +351,18 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
     # Record-only baskets across events (watch.py): settled when the last of
     # their events is, live once the first one is.
     pool = watch_pool(events, shards, overrides, now, locked_days)
+    ev_of = {m["ticker"]: et for et, (e, _) in pool.items() for m in e.get("markets") or []}
     for anchor, r, evs_in in watch.build([e for e, _ in pool.values()], RECORD_SHARDS, skip_series,
                                          recorded=lambda e: spread_event(e, skip_series)):
-        if owns is not None and not owns(anchor):
-            continue
+        if owns is not None:
+            if not owns(anchor):
+                continue
+            # A leg in an event another process owns could be quoted there too, and
+            # one print would fill both: quote-per-market-side holds within a process.
+            r["baskets"] = [b for b in r["baskets"] if all(owns(ev_of.get(l["ticker"], "")) for l in b["legs"])]
+            if not r["baskets"]:
+                continue
+            evs_in = sorted({ev_of[l["ticker"]] for b in r["baskets"] for l in b["legs"]})
         ts = [_timing(pool[et][0], active(pool[et][0]), pool[et][1], now, starts, freqs, live_windows,
                       settle_lead, early_h) for et in evs_in]
         lives = [t[1] for t in ts if t[1]]
@@ -446,12 +452,13 @@ def cheap_events(procs: tuple[str, ...], root: str | None = None, days: int = pa
 
 def select(doc: dict, *, now: pd.Timestamp, days: float | None, max_markets: int | None, known_tickers: set[str] = frozenset(),
            held: set[str] = frozenset(), exclude: set[str] = frozenset(), cheap: set[str] = frozenset(),
-           max_total: int | None = None) -> dict:
+           max_total: int | None = None, unnetted_last: bool = True) -> dict:
     """The part of a scan to trade: relationships settling within `days` (None: any), the
     most traded per market first (24h volume),
     until max_markets markets beyond `known_tickers` (None: no limit), not
     counting `cheap` events' markets, and max_total markets in all.
-    Relationships holding a basket in `held` are always kept."""
+    Relationships holding a basket in `held` are always kept. `unnetted_last`:
+    RECORD_PREFIXES' relationships (recorded, not traded) only take what's left."""
     # Per market, not in total: on 11-05 a 400-market Nasdaq ladder and the
     # 14-market election-margin ladders outranked 3-market games trading
     # $40-110k a day, and only 10 games within 36 h made the budget (32 per market).
@@ -461,8 +468,8 @@ def select(doc: dict, *, now: pd.Timestamp, days: float | None, max_markets: int
 
     horizon = None if days is None else now + pd.Timedelta(days=days)
     out, used, every = [], set(), set()
-    # Recorded-only baskets last: they take only the budget traded markets leave.
-    for r in sorted(doc["relationships"], key=lambda r: (r["relationship_id"].startswith(RECORD_PREFIXES), -per_market(r))):
+    for r in sorted(doc["relationships"], key=lambda r: (unnetted_last and r["relationship_id"].startswith(RECORD_PREFIXES),
+                                                         -per_market(r))):
         ts = {l["ticker"] for b in r["baskets"] for l in b["legs"]} - known_tickers
         costly = set() if r["relationship_id"].split(":", 1)[-1] in cheap else ts
         if any(b["basket_id"] in held for b in r["baskets"]):
@@ -599,7 +606,8 @@ def scan_and_select(root: str, config_path: str | None = None, markets: int | No
               starts=shared("starts", lambda: fetch_starts(now)), freqs=shared("frequencies", fetch_frequencies))
     cheap = cheap_events(group) if group is not None else set()
     sel = select(doc, now=pd.Timestamp.now(tz="UTC"), days=cfg.trading.days_till_expiry, max_markets=markets,
-                 held=held, exclude=set(cfg.watch.exclude), cheap=cheap, max_total=TOTAL_MARKETS_MAX)
+                 held=held, exclude=set(cfg.watch.exclude), cheap=cheap, max_total=TOTAL_MARKETS_MAX,
+                 unnetted_last=not cfg.trading.quote_unnetted)
     info["cheap_events"] = len(cheap)
     atomic_write_json(os.path.join(root, SELECTED), sel, indent=None)
     if owns is not None:

@@ -653,6 +653,29 @@ def test_market_missing_at_first_read_is_picked_up_later(arbs, monkeypatch):
     assert "/trade-api/v2/events/" not in calls
 
 
+def test_market_status_reads_are_signed_and_wait_on_the_shared_read_bucket(arbs, monkeypatch):
+    r, b = arbs
+    calls, takes = [], []
+
+    class Bucket:
+        def take_keeping(self, cost, keep):
+            takes.append((cost, keep))
+            return len(takes) > 2                      # low twice, then paid
+
+    def get(path, params=None, auth=False):
+        calls.append((path, auth))
+        if path.endswith("/markets"):
+            return {"markets": [{"ticker": t, "event_ticker": "X", "status": "active"} for t in ("X-A", "X-B")]}
+        return {"event": {"series_ticker": "XS", "exchange_index": 0}}
+    monkeypatch.setattr(R, "read_budget", lambda: Bucket())
+    monkeypatch.setattr(R.time, "sleep", lambda s: None)
+    monkeypatch.setattr(R, "kalshi_get", get)
+    monkeypatch.setattr(R.kfees, "for_event", lambda s, e: type("F", (), {"taker_rate": 0.07, "maker_rate": 0.0})())
+    r.load_meta(["X-A", "X-B"])
+    assert [auth for path, auth in calls if path.endswith("/markets")] == [True]
+    assert takes == [(R.READ_COST, R.META_READ_KEEP)] * 3
+
+
 def test_a_restart_takes_event_series_shard_and_fees_from_the_cache(arbs, monkeypatch):
     from strategies.ARBS import SERIES
     r, b = arbs
@@ -2842,6 +2865,16 @@ def test_record_only_series_is_watched_but_never_traded(arbs):
     r.series_group = {series: "S:Hockey"}
     r.cfg.watch = dataclasses.replace(r.cfg.watch, record_only=["S:Hockey"])
     assert r.excluded(b)
+
+
+def test_unnetted_baskets_trade_only_with_quote_unnetted(arbs):
+    r, b = arbs
+    u = dataclasses.replace(b, basket_id="spread:NBS-1:PHX8=>PHX2", relationship_id="spread:NBS-1")
+    r.listed = {b.relationship_id, u.relationship_id}
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_unnetted=False)
+    assert r.excluded(u) and not r.excluded(b)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_unnetted=True)
+    assert not r.excluded(u)
 
 
 def test_a_basket_of_an_event_the_other_shard0_process_owns_is_only_finished(arbs):

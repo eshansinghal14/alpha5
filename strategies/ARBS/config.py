@@ -46,6 +46,9 @@ class TradingParams:
                                            "past it. Open positions past it are still completed and settled. Empty: "
                                            "no limit (Kalshi nets an event's positions, so a whole basket ties up no "
                                            "capital however far out it settles).", min=0.0, max=2000.0, step=1.0)
+    quote_unnetted: bool = param("Trade baskets Kalshi doesn't net (spread/total ladders, watch.py's families). "
+                                 "Their cash stays locked to settlement, so the scan lists only those settling "
+                                 "within config_pm.json's days_till_expiry. Off: recorded only.")
     quote_size: int = param("Bundles per resting quote.", min=1, max=10000, step=1)
     quote_live_events: bool = param("Quote events that have started (a game after kickoff). A live score change "
                                     "sweeps every leg at once, so a fill there is usually already a loss; "

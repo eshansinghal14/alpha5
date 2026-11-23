@@ -8,6 +8,7 @@
     "min_exit_edge": null,
     "exit_ref_days": null,
     "days_till_expiry": null,
+    "quote_unnetted": null,
     "quote_size": null,
     "quote_live_events": null,
     "take_live_events": null,

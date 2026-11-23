@@ -7,6 +7,7 @@
     "min_exit_edge": 0.01,
     "exit_ref_days": 30.0,
     "days_till_expiry": 3.0,
+    "quote_unnetted": false,
     "quote_size": 5,
     "quote_live_events": false,
     "take_live_events": false,

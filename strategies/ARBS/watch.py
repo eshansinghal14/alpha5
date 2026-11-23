@@ -1,5 +1,5 @@
-"""Record-only baskets on structures Kalshi doesn't net, for the replay to
-price before any is traded (the runner never quotes or takes WATCH_PREFIX).
+"""Baskets on structures Kalshi doesn't net, traded only with
+trading.quote_unnetted (recorded otherwise).
 Each pays at least its payout whatever happens, from the markets' own rules:
 
   same      sports markets whose rules read the same but for the strike measure
@@ -376,6 +376,6 @@ def build(events: list[dict], shards, skip_series=frozenset(), recorded=lambda e
         evs_in = sorted({ev_of[l["ticker"]] for b in bs for l in b["legs"]})
         out.append((anchor, {"relationship_id": f"{WATCH_PREFIX}{anchor}:{kind}", "type": "implication",
                              "cluster": by_et[anchor]["series_ticker"],
-                             "description": f"{anchor}: {kind} (not netted by Kalshi); recorded only.",
+                             "description": f"{anchor}: {kind} (not netted by Kalshi).",
                              "baskets": bs}, evs_in))
     return out

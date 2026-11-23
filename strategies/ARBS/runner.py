@@ -41,7 +41,8 @@ from infra.config import ConfigStore, _replace_with_retry, atomic_write_json
 from infra.kalshi import fees as kfees
 from infra.kalshi.orders import (RealFill, error_code, http_status, is_market_paused, is_order_group_reject,
                                         is_post_only_reject)
-from infra.kalshi.orders import KEEPALIVE_S, ReadBudgetLow, read_stats, write_budget_tokens_per_s
+from infra.kalshi.orders import (KEEPALIVE_S, READ_COST, ReadBudgetLow, _note_read, read_budget, read_stats,
+                                 write_budget_tokens_per_s)
 from infra.polymarket import limits as pm_limits
 from infra.trading.engine import MARKET_PAUSE_RETRY_S
 from infra.runtime import disk, handoff as hand, notify
@@ -476,6 +477,12 @@ READ_FAILS_LOGGED = 2
 # Between load_meta's market GETs (100 tickers each): ~95 of them per process,
 # six processes, under Kalshi's read limit when they all start together.
 META_GET_GAP_S = 0.25
+# Meta GETs are signed and paid from the account's shared read bucket, leaving
+# this much for fill polls and balance reads (under the bucket's ~300 capacity, or
+# they'd wait forever). Unsigned, they drew the box's public-read 429s, and
+# reads_binding held shard 0's market count at its floor with loops at 38-58%
+# (ARBS 70% of 3 min in 429 backoff, 11-23 23:38 UTC).
+META_READ_KEEP = 150.0
 # Market status comes only from meta reads. Between full reads (every
 # META_FULL_EVERY-th refresh) one reads just the markets we're exposed on: hot or
 # quoted baskets' legs and every held basket's. At ~46k shard 0 markets the full
@@ -1332,8 +1339,11 @@ class ArbsRunner:
                 # Paced: with keep-alive GETs six processes starting at once
                 # read past Kalshi's limit for ~2 min and ARBS exited (11-17 01:40).
                 time.sleep(META_GET_GAP_S)
-            for m in kalshi_get("/trade-api/v2/markets", params={"tickers": ",".join(batch), "limit": 1000}) \
-                    .get("markets", []):
+            while not read_budget().take_keeping(READ_COST, META_READ_KEEP):
+                time.sleep(0.2)
+            _note_read()
+            for m in kalshi_get("/trade-api/v2/markets", params={"tickers": ",".join(batch), "limit": 1000},
+                                auth=True).get("markets", []):
                 got[m["ticker"]] = m
         events = {}
         for t in kt:
@@ -1475,7 +1485,7 @@ class ArbsRunner:
         if ex and (b.basket_id in ex or b.relationship_id in ex or b.cluster in ex
                    or b.relationship_id.split(":", 1)[-1] in ex):
             return True
-        if b.relationship_id.startswith(RECORD_PREFIXES):
+        if b.relationship_id.startswith(RECORD_PREFIXES) and not self.cfg.trading.quote_unnetted:
             return True                   # recorded only (scanner.spreads, watch.py)
         every, by_phase = self.record_only_sets()
         if every or by_phase:
