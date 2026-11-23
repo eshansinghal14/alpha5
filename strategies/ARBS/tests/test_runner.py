@@ -1385,10 +1385,10 @@ def test_plan_budget_follows_real_write_spend(arbs):
         r.update_plan_scale(t0 + i)
     assert abs(r.spend_tps[0] - 100.0) < 1e-6
     assert abs(r.plan_scale[0] - R.WRITE_TARGET * 300 / 100) < 0.01 and 100 not in r.plan_scale
-    for i in range(1805, 3601, 5):                       # now spending more than planned: scale floors at 0.5
-        c.spent_total += 5 * 1000.0
+    for i in range(1805, 3601, 5):                       # now spending 10x the plan: the scale floors
+        c.spent_total += 5 * 3000.0
         r.update_plan_scale(t0 + i)
-    assert abs(r.plan_scale[0] - 0.5) < 0.01
+    assert abs(r.plan_scale[0] - R.PLAN_SCALE_MIN) < 0.01
 
 
 def test_write_cost_counts_top_of_book_changes(arbs, monkeypatch):

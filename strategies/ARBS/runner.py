@@ -297,8 +297,11 @@ LOOP_CPU_BAND, MARKETS_STEP, MARKETS_MIN = 0.05, 0.25, 1000
 # keeps it short of where reads did bind (ARBS0C at 55k couldn't arm, 11-18).
 READ_429_MINUTES, MARKETS_MAX = 3, 20000
 # The ceiling only guards a runaway estimate: at 3 shard 0 stopped at ~1,515
-# hot baskets spending ~170 of 255 target tokens/s (11-15 20:37 UTC).
-PLAN_SCALE_MIN, PLAN_SCALE_MAX = 0.5, 10.0
+# hot baskets spending ~170 of 255 target tokens/s (11-15 20:37 UTC). Cheap
+# baskets left the plan (CHEAP_HOT) while still spending, so the scale sits
+# 2-3x lower: replayed on 11-22's rank dumps, shard 0 would have wanted 0.20-0.64
+# (p10-p90), under the old 0.5 floor in 93% of ARBS's passes, never under 0.15.
+PLAN_SCALE_MIN, PLAN_SCALE_MAX = 0.15, 10.0
 # Processes planning quotes on one shard share its write rate: each aims for
 # its own spend plus an even share of what the others leave, from their
 # WRITE_SPEND files. Fixed thirds of shard 0 left 116 of 300 tokens/s unspent
