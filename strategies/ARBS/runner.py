@@ -771,6 +771,8 @@ class ArbsRunner:
         self.feed = Feeds(self.tickers, self._on_quote, self._on_trade, label=self.S, on_fill=self._on_fill,
                           on_gone=self._on_gone, on_error=lambda m: self.alert("warn", None, m),
                           on_replace=self._on_replace)
+        self.feed.kalshi.first = self._sub_first
+        self.feed.per_market = self.cfg.runtime.feed_ready_per_market
         # The Polymarket process rests quotes on Polymarket legs only: a resting
         # quote of its own on a Kalshi market ARBS also trades could meet an ARBS
         # IOC, which self-trade prevention cancels.
@@ -847,6 +849,7 @@ class ArbsRunner:
         self.pulled: dict[tuple[str, str], float] = {}   # (ticker, side) -> monotonic time its pull ends
         self.pull_wake: dict[str, float] = {}            # basket_id -> pull end its re-evaluation is set for
         self.cool_wake: dict[str, float] = {}            # basket_id -> requote cooldown end its re-evaluation is set for
+        self.grow_since: dict[tuple, float] = {}         # quote key -> since when its room has been 2x what rests
         # (basket_id, leg) -> the other basket its quote is priced through, and
         # ticker -> baskets priced through a basket on it: their quotes move
         # with that basket's books too.
@@ -1085,7 +1088,7 @@ class ArbsRunner:
                 return "order_error_breaker"
             self.order_errors = 0
             self.alert("info", None, f"order error breaker cleared after {ORDER_ERROR_COOLDOWN_S:.0f}s with no new errors")
-        if not self.feed.up and not self.feed.pm._tickers:
+        if not self.feed.up and not self.feed.pm._tickers and not self.feed.per_market:
             return "feed_down"
         if self.exchange_paused:
             return "Kalshi trading paused"
@@ -1964,12 +1967,13 @@ class ArbsRunner:
                 continue
             bid = None if bid is None else round(bid, 4)
             others = 0.0 if bid is None else (depth or 0.0) - self._own(t, bid_side).get(bid, 0.0)
-            if self.pull_watch.fires(key, now, bid, others, c.pull_window_s, c.pull_drop):
+            why = self.pull_watch.fires(key, now, bid, others, c.pull_window_s, c.pull_drop)
+            if why:
                 for tk, sd, bid_id in targets:
                     if self.pulled.get((tk, sd), 0.0) <= now:
                         self.n["pulls"] += 1
                         self.journal({"kind": "pull", "ticker": tk, "side": sd, "by": t, "by_side": leg_side,
-                                      "price": bid, "depth": round(others, 2), "quoted": [bid_id]})
+                                      "price": bid, "depth": round(others, 2), "why": why, "quoted": [bid_id]})
                     self.pulled[(tk, sd)] = now + c.pull_hold_s
         if len(self.pulled) > 5000:
             self.pulled = {k: v for k, v in self.pulled.items() if v > now}
@@ -2529,6 +2533,7 @@ class ArbsRunner:
     def _retire(self, q: Quote):
         if self.quotes.get(q.key) is q:
             del self.quotes[q.key]
+            self.grow_since.pop(q.key, None)
         if q.exchange_id and q.exchange_id in self.real_ledger.quote_ids:
             self.real_ledger.quote_ids[q.exchange_id]["retired_at"] = time.time()
             self.real_ledger.note_quote_id(q.exchange_id)
@@ -3505,7 +3510,7 @@ class ArbsRunner:
                     rate = vs[j].maker_rate
                     plan = dataclasses.replace(plan, price=q.price, edge=plan.edge + pricing.maker_cost(plan.price, rate)
                                                - pricing.maker_cost(q.price, rate))
-                acts.append(self.move_quote(q, plan, size))
+                acts.append(self.move_quote(q, plan, size, why="cut"))
                 continue
             past_limit = q.price > plan.max_price + _EPS
             if (past_limit and not live and q.remaining <= MODEL_PRE_NARROW_SIZE
@@ -3518,12 +3523,24 @@ class ArbsRunner:
             # Grown in place when the room is much bigger than what rests: a
             # quote placed small kept its size through every later move
             # (KXRT-MON-30 stayed 1 lot with 629 behind the other leg, 10-29).
-            grow = size >= 2.0 * q.remaining and cooled
+            wants = size >= 2.0 * q.remaining
+            since = self.grow_since.get(q.key) if wants else self.grow_since.pop(q.key, None)
+            if wants and since is None:
+                since = self.grow_since[q.key] = now
+            grow = wants and cooled
             held = q.price < plan.price <= q.price + t.requote_hold_up + _EPS
-            if past_limit or grow or (ticks >= min_ticks and cooled and not held):
+            step = ticks >= min_ticks and cooled and not held
+            hold_g = t.live_grow_hold_s if live else 0.0
+            if grow and not (past_limit or step) and now - since < hold_g:
+                grow = False                  # a lone grow waits: see live_grow_hold_s
+                self.wake_when_cooled(b.basket_id, since + hold_g)
+            if past_limit or grow or step:
                 if self.live and not past_limit and not self.gw.can_afford(leg.ticker, "amend", reserve):
                     continue
-                acts.append(self.move_quote(q, plan, size if grow else None))
+                why = "limit" if past_limit else "step" if step else "grow"
+                if grow:
+                    self.grow_since.pop(q.key, None)
+                acts.append(self.move_quote(q, plan, size if grow else None, why=why))
             else:
                 q.edge, q.max_price = plan.edge, plan.max_price
                 if not cooled and ((ticks >= min_ticks and not held) or size >= 2.0 * q.remaining):
@@ -3828,7 +3845,7 @@ class ArbsRunner:
             if b is None:
                 self._reach.pop(key)
                 continue
-            if self.excluded(b) or not self.tradeable(b) or self.blocked():
+            if self.excluded(b) or not self.tradeable(b) or self.blocked() or not self.feed.up_for(b.tickers):
                 self._reach.pop(key)
                 self._reach_log("cancel", b, key[1], r, False, why="untradeable")
                 continue
@@ -4759,8 +4776,10 @@ class ArbsRunner:
         order log's sent - book is how long we took to react to it."""
         return max((self.book_wall[t] for t in b.tickers if t in self.book_wall), default=None)
 
-    async def move_quote(self, q: Quote, plan: pricing.QuotePlan, size: float | None = None):
-        """Reprice, and resize to `size` contracts left if given."""
+    async def move_quote(self, q: Quote, plan: pricing.QuotePlan, size: float | None = None, why: str | None = None):
+        """Reprice, and resize to `size` contracts left if given. `why` (an arb
+        quote's: cut, limit, step or grow) and the edge limit are journaled, so
+        forced moves can be told from optional ones."""
         b = self.baskets[q.basket_id]
         q.moved_at = time.time()
         old = q.price
@@ -4809,7 +4828,7 @@ class ArbsRunner:
             self.charge(q.basket_id, ORDER_TOKENS)
         self.note_upkeep(q.basket_id, ORDER_TOKENS)
         self.journal({"kind": "move", "basket_id": q.basket_id, "ticker": q.ticker, "from": old, "to": plan.price,
-                      "size": q.size, **_deep(q)})
+                      "size": q.size, "max": round(plan.max_price, 4), **({"why": why} if why else {}), **_deep(q)})
 
     async def cancel_quote(self, q: Quote, reason: str):
         self.n["quote_cancels"] += 1
@@ -4836,22 +4855,50 @@ class ArbsRunner:
         self._retire(q)
         self.journal({"kind": "cancel", "basket_id": q.basket_id, "ticker": q.ticker, "reason": reason, **_deep(q)})
 
+    def _fed(self, q: Quote) -> bool:
+        b = self.baskets.get(q.basket_id)
+        return b is not None and self.feed.up_for(b.tickers)
+
+    def _sub_first(self) -> list[str]:
+        """Markets a Kalshi reconnect subscribes first: the legs of baskets we
+        hold, then of live baskets with a quote resting, then of the rest quoted."""
+        now_ts = _utc()
+        held = [b for bid, pos in self.real_ledger.baskets.items() if pos.legs and (b := self.baskets.get(bid))]
+        quoted = [b for bid, n in self.quotes.n_by_basket.items() if n and (b := self.baskets.get(bid))]
+        live = [b for b in quoted if self.live_now(b, now_ts)]
+        return [t for b in (*held, *live, *quoted) for t in b.tickers]
+
+    def _pull_rank(self, q: Quote, now_ts) -> int:
+        if q.deep or q.near:
+            return 2
+        b = self.baskets.get(q.basket_id)
+        return 0 if b is not None and self.live_now(b, now_ts) else 1
+
     async def pull_all(self, reason: str, venues: set[str] | None = None):
-        """Every quote off (on `venues` only, if given), then a sweep of them."""
-        qs = [q for q in self.quotes.values() if not q.pending and (venues is None or venue(q.ticker) in venues)]
+        """Every quote off (on `venues` only, if given), then a sweep of them.
+        Live quotes go first and deep/near ones last: at the pacing below a
+        shard 0 process's 3-18k quotes took 25-176 s to pull (feed drops
+        11-20..22). A feed-drop pull leaves quotes whose markets are fed again."""
+        drop = reason == "feed_down"
+        qs = [q for q in self.quotes.values() if not q.pending and (venues is None or venue(q.ticker) in venues)
+              and not (drop and self._fed(q))]
         if self.live and any(is_pm(q.ticker) and q.exchange_id for q in qs) and await self.pm_cancel_all(reason):
             for q in [q for q in qs if is_pm(q.ticker)]:
                 self._retire(q)
                 self.journal({"kind": "cancel", "basket_id": q.basket_id, "ticker": q.ticker, "reason": reason,
                               **_deep(q)})
             qs = [q for q in qs if not is_pm(q.ticker)]
+        now_ts = _utc()
+        qs.sort(key=lambda q: self._pull_rank(q, now_ts))
         # In batches: ~1000 cancels at once drew 429s (feed drop 10-30 06:25 ET).
         for i in range(0, len(qs), PULL_BATCH):
-            await asyncio.gather(*(self.cancel_quote(q, reason) for q in qs[i:i + PULL_BATCH]),
-                                 return_exceptions=True)
+            batch = [q for q in qs[i:i + PULL_BATCH] if self.quotes.get(q.key) is q and not (drop and self._fed(q))]
+            if not batch:
+                continue
+            await asyncio.gather(*(self.cancel_quote(q, reason) for q in batch), return_exceptions=True)
             await asyncio.sleep(PULL_BATCH * SWEEP_PACING_S)
         if self.live:
-            await self.sweep(reason, venues)
+            await self.sweep(reason, venues, keep=self.feed.kalshi.ready if drop and self.feed.per_market else None)
 
     def _pm_stop_all(self, reason: str) -> bool:
         """A stop takes Polymarket quotes down with one cancel-all, not one
@@ -4901,10 +4948,11 @@ class ArbsRunner:
         if s in self.gw.clients:
             self.gw.shard_of[ticker] = s
 
-    async def sweep(self, reason: str, venues: set[str] | None = None):
+    async def sweep(self, reason: str, venues: set[str] | None = None, keep=None):
         """Cancel anything of ours resting: on our tickers, or placed by us on a
-        market since dropped from the scan (KXYTVIEWSW quotes sat 19 h, 10-29).
-        The ground truth after a restart."""
+        market since dropped from the scan (KXYTVIEWSW quotes sat 19 h, 10-29),
+        except on markets keep(ticker) says to leave. The ground truth after a
+        restart."""
         if not self.gw.clients:
             return
         ours = set(self.tickers)
@@ -4918,7 +4966,7 @@ class ArbsRunner:
             resting += await self.gw.call(c._resting, "")
         loop = asyncio.get_running_loop()
         for oid, ticker, cid in resting:
-            if ticker not in ours and oid not in self.real_ledger.quote_ids:
+            if (ticker not in ours and oid not in self.real_ledger.quote_ids) or (keep and keep(ticker)):
                 continue
             if self.gw.client(ticker) is None:
                 await loop.run_in_executor(self.pool, self.learn_shard, ticker)
@@ -5348,10 +5396,11 @@ class ArbsRunner:
     async def guard_loop(self):
         while True:
             await asyncio.sleep(1.0)
+            self.feed.per_market = self.cfg.runtime.feed_ready_per_market
             if self.handing:
                 continue
             down = self.feed.down_venues(self.cfg.runtime.feed_down_pull_s, time.monotonic())
-            if down and any(venue(q.ticker) in down for q in self.quotes.values()):
+            if down and any(venue(q.ticker) in down and not self._fed(q) for q in self.quotes.values()):
                 self.alert("warn", None, f"{', '.join(sorted(down))} websocket down; pulling its quotes")
                 await self.pull_all("feed_down", venues=down)
 

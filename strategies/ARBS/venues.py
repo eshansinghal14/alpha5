@@ -41,6 +41,9 @@ class Feeds:
         self.kalshi = MultiFeed(k, on_quote, on_trade, label=label, on_fill=on_fill, on_error=on_error)
         self.pm = PolyFeed(p, on_quote, on_trade, label=label, on_fill=on_fill, on_gone=on_gone, on_error=on_error,
                            on_replace=on_replace)
+        # runtime.feed_ready_per_market: a Kalshi market counts as fed once its
+        # snapshot is in, not when the whole resubscription is.
+        self.per_market = False
 
     def _of(self, ticker: str):
         return self.pm if is_pm(ticker) else self.kalshi
@@ -73,8 +76,10 @@ class Feeds:
         return min(ds) if ds else None
 
     def up_for(self, tickers) -> bool:
-        """Every venue `tickers` trade on is up."""
-        return all(self._of(t).up for t in tickers)
+        """Every venue `tickers` trade on is up (with per_market, every Kalshi
+        one of them is ready instead)."""
+        k = self.kalshi
+        return all(k.ready(t) if self.per_market and not is_pm(t) else self._of(t).up for t in tickers)
 
     def down_venues(self, longer_than_s: float, now: float) -> set[str]:
         """Venues whose feed has been down longer than `longer_than_s`."""

@@ -40,6 +40,7 @@
     "requote_min_ticks": null,
     "requote_hold_up": null,
     "requote_cooldown_s": null,
+    "live_grow_hold_s": null,
     "take_cooldown_s": null
   },
   "completion": {
@@ -80,6 +81,7 @@
     "max_order_errors": null,
     "liquidity_log_s": null,
     "feed_down_pull_s": null,
+    "feed_ready_per_market": null,
     "record_prints": null,
     "live_params_shadow": null,
     "regime_shadow": null

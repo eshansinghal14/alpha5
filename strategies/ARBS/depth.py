@@ -38,7 +38,8 @@ class AskWatch:
     def __init__(self):
         self.h: dict[tuple[str, str], collections.deque] = {}
 
-    def fires(self, key: tuple[str, str], now: float, bid, depth: float, window: float, drop: float) -> bool:
+    def fires(self, key: tuple[str, str], now: float, bid, depth: float, window: float, drop: float) -> str | None:
+        """Why it fired ("gone", "rise" or "size"), or None."""
         d = self.h.get(key)
         if d is None:
             d = self.h[key] = collections.deque()
@@ -49,10 +50,12 @@ class AskWatch:
         if not d or (d[-1][1], d[-1][2]) != (bid, depth):
             d.append((now, bid, depth))
         if hi is None:
-            return False
+            return None
         if bid is None:
-            return True
-        return bid < hi - 1e-9 or (peak > 0 and depth < (1 - drop) * peak)
+            return "gone"
+        if bid < hi - 1e-9:
+            return "rise"
+        return "size" if peak > 0 and depth < (1 - drop) * peak else None
 
     def forget(self, key: tuple[str, str]):
         self.h.pop(key, None)

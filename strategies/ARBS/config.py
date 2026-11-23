@@ -167,6 +167,10 @@ class TradingParams:
     requote_cooldown_s: float = param("Least time between voluntary moves (reprice or resize) of one resting "
                                       "quote. A new quote after a fill isn't a move.",
                                       min=0.0, step=0.5)
+    # 11-22 ARBS0B in-play: 4,900 grows/h, a fifth cut back within 3 s (each a
+    # 10-token amend that loses the queue); a 2-3 s hold cost 11-18 filled lots a day.
+    live_grow_hold_s: float = param("A live quote is grown (to 2x+ what rests) only once its room has stayed that "
+                                    "big this long, unless it is repriced anyway. 0: at once.", min=0.0, step=0.5)
 
 
 @section
@@ -265,6 +269,9 @@ class RuntimeParams:
                                    "(data/live/ARBS/liquidity/).", min=30.0, step=30.0, editable=False)
     feed_down_pull_s: float = param("Pull every quote once the Kalshi websocket has been down this long.",
                                     min=0.0, step=1.0, editable=False)
+    feed_ready_per_market: bool = param("After a Kalshi reconnect, a basket trades (and a feed-down pull leaves its "
+                                        "quotes) once each of its markets has its fresh snapshot, instead of "
+                                        "waiting for every market to be resubscribed.", editable=False)
     record_prints: bool = param("Log trade-time book snapshots on basket legs (data/live/ARBS/prints/), for "
                                 "replaying edge and size settings offline.")
     live_params_shadow: bool = param("Score each recorded live print at every edge (replay.py) and keep the "

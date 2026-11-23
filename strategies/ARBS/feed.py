@@ -52,6 +52,32 @@ class MultiFeed(LiveKalshiFeed):
         self._new: list[str] = []
         self.n_refreshes = 0
         self._sub_id = 1
+        # Markets whose snapshot arrived on this connection (ready()).
+        self.fresh: set[str] = set()
+        # Markets a (re)connect subscribes ahead of the rest, asked at each connect.
+        self.first = None
+
+    def ready(self, ticker: str) -> bool:
+        """`ticker`'s book is current: the feed is up, or the market's
+        snapshot has arrived since the last reconnect. A shard 0 process
+        resubscribes ~14k markets at 250/s, so the feed is only up ~60 s after
+        a drop (11-20..22)."""
+        return self.up or ticker in self.fresh
+
+    def _ordered(self) -> list[str]:
+        try:
+            lead = [t for t in (self.first() if self.first else ()) if t in self._books]
+        except Exception as e:          # a bad order must not stop the reconnect
+            print(f"[{self.label}] subscribe order failed ({e!r}); plain order", flush=True)
+            lead = []
+        return list(dict.fromkeys([*lead, *self._tickers]))
+
+    def _handle_message(self, d: dict):
+        super()._handle_message(d)
+        if d.get("type") == "orderbook_snapshot":
+            t = (d.get("msg") or {}).get("market_ticker")
+            if t in self._books:
+                self.fresh.add(t)
 
     def add(self, tickers):
         """Subscribe to more markets: on the open connection, and on every
@@ -79,10 +105,11 @@ class MultiFeed(LiveKalshiFeed):
         add() queues. Runs beside the reader: subscribing 12-23k markets before
         reading took 50-90 s, the unread snapshots stalled the 20 s keepalive,
         and the connection closed 1011 and resubscribed in a loop (11-17)."""
-        await self._subscribe(ws, first)
         if self._on_fill:
-            # `fill` is account-wide; one subscription covers every market.
+            # `fill` is account-wide; one subscription covers every market. First:
+            # after the books it came ~60 s into a shard 0 reconnect.
             await ws.send(json.dumps({"id": self._next_id(), "cmd": "subscribe", "params": {"channels": ["fill"]}}))
+        await self._subscribe(ws, first)
         self._set_up(True)
         while True:
             if self._new:
@@ -102,6 +129,8 @@ class MultiFeed(LiveKalshiFeed):
             self.down_since = None
         elif not up and self.up:
             self.down_since = time.monotonic()
+        if not up:
+            self.fresh.clear()
         self.up = up
 
     async def run(self):
@@ -116,7 +145,7 @@ class MultiFeed(LiveKalshiFeed):
                                               open_timeout=OPEN_TIMEOUT_S, max_size=None) as ws:
                     self.connected_at = time.monotonic()
                     self._new = []
-                    sub = asyncio.create_task(self._subscriber(ws, list(self._tickers)))
+                    sub = asyncio.create_task(self._subscriber(ws, self._ordered()))
                     last_seq: dict = {}
                     ob_sid, refresh_i = None, 0
                     refresh_at = time.monotonic() + self._refresh_gap()

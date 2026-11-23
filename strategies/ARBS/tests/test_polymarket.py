@@ -746,7 +746,7 @@ def test_a_feed_drop_pulls_only_that_venues_quotes(pm_arbs):
     async def pm_cancel_all(reason, raise_=False):
         raise AssertionError("polymarket quotes pulled for a kalshi drop")
 
-    async def sweep(reason, venues=None):
+    async def sweep(reason, venues=None, keep=None):
         swept.append(venues)
     r.cancel_quote, r.pm_cancel_all, r.sweep = cancel_quote, pm_cancel_all, sweep
     asyncio.run(r.pull_all("feed_down", venues={"kalshi"}))
