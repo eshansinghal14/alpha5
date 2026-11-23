@@ -557,6 +557,24 @@ def test_rescan_reordering_legs_keeps_quotes_on_their_markets(arbs):
     assert {q.ticker: q.price for q in r.quotes.values() if not q.deep} == before
 
 
+def test_quote_filed_under_another_legs_market_is_cancelled_not_repriced(arbs):
+    r, b = arbs
+    book(r, "X-A", [(0.30, 10)], [(0.35, 10)])
+    book(r, "X-B", [(0.40, 10)], [(0.45, 10)])
+    _eval(r, b)
+    before = {q.ticker: q.price for q in r.quotes.values() if not q.deep}
+    assert set(before) == {"X-A", "X-B"}
+    # Legs reordered under resting quotes by a path that skips set_baskets' order pin.
+    flipped = dataclasses.replace(b, legs=tuple(reversed(b.legs)))
+    r.baskets[b.basket_id] = flipped
+    moves = r.n["quote_moves"]
+    _eval(r, flipped)
+    assert not r.quotes and r.n["quote_moves"] == moves and r.n["misfiled"] >= 2
+    _eval(r, flipped)
+    assert all(flipped.legs[q.leg].ticker == q.ticker for q in r.quotes.values())
+    assert {q.ticker: q.price for q in r.quotes.values() if not q.deep} == before
+
+
 def test_live_events_quoted_only_when_enabled_and_smaller(arbs):
     r, b = arbs
     live = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))

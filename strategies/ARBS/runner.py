@@ -883,7 +883,7 @@ class ArbsRunner:
         self.tasks: set[asyncio.Task] = set()
         self.n = {"takes": 0, "take_bundles": 0.0, "quotes_placed": 0, "quote_moves": 0, "quote_cancels": 0,
                   "quote_fills": 0, "completions": 0, "unwinds": 0, "exit_unpriced": 0, "post_only_rejects": 0,
-                  "moves_refused": 0, "pulls": 0, "alt_fills": 0, "live_subset_fills": 0}
+                  "moves_refused": 0, "pulls": 0, "alt_fills": 0, "live_subset_fills": 0, "misfiled": 0}
         self.started = _utc()
         self.liq = Liquidity(self.root)
         self.prints = Prints(self.root)
@@ -3310,6 +3310,10 @@ class ArbsRunner:
                 self.resolve(b, pos, qs, now)
             return
         if self.standby is None:
+            bad = self.misfiled(b, live_qs)
+            if bad:
+                self.spawn(self.cancel_quotes(bad, "misfiled"), b.basket_id)
+                return
             if pos is not None and self.closing(b.basket_id):
                 self.close_out(b, pos, live_qs)
                 return
@@ -3386,6 +3390,20 @@ class ArbsRunner:
                     self.spawn(self.take(b, plan, held), b.basket_id)
                     return
         self.manage_quotes(b, vs, now)
+
+    def misfiled(self, b: Basket, qs: list[Quote]) -> list[Quote]:
+        """Quotes resting on another market than the leg they are filed under.
+        Quotes are keyed by leg index, so one whose basket's legs were reordered
+        under it is priced as the other leg: a LAL NO bid followed UTA's 41-45c
+        while LAL NO was worth ~30c and was picked off (KXNBA2H, 11-23, -$44)."""
+        bad = [q for q in qs if q.leg >= len(b.legs) or b.legs[q.leg].ticker != q.ticker
+               or (q.kind == "arb" and b.legs[q.leg].side != q.side)]
+        for q in bad:
+            self.n["misfiled"] += 1
+            self.journal({"kind": "misfiled", "basket_id": b.basket_id, "leg": q.leg, "ticker": q.ticker,
+                          "side": q.side, "legs": b.tickers, "price": q.price, "size": q.remaining,
+                          "quote_kind": q.kind, "placed_at": q.placed_at, **_deep(q)})
+        return bad
 
     def manage_quotes(self, b: Basket, vs, now: float):
         """One quote per leg, each priced on its own: a fill on leg j is
@@ -6001,10 +6019,16 @@ class ArbsRunner:
 
     def _restore_baskets(self, st: dict):
         """Baskets the state's quotes and exits are on, even ones the scan this
-        process read no longer lists; set_baskets keeps them while held."""
+        process read no longer lists; set_baskets keeps them while held. One
+        this process's scan lists in another leg order takes the state's order:
+        the handed-over quotes are keyed by its leg indices (288 quotes were on
+        the wrong leg after the 11-23 04:35 UTC handoff)."""
         for bid, d in (st.get("baskets") or {}).items():
-            if bid not in self.baskets:
-                self.baskets[bid] = basket_from_dict(d)
+            got, cur = basket_from_dict(d), self.baskets.get(bid)
+            if cur is None:
+                self.baskets[bid] = got
+            elif cur.legs != got.legs and set(cur.legs) == set(got.legs):
+                self.baskets[bid] = dataclasses.replace(cur, legs=got.legs)
 
     def restore(self, st: dict) -> list[str]:
         """Takes on handoff_state's state; returns tickers new to this process.

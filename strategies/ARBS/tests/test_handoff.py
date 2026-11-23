@@ -220,6 +220,21 @@ def test_state_round_trips_the_quote_table_and_exit_state_exactly(root):
     assert list(sb.upkeep[b.basket_id]) == [(now - 30.0, 12.0)]
 
 
+def test_restored_quotes_stay_on_their_legs_when_the_new_scan_orders_legs_differently(root):
+    old, b = _runner()
+    _quotes(old, b)
+    st = json.loads(json.dumps(old.handoff_state("h1")))
+    sb, _ = _runner(standby="h1")
+    sb.baskets.clear()                              # the standby's own scan: same basket, legs the other way
+    sb.set_baskets([dataclasses.replace(b, legs=tuple(reversed(b.legs)))])
+
+    async def go():
+        sb.restore(st)
+    asyncio.run(go())
+    assert sb.baskets[b.basket_id].legs == b.legs
+    assert all(sb.baskets[q.basket_id].legs[q.leg].ticker == q.ticker for q in sb.quotes.values())
+
+
 def test_restored_quotes_keep_their_order_client(root):
     old, b = _runner()
     _quotes(old, b)
