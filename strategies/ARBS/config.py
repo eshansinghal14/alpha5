@@ -49,6 +49,8 @@ class TradingParams:
     quote_unnetted: bool = param("Trade baskets Kalshi doesn't net (spread/total ladders, watch.py's families). "
                                  "Their cash stays locked to settlement, so the scan lists only those settling "
                                  "within config_pm.json's days_till_expiry. Off: recorded only.")
+    unnetted_quote_size: int = param("Most bundles a quote may rest on a basket Kalshi doesn't net, before and in "
+                                     "play (in play also within live_quote_size).", min=1, max=10000, step=1)
     quote_size: int = param("Bundles per resting quote.", min=1, max=10000, step=1)
     quote_live_events: bool = param("Quote events that have started (a game after kickoff). A live score change "
                                     "sweeps every leg at once, so a fill there is usually already a loss; "

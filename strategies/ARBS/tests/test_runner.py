@@ -1744,15 +1744,15 @@ def test_deep_quote_sized_to_what_the_other_legs_complete(arbs):
     assert r.quotes[(b.basket_id, 0, "deep")].size == 10
 
 
-def test_an_unnetted_basket_quotes_at_the_live_size_before_the_game_too(arbs):
+def test_an_unnetted_basket_quotes_within_unnetted_quote_size_before_the_game_too(arbs):
     r, b = arbs
     u = dataclasses.replace(b, basket_id="spread:X:B=>A", relationship_id="spread:X")
     r.set_baskets([u])
     r.hot, r.listed = [u.basket_id], {u.relationship_id}
-    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=50, live_quote_size=3, quote_unnetted=True)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=50, unnetted_quote_size=3, quote_unnetted=True)
     _slow_gap(r, u)
     assert not r.live_now(u, R._utc())
-    # A netted basket's deep quote here is 10 (test above): this one stops at live_quote_size.
+    # A netted basket's deep quote here is 10 (test above): this one stops at unnetted_quote_size.
     assert r.quotes[(u.basket_id, 0, "deep")].size == 3
     assert all(q.size <= 3 for q in r.quotes.values())
 
@@ -1762,7 +1762,7 @@ def test_a_resting_deep_quote_past_the_unnetted_cap_shrinks_at_its_price(arbs, m
     u = dataclasses.replace(b, basket_id="spread:X:B=>A", relationship_id="spread:X")
     r.set_baskets([u])
     r.hot, r.listed = [u.basket_id], {u.relationship_id}
-    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=50, live_quote_size=50, quote_unnetted=True)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=50, unnetted_quote_size=50, quote_unnetted=True)
     _slow_gap(r, u)
     dq = r.quotes[(u.basket_id, 0, "deep")]
     price = dq.price
@@ -1770,7 +1770,7 @@ def test_a_resting_deep_quote_past_the_unnetted_cap_shrinks_at_its_price(arbs, m
     monkeypatch.setattr(r, "deep_plan", lambda *a, **k: (None, 0))    # no new plan: the keep path
     _eval(r, u)
     assert r.quotes[(u.basket_id, 0, "deep")].remaining == 10        # within the cap, untouched
-    r.cfg.trading = dataclasses.replace(r.cfg.trading, live_quote_size=3)
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, unnetted_quote_size=3)
     _eval(r, u)
     dq = r.quotes[(u.basket_id, 0, "deep")]                           # same order, cut in place
     assert dq.remaining == 3 and dq.price == pytest.approx(price)

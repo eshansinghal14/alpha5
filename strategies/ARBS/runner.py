@@ -3906,14 +3906,18 @@ class ArbsRunner:
 
     def size_cap(self, b: Basket, live: bool) -> float:
         """Most bundles any quote completing through `b` may rest:
-        live_quote_size in play, and always on a basket Kalshi doesn't net (its
-        cash stays locked to settlement; a pre-game deep quote on a CIN-WAS 1H
-        spread ladder filled 3,577 lots in one sweep, completed $184 worse than
-        planned, 11-24 00:52 UTC); quote_size otherwise. A ladder never above
-        LADDER_QUOTE_SIZE."""
+        live_quote_size in play, quote_size before; on a basket Kalshi doesn't
+        net never past unnetted_quote_size (its cash stays locked to settlement;
+        a pre-game deep quote on a CIN-WAS 1H spread ladder filled 3,577 lots in
+        one sweep, completed $184 worse than planned, 11-24 00:52 UTC), and on a
+        ladder never above LADDER_QUOTE_SIZE."""
         t = self.cfg.trading
-        cap = float(t.live_quote_size if live or b.relationship_id.startswith(RECORD_PREFIXES) else t.quote_size)
-        return min(cap, LADDER_QUOTE_SIZE) if b.relationship_id.startswith(LADDER_PREFIX) else cap
+        cap = float(t.live_quote_size if live else t.quote_size)
+        if b.relationship_id.startswith(RECORD_PREFIXES):
+            cap = min(cap, float(t.unnetted_quote_size))
+        if b.relationship_id.startswith(LADDER_PREFIX):
+            cap = min(cap, LADDER_QUOTE_SIZE)
+        return cap
 
     def deep_cap(self, b: Basket, j: int, live: bool) -> float:
         """Most bundles a deep quote on leg j may rest: the arb quote's own

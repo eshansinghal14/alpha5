@@ -9,6 +9,7 @@
     "exit_ref_days": null,
     "days_till_expiry": null,
     "quote_unnetted": null,
+    "unnetted_quote_size": null,
     "quote_size": null,
     "quote_live_events": null,
     "take_live_events": null,
