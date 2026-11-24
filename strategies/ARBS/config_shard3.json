@@ -65,6 +65,8 @@
     "interval_s": null,
     "mecnet_max_legs": null,
     "ladder_span": null,
+    "mecnet_longshots": null,
+    "unnetted_ladders": null,
     "complete_set_exclude": null,
     "live_before_settle_h": null,
     "live_early_h": null,

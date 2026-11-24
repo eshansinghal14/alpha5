@@ -507,12 +507,15 @@ PM_MODIFY_ECHO_S = 2.0
 ALT_SEARCH_S = 0.5
 # best_plan also prices a MECNET NO leg through its greedy subset: that market
 # plus the cheapest other NO asks among its event's listed markets, up to
-# scan.mecnet_max_legs. Each further market adds its $1 less its ask, fee and
-# the edge that $1 needs, so the best k-market set is the k-1 cheapest. The
-# scan lists the k likeliest by YES price, which keeps long shots whose NO
-# costs more than that: at top of book on 11-23 the greedy subset priced
-# 3-13% of quotable NO legs on shards 0 and 3 higher, by ~3 ticks.
+# scan.mecnet_max_legs (every one with scan.mecnet_longshots). Each further
+# market adds its $1 less its ask, fee and the edge that $1 needs, so the best
+# k-market set is the k-1 cheapest. The scan lists the k likeliest by YES
+# price, which keeps long shots whose NO costs more than that: at top of book
+# on 11-23 the greedy subset priced 3-13% of quotable NO legs on shards 0 and
+# 3 higher, by ~3 ticks.
 GREEDY_SUBSETS = True
+# Relationship kinds whose NO legs share one MECNET event (scanner.LONGSHOT_PREFIX's too).
+MECNET_KINDS = ("mecnet", "complete_set", scanner.LONGSHOT_PREFIX.rstrip(":"))
 # Rested depth (aged_room) is re-read after a book change or this long.
 HELD_CACHE_S = 0.25
 # Live quotes in trading.model_series: edge and size from the exit-cost model,
@@ -1250,7 +1253,7 @@ class ArbsRunner:
         self.event_markets: dict[str, set[str]] = {}
         for b in self.all_baskets:
             kind, _, et = b.relationship_id.partition(":")
-            if kind in ("mecnet", "complete_set") and b.exact:
+            if kind in MECNET_KINDS and b.exact:
                 self.event_markets.setdefault(et, set()).update(b.tickers)
         self.dirty = {d for d in self.dirty if d in new} | changed
         self.rank_rows = {k: v for k, v in self.rank_rows.items() if k in new}
@@ -4145,7 +4148,7 @@ class ArbsRunner:
         here, not registered; book_target registers the one it books into."""
         leg = b.legs[j]
         kind, _, et = b.relationship_id.partition(":")
-        if leg.side != "no" or kind not in ("mecnet", "complete_set") or not b.exact:
+        if leg.side != "no" or kind not in MECNET_KINDS or not b.exact:
             return []
         markets = self.event_markets.get(et, set())
         others = []
@@ -4215,13 +4218,17 @@ class ArbsRunner:
         GREEDY_SUBSETS."""
         leg = b.legs[j]
         kind, _, et = b.relationship_id.partition(":")
-        if leg.side != "no" or kind not in ("mecnet", "complete_set") or not b.exact:
+        if leg.side != "no" or kind not in MECNET_KINDS or not b.exact:
             return None
         n_mk = len(self.event_markets.get(et, ()))
         others = [x for x in self._no_ranked(et, time.time()) if x[1] != leg.ticker]
         best, best_k, cum = None, 0, 0.0
-        for k in range(2, min(len(others) + 1, self.cfg.scan.mecnet_max_legs) + 1):
-            if k == n_mk:
+        cap, whole = self.cfg.scan.mecnet_max_legs, True
+        if self.cfg.scan.mecnet_longshots:
+            # The scan lists NO on every market only as a complete set's buy_all_no.
+            cap, whole = n_mk, f"complete_set:{et}:buy_all_no" in self.baskets
+        for k in range(2, min(len(others) + 1, cap) + 1):
+            if k == n_mk and whole:
                 break  # every market: listed already (mecnet or the complete set's buy_all_no)
             cum += others[k - 2][0]
             room = (k - 1) - need_of(float(k - 1)) - cum
@@ -4334,6 +4341,13 @@ class ArbsRunner:
         best, cost = b, rise(b, q.leg)
         now_ts = _utc()
         alts = self.alternatives(b, q.leg)
+        # The subset the quote was priced through: past mecnet_max_legs live_subsets doesn't build it.
+        via, leg = self._basket(self.via.get((b.basket_id, q.leg))), b.legs[q.leg]
+        k = None if via is None else next((i for i, l in enumerate(via.legs)
+                                           if l.ticker == leg.ticker and l.side == leg.side), None)
+        if (k is not None and via.basket_id not in {b.basket_id} | {y.basket_id for y, _ in alts}
+                and self.can_book(via, now_ts)):
+            alts.append((via, k))
         seen = {b.basket_id} | {y.basket_id for y, _ in alts}
         alts += [(y, k) for y, k in self.live_subsets(b, q.leg) if y.basket_id not in seen and self.can_book(y, now_ts)]
         for y, k in alts:

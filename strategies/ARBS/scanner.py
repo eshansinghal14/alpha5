@@ -5,6 +5,9 @@ relationships in spec.py's format, written to scanned_spec.json.
   MECNET     NO on the k likeliest markets pays at least k-1, for k = 2 up to
              scan.mecnet_max_legs. Any subset is safe; ranked by YES price at
              scan time so the subsets that can clear are the ones listed.
+  longshots  with scan.mecnet_longshots, the markets past those are listed
+             too (NO on a few of them with the likeliest market), so each can
+             be quoted; runner.greedy_subset prices them through every market.
   coverage   MECNET buckets running from a "below" tail through between ranges
              to an "above" tail are exhaustive as well: a complete set (both
              directions), unless the series is in scan.complete_set_exclude.
@@ -53,6 +56,10 @@ SPREAD_PREFIX = "spread:"
 RECORD_PREFIXES = (SPREAD_PREFIX, watch.WATCH_PREFIX)
 RECORD_SHARDS = (0, 3)
 SPREAD_CROSS = 3          # each team's lowest strikes paired across teams
+# Long shots get their own relationship, ranked by their own volume: select ranks
+# by volume per market, and dozens of quiet long shots in the event's relationship
+# would sink it under the market cap, the likeliest markets with it.
+LONGSHOT_PREFIX = "longshot:"
 
 
 def fetch_events() -> list[dict]:
@@ -210,7 +217,7 @@ def coverage_step(markets: list[dict]) -> float | None:
     return max(gaps) if min(gaps) >= 0 else None
 
 
-def mecnet(event: dict, markets: list[dict], max_legs: int, complete: bool) -> list[dict]:
+def mecnet(event: dict, markets: list[dict], max_legs: int, complete: bool, longshots: bool = False) -> list[dict]:
     et, series = event["event_ticker"], event["series_ticker"]
     ranked = sorted(markets, key=lambda m: -yes_price(m))
     rels = []
@@ -234,6 +241,16 @@ def mecnet(event: dict, markets: list[dict], max_legs: int, complete: bool) -> l
         rels.append({"relationship_id": f"mecnet:{et}", "type": "mutually_exclusive_no", "cluster": series,
                      "description": f"{et}: at most one market resolves YES; NO on any k of them pays k-1.",
                      "baskets": baskets})
+    if longshots and not complete and len(ranked) > max_legs:
+        top, rest = ranked[0]["ticker"], ranked[max_legs:]
+        lb = []
+        for i in range(0, len(rest), max_legs - 1):
+            ts = [top] + [m["ticker"] for m in rest[i:i + max_legs - 1]]
+            lb.append({"basket_id": f"mecnet:{et}:no:" + "+".join(sorted(_sfx(et, t) for t in ts)),
+                       "payout": len(ts) - 1, "legs": _legs(*((t, "no") for t in ts))})
+        rels.append({"relationship_id": f"{LONGSHOT_PREFIX}{et}", "type": "mutually_exclusive_no", "cluster": series,
+                     "description": f"{et}: the markets past the {max_legs} likeliest, NO on a few with the likeliest.",
+                     "baskets": lb, "volume_24h": round(sum(_f(m.get("volume_24h_fp")) for m in rest), 2)})
     return rels
 
 
@@ -307,7 +324,8 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
          skip_series: set[str] = frozenset(), starts: dict[str, str] | None = None,
          freqs: dict[str, str] | None = None, live_windows: dict[str, list[str]] | None = None,
          settle_lead: pd.Timedelta | None = None, early_h: dict[str, float] | None = None,
-         owns=None, locked_days: float | None = None) -> dict:
+         owns=None, locked_days: float | None = None, longshots: bool = False,
+         unnetted_ladders: set[str] = frozenset()) -> dict:
     """Every relationship found, each with its event's expected settlement,
     24h volume for `select`. `owns(event)`: only the events it accepts (shard
     0's split, parts.py). `starts`: event -> when it goes live
@@ -317,7 +335,8 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
     without a kickoff is live from this long before its expected settlement;
     `early_h`: series -> hours before its start an event turns live;
     `locked_days`: record-only baskets (RECORD_PREFIXES) come only from events
-    settling within this many days, None for no limit."""
+    settling within this many days, None for no limit; `longshots`:
+    scan.mecnet_longshots; `unnetted_ladders`: watch.ladders' series."""
     rels, tickers = [], set()
     locked_until = now + pd.Timedelta(days=locked_days) if locked_days is not None else None
 
@@ -339,13 +358,13 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
         elif e["collateral_return_type"] == "MECNET":
             complete = len(ms) == len(e["markets"]) and coverage_step(ms) is not None \
                 and e["series_ticker"] not in complete_set_exclude
-            got = mecnet(e, ms, mecnet_max_legs, complete)
+            got = mecnet(e, ms, mecnet_max_legs, complete, longshots)
         else:
             got = ladder(e, ms, ladder_span)
         s, live_from, vol = _timing(e, ms, s, now, starts, freqs, live_windows, settle_lead, early_h)
         for r in got:
             r.update(expected_settlement_utc=s.isoformat(), quote_until_utc=None, resume_quoting_utc=None,
-                     live_from_utc=live_from, volume_24h=vol)
+                     live_from_utc=live_from, volume_24h=r.get("volume_24h", vol))
             tickers |= {l["ticker"] for b in r["baskets"] for l in b["legs"]}
         rels += got
     # Record-only baskets across events (watch.py): settled when the last of
@@ -353,7 +372,8 @@ def scan(events: list[dict], *, now: pd.Timestamp, mecnet_max_legs: int, ladder_
     pool = watch_pool(events, shards, overrides, now, locked_days)
     ev_of = {m["ticker"]: et for et, (e, _) in pool.items() for m in e.get("markets") or []}
     for anchor, r, evs_in in watch.build([e for e, _ in pool.values()], RECORD_SHARDS, skip_series,
-                                         recorded=lambda e: spread_event(e, skip_series)):
+                                         recorded=lambda e: spread_event(e, skip_series),
+                                         ladder_series=unnetted_ladders):
         if owns is not None:
             if not owns(anchor):
                 continue
@@ -533,7 +553,8 @@ def run(cfg, spec_path: str, held: set[str] = frozenset(), owns=None, events: li
                freqs=fetch_frequencies() if freqs is None else freqs, live_windows=cfg.scan.live_windows,
                settle_lead=pd.Timedelta(hours=cfg.scan.live_before_settle_h) if cfg.scan.live_before_settle_h > 0 else None,
                early_h=cfg.scan.live_early_h, locked_days=locked_days,
-               overrides=settlement_overrides())
+               overrides=settlement_overrides(), longshots=cfg.scan.mecnet_longshots,
+               unnetted_ladders=set(cfg.scan.unnetted_ladders))
     have = {r["relationship_id"] for r in doc["relationships"]}
     try:
         with open(spec_path, encoding="utf-8") as fh:
@@ -590,7 +611,9 @@ def scan_and_select(root: str, config_path: str | None = None, markets: int | No
             pool = watch_pool(events, set(cfg.scan.shards), settlement_overrides(), pd.Timestamp.now(tz="UTC"),
                               locked_days)
             listed += sorted({a for a, _, _ in watch.build([e for e, _ in pool.values()], RECORD_SHARDS, skip,
-                                                          recorded=lambda e: spread_event(e, skip))} - set(listed))
+                                                          recorded=lambda e: spread_event(e, skip),
+                                                          ladder_series=set(cfg.scan.unnetted_ladders))}
+                             - set(listed))
             cpu = parts.spend(procs=group, name=parts.CPU)
             if sum(cpu.values()) < parts.CPU_MIN_S:
                 cpu = parts.spend(procs=group, name=parts.MSGS)

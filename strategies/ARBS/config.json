@@ -66,6 +66,8 @@
     "interval_s": 120.0,
     "mecnet_max_legs": 6,
     "ladder_span": 3,
+    "mecnet_longshots": false,
+    "unnetted_ladders": [],
     "complete_set_exclude": [],
     "live_before_settle_h": 6.0,
     "live_early_h": {

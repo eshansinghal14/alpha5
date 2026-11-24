@@ -226,6 +226,12 @@ class ScanParams:
                                  min=2, max=50, step=1, editable=False)
     ladder_span: int = param("DIRECNET strikes each strike is paired with, going up the ladder.", min=1, max=100,
                              step=1, editable=False)
+    mecnet_longshots: bool = param("List a MECNET event's markets past the mecnet_max_legs likeliest too (NO on a "
+                                   "few of them with the likeliest market), ranked by their own volume, and price "
+                                   "NO quotes through subsets of any size.", editable=False)
+    unnetted_ladders: list[str] = param("Series Kalshi doesn't net whose events' strikes measure one quantity: "
+                                        "YES on a strike + NO on a higher one is listed (watch.ladders).",
+                                        editable=False)
     complete_set_exclude: list[str] = param("Series whose MECNET buckets are not traded as complete sets "
                                             "(buy every YES / every NO), though they look like they cover "
                                             "every outcome.", editable=False)

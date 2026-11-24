@@ -2833,6 +2833,50 @@ def test_quote_priced_through_the_greedy_subset_even_if_unlisted(arbs):
     assert ab.basket_id not in r.via_by_ticker.get("E-C", set())
 
 
+def _event_longshots(r):
+    """Event E: A, B, C likeliest (YES bids 0.40/0.20/0.10), long shots D..G at
+    0.05; mecnet_max_legs 3, so D and E are listed only as NO on A+D+E."""
+    from backtest.book import L2Book
+    mk = lambda bid, rel, ts, payout: Basket(basket_id=bid, relationship_id=rel, type="mutually_exclusive_no",
+                                             cluster="E", legs=tuple(Leg(f"E-{t}", "no") for t in ts), payout=payout,
+                                             quote_until=None, resume_quoting=None)
+    bs = [mk("mecnet:E:no:A+B", "mecnet:E", "AB", 1.0), mk("mecnet:E:no:A+B+C", "mecnet:E", "ABC", 2.0),
+          mk("mecnet:E:no:A+D+E", "longshot:E", "ADE", 2.0), mk("mecnet:E:no:A+F+G", "longshot:E", "AFG", 2.0)]
+    bids = {"A": 0.40, "B": 0.20, "C": 0.10, "D": 0.05, "E": 0.05, "F": 0.05, "G": 0.05}
+    for t, y in bids.items():
+        r.feed._books[f"E-{t}"] = L2Book(f"E-{t}")
+        r.meta[f"E-{t}"] = R.Meta(ticker=f"E-{t}", event="E", status="active", shard=0, taker_rate=0.07,
+                                  maker_rate=0.0)
+    r.set_baskets(bs)
+    r.hot = [b.basket_id for b in bs]
+    for t, y in bids.items():
+        book(r, f"E-{t}", [(y, 100)], [(round(1 - y - 0.30, 2), 100)])     # NO bids well under the asks
+    return bs[2]
+
+
+def test_longshots_price_through_every_market_and_a_fill_books_there(arbs):
+    r, _ = arbs
+    r.cfg.scan = dataclasses.replace(r.cfg.scan, mecnet_max_legs=3, mecnet_longshots=False)
+    ade = _event_longshots(r)
+    _eval(r, ade)
+    capped = r.quotes[(ade.basket_id, 1)].max_price
+    assert len(r._basket(r.via[(ade.basket_id, 1)]).legs) <= 3
+    r.cfg.scan = dataclasses.replace(r.cfg.scan, mecnet_longshots=True)
+    r._alt_pick.clear()
+    r._no_rank.clear()
+    _eval(r, ade)
+    q = r.quotes[(ade.basket_id, 1)]
+    via = r._basket(r.via[(ade.basket_id, 1)])
+    # NO on all seven markets pays $6: each long shot's $0.05 YES bid adds to D's price.
+    assert {l.ticker for l in via.legs} == {f"E-{t}" for t in "ABCDEFG"} and via.payout == 6.0
+    assert q.max_price > capped + 0.10
+    rows = []
+    r.journal = rows.append
+    r._quote_fill(q, 5, 5 * q.price, None, "shadow")
+    fill = [x for x in rows if x["kind"] == "fill"][0]
+    assert fill["basket_id"] == via.basket_id and fill["quoted_in"] == ade.basket_id
+
+
 def test_greedy_subsets_off_prices_through_listed_baskets_only(arbs, monkeypatch):
     monkeypatch.setattr(R, "GREEDY_SUBSETS", False)
     r, _ = arbs

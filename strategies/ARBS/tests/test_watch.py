@@ -60,6 +60,19 @@ def test_same_quantity_ladders_across_events_and_equal_strikes_both_ways():
                    for x in r["baskets"] for l in x["legs"])
 
 
+def test_unnetted_ladders_hold_on_every_count_for_listed_series_only():
+    et = "KXGTA6UNITS-01MAR27"
+    e = ev(et, [mk(f"{et}-T{k}", f"At least {k} million", k, typ="greater_or_equal") for k in (33, 36, 39, 42, 45)],
+           shard=0, category="Entertainment")
+    assert not watch.build([e], {0})
+    rels = watch.build([e], {0}, ladder_series={"KXGTA6UNITS"})
+    ids = {x["basket_id"] for _, r, _ in rels for x in r["baskets"]}
+    assert f"watch:{et}:ladder:T42=>T33" in ids and f"watch:{et}:ladder:T45=>T33" not in ids   # SPAN 3
+    strikes = {m["ticker"]: m["floor_strike"] for m in e["markets"]}
+    assert check_all(rels, lambda t, w: w >= strikes[t], range(30, 50)) == 3 + 3 + 2 + 1
+    assert not watch.build([{**e, "collateral_return_type": "DIRECNET"}], {0}, ladder_series={"KXGTA6UNITS"})
+
+
 def test_same_quantity_ladders_are_sports_only():
     a = total("KXNBATOTAL-26NOV22AB", [199.5, 201.5])
     b = total("KXNBATOTALPRECISE-26NOV22AB", [200.5, 201.5])

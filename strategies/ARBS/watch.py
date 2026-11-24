@@ -16,6 +16,8 @@ Each pays at least its payout whatever happens, from the markets' own rules:
             scores can't fall between.
   props     points, rebounds or assists <= PRA; 3 x threes <= points; scoring
             the first touchdown means scoring one.
+  ladder    the series in scan.unnetted_ladders: one event's "at least" strikes
+            measure one quantity, so a higher one implies every lower one.
 
 Every basket's id is WATCH_PREFIX + its anchor event + kind, so parts.event_of
 gives the anchor and a split shard's owner of that event records it.
@@ -359,17 +361,40 @@ def props(by_et: dict[str, dict]) -> list[tuple[str, str, list[dict]]]:
     return out
 
 
-def build(events: list[dict], shards, skip_series=frozenset(), recorded=lambda e: False) -> list[tuple[str, dict, list[str]]]:
+def ladders(by_et: dict[str, dict], series) -> list[tuple[str, str, list[dict]]]:
+    """Within one event of `series`: YES on a strike and NO on one of the next
+    SPAN past it pays at least 1 (UP strikes upward, DOWN downward)."""
+    out = []
+    for et, e in by_et.items():
+        if e.get("series_ticker") not in series or e.get("collateral_return_type"):
+            continue
+        bs = []
+        for types, field, sign in ((UP, "floor_strike", 1.0), (DOWN, "cap_strike", -1.0)):
+            rungs = sorted((sign * _f(m[field]), m["ticker"]) for m in _active(e)
+                           if m.get("strike_type") in types and _f(m.get(field)) is not None)
+            for i, (ka, a) in enumerate(rungs):
+                for kb, b in rungs[i + 1:i + 1 + SPAN]:
+                    if kb - ka > 1e-9:
+                        bs.append({"basket_id": f"{WATCH_PREFIX}{et}:ladder:{_sfx(et, b)}=>{_sfx(et, a)}",
+                                   "payout": 1, "legs": _legs((a, "yes"), (b, "no"))})
+        if bs:
+            out.append((et, "ladder", bs))
+    return out
+
+
+def build(events: list[dict], shards, skip_series=frozenset(), recorded=lambda e: False,
+          ladder_series=frozenset()) -> list[tuple[str, dict, list[str]]]:
     """(anchor event, relationship, events its legs are in) for every family,
     over the events on `shards` (a basket's legs share one shard). `recorded`:
-    events scanner.spreads lists already."""
+    events scanner.spreads lists already; `ladder_series`: the ladder family's."""
     evs = [e for e in events if e.get("exchange_index") in shards and e.get("category") not in SKIP_CATEGORIES
            and e.get("series_ticker") not in skip_series]
     by_et = {e["event_ticker"]: e for e in evs}
     ev_of = {m["ticker"]: e["event_ticker"] for e in evs for m in e.get("markets") or []}
     shard_of = {m["ticker"]: e.get("exchange_index") for e in evs for m in e.get("markets") or []}
     out = []
-    for anchor, kind, bs in same(evs, recorded) + deadlines(evs) + margins(by_et) + winners(by_et) + sums(by_et) + props(by_et):
+    for anchor, kind, bs in (same(evs, recorded) + deadlines(evs) + margins(by_et) + winners(by_et) + sums(by_et) + props(by_et)
+                              + ladders(by_et, ladder_series)):
         bs = [b for b in bs if len({shard_of.get(l["ticker"]) for l in b["legs"]}) == 1]
         if not bs:
             continue

@@ -47,6 +47,38 @@ def test_mecnet_lists_no_on_the_likeliest_k():
     assert b.payout == 2 and {l.side for l in b.legs} == {"no"}
 
 
+def test_longshots_listed_with_the_likeliest_in_their_own_relationship():
+    e = event("EV-2", "MECNET", [mkt(f"EV-2-M{i}", 0.5 - 0.05 * i, vol=100 * (i + 1)) for i in range(9)])
+    args = dict(now=NOW, mecnet_max_legs=3, ladder_span=3, complete_set_exclude=[], overrides={})
+    assert [r["relationship_id"] for r in scanner.scan([e], **args)["relationships"]] == ["mecnet:EV-2"]
+    doc = scanner.scan([e], **args, longshots=True)
+    rels = {r["relationship_id"]: r for r in doc["relationships"]}
+    ls = rels["longshot:EV-2"]
+    # Past the 3 likeliest, two at a time with the likeliest (M0).
+    assert [sorted(l["ticker"][-2:] for l in b["legs"]) for b in ls["baskets"]] ==         [["M0", "M3", "M4"], ["M0", "M5", "M6"], ["M0", "M7", "M8"]]
+    assert all(b["payout"] == 2 and {l["side"] for l in b["legs"]} == {"no"} for b in ls["baskets"])
+    assert ls["volume_24h"] == sum(100 * (i + 1) for i in range(3, 9))
+    assert rels["mecnet:EV-2"]["volume_24h"] == sum(100 * (i + 1) for i in range(9))
+    assert len(baskets(doc)) == 2 + 3
+    # Ranked on their own: they don't pull the event's likeliest markets out of the cap.
+    sel = scanner.select(doc, now=NOW, days=90, max_markets=3)
+    assert [r["relationship_id"] for r in sel["relationships"]] == ["mecnet:EV-2"]
+    # A complete set lists every market already.
+    doc = scanner.scan([event("EV-3", "MECNET", buckets("EV-3"))], **args, longshots=True)
+    assert not any(r["relationship_id"].startswith("longshot:") for r in doc["relationships"])
+
+
+def test_unnetted_ladder_series_listed_as_watch_ladders():
+    ms = [mkt(f"KXGTA6UNITS-01MAR27-T{k}", strike_type="greater_or_equal", floor_strike=k) for k in (33, 36, 39)]
+    e = {**event("KXGTA6UNITS-01MAR27", "", ms), "category": "Entertainment"}
+    args = dict(now=NOW, mecnet_max_legs=6, ladder_span=3, complete_set_exclude=[], overrides={}, locked_days=120)
+    assert not scanner.scan([e], **args)["relationships"]
+    doc = scanner.scan([e], **args, unnetted_ladders={"KXGTA6UNITS"})
+    assert {b["basket_id"] for r in doc["relationships"] for b in r["baskets"]} == {
+        "watch:KXGTA6UNITS-01MAR27:ladder:T36=>T33", "watch:KXGTA6UNITS-01MAR27:ladder:T39=>T33",
+        "watch:KXGTA6UNITS-01MAR27:ladder:T39=>T36"}
+
+
 def test_ladder_pairs_strikes_within_span():
     ms = [mkt(f"L-1-T{k}", strike_type="greater", floor_strike=k) for k in range(5)]
     ms.append(mkt("L-1-X", strike_type="greater_or_equal", floor_strike=2))
