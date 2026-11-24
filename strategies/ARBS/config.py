@@ -194,6 +194,12 @@ class CompletionParams:
                                  "in full.", min=1, max=100, step=1)
     max_broken_baskets: int = param("No new takes or quotes while this many baskets are broken.", min=1,
                                     max=1000, step=1, editable=False)
+    exit_wait_s: float = param("A forced exit (a fast move, or a live event) rests post-only bids this long, "
+                               "then takes what is left. An exit at least as good as planned still goes at "
+                               "once. 0: forced exits take at once.", min=0.0, max=1800.0, step=30.0)
+    exit_now_spread: float = param("A forced exit takes at once, without exit_wait_s, when 0.1 s after it comes "
+                                   "due every filled leg's market spread is at most this ($), or the market is "
+                                   "a daily temperature.", min=0.0, max=0.5, step=0.01)
 
 
 @section

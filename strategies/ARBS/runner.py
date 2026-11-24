@@ -26,6 +26,7 @@ import json
 import math
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -383,6 +384,13 @@ PRE_LIMIT_SLACK_TICKS = 1
 EVAL_SLICE_S = 0.001
 ORDER_ERROR_COOLDOWN_S = 120.0
 EXIT_CREATE_WAIT_S = 0.005
+# completion.exit_wait_s is decided on the book this long after a forced exit
+# comes due: the sweep study's "exit now" price was the touch 0.1 s after the
+# sweep (113k sweeps 11-04..23, alpha5_research/sweep_types/RESULTS.md).
+EXIT_WAIT_LOOK_S = 0.1
+# Daily high/low temperature series: waiting gained nothing measurable there
+# (+0.3c/lot [-0.1, +0.8] at 5 min, 10.6k sweeps 11-04..23), so they exit at once.
+DAILY_WEATHER = re.compile(r"KX(HIGH|LOW)T?[A-Z]{2,4}")
 # A book update that leaves the top unchanged re-evaluates a pre-game basket at
 # most once per LAZY_EVAL_S: deep-level churn on KXNVDACEO-29JAN (2.75M updates
 # on 11-18, 12x the day before) re-evaluated its 6 baskets on every one, a
@@ -890,6 +898,7 @@ class ArbsRunner:
         # paths and over time anyway.
         self.exit_hist: dict[str, collections.deque] = {}
         self.exit_planned: dict[str, float] = {}  # exit cost the fill or take was priced at
+        self.exit_wait: dict[str, dict] = {}      # basket_id -> its forced exit's wait (exit_wait_why)
         # basket_id -> [exit fills' cash since the plan, bundles held then]:
         # puts a partly done exit's cost back on the plan's basis.
         self.exit_base: dict[str, list[float]] = {}
@@ -2499,6 +2508,17 @@ class ArbsRunner:
         return cost + base[0] - b.payout * (pos.bundles(b.tickers) - base[1])
 
     def end_exit(self, basket_id: str):
+        w = self.exit_wait.pop(basket_id, None)
+        if w is not None and w["wait"] is not None:
+            # What the exit cost in the end, on the basis of the cost when it
+            # was decided: their difference is what waiting saved. "flat": no
+            # position left, which is also how a settled market looks.
+            b, pos, base = self.baskets.get(basket_id), self.ledger.baskets.get(basket_id), self.exit_base.get(basket_id)
+            done = None if b is None or base is None else \
+                base[0] - b.payout * ((pos.bundles(b.tickers) if pos else 0.0) - base[1])
+            self.journal({"kind": "exit_wait_end", "basket_id": basket_id, "wait": w["wait"], "why": w["why"],
+                          "cost": w["cost"], "done_cost": None if done is None else round(done, 4),
+                          "flat": pos is None, "secs": round(time.time() - w["at"], 1)})
         for d in (self.exit_hist, self.exit_planned, self.exit_base, self.exit_misses):
             d.pop(basket_id, None)
 
@@ -4589,6 +4609,7 @@ class ArbsRunner:
         why = ("fast move" if cost - best >= moved - _EPS else
                "at plan" if at_plan else
                "live event" if self.live_now(b, _utc()) or not b.quoting_allowed(_utc()) else None)
+        why = self.exit_wait_why(b, ex, legs, path, cost, why, now)
         misses = self.exit_misses.get(bid, 0)
         if why is not None and misses >= c.max_exit_misses:
             why = None
@@ -4603,6 +4624,55 @@ class ArbsRunner:
             if self.last_exit.get(bid) != sig:
                 self.last_exit[bid] = sig
                 self.spawn(self.exit_now(b, path, ex, legs, others, qs, cost, why), bid, eager=True)
+
+    def exit_wait_why(self, b: Basket, ex: pricing.Exits, legs, path: str, cost: float, why: str | None,
+                      now: float) -> str | None:
+        """The why to take the exit on now, or None to rest. A forced exit (a fast
+        move or a live event) rests for completion.exit_wait_s and then takes,
+        unless EXIT_WAIT_LOOK_S after it came due every filled leg's spread is
+        within exit_now_spread, or it is daily weather. An exit at plan goes at
+        once. Sweeps 11-04..23: a 5 min wait was 2.2c/lot cheaper (pessimistic),
+        but 0.5c dearer where the spread was 2c or less."""
+        c, bid = self.cfg.completion, b.basket_id
+        w = self.exit_wait.get(bid)
+        if w is None:
+            if why not in ("fast move", "live event") or c.exit_wait_s <= 0:
+                return why
+            w = self.exit_wait[bid] = {"at": now, "why": why, "wait": None, "cost": None}
+            self._urgent_in(bid, EXIT_WAIT_LOOK_S)
+        if w["wait"] is None:
+            if now < w["at"] + EXIT_WAIT_LOOK_S:
+                return why if why == "at plan" else None
+            filled = [j for j, e in enumerate(ex.excess) if e > _EPS]
+            spread = max((legs[j].best_ask - legs[j].bid
+                          if legs[j] is not None and legs[j].bid is not None and legs[j].best_ask is not None
+                          else math.inf for j in filled), default=0.0)
+            weather = any(DAILY_WEATHER.fullmatch(b.legs[j].ticker.split("-")[0]) for j in filled)
+            w["wait"] = spread > c.exit_now_spread + _EPS and not weather
+            w["cost"] = round(cost, 4)
+            self.journal({"kind": "exit_wait", "basket_id": bid, "wait": w["wait"], "why": w["why"], "path": path,
+                          "cost": w["cost"], "spread": None if math.isinf(spread) else round(spread, 4),
+                          "weather": weather})
+            if not w["wait"]:
+                return why or w["why"]
+            # The markets are treated as live from now, as the exit at once did:
+            # other baskets on them quote live and their own breaks wait too.
+            self.flag_exit(b, path, w["why"])
+            self._urgent_in(bid, w["at"] + c.exit_wait_s - now)
+        if not w["wait"] or why == "at plan":
+            return why
+        return (why or w["why"]) if now >= w["at"] + c.exit_wait_s else None
+
+    def _urgent_in(self, basket_id: str, delay: float):
+        asyncio.get_running_loop().call_later(max(delay, 0.0), self._mark_urgent, basket_id)
+
+    def flag_exit(self, b: Basket, path: str, why: str):
+        # Not an unwind that doesn't lose: real arbs within 5 min of one made
+        # 3.8c/lot (225 arbs, 10-30..11-12), against -4.1c after a losing unwind.
+        if why == "fast move" or (path == "unwind" and why != "at plan"):
+            self.flag_live(b, f"a {why} {path}")
+        elif why == "at plan":
+            self.unflag_live(b)
 
     def _finish_cost(self, b: Basket, held: list[float]) -> float:
         """Cash the cheaper exit costs from `held` at today's books, less the
@@ -4654,17 +4724,14 @@ class ArbsRunner:
             self.n["completions" if path == "complete" else "unwinds"] += 1
             planned = self.exit_planned.get(bid)
             worse = None if planned is None else cost - planned
+            w = self.exit_wait.get(bid)
             self.journal({"kind": path, "basket_id": bid, "why": why, "cost": round(cost, 4),
                           "vs_plan": None if worse is None else round(worse, 4),
-                          "orders": {t: [sd, n, p] for _, t, sd, n, _, p in orders}})
+                          "orders": {t: [sd, n, p] for _, t, sd, n, _, p in orders},
+                          **({"waited_s": round(decided_at - w["at"], 1)} if w and w["wait"] else {})})
             if worse is not None and worse > _EPS:
                 self.alert("warn", bid, f"{path} ${worse:.2f} worse than planned ({why})")
-            # Not an unwind that doesn't lose: real arbs within 5 min of one made
-            # 3.8c/lot (225 arbs, 10-30..11-12), against -4.1c after a losing unwind.
-            if why == "fast move" or (path == "unwind" and why != "at plan"):
-                self.flag_live(b, f"a {why} {path}")
-            elif why == "at plan":
-                self.unflag_live(b)
+            self.flag_exit(b, path, why)
             res = await asyncio.gather(*sends, *pulls)
             res = res[:len(orders)]
         finally:
@@ -6139,7 +6206,7 @@ class ArbsRunner:
             "baskets": {b: basket_to_dict(self.baskets[b]) for b in bids if b in self.baskets},
             "exit": {"hist": {b: [list(x) for x in h] for b, h in self.exit_hist.items()},
                      "planned": self.exit_planned, "base": self.exit_base, "misses": self.exit_misses,
-                     "notes": self.completion_note, "unpriced": self.unpriced_alert_at},
+                     "notes": self.completion_note, "unpriced": self.unpriced_alert_at, "wait": self.exit_wait},
             "groups": {ev: {**g, "fills": [list(x) for x in g["fills"]]} for ev, g in self.groups.items()},
             "flagged": self.flagged,
             "model_state": [[k[0], k[1], k[2], v] for k, v in self.model_state.items()],
@@ -6204,6 +6271,7 @@ class ArbsRunner:
         # Kept: an unpriced basket alerted once per break, not again at every handoff
         # (KXART 11-20 ladders waiting on settlement, 36 alerts over 6 handoffs).
         self.unpriced_alert_at = dict(ex.get("unpriced") or {})
+        self.exit_wait = dict(ex.get("wait") or {})
         self.groups = {ev: {**g, "fills": collections.deque(tuple(x) for x in g["fills"])}
                        for ev, g in st["groups"].items()}
         self._group_ev = {g["id"]: ev for ev, g in self.groups.items() if g["id"]}
@@ -6214,6 +6282,9 @@ class ArbsRunner:
         self.restore_warm(st["warm"])
         self.restore_cheap(st.get("cheap"))
         loop = asyncio.get_running_loop()
+        for bid, w in self.exit_wait.items():
+            if w["wait"]:
+                self._urgent_in(bid, w["at"] + self.cfg.completion.exit_wait_s - time.time())
         for q in self.quotes.values():
             if q.pm_from is not None:
                 loop.call_later(PM_MODIFY_ECHO_S, self._pm_unconfirmed, q, q.pm_from[1])

@@ -49,7 +49,9 @@
     "chase_ticks": null,
     "chase_window_s": null,
     "max_exit_misses": null,
-    "max_broken_baskets": null
+    "max_broken_baskets": null,
+    "exit_wait_s": null,
+    "exit_now_spread": null
   },
   "watch": {
     "queue_window_s": null,

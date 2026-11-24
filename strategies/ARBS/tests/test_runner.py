@@ -523,6 +523,8 @@ def test_slow_drift_keeps_resting(arbs):
     r.cfg.completion = dataclasses.replace(r.cfg.completion, chase_window_s=0.0)
     _broken(r, b)
     _eval(r, b)
+    # Aged by hand: Windows' time.time() ticks every 15.6 ms, so both evals can read the same time.
+    r.exit_hist[b.basket_id] = collections.deque((t - 1.0, v) for t, v in r.exit_hist[b.basket_id])
     book(r, "X-A", [(0.25, 10)], [(0.35, 10)])       # same 5-tick move, but nothing recent to measure from
     _eval(r, b)
     assert r.shadow_ledger.baskets[b.basket_id].unhedged(b.tickers) == {"X-A": 5}
@@ -1610,6 +1612,77 @@ def test_an_unwind_on_a_fast_move_flags_the_markets_live(arbs):
     book(r, "X-A", [(0.25, 10)], [(0.35, 10)])      # the unwind runs 0.25 away
     _eval(r, b)
     assert b.basket_id not in r.shadow_ledger.baskets and set(r.flagged) == {"X-A", "X-B"}
+
+
+def _waiting(r, b, live=True):
+    """Exit waits on, and `b` broken on a live event: 5 YES A, A's spread 35c."""
+    r.cfg.completion = dataclasses.replace(r.cfg.completion, exit_wait_s=300.0, exit_now_spread=0.02)
+    if live:
+        b = dataclasses.replace(b, live_from=pd.Timestamp("2026-01-01", tz="UTC"))
+        r.baskets[b.basket_id] = b
+    _broken(r, b)
+    return b
+
+
+def _journal(tmp_path):
+    return [json.loads(l) for f in (tmp_path / "ARBS" / "journal").glob("*.jsonl") for l in open(f)]
+
+
+def test_a_forced_exit_on_a_wide_spread_rests_then_takes_after_exit_wait_s(arbs, tmp_path):
+    r, b = arbs
+    b = _waiting(r, b)
+    _eval(r, b)                                           # due: rests until the 0.1 s look
+    assert r.quotes[(b.basket_id, 0)].kind == "unwind" and b.basket_id in r.shadow_ledger.baskets
+    r.exit_wait[b.basket_id]["at"] -= R.EXIT_WAIT_LOOK_S
+    _eval(r, b)                                           # 35c spread: waits, the markets go live
+    assert r.exit_wait[b.basket_id]["wait"] is True and b.basket_id in r.shadow_ledger.baskets
+    assert set(r.flagged) == {"X-A", "X-B"}
+    r.exit_wait[b.basket_id]["at"] -= 300.0
+    _eval(r, b)
+    assert b.basket_id not in r.shadow_ledger.baskets and b.basket_id not in r.exit_wait
+    rows = _journal(tmp_path)
+    w = next(x for x in rows if x["kind"] == "exit_wait")
+    assert (w["wait"], w["why"], w["spread"], w["weather"]) == (True, "live event", 0.35, False)
+    assert next(x for x in rows if x["kind"] == "unwind")["waited_s"] >= 300.0
+    end = next(x for x in rows if x["kind"] == "exit_wait_end")
+    assert end["wait"] is True and end["flat"] is True
+
+
+def test_a_forced_exit_on_a_tight_spread_takes_at_the_look(arbs, tmp_path):
+    r, b = arbs
+    b = _waiting(r, b)
+    book(r, "X-A", [(0.34, 10)], [(0.65, 10)])            # A: YES 0.34 bid / 0.35 ask
+    _eval(r, b)
+    assert b.basket_id in r.shadow_ledger.baskets
+    r.exit_wait[b.basket_id]["at"] -= R.EXIT_WAIT_LOOK_S
+    _eval(r, b)
+    assert b.basket_id not in r.shadow_ledger.baskets
+    w = next(x for x in _journal(tmp_path) if x["kind"] == "exit_wait")
+    assert (w["wait"], w["spread"]) == (False, 0.01)
+
+
+def test_an_exit_at_plan_goes_at_once_while_waiting(arbs):
+    r, b = arbs
+    b = _waiting(r, b)
+    _eval(r, b)
+    r.exit_wait[b.basket_id]["at"] -= R.EXIT_WAIT_LOOK_S
+    _eval(r, b)
+    assert b.basket_id in r.shadow_ledger.baskets
+    book(r, "X-A", [(0.45, 10)], [(0.35, 10)])            # A's NO ask 0.55: netting out no longer loses
+    _eval(r, b)
+    assert b.basket_id not in r.shadow_ledger.baskets
+
+
+def test_a_pre_game_rest_is_not_a_forced_exit(arbs):
+    r, b = arbs
+    b = _waiting(r, b, live=False)
+    _eval(r, b)
+    assert b.basket_id not in r.exit_wait and r.quotes[(b.basket_id, 0)].kind == "unwind"
+
+
+def test_daily_weather_series():
+    assert all(R.DAILY_WEATHER.fullmatch(s) for s in ("KXHIGHNY", "KXHIGHTSATX", "KXLOWTNYC", "KXHIGHPHIL"))
+    assert not any(R.DAILY_WEATHER.fullmatch(s) for s in ("KXHIGHINFLATION", "KXLOWESTRATE", "KXHIGHMOVDJT", "X"))
 
 
 def test_live_edge_add_raises_the_quote_edge(arbs):
