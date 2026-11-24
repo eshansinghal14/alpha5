@@ -37,5 +37,5 @@ chmod 700 "$APP/secrets"
 
 sudo cp deploy/systemd/*.service deploy/systemd/*.timer /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now alpha5-archive.timer
+sudo systemctl enable --now alpha5-archive.timer alpha5-disk-guard.timer
 echo "bootstrap done at $(git rev-parse --short HEAD). Copy secrets, then: sudo systemctl enable --now alpha5-crypto alpha5-arbs"

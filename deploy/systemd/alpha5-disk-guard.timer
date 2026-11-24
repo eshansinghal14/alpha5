@@ -1,0 +1,9 @@
+[Unit]
+Description=alpha5: disk guard, hourly
+
+[Timer]
+OnCalendar=*-*-* *:50:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

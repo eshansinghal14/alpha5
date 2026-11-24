@@ -1,0 +1,13 @@
+[Unit]
+Description=alpha5: rotate oversized logs; ship recorded days to S3 early while the disk is low (deploy/disk_guard.sh)
+
+[Service]
+Type=oneshot
+User=ubuntu
+Nice=19
+OOMScoreAdjust=1000
+IOSchedulingClass=idle
+MemoryMax=600M
+# "+" runs it as root: systemd opened the services' logs as root.
+ExecStart=+/bin/bash /opt/alpha5/deploy/disk_guard.sh logs
+ExecStart=/bin/bash /opt/alpha5/deploy/disk_guard.sh archive

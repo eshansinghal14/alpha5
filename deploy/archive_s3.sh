@@ -15,6 +15,9 @@ BUCKET=alpha5-archive-992536799271
 KEEP_DAYS=${KEEP_DAYS:-5}
 cutoff=$(date -u -d "-$KEEP_DAYS days" +%F)
 cd /opt/alpha5/data || exit 1
+# deploy/disk_guard.sh runs this too: two runs would upload and slim the same journal.
+exec 9> .archive.lock
+flock 9
 
 # Succeeds only once S3 holds at least the paths' file bytes (a tar is never
 # smaller). Each step is checked explicitly: errexit is off inside a function
