@@ -3724,6 +3724,37 @@ def test_sweep_cancels_our_order_on_a_market_no_longer_in_meta(arbs, monkeypatch
     assert calls == ["/trade-api/v2/markets/SENATEIN-28-R", "/trade-api/v2/events/SENATEIN-28"]
 
 
+def test_pm_process_sweep_and_reconcile_leave_kalshi_siblings_quotes(arbs):
+    # ARBSPM scans only the Polymarket shard but lists shard 0 markets for its
+    # cross-venue baskets; the Kalshi processes rest quotes there from the same account.
+    import dataclasses
+    import types
+    r, b = arbs
+    r.cfg.scan = dataclasses.replace(r.cfg.scan, shards=[R.PM_SHARD])
+    rows = [("sibling", "X-A", "c1"), ("ours", "X-B", "c2")]
+    r.gw.clients = {0: types.SimpleNamespace(shard=0, _resting=lambda *a: rows)}
+    r.real_ledger.quote_ids["ours"] = {"ticker": "X-B"}
+    sent = []
+
+    async def call(fn, *a):
+        return fn(*a)
+
+    async def cancel(ticker, oid, reason):
+        sent.append(oid)
+        return True, None, True
+
+    r.gw.call, r.gw.cancel = call, cancel
+    asyncio.run(r.sweep("arm"))
+    assert sent == ["ours"]
+    sent.clear()
+    asyncio.run(r.reconcile_resting([], strict=False))
+    assert sent == ["ours"]
+    r.cfg.scan = dataclasses.replace(r.cfg.scan, shards=[0])     # a Kalshi process still sweeps its markets
+    sent.clear()
+    asyncio.run(r.sweep("arm"))
+    assert sent == ["sibling", "ours"]
+
+
 def test_gateway_keeps_a_dropped_markets_shard():
     from strategies.ARBS import execution as E
     g = E.Gateway(pool=None)

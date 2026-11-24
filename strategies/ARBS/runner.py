@@ -5194,11 +5194,20 @@ class ArbsRunner:
         if s in self.gw.clients:
             self.gw.shard_of[ticker] = s
 
+    def sweeps_market(self, ticker: str) -> bool:
+        """Whether an order on `ticker` we don't track is ours to cancel by its
+        market alone: only on a shard this process scans. ARBSPM's cross-venue
+        baskets list shard 0 markets that the Kalshi processes quote from the
+        same account, and its arm cancelled 365 of their quotes (11-24)."""
+        m = self.meta.get(ticker)
+        s = m.shard if m is not None else self.gw.shard_of.get(ticker)
+        return s is None or s in self.cfg.scan.shards
+
     async def sweep(self, reason: str, venues: set[str] | None = None, keep=None):
-        """Cancel anything of ours resting: on our tickers, or placed by us on a
-        market since dropped from the scan (KXYTVIEWSW quotes sat 19 h, 10-29),
-        except on markets keep(ticker) says to leave. The ground truth after a
-        restart."""
+        """Cancel anything of ours resting: on our tickers of a shard we scan,
+        or placed by us anywhere, e.g. on a market since dropped from the scan
+        (KXYTVIEWSW quotes sat 19 h, 10-29), except on markets keep(ticker)
+        says to leave. The ground truth after a restart."""
         if not self.gw.clients:
             return
         ours = set(self.tickers)
@@ -5212,7 +5221,8 @@ class ArbsRunner:
             resting += await self.gw.call(c._resting, "")
         loop = asyncio.get_running_loop()
         for oid, ticker, cid in resting:
-            if (ticker not in ours and oid not in self.real_ledger.quote_ids) or (keep and keep(ticker)):
+            mine = oid in self.real_ledger.quote_ids or (ticker in ours and self.sweeps_market(ticker))
+            if not mine or (keep and keep(ticker)):
                 continue
             if self.gw.client(ticker) is None:
                 await loop.run_in_executor(self.pool, self.learn_shard, ticker)
@@ -6324,7 +6334,8 @@ class ArbsRunner:
         of ours that neither holds is cancelled: strict (a takeover), only one
         ours by order id (quote_ids) or by a create the old process had in
         flight (`cids`), as other ARBS processes may rest on a market we hold;
-        otherwise anything on our markets, as the arm's sweep does. Returns
+        otherwise also anything on our markets of a shard we scan, as the arm's
+        sweep does. Returns
         the exchange ids still resting, or None if a listing was cut short."""
         resting, complete = set(), True
         ours = set(self.tickers)
@@ -6343,7 +6354,8 @@ class ArbsRunner:
                 # the breaker's 558 pulls drew a burst of 429s (ARBS3B 11-19 05:39).
                 if oid in known or (cid and cid in pending) or mono - self.recent_cancels.get(oid, -1e9) < 60.0:
                     continue
-                if oid in self.real_ledger.quote_ids or (cid and cid in cids) or (not strict and ticker in ours):
+                if (oid in self.real_ledger.quote_ids or (cid and cid in cids)
+                        or (not strict and ticker in ours and self.sweeps_market(ticker))):
                     stray.append((oid, ticker))
             for oid, ticker in stray:
                 if self.gw.client(ticker) is None:
