@@ -545,4 +545,17 @@ def test_a_failed_hand_over_trades_on_unfrozen(root):
     assert not (old.handing or old.gw.frozen or old._buffering or old.retired)
     assert old._io_lock.acquire(blocking=False)               # released
     assert not hand.has(R.LIVE_ROOT, "ARBS", "h1", "handed")
+    assert hand.has(R.LIVE_ROOT, "ARBS", "h1", "resumed")    # the parent's cue that it trades on
     assert any("hand-over failed" in a["msg"] for a in old.alerts)
+
+
+def test_an_aborted_hand_over_says_it_trades_on(root):
+    old, b = _runner()
+    _attach(old, Client())
+    old.live = True
+    hand.mark(R.LIVE_ROOT, "ARBS", "h1", "abort")
+
+    async def go():
+        return await old.hand_off("h1")
+    assert asyncio.run(go()) is False
+    assert hand.has(R.LIVE_ROOT, "ARBS", "h1", "resumed") and not hand.has(R.LIVE_ROOT, "ARBS", "h1", "handed")

@@ -10,6 +10,7 @@ Files under the live root:
   <SERIES>/handoff/<id>.handed      old process: state saved, exiting without cancels
   <SERIES>/handoff/<id>.taken       standby: now the active process
   <SERIES>/handoff/<id>.abort       parent -> standby: exit without writing anything
+  <SERIES>/handoff/<id>.resumed     old process: saw the abort before handing over; trading on
 
 The parent side is Driver, stepped from launch_many's poll loop. A standby
 only ever writes into its series' handoff dir until it has taken over.
@@ -32,6 +33,11 @@ HANDED_TIMEOUT_S = 10.0
 # The standby's takeover targets 2 s; past this it is presumed stuck.
 TAKEN_TIMEOUT_S = 30.0
 EXIT_WAIT_S = 30.0
+# After an abort, an old process past its abort check may still be writing its
+# hand-over: with the box swapping, ARBSPM's took 56 s, handed over after the
+# parent had concluded it trades on, and the series was left with no process
+# (11-24 00:02 UTC). Only <id>.resumed confirms it trades on; without it, this long.
+RESUME_WAIT_S = 180.0
 
 
 def hdir(root: str, series: str) -> str:
@@ -217,13 +223,18 @@ class Driver:
             if not self._gone(sb) and age < 5.0:
                 return
             self._kill(sb)
-            if has(R, name, hid, "handed") and not self._gone(old) and age < EXIT_WAIT_S:
+            handed = has(R, name, hid, "handed")
+            if handed and not self._gone(old) and age < EXIT_WAIT_S:
                 return                         # it handed over as we aborted: let it exit first
-            if not self._gone(old) and not has(R, name, hid, "handed"):
-                self._fail(name, f"{j['why']}; aborted, old process continues")
-            else:
-                self._kill(old)
-                self._cold_start(name, f"{j['why']}; aborted after the old process stopped")
+            if not handed and not self._gone(old):
+                if has(R, name, hid, "resumed"):
+                    self._fail(name, f"{j['why']}; aborted, old process continues")
+                elif age >= RESUME_WAIT_S:
+                    self._fail(name, f"{j['why']}; aborted, old process continues "
+                                     f"(no .resumed in {RESUME_WAIT_S:.0f}s)")
+                return
+            self._kill(old)
+            self._cold_start(name, f"{j['why']}; aborted after the old process stopped")
         elif j["phase"] == "taking":
             if has(R, name, hid, "taken"):
                 self._phase("retire")

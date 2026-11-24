@@ -126,7 +126,43 @@ def test_no_hand_over_in_time_aborts_and_the_old_process_continues(tmp_path):
     assert H.has(w.root, "ARBS", "h1", "abort")
     sb.exit(0)                                     # the standby saw the abort
     w.step()
+    assert w.d.busy()                              # the old process hasn't confirmed yet
+    H.mark(w.root, "ARBS", "h1", "resumed")
+    w.step()
     assert w.proc("ARBS") is old and w.status()["state"] == "failed" and len(w.spawned) == 1
+
+
+def test_a_hand_over_slower_than_the_abort_is_still_adopted(tmp_path):
+    w = World(tmp_path, names=("ARBS",))
+    w.request()
+    old = w.proc("ARBS")
+    w.step()
+    sb = w.spawned[-1][1]
+    H.mark(w.root, "ARBS", "h1", "ready")
+    w.step()
+    w.step(H.HANDED_TIMEOUT_S + 1)                 # abort written
+    sb.exit(0)
+    w.step(30.0)                                   # past its abort check, still writing (11-24: 56 s)
+    assert w.d.busy() and len(w.spawned) == 1
+    H.mark(w.root, "ARBS", "h1", "handed")
+    old.exit(0)
+    w.step()
+    cold = w.spawned[-1][1]
+    assert cold.args == ["--adopt", "h1"] and w.proc("ARBS") is cold
+
+
+def test_an_abort_never_confirmed_leaves_the_old_process_trading(tmp_path):
+    w = World(tmp_path, names=("ARBS",))
+    w.request()
+    old = w.proc("ARBS")
+    w.step()
+    sb = w.spawned[-1][1]
+    H.mark(w.root, "ARBS", "h1", "ready")
+    w.step()
+    w.step(H.HANDED_TIMEOUT_S + 1)
+    sb.exit(0)
+    w.step(H.RESUME_WAIT_S + 1)
+    assert w.proc("ARBS") is old and old.returncode is None and w.status()["state"] == "failed"
 
 
 def test_old_process_gone_without_hand_over_cold_starts(tmp_path):

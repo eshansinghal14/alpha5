@@ -6302,6 +6302,10 @@ class ArbsRunner:
         self.gw.frozen = self.handing = self._buffering = False
         self._replay_buffer()
         self.dirty |= set(self.baskets)
+        try:
+            hand.mark(LIVE_ROOT, self.S, hid, "resumed")
+        except OSError as e:
+            _log(f"WARN: handoff {hid}: .resumed not written ({e!r})")
         self._hlog(f"{hid}: aborted by the parent; trading on")
 
     def _replay_buffer(self):
