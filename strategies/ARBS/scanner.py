@@ -444,10 +444,10 @@ def _timing(e, ms, s, now, starts, freqs, live_windows, settle_lead, early_h):
 # too) doesn't count against the CPU-held market count. 82-88% of shard 0's
 # events took under 1 s a day on 11-18, and cutting the count dropped them first
 # while the busy few kept the CPU: ARBS0B went from 10.6k events to 1.1k at the
-# same 11-12 core-hours a day (11-19). TOTAL_MARKETS_MAX holds each process's
-# scan where shard 0's reads held (~31k across its processes on 11-17), well
-# short of where they didn't (ARBS0C alone at 55k couldn't arm, 11-18).
-CHEAP_EVENT_S, TOTAL_MARKETS_MAX = 10.0, 15000
+# same 11-12 core-hours a day (11-19). TOTAL_MARKETS_MAX keeps each process's
+# scan short of where its reads didn't hold (ARBS0C alone at 55k couldn't arm,
+# 11-18, on meta reads since signed).
+CHEAP_EVENT_S, TOTAL_MARKETS_MAX = 10.0, 30000
 
 
 def cheap_events(procs: tuple[str, ...], root: str | None = None, days: int = parts.SPEND_DAYS) -> set[str]:
