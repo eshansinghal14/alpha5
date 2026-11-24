@@ -1686,6 +1686,16 @@ def test_an_exit_at_plan_goes_at_once_while_waiting(arbs):
     assert b.basket_id not in r.shadow_ledger.baskets
 
 
+def test_a_fast_move_that_is_still_at_plan_does_not_wait(arbs):
+    r, b = arbs
+    b = _waiting(r, b, live=False)
+    _eval(r, b)                                           # pre-game: rests
+    r.exit_planned[b.basket_id] = 10.0                    # a plan this exit can't be worse than
+    r.exit_hist[b.basket_id] = collections.deque([(time.time(), -10.0)])
+    _eval(r, b)                                           # a fast move from the -10 in the window, at plan
+    assert b.basket_id not in r.shadow_ledger.baskets and b.basket_id not in r.exit_wait
+
+
 def test_a_pre_game_rest_is_not_a_forced_exit(arbs):
     r, b = arbs
     b = _waiting(r, b, live=False)

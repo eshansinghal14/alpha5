@@ -4609,7 +4609,8 @@ class ArbsRunner:
         why = ("fast move" if cost - best >= moved - _EPS else
                "at plan" if at_plan else
                "live event" if self.live_now(b, _utc()) or not b.quoting_allowed(_utc()) else None)
-        why = self.exit_wait_why(b, ex, legs, path, cost, why, now)
+        if not at_plan:                 # a fast move outranks "at plan" in `why`, but at plan never waits
+            why = self.exit_wait_why(b, ex, legs, path, cost, why, now)
         misses = self.exit_misses.get(bid, 0)
         if why is not None and misses >= c.max_exit_misses:
             why = None
