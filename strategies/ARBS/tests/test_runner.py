@@ -1757,6 +1757,25 @@ def test_an_unnetted_basket_quotes_at_the_live_size_before_the_game_too(arbs):
     assert all(q.size <= 3 for q in r.quotes.values())
 
 
+def test_a_resting_deep_quote_past_the_unnetted_cap_shrinks_at_its_price(arbs, monkeypatch):
+    r, b = arbs
+    u = dataclasses.replace(b, basket_id="spread:X:B=>A", relationship_id="spread:X")
+    r.set_baskets([u])
+    r.hot, r.listed = [u.basket_id], {u.relationship_id}
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=50, live_quote_size=50, quote_unnetted=True)
+    _slow_gap(r, u)
+    dq = r.quotes[(u.basket_id, 0, "deep")]
+    price = dq.price
+    assert dq.remaining == 10
+    monkeypatch.setattr(r, "deep_plan", lambda *a, **k: (None, 0))    # no new plan: the keep path
+    _eval(r, u)
+    assert r.quotes[(u.basket_id, 0, "deep")].remaining == 10        # within the cap, untouched
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, live_quote_size=3)
+    _eval(r, u)
+    dq = r.quotes[(u.basket_id, 0, "deep")]                           # same order, cut in place
+    assert dq.remaining == 3 and dq.price == pytest.approx(price)
+
+
 def test_deep_fill_is_journaled_as_deep_and_completed(arbs, tmp_path):
     r, b = arbs
     live = _live_gap(r, b, [(0.45, 10), (0.20, 5)])

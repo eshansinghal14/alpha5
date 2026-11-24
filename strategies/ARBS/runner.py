@@ -4020,6 +4020,12 @@ class ArbsRunner:
                     self.covered(b, vs, j, dq.remaining, dq.price) >= dq.remaining - _EPS
                 if keep:
                     dq.max_price = p.max_price
+                    cap = self.size_cap(b, live)
+                    if dq.remaining > cap + _EPS:
+                        # Down to size_cap at its price, a pure size decrease that keeps its
+                        # queue place: deep quotes placed before the unnetted cap kept their
+                        # size here, 5,000 lots on an NFL prop (11-24).
+                        acts.append(self.move_quote(dq, dataclasses.replace(p, price=dq.price), cap))
                 else:
                     acts.append(self.cancel_quote(dq, "deep_off"))
                 continue
