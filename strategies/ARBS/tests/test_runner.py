@@ -1807,6 +1807,18 @@ def test_a_deep_quote_past_the_cap_is_cut_without_spare_write_tokens(arbs):
         r.live = False
 
 
+def test_a_reach_quote_past_the_cap_shrinks_to_it(arbs):
+    r, b = arbs
+    u = dataclasses.replace(b, basket_id="spread:X:B=>A", relationship_id="spread:X")
+    r.set_baskets([u])
+    r.hot, r.listed = [u.basket_id], {u.relationship_id}
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=50, unnetted_quote_size=3, quote_unnetted=True)
+    _slow_gap(r, u)
+    now = time.time()
+    assert r.reach_decide(u, r.views(u), 0, None, False, 0.05, False, (0.21, 10.0, now), now, False) == ("shrink", 3.0)
+    assert r.reach_decide(u, r.views(u), 0, None, False, 0.05, False, (0.21, 3.0, now), now, False)[0] != "shrink"
+
+
 def test_deep_fill_is_journaled_as_deep_and_completed(arbs, tmp_path):
     r, b = arbs
     live = _live_gap(r, b, [(0.45, 10), (0.20, 5)])

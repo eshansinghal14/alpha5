@@ -3778,6 +3778,12 @@ class ArbsRunner:
             vs, j, b.payout, need, float(int(self.deep_cap(b, j, live) + _EPS)), at=px), px)
         if cur is not None:
             price, size, t_set = cur
+            cap = self.size_cap(b, live)
+            qc = pricing.quote_leg(vs, j, b.payout, need, cap) if size > cap + _EPS else None
+            if qc is not None and price <= qc.max_price + _EPS and gap_ok(price):
+                # Placed before a lower cap: the shrink below waits until well short,
+                # and 27 ladder reach quotes stayed at 205-384 over a 200 cap (11-24).
+                return ("shrink", cap)
             q = pricing.quote_leg(vs, j, b.payout, need, size) if size >= 1 else None
             if q is None or price > q.max_price + _EPS or not gap_ok(price):
                 # Edge gone at its size: smaller may still clear, else re-plan or go.
