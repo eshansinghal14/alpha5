@@ -1776,6 +1776,37 @@ def test_a_resting_deep_quote_past_the_unnetted_cap_shrinks_at_its_price(arbs, m
     assert dq.remaining == 3 and dq.price == pytest.approx(price)
 
 
+def test_a_deep_quote_past_the_cap_is_cut_without_spare_write_tokens(arbs):
+    from infra.kalshi.orders import RestingAck
+    r, b = arbs
+    u = dataclasses.replace(b, basket_id="spread:X:B=>A", relationship_id="spread:X")
+    r.set_baskets([u])
+    r.hot, r.listed = [u.basket_id], {u.relationship_id}
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=50, unnetted_quote_size=50, quote_unnetted=True)
+    r.live = True
+    ids, amends = iter(range(1000)), []
+
+    async def rest(ticker, side, price, size, cid, group=None):
+        return RestingAck(exchange_order_id=f"o{next(ids)}", fill=None), None, True
+
+    async def amend(ticker, side, oid, price, left, filled):
+        amends.append((ticker, left))
+        return {"order": {"order_id": oid}}, None, True
+    r.gw.rest, r.gw.amend = rest, amend
+    r.gw.can_afford = lambda *a, **k: True
+    try:
+        _slow_gap(r, u)
+        dq = r.quotes[(u.basket_id, 0, "deep")]
+        assert dq.remaining == 10
+        r.gw.can_afford = lambda *a, **k: False             # the bucket at its reserve
+        r.cfg.trading = dataclasses.replace(r.cfg.trading, unnetted_quote_size=3)
+        dq.placed_at -= R.DEEP_REQUOTE_S
+        _eval(r, u)
+        assert r.quotes[(u.basket_id, 0, "deep")].remaining == 3 and ("X-A", 3) in amends
+    finally:
+        r.live = False
+
+
 def test_deep_fill_is_journaled_as_deep_and_completed(arbs, tmp_path):
     r, b = arbs
     live = _live_gap(r, b, [(0.45, 10), (0.20, 5)])

@@ -4058,7 +4058,11 @@ class ArbsRunner:
                 left = reserve if cut else near_reserve
             else:
                 move = cooled and (stepped or abs(dq.remaining - size) > _EPS)
-            if past_limit or (move and (not self.live or self.gw.can_afford(leg.ticker, "amend", left))):
+            # Down to size_cap goes out past the reserve, as a past-limit move does: with
+            # shard 0's bucket at its reserve, deep quotes placed before the unnetted and
+            # ladder caps kept up to 1,944 lots (11-24 03:12 UTC).
+            over = dq.remaining > self.size_cap(b, live) + _EPS and size < dq.remaining - _EPS
+            if past_limit or (move and (over or not self.live or self.gw.can_afford(leg.ticker, "amend", left))):
                 dq.near = near
                 dq.reach = False
                 acts.append(self.move_quote(dq, plan, size))
