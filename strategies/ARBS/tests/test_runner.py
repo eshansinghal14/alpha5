@@ -3934,3 +3934,13 @@ def test_live_quotes_named_in_size_table_rest_at_the_tables_size(arbs):
     _eval(r, live)
     assert r.quotes and all(q.size == 5 for q in r.quotes.values())
     r.live = False
+
+
+def test_size_cap_holds_a_ladder_to_its_own_cap(arbs):
+    r, b = arbs
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=5000, live_quote_size=200)
+    ladder = dataclasses.replace(b, basket_id="ladder:E:T13=>T12", relationship_id="ladder:E")
+    assert r.size_cap(ladder, False) == R.LADDER_QUOTE_SIZE == 200.0
+    assert r.size_cap(b, False) == 5000.0                                  # other pre-game baskets keep quote_size
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, live_quote_size=50)
+    assert r.size_cap(ladder, True) == 50.0                                # a smaller live cap still wins
