@@ -1747,6 +1747,19 @@ def test_deep_quote_sized_to_what_the_other_legs_complete(arbs):
     assert r.quotes[(b.basket_id, 0, "deep")].size == 10
 
 
+def test_an_unnetted_basket_quotes_at_the_live_size_before_the_game_too(arbs):
+    r, b = arbs
+    u = dataclasses.replace(b, basket_id="spread:X:B=>A", relationship_id="spread:X")
+    r.set_baskets([u])
+    r.hot, r.listed = [u.basket_id], {u.relationship_id}
+    r.cfg.trading = dataclasses.replace(r.cfg.trading, quote_size=50, live_quote_size=3, quote_unnetted=True)
+    _slow_gap(r, u)
+    assert not r.live_now(u, R._utc())
+    # A netted basket's deep quote here is 10 (test above): this one stops at live_quote_size.
+    assert r.quotes[(u.basket_id, 0, "deep")].size == 3
+    assert all(q.size <= 3 for q in r.quotes.values())
+
+
 def test_deep_fill_is_journaled_as_deep_and_completed(arbs, tmp_path):
     r, b = arbs
     live = _live_gap(r, b, [(0.45, 10), (0.20, 5)])

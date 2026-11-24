@@ -1600,7 +1600,7 @@ class ArbsRunner:
         score, quiet, fastest = 0.0, 0.0, float("inf")
         px, parts = [], []
         for j, leg in enumerate(b.legs):
-            size = max(1.0, pricing.depth_size(vs, j, b.payout, need, float(t.quote_size)))
+            size = max(1.0, pricing.depth_size(vs, j, b.payout, need, self.size_cap(b, live)))
             plan = pricing.quote_leg(vs, j, b.payout, need, size)
             if plan is not None:
                 size = max(1.0, self.covered(b, vs, j, size, plan.price))
@@ -3437,7 +3437,7 @@ class ArbsRunner:
         if not want and b.basket_id not in self.quotes.n_by_basket:
             return              # no plan is made and nothing rests to cancel: most baskets, most ticks
         live = self.live_now(b, now_ts)
-        cap = float(t.live_quote_size if live else t.quote_size)
+        cap = self.size_cap(b, live)
         quote_need = edge_dollars(b.payout, t.min_edge + t.quote_edge_add) + (t.live_edge_add if live else 0.0)
         reserve = self.cfg.runtime.write_reserve_tokens
         acts = []
@@ -3630,7 +3630,7 @@ class ArbsRunner:
         arb quote has already used."""
         t = self.cfg.trading
         least = max(1.0, t.near_min_size * (NEAR_KEEP if held is not None else 1.0))
-        if t.quote_size - main.remaining < least:
+        if self.size_cap(b, False) - main.remaining < least:
             return None, 0
         y, k, vy = b, j, vs
         via = self.via.get((b.basket_id, j))
@@ -3648,7 +3648,7 @@ class ArbsRunner:
         # Only what the arb quote leaves of quote_size: with a quote_size of its
         # own it sat under every arb quote already at quote_size, ~700 of them
         # at 1,000 lots within 2 min, and emptied the write bucket (11-12 23:53).
-        cap = min(float(t.quote_size), self.room_bundles(y, k), float(self.quote_size_by_dollars(y))) - main.remaining
+        cap = min(self.size_cap(y, False), self.room_bundles(y, k), float(self.quote_size_by_dollars(y))) - main.remaining
         if cap < least:
             return None, 0
         prices = [lv.ticks.down(main.price)]
@@ -3901,14 +3901,22 @@ class ArbsRunner:
                       "side": b.legs[j].side, "price": r["price"], "size": round(r["size"], 2),
                       "spend": round(r["spend"], 2), "live": live, **kw})
 
+    def size_cap(self, b: Basket, live: bool) -> float:
+        """Most bundles any quote completing through `b` may rest:
+        live_quote_size in play, and always on a basket Kalshi doesn't net (its
+        cash stays locked to settlement; a pre-game deep quote on a CIN-WAS 1H
+        spread ladder filled 3,577 lots in one sweep, completed $184 worse than
+        planned, 11-24 00:52 UTC); quote_size otherwise."""
+        t = self.cfg.trading
+        return float(t.live_quote_size if live or b.relationship_id.startswith(RECORD_PREFIXES) else t.quote_size)
+
     def deep_cap(self, b: Basket, j: int, live: bool) -> float:
         """Most bundles a deep quote on leg j may rest: the arb quote's own
         size cap, held to the bundle and dollar room left after the arb quote
         on that leg (a sweep can fill both)."""
-        t = self.cfg.trading
         main = self.quotes.get((b.basket_id, j))
         dollars = self.quote_size_by_dollars(b) - (main.remaining if main is not None else 0.0)
-        return max(0.0, min(float(t.live_quote_size if live else t.quote_size), self.room_bundles(b, j), dollars))
+        return max(0.0, min(self.size_cap(b, live), self.room_bundles(b, j), dollars))
 
     def aged_room(self, b: Basket, j: int) -> float:
         """Bundles the other legs' touch has offered for trading.depth_age_s:
@@ -4247,7 +4255,7 @@ class ArbsRunner:
             live = self.live_now(y, now_ts)
             need = edge_dollars(y.payout, t.min_edge + t.quote_edge_add) + (t.live_edge_add if live else 0.0)
             need = max(need, min_need)
-            r = min(room, self.room_bundles(y), float(self.quote_size_by_dollars(y)))
+            r = min(room, self.size_cap(y, live), self.room_bundles(y), float(self.quote_size_by_dollars(y)))
             n = pricing.depth_size(vy, k, y.payout, need, float(int(r + _EPS)))
             p = pricing.quote_leg(vy, k, y.payout, need, n) if n >= 1 else None
             p, n = self.cover_plan(y, vy, k, p, n, need)
