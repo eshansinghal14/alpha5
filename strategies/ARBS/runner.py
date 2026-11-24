@@ -4765,9 +4765,20 @@ class ArbsRunner:
 
     def rest_exit(self, b: Basket, path: str, ex: pricing.Exits, legs, others, qs, now: float):
         """Post-only bids on every order the exit needs, re-pegged one tick
-        over the best bid; quotes for the other path are pulled."""
-        want = {j: (t, sd, n, pricing.rest_price(v) if v is not None else None)
-                for j, t, sd, n, v in self._exit_orders(b, path, ex, legs, others)}
+        over the best bid; quotes for the other path are pulled. During a
+        forced exit's wait a bid keeps the price it was first placed at, lower
+        only to stay under the ask: the wait was tested with a fixed bid, and
+        one following the bid up bought at the top of the run (ARBS3B 11-24)."""
+        w = self.exit_wait.get(b.basket_id)
+        fixed = w.setdefault("px", {}) if w and w["wait"] else None
+        want = {}
+        for j, t, sd, n, v in self._exit_orders(b, path, ex, legs, others):
+            p = pricing.rest_price(v) if v is not None else None
+            if fixed is not None and p is not None:
+                p = fixed.setdefault(f"{t} {sd}", p)
+                if v.best_ask is not None:
+                    p = min(p, v.ticks.down(v.best_ask))
+            want[j] = (t, sd, n, p)
         reserve = self.cfg.runtime.write_reserve_tokens
         # Another fill on a deep quote would add to what the exit has to cover.
         acts = [self.cancel_quote(q, "broken") for q in qs if q.deep and not q.pending]

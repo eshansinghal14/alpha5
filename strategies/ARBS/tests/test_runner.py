@@ -1649,6 +1649,18 @@ def test_a_forced_exit_on_a_wide_spread_rests_then_takes_after_exit_wait_s(arbs,
     assert end["wait"] is True and end["flat"] is True
 
 
+def test_a_waiting_exit_bid_does_not_follow_the_bid_up(arbs):
+    r, b = arbs
+    b = _waiting(r, b)
+    _eval(r, b)
+    r.exit_wait[b.basket_id]["at"] -= R.EXIT_WAIT_LOOK_S
+    _eval(r, b)
+    assert r.quotes[(b.basket_id, 0)].price == 0.36      # NO A: one tick over its 0.35 bid
+    book(r, "X-A", [(0.30, 10)], [(0.50, 10)])            # NO A's bid runs to 0.50
+    _eval(r, b)
+    assert r.quotes[(b.basket_id, 0)].price == 0.36
+
+
 def test_a_forced_exit_on_a_tight_spread_takes_at_the_look(arbs, tmp_path):
     r, b = arbs
     b = _waiting(r, b)
