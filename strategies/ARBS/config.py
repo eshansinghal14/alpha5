@@ -22,8 +22,10 @@ class TradingParams:
     enable_takes: bool = param("Take a whole basket (IOC on every leg) when its return clears min_edge after fees.")
     enable_quoting: bool = param("Rest a bid on every leg of the hottest baskets that can clear the quote "
                                  "edge; a fill is completed at once by taking the other legs.")
-    # Dollars per bundle since 11-24 (runner.EDGE_PER_BUNDLE); before, a
-    # fraction of the bundle's cost.
+    # Dollars per bundle, not a fraction of its cost (until 11-24): Kalshi
+    # returns a netted basket's payout as cash once it completes (balance reads
+    # 11-21..23), and real pre-game completions 10-24..11-23 didn't slip more
+    # with more legs (2 legs -2.6c/lot vs plan, 3-6 legs about on plan).
     min_edge: float = param("Required profit in $ per bundle (0.03 = 3c, whatever the bundle pays), after "
                             "fees, for a take, and for a quote assuming it fills and the other legs are taken "
                             "at today's asks.", min=0.0, max=0.5, step=0.0025)

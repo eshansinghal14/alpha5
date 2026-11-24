@@ -6,8 +6,7 @@ Per pass over baskets whose books changed:
      extra ones out (pricing.exits), when it worsens by chase_ticks within
      chase_window_s or the event is live;
      otherwise it rests post-only bids on that exit, re-pegged every pass;
-  2. a whole-basket take if payout - sum(ask + fee) >= min_edge per bundle
-     (see edge_dollars);
+  2. a whole-basket take if payout - sum(ask + fee) >= min_edge per bundle;
   3. one resting quote per leg of each hot basket (the best by expected
      quote profit per hour, as many as the write budget covers), priced so a
      fill completed at today's asks still returns min_edge + quote_edge_add.
@@ -510,13 +509,6 @@ ALT_SEARCH_S = 0.5
 # costs more than that: at top of book on 11-23 the greedy subset priced
 # 3-13% of quotable NO legs on shards 0 and 3 higher, by ~3 ticks.
 GREEDY_SUBSETS = True
-# min_edge and quote_edge_add are dollars per bundle, whatever the bundle pays
-# (edge_dollars). A fraction of its cost charged capital that isn't held:
-# Kalshi returns a netted basket's payout as cash once it completes (balance
-# reads 11-21..23). And completions don't slip more with more legs: real
-# pre-game fills 10-24..11-23 ran 2 legs -2.6c/lot vs plan, 3-6 legs about on
-# plan. False: a fraction of the bundle's cost.
-EDGE_PER_BUNDLE = True
 # Rested depth (aged_room) is re-read after a book change or this long.
 HELD_CACHE_S = 0.25
 # Live quotes in trading.model_series: edge and size from the exit-cost model,
@@ -1603,7 +1595,7 @@ class ArbsRunner:
         leg's edge x size over the time trading takes to reach it."""
         t = self.cfg.trading
         live = self.live_now(b, _utc())
-        need = edge_dollars(b.payout, t.min_edge + t.quote_edge_add) + (t.live_edge_add if live else 0.0)
+        need = t.min_edge + t.quote_edge_add + (t.live_edge_add if live else 0.0)
         score, quiet, fastest = 0.0, 0.0, float("inf")
         px, parts = [], []
         for j, leg in enumerate(b.legs):
@@ -3395,7 +3387,7 @@ class ArbsRunner:
         if (t.enable_takes and (t.take_live_events or not self.live_now(b, _utc()))
                 and now - self.last_take.get(b.basket_id, 0.0) >= t.take_cooldown_s):
             g = pricing.gap(vs, b.payout)
-            need = edge_dollars(b.payout, t.min_edge) + (t.live_edge_add if self.live_now(b, _utc()) else 0.0)
+            need = t.min_edge + (t.live_edge_add if self.live_now(b, _utc()) else 0.0)
             ex = self.exit_room(b)
             # An apparent arb on a live game is usually one leg not yet
             # repriced after a score, already being taken by faster traders.
@@ -3445,7 +3437,7 @@ class ArbsRunner:
             return              # no plan is made and nothing rests to cancel: most baskets, most ticks
         live = self.live_now(b, now_ts)
         cap = self.size_cap(b, live)
-        quote_need = edge_dollars(b.payout, t.min_edge + t.quote_edge_add) + (t.live_edge_add if live else 0.0)
+        quote_need = t.min_edge + t.quote_edge_add + (t.live_edge_add if live else 0.0)
         reserve = self.cfg.runtime.write_reserve_tokens
         acts = []
         mains: dict[int, pricing.QuotePlan] = {}
@@ -3650,7 +3642,7 @@ class ArbsRunner:
             vy = self.views(y) if k is not None else None
             if vy is None or self.live_now(y, _utc()):
                 return None, 0
-            need = edge_dollars(y.payout, t.min_edge + t.quote_edge_add)
+            need = t.min_edge + t.quote_edge_add
         lv = vy[k]
         # Only what the arb quote leaves of quote_size: with a quote_size of its
         # own it sat under every arb quote already at quote_size, ~700 of them
@@ -3899,7 +3891,7 @@ class ArbsRunner:
                 self._reach_log("cancel", b, key[1], r, False, why="untradeable")
                 continue
             live = self.live_now(b, _utc())
-            need = edge_dollars(b.payout, t.min_edge + t.quote_edge_add) + (t.live_edge_add if live else 0.0)
+            need = t.min_edge + t.quote_edge_add + (t.live_edge_add if live else 0.0)
             self.reach_shadow(b, self.views(b), key[1], None, None, need, now, live)
 
     def _reach_log(self, action: str, b: Basket, j: int, r: dict, live: bool, **kw):
@@ -4251,7 +4243,7 @@ class ArbsRunner:
             if GREEDY_SUBSETS:
                 add = t.live_edge_add if self.live_now(b, now_ts) else 0.0
                 g = self.greedy_subset(b, j, lambda pay: max(
-                    edge_dollars(pay, t.min_edge + t.quote_edge_add) + add, min_need))
+                    t.min_edge + t.quote_edge_add + add, min_need))
                 if (g is not None and g[0].basket_id != b.basket_id
                         and all(y.basket_id != g[0].basket_id for y, _ in cands) and self.can_book(g[0], now_ts)):
                     cands.append(g)
@@ -4260,7 +4252,7 @@ class ArbsRunner:
             if vy is None:
                 continue
             live = self.live_now(y, now_ts)
-            need = edge_dollars(y.payout, t.min_edge + t.quote_edge_add) + (t.live_edge_add if live else 0.0)
+            need = t.min_edge + t.quote_edge_add + (t.live_edge_add if live else 0.0)
             need = max(need, min_need)
             r = min(room, self.size_cap(y, live), self.room_bundles(y), float(self.quote_size_by_dollars(y)))
             n = pricing.depth_size(vy, k, y.payout, need, float(int(r + _EPS)))
@@ -6624,14 +6616,6 @@ def _deep(q: Quote) -> dict:
 
 def datetime_iso(ts: float) -> str:
     return pd.Timestamp(ts, unit="s", tz="UTC").isoformat()
-
-
-def edge_dollars(payout: float, rate: float) -> float:
-    """Dollar edge per bundle the config's `rate` (min_edge, quote_edge_add)
-    asks for: `rate` itself under EDGE_PER_BUNDLE, else the edge that returns
-    `rate` on the bundle's cost (cost is payout - edge, so edge >= rate *
-    payout / (1 + rate))."""
-    return rate if EDGE_PER_BUNDLE else rate * payout / (1.0 + rate)
 
 
 def edge_return(payout: float, edge: float) -> float:

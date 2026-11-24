@@ -117,7 +117,7 @@ def test_each_leg_priced_against_the_others_asks(arbs):
         await drain(r)
     asyncio.run(go())
     qa, qb = r.quotes[(b.basket_id, 0)], r.quotes[(b.basket_id, 1)]
-    req = R.edge_dollars(b.payout, r.cfg.trading.min_edge + r.cfg.trading.quote_edge_add)
+    req = r.cfg.trading.min_edge + r.cfg.trading.quote_edge_add
     assert qa.max_price + 0.55 + 0.0174 <= 1 - req + 1e-9
     assert qb.max_price + 0.65 + 0.0160 <= 1 - req + 1e-9
 
@@ -310,24 +310,18 @@ def test_resting_quotes_are_not_capital_used(arbs):
     assert r.committed() == 0.0
 
 
-def test_edge_is_dollars_per_bundle_whatever_it_pays():
-    assert R.edge_dollars(2.0, 0.015) == R.edge_dollars(1.0, 0.015) == 0.015
+def test_edge_return_is_a_fraction_of_bundle_cost():
+    assert R.edge_return(2.0, 0.04) == pytest.approx(0.04 / 1.96)
 
 
-def test_edge_as_a_return_on_bundle_cost_when_switched_off(monkeypatch):
-    monkeypatch.setattr(R, "EDGE_PER_BUNDLE", False)
-    # 1.5% on a payout-2 bundle needs about twice the dollar edge of payout-1.
-    assert R.edge_dollars(2.0, 0.015) == pytest.approx(2 * R.edge_dollars(1.0, 0.015))
-    e = R.edge_dollars(1.0, 0.015)
-    assert R.edge_return(1.0, e) == pytest.approx(0.015)
-
-
-def _take_payout_2(r, b2):
+def test_take_needs_cents_per_bundle_not_a_return(arbs):
+    r, b2 = arbs
     b = dataclasses.replace(b2, payout=2.0, basket_id="t:b2")
     r.all_baskets.append(b)
     r.baskets[b.basket_id] = b
     r.cfg.trading = dataclasses.replace(r.cfg.trading, min_edge=0.015, enable_quoting=False)
-    # Asks 0.99 + 0.99 (+fees ~0.0014): edge ~1.86c a bundle, 0.94% of its ~$1.98 cost.
+    # Asks 0.99 + 0.99 (+fees ~0.0014): edge ~1.86c a bundle, which clears 1.5c
+    # though it is only 0.94% of the ~$1.98 bundle.
     book(r, "X-A", [], [(0.01, 10)])
     book(r, "X-B", [], [(0.01, 10)])
 
@@ -335,20 +329,7 @@ def _take_payout_2(r, b2):
         r.evaluate(b)
         await drain(r)
     asyncio.run(go())
-    return b
-
-
-def test_take_needs_cents_per_bundle_not_a_return(arbs):
-    r, b2 = arbs
-    b = _take_payout_2(r, b2)
-    assert r.shadow_ledger.baskets[b.basket_id].bundles(b.tickers) == 10       # 1.86c clears 1.5c
-
-
-def test_take_needs_a_return_when_switched_off(arbs, monkeypatch):
-    monkeypatch.setattr(R, "EDGE_PER_BUNDLE", False)
-    r, b2 = arbs
-    b = _take_payout_2(r, b2)
-    assert b.basket_id not in r.shadow_ledger.baskets                          # 0.94% < 1.5%
+    assert r.shadow_ledger.baskets[b.basket_id].bundles(b.tickers) == 10
 
 
 def test_dollar_cap_blocks_quote(arbs):
@@ -990,7 +971,7 @@ def test_quote_priced_through_the_cheapest_basket_with_its_leg(arbs):
     r, b = arbs
     c = _cheaper_through_c(r, b)
     t = r.cfg.trading
-    own = R.pricing.quote_leg(r.views(b), 0, 1.0, R.edge_dollars(1.0, t.min_edge + t.quote_edge_add), 5)
+    own = R.pricing.quote_leg(r.views(b), 0, 1.0, t.min_edge + t.quote_edge_add, 5)
     _eval(r, b)
     q = r.quotes[(b.basket_id, 0)]
     assert r.via[(b.basket_id, 0)] == c.basket_id
@@ -1018,7 +999,7 @@ def test_a_kept_alternative_is_priced_on_fresh_books_and_dropped_when_unbookable
     r, b = arbs
     c = _cheaper_through_c(r, b)
     t = r.cfg.trading
-    need = R.edge_dollars(1.0, t.min_edge + t.quote_edge_add)
+    need = t.min_edge + t.quote_edge_add
     plan = lambda: R.pricing.quote_leg(r.views(b), 0, 1.0, need, 5)
     p1, _ = r.best_plan(b, 0, plan(), 5, 5.0)
     assert r.via[(b.basket_id, 0)] == c.basket_id
@@ -3137,7 +3118,7 @@ def test_a_pregame_model_quote_keeps_its_size_unless_narrower_than_the_config(ar
                         (0.10, cap))
     _eval(r, b)
     q = r.quotes[(b.basket_id, 0)]
-    fixed = R.edge_dollars(b.payout, r.cfg.trading.min_edge + r.cfg.trading.quote_edge_add)
+    fixed = r.cfg.trading.min_edge + r.cfg.trading.quote_edge_add
     limit = 1.0 - R.pricing.taker_cost(0.55, 0.07) - fixed
     assert limit - 0.01 - 1e-9 <= q.max_price <= limit + 1e-9               # shadow: the config's edge
     assert seen[0][0] is False and seen[0][1] == 1000 and seen[0][2]["shadow"] is True
