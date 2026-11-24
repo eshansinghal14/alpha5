@@ -1593,6 +1593,47 @@ def test_bad_exit_flags_markets_live_until_a_clean_fill(arbs):
     assert not r.live_now(b, now) and not r.flagged
 
 
+def test_a_live_flag_expires_after_live_flag_s_and_a_new_one_renews_it(arbs):
+    r, b = arbs
+    now = pd.Timestamp.now(tz="UTC")
+    r.flag_live(b, "a fast move unwind")
+    r.flagged["X-A"] -= R.LIVE_FLAG_S + 1                 # A flagged long ago, B just now
+    assert r.live_now(b, now)
+    r.flag_live(b, "a fast move complete")                # renews A
+    assert time.time() - r.flagged["X-A"] < 1
+    for t in r.flagged:
+        r.flagged[t] -= R.LIVE_FLAG_S + 1
+    assert not r.live_now(b, now) and r._live_at(b.basket_id) == float("inf")
+    r.dirty.clear()
+    r.expire_flags()
+    assert not r.flagged and b.basket_id in r.dirty
+
+
+def test_a_flag_from_another_basket_leaves_a_pre_game_exit_resting(arbs):
+    r, b = arbs
+    _broken(r, b)
+    other = Basket(basket_id="t:o", relationship_id="t", type="complete_set", cluster="t",
+                   legs=(Leg("X-A", "no"), Leg("X-C", "no")), payout=1.0, quote_until=None, resume_quoting=None)
+    r.flag_live(other, "a fast move unwind")              # a sibling's bad exit on X-A
+    _eval(r, b)
+    assert b.basket_id in r.shadow_ledger.baskets and b.basket_id not in r.exit_wait
+    assert r.quotes[(b.basket_id, 0)].kind == "unwind"
+    assert r.live_now(b, pd.Timestamp.now(tz="UTC"))      # its quotes are still priced live
+
+
+def test_a_forced_exit_stays_forced_until_done_without_the_flag(arbs):
+    r, b = arbs
+    r.cfg.completion = dataclasses.replace(r.cfg.completion, exit_wait_s=300.0, exit_now_spread=0.02)
+    _broken(r, b)
+    w = r.exit_wait[b.basket_id] = {"at": time.time() - 1.0, "why": "fast move", "wait": False, "cost": 1.0}
+    assert r.exit_wait_why(b, None, None, "unwind", 1.0, None, time.time()) == "fast move"
+    w["wait"] = True
+    assert r.exit_wait_why(b, None, None, "unwind", 1.0, None, time.time()) is None
+    w["at"] -= 300.0
+    assert r.exit_wait_why(b, None, None, "unwind", 1.0, None, time.time()) == "fast move"
+    assert r.exit_wait_why(b, None, None, "unwind", 1.0, "at plan", time.time()) == "at plan"
+
+
 def test_an_unwind_that_does_not_lose_leaves_the_markets_pre_game(arbs):
     r, b = arbs
     # 5 YES A bought at 0.20 with others bidding 0.45: netting out at A's 0.55 NO ask makes money,

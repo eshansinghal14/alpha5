@@ -391,6 +391,11 @@ EXIT_WAIT_LOOK_S = 0.1
 # Daily high/low temperature series: waiting gained nothing measurable there
 # (+0.3c/lot [-0.1, +0.8] at 5 min, 10.6k sweeps 11-04..23), so they exit at once.
 DAILY_WEATHER = re.compile(r"KX(HIGH|LOW)T?[A-Z]{2,4}")
+# How long a bad exit's live flag lasts, renewed by each new one. 5c quotes
+# replayed on flagged pre-game markets (11-07..23, 373 events) didn't lose after
+# the flag and were back to normal within the hour; any expiry from 5 to 60 min
+# came out the same, a flag that never expired ~$300 worse.
+LIVE_FLAG_S = 300.0
 # A book update that leaves the top unchanged re-evaluates a pre-game basket at
 # most once per LAZY_EVAL_S: deep-level churn on KXNVDACEO-29JAN (2.75M updates
 # on 11-18, 12x the day before) re-evaluated its 6 baskets on every one, a
@@ -985,7 +990,8 @@ class ArbsRunner:
         self.ids_dirty = True
         # ticker -> unix time a bad exit flagged it live: a fast move, or an
         # unwind that loses, means the market reprices like a live game (weather
-        # readings, news). Cleared by a clean completion or an even take on it.
+        # readings, news). It quotes live for LIVE_FLAG_S, or until a clean
+        # completion or an even take on it; exits keep to their own rules.
         self.flagged: dict[str, float] = {}
         self.unpriced_alert_at: dict[str, float | None] = {}
         self._horizon: tuple[float, pd.Timestamp] | None = None
@@ -1935,7 +1941,7 @@ class ArbsRunner:
             self._live_from[bid] = t
         if self.flagged and t > 0:
             b = self.baskets.get(bid)
-            if b is not None and any(x in self.flagged for x in b.tickers):
+            if b is not None and self.is_flagged(b):
                 return 0.0
         return t
 
@@ -2897,15 +2903,20 @@ class ArbsRunner:
         return int(max(0.0, held.bundles(self.baskets[fid].tickers) - mine) + _EPS)
 
     def live_now(self, b: Basket, now: pd.Timestamp) -> bool:
-        return b.is_live(now) or any(t in self.flagged for t in b.tickers)
+        return b.is_live(now) or (bool(self.flagged) and self.is_flagged(b))
+
+    def is_flagged(self, b: Basket) -> bool:
+        cut = time.time() - LIVE_FLAG_S
+        return any(self.flagged.get(t, 0.0) > cut for t in b.tickers)
 
     def events_of(self, b: Basket) -> set[str]:
         return {self.meta[t].event for t in b.tickers if t in self.meta and self.meta[t].event}
 
     def flag_live(self, b: Basket, why: str):
+        now = time.time()
         new = [t for t in b.tickers if t not in self.flagged]
-        for t in new:
-            self.flagged[t] = time.time()
+        for t in b.tickers:
+            self.flagged[t] = now
         if new:
             self.alert("info", b.basket_id, f"treated as live after {why}: {', '.join(new)}")
 
@@ -2913,6 +2924,16 @@ class ArbsRunner:
         gone = [t for t in b.tickers if self.flagged.pop(t, None) is not None]
         if gone:
             self.alert("info", b.basket_id, f"no longer treated as live after a clean fill: {', '.join(gone)}")
+
+    def expire_flags(self):
+        cut = time.time() - LIVE_FLAG_S
+        gone = [t for t, at in self.flagged.items() if at <= cut]
+        for t in gone:
+            del self.flagged[t]
+        if gone:
+            self.dirty |= {bid for t in gone for bid in self.by_ticker.get(t, ())}
+            self.alert("info", None, f"no longer treated as live {LIVE_FLAG_S / 60:.0f} min after a bad exit: "
+                                     f"{', '.join(gone)}")
 
     def exit_need(self, b: Basket, need: float, now: pd.Timestamp) -> float:
         """Edge ($/bundle) to close held bundles through flip basket `b`:
@@ -4606,9 +4627,12 @@ class ArbsRunner:
         # (TXSEND-P4 rested 48 min on thin legs 10-29 with completing worth +$0.54).
         planned = self.exit_planned.get(bid)
         at_plan = loss <= _EPS or (planned is not None and cost <= planned + _EPS)
+        # Live by schedule only: a sibling's bad-exit flag forced each next
+        # strike's unwind into the same sweep (KXHORMUZWEEKLY 11-23, -$1.3k
+        # against about +$440 held). Once forced, exit_wait keeps it forced.
         why = ("fast move" if cost - best >= moved - _EPS else
                "at plan" if at_plan else
-               "live event" if self.live_now(b, _utc()) or not b.quoting_allowed(_utc()) else None)
+               "live event" if b.is_live(_utc()) or not b.quoting_allowed(_utc()) else None)
         if not at_plan:                 # a fast move outranks "at plan" in `why`, but at plan never waits
             why = self.exit_wait_why(b, ex, legs, path, cost, why, now)
         misses = self.exit_misses.get(bid, 0)
@@ -4641,7 +4665,10 @@ class ArbsRunner:
         c, bid = self.cfg.completion, b.basket_id
         w = self.exit_wait.get(bid)
         if w is None:
-            if why not in ("fast move", "live event") or c.exit_wait_s <= 0:
+            if why not in ("fast move", "live event"):
+                return why
+            if c.exit_wait_s <= 0:
+                self.exit_wait[bid] = {"at": now, "why": why, "wait": False, "cost": round(cost, 4)}
                 return why
             w = self.exit_wait[bid] = {"at": now, "why": why, "wait": None, "cost": None}
             self._urgent_in(bid, EXIT_WAIT_LOOK_S)
@@ -4660,12 +4687,13 @@ class ArbsRunner:
                           "weather": weather})
             if not w["wait"]:
                 return why or w["why"]
-            # The markets are treated as live from now, as the exit at once did:
-            # other baskets on them quote live and their own breaks wait too.
+            # The markets quote live from now, as after an exit at once.
             self.flag_exit(b, path, w["why"])
             self._urgent_in(bid, w["at"] + c.exit_wait_s - now)
-        if not w["wait"] or why == "at plan":
+        if why == "at plan":
             return why
+        if not w["wait"]:
+            return why or w["why"]
         return (why or w["why"]) if now >= w["at"] + c.exit_wait_s else None
 
     def _urgent_in(self, basket_id: str, delay: float):
@@ -5656,6 +5684,8 @@ class ArbsRunner:
             self.feed.per_market = self.cfg.runtime.feed_ready_per_market
             if self.handing:
                 continue
+            if self.flagged:
+                self.expire_flags()
             down = self.feed.down_venues(self.cfg.runtime.feed_down_pull_s, time.monotonic())
             if down and any(venue(q.ticker) in down and not self._fed(q) for q in self.quotes.values()):
                 self.alert("warn", None, f"{', '.join(sorted(down))} websocket down; pulling its quotes")
