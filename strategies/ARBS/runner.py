@@ -4616,7 +4616,11 @@ class ArbsRunner:
         self.completion_note[bid]["window_best"] = round(best, 4)
         self.completion_note[bid].update(action="take" if why else "rest", why=why, misses=misses)
         if why is None:
-            self.rest_exit(b, path, ex, legs, others, qs, now)
+            # No orders during the look: their writes held the basket busy past
+            # it, and the decision came 0.84 s after the fill (ARBS3B 11-24 17:59).
+            w = self.exit_wait.get(bid)
+            if w is None or w["wait"] is not None:
+                self.rest_exit(b, path, ex, legs, others, qs, now)
         else:
             # A missed IOC leaves our book showing the level it missed until
             # Kalshi's update lands; retrying before that fires at it again.

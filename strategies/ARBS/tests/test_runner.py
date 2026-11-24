@@ -1631,11 +1631,12 @@ def _journal(tmp_path):
 def test_a_forced_exit_on_a_wide_spread_rests_then_takes_after_exit_wait_s(arbs, tmp_path):
     r, b = arbs
     b = _waiting(r, b)
-    _eval(r, b)                                           # due: rests until the 0.1 s look
-    assert r.quotes[(b.basket_id, 0)].kind == "unwind" and b.basket_id in r.shadow_ledger.baskets
+    _eval(r, b)                                           # due: no orders until the 0.1 s look
+    assert not r.quotes and b.basket_id in r.shadow_ledger.baskets
     r.exit_wait[b.basket_id]["at"] -= R.EXIT_WAIT_LOOK_S
-    _eval(r, b)                                           # 35c spread: waits, the markets go live
+    _eval(r, b)                                           # 35c spread: waits resting, the markets go live
     assert r.exit_wait[b.basket_id]["wait"] is True and b.basket_id in r.shadow_ledger.baskets
+    assert r.quotes[(b.basket_id, 0)].kind == "unwind"
     assert set(r.flagged) == {"X-A", "X-B"}
     r.exit_wait[b.basket_id]["at"] -= 300.0
     _eval(r, b)
