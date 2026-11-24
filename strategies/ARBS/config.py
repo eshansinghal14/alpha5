@@ -22,15 +22,13 @@ class TradingParams:
     enable_takes: bool = param("Take a whole basket (IOC on every leg) when its return clears min_edge after fees.")
     enable_quoting: bool = param("Rest a bid on every leg of the hottest baskets that can clear the quote "
                                  "edge; a fill is completed at once by taking the other legs.")
-    # A fraction of the bundle's dollar cost, not cents per bundle: a payout-2
-    # basket costs ~2x a payout-1 one, so a flat cent edge earned it half the
-    # return on capital (10-24 fills: 0.9% on SENATEME:TAL vs 1.1% on DEMDEM).
-    min_edge: float = param("Required profit as a fraction of what a bundle costs (0.015 = 1.5%), after fees, "
-                            "for a take, and for a quote assuming it fills and the other legs are taken at "
-                            "today's asks.", min=0.0, max=0.5, step=0.0025)
-    quote_edge_add: float = param("Extra return (fraction of bundle cost) a quote must clear on top of min_edge: "
-                                  "pays for being filled just as the other legs move away.", min=0.0, max=0.5,
-                                  step=0.0025)
+    # Dollars per bundle since 11-24 (runner.EDGE_PER_BUNDLE); before, a
+    # fraction of the bundle's cost.
+    min_edge: float = param("Required profit in $ per bundle (0.03 = 3c, whatever the bundle pays), after "
+                            "fees, for a take, and for a quote assuming it fills and the other legs are taken "
+                            "at today's asks.", min=0.0, max=0.5, step=0.0025)
+    quote_edge_add: float = param("Extra $ per bundle a quote must clear on top of min_edge: pays for being "
+                                  "filled just as the other legs move away.", min=0.0, max=0.5, step=0.0025)
     min_exit_edge: float = param("Least profit ($ per bundle, after fees) to take or quote a basket's flip "
                                  "(every leg's other side) up to the bundles held in it. Kalshi nets the pair to "
                                  "$1 a leg at once, so this closes a position early and frees its capital; no "

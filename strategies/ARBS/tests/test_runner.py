@@ -310,21 +310,24 @@ def test_resting_quotes_are_not_capital_used(arbs):
     assert r.committed() == 0.0
 
 
-def test_edge_is_a_return_on_bundle_cost():
+def test_edge_is_dollars_per_bundle_whatever_it_pays():
+    assert R.edge_dollars(2.0, 0.015) == R.edge_dollars(1.0, 0.015) == 0.015
+
+
+def test_edge_as_a_return_on_bundle_cost_when_switched_off(monkeypatch):
+    monkeypatch.setattr(R, "EDGE_PER_BUNDLE", False)
     # 1.5% on a payout-2 bundle needs about twice the dollar edge of payout-1.
     assert R.edge_dollars(2.0, 0.015) == pytest.approx(2 * R.edge_dollars(1.0, 0.015))
     e = R.edge_dollars(1.0, 0.015)
     assert R.edge_return(1.0, e) == pytest.approx(0.015)
 
 
-def test_take_needs_return_not_cents(arbs):
-    r, b2 = arbs
+def _take_payout_2(r, b2):
     b = dataclasses.replace(b2, payout=2.0, basket_id="t:b2")
     r.all_baskets.append(b)
     r.baskets[b.basket_id] = b
     r.cfg.trading = dataclasses.replace(r.cfg.trading, min_edge=0.015, enable_quoting=False)
-    # Asks 0.99 + 0.99 (+fees ~0.0014): edge ~1.86c, which clears 1.5c, but on a
-    # ~$1.98 bundle that is 0.94% < 1.5%.
+    # Asks 0.99 + 0.99 (+fees ~0.0014): edge ~1.86c a bundle, 0.94% of its ~$1.98 cost.
     book(r, "X-A", [], [(0.01, 10)])
     book(r, "X-B", [], [(0.01, 10)])
 
@@ -332,7 +335,20 @@ def test_take_needs_return_not_cents(arbs):
         r.evaluate(b)
         await drain(r)
     asyncio.run(go())
-    assert b.basket_id not in r.shadow_ledger.baskets
+    return b
+
+
+def test_take_needs_cents_per_bundle_not_a_return(arbs):
+    r, b2 = arbs
+    b = _take_payout_2(r, b2)
+    assert r.shadow_ledger.baskets[b.basket_id].bundles(b.tickers) == 10       # 1.86c clears 1.5c
+
+
+def test_take_needs_a_return_when_switched_off(arbs, monkeypatch):
+    monkeypatch.setattr(R, "EDGE_PER_BUNDLE", False)
+    r, b2 = arbs
+    b = _take_payout_2(r, b2)
+    assert b.basket_id not in r.shadow_ledger.baskets                          # 0.94% < 1.5%
 
 
 def test_dollar_cap_blocks_quote(arbs):
@@ -2757,7 +2773,7 @@ def test_quote_priced_through_the_greedy_subset_even_if_unlisted(arbs):
     ab = _event_e(r)
     _eval(r, ab)
     q = r.quotes[(ab.basket_id, 0)]
-    # A+B+C pays $2: 2 - 0.0583 edge - (0.70 + 0.60 + fees) leaves 0.61, capped
+    # A+B+C pays $2: 2 - 0.03 edge - (0.70 + 0.60 + fees) leaves 0.64, capped
     # under A's NO ask at 0.54. Listed A+B leaves 0.25; A+B+D and ABCD can't price.
     assert r.via[(ab.basket_id, 0)] == "mecnet:E:no:A+B+C"
     assert q.max_price == pytest.approx(0.54) and q.price == pytest.approx(0.21)
@@ -2765,9 +2781,8 @@ def test_quote_priced_through_the_greedy_subset_even_if_unlisted(arbs):
     assert ab.basket_id in r.via_by_ticker["E-C"]                # C's book now moves this quote
     _eval(r, ab)                                                 # within ALT_SEARCH_S: the kept pick
     assert r.via[(ab.basket_id, 0)] == "mecnet:E:no:A+B+C"
-    # C's NO ask 0.60 -> 0.98: its $1 adds less than the 2.9c it needs, so A+B
-    # (the quote's own basket) is best again.
-    book(r, "E-C", [(0.02, 10)], [(0.90, 10)])
+    # C's NO ask gone: A+B (the quote's own basket) is best again.
+    book(r, "E-C", [], [(0.90, 10)])
     r._alt_pick.clear()
     r._no_rank.clear()
     _eval(r, ab)

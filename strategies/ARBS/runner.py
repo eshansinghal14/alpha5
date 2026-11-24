@@ -6,8 +6,8 @@ Per pass over baskets whose books changed:
      extra ones out (pricing.exits), when it worsens by chase_ticks within
      chase_window_s or the event is live;
      otherwise it rests post-only bids on that exit, re-pegged every pass;
-  2. a whole-basket take if (payout - sum(ask + fee)) / sum(ask + fee) >= min_edge
-     (a return on the bundle's cost, see edge_dollars);
+  2. a whole-basket take if payout - sum(ask + fee) >= min_edge per bundle
+     (see edge_dollars);
   3. one resting quote per leg of each hot basket (the best by expected
      quote profit per hour, as many as the write budget covers), priced so a
      fill completed at today's asks still returns min_edge + quote_edge_add.
@@ -510,6 +510,13 @@ ALT_SEARCH_S = 0.5
 # costs more than that: at top of book on 11-23 the greedy subset priced
 # 3-13% of quotable NO legs on shards 0 and 3 higher, by ~3 ticks.
 GREEDY_SUBSETS = True
+# min_edge and quote_edge_add are dollars per bundle, whatever the bundle pays
+# (edge_dollars). A fraction of its cost charged capital that isn't held:
+# Kalshi returns a netted basket's payout as cash once it completes (balance
+# reads 11-21..23). And completions don't slip more with more legs: real
+# pre-game fills 10-24..11-23 ran 2 legs -2.6c/lot vs plan, 3-6 legs about on
+# plan. False: a fraction of the bundle's cost.
+EDGE_PER_BUNDLE = True
 # Rested depth (aged_room) is re-read after a book change or this long.
 HELD_CACHE_S = 0.25
 # Live quotes in trading.model_series: edge and size from the exit-cost model,
@@ -6620,10 +6627,11 @@ def datetime_iso(ts: float) -> str:
 
 
 def edge_dollars(payout: float, rate: float) -> float:
-    """Dollar edge per bundle that returns `rate` on the bundle's cost. Cost
-    is payout - edge, so edge / (payout - edge) >= rate is edge >= rate *
-    payout / (1 + rate)."""
-    return rate * payout / (1.0 + rate)
+    """Dollar edge per bundle the config's `rate` (min_edge, quote_edge_add)
+    asks for: `rate` itself under EDGE_PER_BUNDLE, else the edge that returns
+    `rate` on the bundle's cost (cost is payout - edge, so edge >= rate *
+    payout / (1 + rate))."""
+    return rate if EDGE_PER_BUNDLE else rate * payout / (1.0 + rate)
 
 
 def edge_return(payout: float, edge: float) -> float:
